@@ -1,0 +1,28 @@
+# VRP — ignore
+build/
+cmake-build-*/
+.cache/
+compile_commands.json
+
+# IDE / OS
+.idea/
+.vscode/
+*~
+*.swp
+.DS_Store
+
+# Local media
+samples/
+*.mp4
+*.mkv
+*.webm
+*.mov
+
+# Compiled shaders
+shaders/*.spv
+
+# Not for public tracking
+packaging/README.md
+*.plan.md
+**/*.plan.md
+.cursor/

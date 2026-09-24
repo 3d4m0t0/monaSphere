@@ -1,0 +1,50 @@
+#version 450
+// Convert video source (RGBA or NV12) into an RGBA8 texture for FSR1.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0) uniform blit_params {
+  uint width;
+  uint height;
+  uint nv12;       // 0=RGBA, 1=limited, 2=full
+  uint _pad;
+};
+
+layout(set = 0, binding = 1) uniform sampler2D srcY;   // RGBA or Y
+layout(set = 0, binding = 2) uniform sampler2D srcUV;  // UV or unused
+layout(set = 0, binding = 3, rgba8) uniform image2D dst;
+
+vec3 yuv_to_rgb_limited(float y, float u, float v) {
+  y = (y - 16.0 / 255.0) * (255.0 / 219.0);
+  u = (u - 128.0 / 255.0) * (255.0 / 224.0);
+  v = (v - 128.0 / 255.0) * (255.0 / 224.0);
+  float r = y + 1.5748 * v;
+  float g = y - 0.1873 * u - 0.4681 * v;
+  float b = y + 1.8556 * u;
+  return clamp(vec3(r, g, b), 0.0, 1.0);
+}
+
+vec3 yuv_to_rgb_full(float y, float u, float v) {
+  u = u - 0.5;
+  v = v - 0.5;
+  float r = y + 1.5748 * v;
+  float g = y - 0.1873 * u - 0.4681 * v;
+  float b = y + 1.8556 * u;
+  return clamp(vec3(r, g, b), 0.0, 1.0);
+}
+
+void main() {
+  ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+  if (p.x >= int(width) || p.y >= int(height)) return;
+  vec2 uv = (vec2(p) + 0.5) / vec2(float(width), float(height));
+  vec3 rgb;
+  if (nv12 != 0u) {
+    float y = texture(srcY, uv).r;
+    vec2 chroma = texture(srcUV, uv).rg;
+    rgb = (nv12 == 2u) ? yuv_to_rgb_full(y, chroma.r, chroma.g)
+                       : yuv_to_rgb_limited(y, chroma.r, chroma.g);
+  } else {
+    rgb = texture(srcY, uv).rgb;
+  }
+  imageStore(dst, p, vec4(rgb, 1.0));
+}
