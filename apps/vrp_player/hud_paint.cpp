@@ -1,5 +1,5 @@
 #include "hud_paint.hpp"
-
+#include "i18n.hpp"
 #include "options.hpp"
 
 #include <QPainter>
@@ -203,7 +203,7 @@ void draw_chip(QPainter& p, const QRect& r, const QString& text, bool selected, 
 
 QString fsr_label(FsrMode m) {
   switch (m) {
-    case FsrMode::Off: return QStringLiteral("FSR切");
+    case FsrMode::Off: return QStringLiteral("FSR ") + VRP_TR("Off");
     case FsrMode::UltraQuality: return QStringLiteral("FSR UQ");
     case FsrMode::Quality: return QStringLiteral("FSR Q");
     case FsrMode::Performance: return QStringLiteral("FSR P");
@@ -213,18 +213,18 @@ QString fsr_label(FsrMode m) {
 
 QString proj_label(ProjectionMode m) {
   switch (m) {
-    case ProjectionMode::Flat: return QStringLiteral("FLAT");
-    case ProjectionMode::Deg180: return QStringLiteral("180");
-    case ProjectionMode::Deg360: return QStringLiteral("360");
+    case ProjectionMode::Flat: return VRP_TR("Flat");
+    case ProjectionMode::Deg180: return QStringLiteral("180°");
+    case ProjectionMode::Deg360: return QStringLiteral("360°");
   }
   return QStringLiteral("?");
 }
 
 QString stereo_label(StereoLayout s) {
   switch (s) {
-    case StereoLayout::Mono: return QStringLiteral("MONO");
+    case StereoLayout::Mono: return QStringLiteral("mono");
     case StereoLayout::Sbs: return QStringLiteral("SBS");
-    case StereoLayout::OverUnder: return QStringLiteral("TB");
+    case StereoLayout::OverUnder: return QStringLiteral("OU");
   }
   return QStringLiteral("?");
 }
@@ -259,7 +259,7 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
 
   // Title + rate (long names marquee)
   p.setFont(body_font);
-  const QString fname = snap.media_name.empty() ? QString::fromStdString(snap.title)
+  const QString fname = snap.media_name.empty() ? VRP_TR(snap.title.c_str())
                                                 : QString::fromStdString(snap.media_name);
   draw_scrolling_text(p, QRect(panel_x + pad, top + 4, panel_w - pad * 2 - 80, 24), fname,
                       QColor(230, 240, 255));
@@ -292,7 +292,7 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
   p.setFont(hint_font);
   const int vol_pct = static_cast<int>(std::lround(snap.volume * 100.f));
   const QRect vol_r(x, y, vol_w, chip_h);
-  draw_chip(p, vol_r, QStringLiteral("音量%1%").arg(vol_pct), sel == 6,
+  draw_chip(p, vol_r, VRP_TR("Vol%1%").arg(vol_pct), sel == 6,
             snap.controls_edit == VrMenu::ControlsEdit::Volume);
   x += vol_w + gap;
 
@@ -311,7 +311,7 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
   QString hz_chip;
   if (snap.preferred_hz > 0) hz_chip = QStringLiteral("%1Hz").arg(snap.preferred_hz);
   else if (snap.display_hz > 0.5f) hz_chip = QStringLiteral("%1Hz").arg(snap.display_hz, 0, 'f', 0);
-  else hz_chip = QStringLiteral("自動");
+  else hz_chip = VRP_TR("Auto");
   draw_chip(p, hz_r, hz_chip, sel == 9,
             snap.controls_edit == VrMenu::ControlsEdit::HzPick ||
                 snap.controls_edit == VrMenu::ControlsEdit::HzConfirm);
@@ -377,14 +377,14 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
     p.drawRoundedRect(box, 6, 6);
     p.setFont(hint_font);
     p.setPen(QColor(220, 230, 245));
-    const QString msg = QStringLiteral("リフレッシュレート変更には\n再起動が必要です");
+    const QString msg = VRP_TR("Hz change\nneeds restart");
     p.drawText(box.adjusted(10, 8, -10, -40), Qt::AlignTop | Qt::AlignHCenter | Qt::TextWordWrap,
                msg);
     const QRect btn_r(box.center().x() - 48, box.bottom() - 36, 96, 28);
     p.setBrush(QColor(40, 120, 200, 230));
     p.drawRoundedRect(btn_r, 4, 4);
     p.setPen(QColor(255, 255, 255));
-    p.drawText(btn_r, Qt::AlignCenter, QStringLiteral("[再起動]"));
+    p.drawText(btn_r, Qt::AlignCenter, VRP_TR("[Restart]"));
   } else if (snap.controls_edit == VrMenu::ControlsEdit::FsrPick ||
              snap.controls_edit == VrMenu::ControlsEdit::FormatPick ||
              snap.controls_edit == VrMenu::ControlsEdit::HzPick) {
@@ -411,7 +411,7 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
         switch (i) {
           case 1: label = QStringLiteral("90Hz"); break;
           case 2: label = QStringLiteral("120Hz"); break;
-          default: label = QStringLiteral("自動"); break;
+          default: label = VRP_TR("Auto"); break;
         }
       } else if (i < 3) {
         label = proj_label(static_cast<ProjectionMode>(i));
@@ -433,7 +433,7 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
   p.setPen(QColor(140, 160, 180));
   p.setFont(hint_font);
   p.drawText(QRect(panel_x + pad, height - 24, panel_w - pad * 2, 18),
-             Qt::AlignVCenter | Qt::AlignLeft, QString::fromStdString(snap.hint));
+             Qt::AlignVCenter | Qt::AlignLeft, VRP_TR(snap.hint.c_str()));
 }
 
 }  // namespace
@@ -479,12 +479,12 @@ QImage paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height) {
   p.setFont(title_font);
   p.setPen(QColor(230, 240, 255));
   p.drawText(QRect(side + 16, 4, content_w - 32, 40), Qt::AlignVCenter | Qt::AlignLeft,
-             QString::fromStdString(snap.title));
+             VRP_TR(snap.title.c_str()));
 
   p.setFont(hint_font);
   p.setPen(QColor(140, 160, 180));
   p.drawText(QRect(side + 16, height - 36, content_w - 32, 28), Qt::AlignVCenter | Qt::AlignLeft,
-             QString::fromStdString(snap.hint));
+             VRP_TR(snap.hint.c_str()));
 
   if (snap.screen == VrMenu::Screen::Browser) {
     const int list_top = 64;
@@ -526,8 +526,7 @@ QImage paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height) {
     }
   } else if (snap.screen == VrMenu::Screen::Format) {
     p.setFont(body_font);
-    const char* labels[] = {"投影: Flat", "投影: 180°", "投影: 360°",
-                            "立体: Mono", "立体: SBS", "立体: TB (上下)"};
+    const char* labels[] = {QT_TR_NOOP("Flat"), "180°", "360°", "mono", "SBS", "OU"};
     for (int i = 0; i < 6; ++i) {
       bool on = false;
       if (i == 0) on = snap.projection == ProjectionMode::Flat;
@@ -536,7 +535,7 @@ QImage paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height) {
       if (i == 3) on = snap.stereo == StereoLayout::Mono;
       if (i == 4) on = snap.stereo == StereoLayout::Sbs;
       if (i == 5) on = snap.stereo == StereoLayout::OverUnder;
-      QString t = QString::fromUtf8(labels[i]);
+      QString t = (i == 0) ? VRP_TR(labels[i]) : QString::fromUtf8(labels[i]);
       if (on) t += QStringLiteral("  ✓");
       draw_row(p, QRect(side + 24, 80 + i * 48, content_w - 48, 44), t, i == snap.format_cursor);
     }

@@ -76,6 +76,8 @@ class HostWindow : public QMainWindow {
   void buildMenus();
   void restoreWindowGeometry();
   void saveWindowGeometry() const;
+  void loadAppConf();
+  void saveAppConf() const;
   void applyHmdInfoVisibility(bool visible);
   void setSessionChrome(bool session_active);
   void setHealth(const QString& health, const QString& detail);

@@ -2,18 +2,16 @@
 # spec file for package monasphere
 #
 # 方針: ffmpeg-N-mini-devel でビルドして配布（License: MIT）。
-# ユーザー実行時は Packman の同 SONAME FFmpeg に差し替え可能（H.265）。
-# バイナリ名 monasphere（Debian の定理証明器 mona との衝突回避）。
+# Policy: build and distribute against ffmpeg-N-mini-devel (License: MIT).
 #
 
 Name:           monasphere
-Version:        0
-Release:        0
+Version:        1.0.0
+Release:        1
 Summary:        Native Linux VR video player (OpenXR / Vulkan)
 License:        MIT
 Group:          Productivity/Multimedia/Video/Players
-# Set URL/Source to the real upstream when submitting to OBS.
-URL:            https://opensource.org/licenses/MIT
+URL:            https://github.com/3d4m0t0/monaSphere
 Source:         %{name}-%{version}.tar.xz
 
 BuildRequires:  cmake
@@ -25,12 +23,12 @@ BuildRequires:  pkgconfig(openxr)
 BuildRequires:  pkgconfig(vulkan)
 BuildRequires:  pkgconfig(sdl2)
 BuildRequires:  glslang-devel
-# Canonical: LGPL mini only — do not BuildRequire Packman FFmpeg.
+# LGPL mini devel only. Do not build against a nonfree FFmpeg.
 BuildRequires:  ffmpeg-8-mini-devel
 BuildRequires:  pkgconfig(libpulse)
 BuildRequires:  pkgconfig(libpulse-simple)
 
-# SONAME caps — satisfied by mini-libs or full libav* (OSS / Packman).
+# SONAME caps. Any libav* build that provides these SONAMEs can satisfy them.
 Requires:       libavcodec.so.62()(64bit)
 Requires:       libavformat.so.62()(64bit)
 Requires:       libavutil.so.60()(64bit)
@@ -42,14 +40,16 @@ monaSphere (command: monasphere) is a Linux-native VR video player using
 Vulkan and OpenXR (Monado). Flat / 180 / 360 projection, FSR1, host UI.
 
 Built against openSUSE ffmpeg-*-mini (LGPL) so this package stays MIT for
-Factory/OSS. At runtime, users may replace the FFmpeg stack with Packman
-(same SONAME) for software HEVC and other codecs.
+Factory/OSS. Codecs at runtime follow the FFmpeg libraries that provide the
+same SONAME on the user's system. This package does not promise a codec set.
 
 %prep
-%autosetup -n VRP-%{version}
+%autosetup -n %{name}-%{version}
 
 %build
-%cmake -G Ninja -DCMAKE_BUILD_TYPE=Release
+# Select Ninja via __builder. Passing -G again duplicates the generator flag.
+%define __builder ninja
+%cmake
 %cmake_build
 
 %install
@@ -58,11 +58,14 @@ Factory/OSS. At runtime, users may replace the FFmpeg stack with Packman
 %files
 %license LICENSE
 %doc README.md
-%{_docdir}/monasphere/
+# CMake installs these under /usr/share/doc, not %%{_docdir} (/usr/share/doc/packages).
+%{_datadir}/doc/monasphere/
 %{_bindir}/monasphere
-%{_datadir}/monasphere/shaders/
+%{_datadir}/monasphere/
+%{_datadir}/icons/hicolor/256x256/apps/monasphere.png
+%{_datadir}/applications/monasphere.desktop
 
 %changelog
-* Thu Sep 24 2026 - 0-0
-- Rename binary/package to monasphere (avoid Debian mona clash).
-- Policy: build with ffmpeg mini; runtime Packman optional for HEVC.
+* Thu Sep 24 2026 flex - 1.0.0-1
+- Package monasphere 1.0.0.
+- Build with ffmpeg mini. Runtime codecs follow the installed FFmpeg SONAME.

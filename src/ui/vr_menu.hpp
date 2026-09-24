@@ -130,6 +130,8 @@ class VrMenu {
   float rate() const { return rate_; }
   void set_fsr(FsrMode m);
   FsrMode fsr() const { return fsr_; }
+  void save_last_dir() const;
+  std::filesystem::path load_last_dir() const;
   void set_preferred_hz(int hz);
   int preferred_hz() const { return preferred_hz_; }
   void set_display_hz(float hz);

@@ -1,0 +1,10 @@
+<!DOCTYPE RCC>
+<RCC version="1.0">
+  <qresource prefix="/i18n">
+    <file alias="monasphere_en.json">../../translations/monasphere_en.json</file>
+    <file alias="monasphere_ja.json">../../translations/monasphere_ja.json</file>
+  </qresource>
+  <qresource prefix="/icons">
+    <file alias="monasphere.png">../../icons/hicolor/256x256/apps/monasphere.png</file>
+  </qresource>
+</RCC>

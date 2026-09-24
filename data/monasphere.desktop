@@ -1,0 +1,27 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=monaSphere
+GenericName=VR Video Player
+Comment=Native Linux VR video player (OpenXR / Vulkan)
+GenericName[ja]=VR 動画プレーヤー
+GenericName[zh_CN]=VR 视频播放器
+GenericName[zh_TW]=VR 影片播放器
+GenericName[ko]=VR 동영상 플레이어
+GenericName[de]=VR-Videoplayer
+GenericName[fr]=Lecteur vidéo VR
+GenericName[es]=Reproductor de vídeo VR
+Comment[ja]=Linux 向けのネイティブ VR 動画プレーヤー
+Comment[zh_CN]=Linux 原生 VR 视频播放器（OpenXR / Vulkan）
+Comment[zh_TW]=Linux 原生 VR 影片播放器（OpenXR / Vulkan）
+Comment[ko]=Linux 네이티브 VR 동영상 플레이어 (OpenXR / Vulkan)
+Comment[de]=Nativer Linux-VR-Videoplayer (OpenXR / Vulkan)
+Comment[fr]=Lecteur vidéo VR natif pour Linux (OpenXR / Vulkan)
+Comment[es]=Reproductor de vídeo VR nativo para Linux (OpenXR / Vulkan)
+Exec=monasphere %f
+Icon=monasphere
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=VR;OpenXR;video;player;monasphere;
+MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;
+StartupNotify=true

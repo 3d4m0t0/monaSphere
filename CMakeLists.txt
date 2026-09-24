@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_AUTOMOC ON)
+set(CMAKE_AUTORCC ON)
 
 find_package(PkgConfig REQUIRED)
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
@@ -93,7 +94,9 @@ list(APPEND VRP_SPV_FILES ${SPV})
 
 add_custom_target(vrp_shaders ALL DEPENDS ${VRP_SPV_FILES})
 
-add_library(vrp_core
+# STATIC: the SUSE cmake macro sets BUILD_SHARED_LIBS=ON, which would
+# otherwise emit an unpackaged libvrp_core.so that the player requires.
+add_library(vrp_core STATIC
   src/xr/xr_vulkan_app.cpp
   src/video/video_decoder.cpp
   src/video/cuda_minimal.cpp
@@ -150,6 +153,9 @@ endif()
 
 add_executable(vrp_player
   apps/vrp_player/main.cpp
+  apps/vrp_player/i18n.cpp
+  apps/vrp_player/i18n.hpp
+  apps/vrp_player/i18n.qrc
   apps/vrp_player/host_window.cpp
   apps/vrp_player/host_window.hpp
   apps/vrp_player/hud_paint.cpp
@@ -164,12 +170,22 @@ add_dependencies(vrp_player vrp_shaders)
 add_custom_command(TARGET vrp_player POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:vrp_player>/shaders
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${VRP_SPV_DIR} $<TARGET_FILE_DIR:vrp_player>/shaders
+  COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:vrp_player>/translations
+  COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/translations $<TARGET_FILE_DIR:vrp_player>/translations
 )
 
 install(TARGETS vrp_player RUNTIME DESTINATION bin)
+install(FILES ${CMAKE_SOURCE_DIR}/icons/hicolor/256x256/apps/monasphere.png
+  DESTINATION share/icons/hicolor/256x256/apps)
+install(FILES ${CMAKE_SOURCE_DIR}/data/monasphere.desktop
+  DESTINATION share/applications)
 install(DIRECTORY ${VRP_SPV_DIR}/ DESTINATION share/monasphere/shaders)
-install(FILES
-  ${CMAKE_SOURCE_DIR}/LICENSE
-  ${CMAKE_SOURCE_DIR}/THIRD_PARTY.md
+install(FILES ${CMAKE_SOURCE_DIR}/THIRD_PARTY.md
   DESTINATION share/doc/monasphere
+)
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/translations/
+  DESTINATION share/monasphere/translations
+  FILES_MATCHING PATTERN "monasphere_*.json"
+  PATTERN "monasphere_en.json" EXCLUDE
+  PATTERN "monasphere_ja.json" EXCLUDE
 )

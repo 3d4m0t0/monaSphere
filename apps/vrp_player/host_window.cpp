@@ -12,7 +12,9 @@
 #include "video/video_decoder.hpp"
 #include "xr/xr_vulkan_app.hpp"
 
-#include <QCloseEvent>
+#include <QCoreApplication>
+
+#include <fstream>
 #include <QCoreApplication>
 #include <QEventLoop>
 #include <QImage>
@@ -28,7 +30,10 @@
 #include <QMenuBar>
 #include <QAction>
 #include <QActionGroup>
-#include <QMessageBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QIcon>
+#include <QPixmap>
 #include <QPlainTextEdit>
 #include <QProcess>
 #include <QSettings>
@@ -37,7 +42,10 @@
 #include <QStandardPaths>
 #include <QThread>
 #include <QTimer>
-#include <QDateTime>
+#include <QCloseEvent>
+#include <QDir>
+#include <QFile>
+#include <QTextStream>
 #include <QVBoxLayout>
 #include <QDir>
 #include <QFile>
@@ -79,8 +87,8 @@ HostWindow::HostWindow(vrp::PlayerOptions opt, QString shader_dir, QWidget* pare
   connect(monado_, &QProcess::readyReadStandardOutput, this, &HostWindow::onMonadoOutput);
   connect(monado_, &QProcess::finished, this, &HostWindow::onMonadoFinished);
   // Do not start Monado at launch — start on HMD connect, stop on disconnect (lighter idle/exit).
-  monado_label_->setText(QStringLiteral("停止（HMD 接続時に起動）"));
-  setHealth(QStringLiteral("待機"), QStringLiteral("USB HMD の認識を待ちます"));
+  monado_label_->setText(tr("Idle"));
+  setHealth("Wait", tr("Waiting for USB HMD"));
   loadMonadoModeTable();
   QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
 }
@@ -103,7 +111,7 @@ void HostWindow::closeEvent(QCloseEvent* event) {
   shutting_down_.store(true);
   thumb_cancel_.store(true);
   if (!shutdownXrSession(10000, true)) {
-    appendLog("XR スレッドが終了しないため detach します（最終手段）");
+    appendLog(tr("XR thread hung — detach"));
     VRP_ERR("XR thread join timed out on close — detaching");
     if (xr_thread_.joinable()) xr_thread_.detach();
   }
@@ -157,8 +165,8 @@ bool HostWindow::ensureMonadoReady() {
     QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
   }
   if (!isMonadoIpcLive()) {
-    setHealth(tr("異常"), tr("Monado が応答しません"));
-    appendLog(tr("Monado IPC がタイムアウトしました"));
+    setHealth("Error", "Monado not responding");
+    appendLog(tr("Monado IPC timed out"));
     return false;
   }
   return true;
@@ -233,7 +241,7 @@ void HostWindow::maybeAutoConnectHeadset() {
     const int n = countConnectedHmds();
     last_usb_hmd_count_ = n;
     if (n == 0) {
-      appendLog("USB: HMD 物理切断を検出 — セッション終了と Monado 停止");
+      appendLog(tr("USB: HMD unplugged — stop session"));
       disconnectHeadsetSession(/*resume_auto_poll=*/!user_suppressed_auto_connect_);
       return;
     }
@@ -254,9 +262,9 @@ void HostWindow::maybeAutoConnectHeadset() {
   // Monado if USB never showed an HMD — debug「Monado 起動」).
   if (n == 0) {
     if (prev == 1 && !monado_external_ && monado_ && monado_->state() != QProcess::NotRunning) {
-      appendLog("USB HMD 抜去 — 所有 Monado を停止します");
+      appendLog(tr("USB HMD removed — stop Monado"));
       stopMonadoProcess();
-      monado_label_->setText(QStringLiteral("停止（HMD 接続時に起動）"));
+      monado_label_->setText(tr("Idle"));
     }
     QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
     return;
@@ -265,8 +273,8 @@ void HostWindow::maybeAutoConnectHeadset() {
   if (n >= 2) {
     if (!monado_multi_hmd_logged_) {
       monado_multi_hmd_logged_ = true;
-      appendLog(QString("自動接続: HMD が %1 台検出されたため接続しません（1 台にしてから接続）").arg(n));
-      setHealth("待機", "HMD が複数あるため手動接続してください");
+      appendLog(tr("Auto-connect skipped: %1 HMDs").arg(n));
+      setHealth("Wait", "Multiple HMDs — connect manually");
     }
     QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
     return;
@@ -280,7 +288,7 @@ void HostWindow::maybeAutoConnectHeadset() {
 
   // Start Monado only when a single USB HMD is present (probe sees the real device).
   if (!isMonadoIpcLive()) {
-    setHealth("待機", "Monado 起動中…");
+    setHealth("Wait", "Starting Monado…");
     if (monado_hz_require_owned_ || (preferred_hz_ > 0 && monado_desired_mode_ >= 0)) {
       startOwnedMonado(/*allow_external_adopt=*/false);
     } else {
@@ -292,7 +300,7 @@ void HostWindow::maybeAutoConnectHeadset() {
   // Prefer owned process when DESIRED_MODE must apply — don't silently adopt systemd.
   if (monado_hz_require_owned_ &&
       (!monado_ || monado_->state() == QProcess::NotRunning || monado_external_)) {
-    appendLog("自動接続: DESIRED_MODE 適用のため外部 Monado を置換します");
+    appendLog(tr("Auto-connect: replace external Monado for Hz"));
     restartOwnedMonadoForHz();
     return;
   }
@@ -308,8 +316,7 @@ void HostWindow::onAutoConnectXrReady(const QString& system_name) {
       monado_auto_connect_cooldown_ms_ = QDateTime::currentMSecsSinceEpoch() + 3000;
       if (!monado_simulated_reject_logged_) {
         monado_simulated_reject_logged_ = true;
-        appendLog(QString("自動接続: 「%1」は実機ではないため切断し、Monado を停止します")
-                      .arg(system_name.isEmpty() ? QStringLiteral("(空)") : system_name));
+        appendLog(tr("Auto-connect: %1 is not a real HMD").arg(system_name.isEmpty() ? tr("(none)") : system_name));
       }
       QTimer::singleShot(0, this, [this] {
         disconnectHeadsetSession(/*resume_auto_poll=*/true);
@@ -328,13 +335,13 @@ void HostWindow::onAutoConnectXrReady(const QString& system_name) {
 void HostWindow::syncDisconnectedUi(const QString& detail) {
   setSessionChrome(false);
   last_xr_system_.clear();
-  hmd_label_->setText(QStringLiteral("HMD: 未検出"));
+  hmd_label_->setText(tr("HMD: none"));
   sync_lag_hold_until_ms_ = 0;
   if (sync_status_label_) {
     sync_status_label_->setText(QStringLiteral("-"));
     sync_status_label_->setStyleSheet({});
   }
-  setHealth(QStringLiteral("待機"), detail);
+  setHealth("Wait", detail);
   // Drop HMD HDMI route; Pulse may still list PSVR2 briefly after unplug.
   refreshAudioDevices(/*prefer_hmd=*/false);
   rebuildConnectDeviceMenu();
@@ -487,17 +494,17 @@ void HostWindow::buildUi() {
   runtime_label_ = new QLabel(status);
   runtime_label_->hide();
   if (!runtime_json_.isEmpty()) runtime_label_->setText(runtime_json_);
-  monado_label_ = new QLabel(QStringLiteral("停止"), status);
+  monado_label_ = new QLabel(tr("Stopped"), status);
   monado_label_->hide();
 
-  health_label_ = new QLabel(QStringLiteral("待機"));
+  health_label_ = new QLabel(tr("Wait"));
   sync_status_label_ = new QLabel(QStringLiteral("-"));
   sync_status_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
-  form->addRow(tr("状態"), health_label_);
-  form->addRow(tr("HMD同期"), sync_status_label_);
+  form->addRow(tr("Status"), health_label_);
+  form->addRow(tr("Sync"), sync_status_label_);
 
   // Status bar: HMD name only (表示 → HMD情報).
-  hmd_label_ = new QLabel(tr("HMD: 未接続"));
+  hmd_label_ = new QLabel(tr("HMD: none"));
   statusBar()->addWidget(hmd_label_, 1);
 
   log_ = new QPlainTextEdit();
@@ -508,7 +515,7 @@ void HostWindow::buildUi() {
     log_->setFont(term);
     if (log_->document()) log_->document()->setDefaultFont(term);
   }
-  log_->setPlaceholderText(QStringLiteral("Monado とアプリのログ"));
+  log_->setPlaceholderText(tr("Log"));
 
   auto* split = new QSplitter(Qt::Vertical);
   split->addWidget(status);
@@ -535,6 +542,38 @@ void HostWindow::buildUi() {
   hmd_menu_timer->start(2000);
 
   restoreWindowGeometry();
+  loadAppConf();
+  rebuildFsrMenu();
+}
+
+void HostWindow::saveAppConf() const {
+  const QString dir = QDir::homePath() + QStringLiteral("/.config/monasphere");
+  QDir().mkpath(dir);
+  QFile f(dir + QStringLiteral("/conf"));
+  QString last_dir;
+  if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    while (!f.atEnd()) {
+      const QString line = QString::fromUtf8(f.readLine()).trimmed();
+      if (line.startsWith(QStringLiteral("last_dir="))) last_dir = line.mid(9);
+    }
+    f.close();
+  }
+  if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) return;
+  QTextStream out(&f);
+  if (!last_dir.isEmpty()) out << "last_dir=" << last_dir << '\n';
+  out << "fsr=" << static_cast<int>(preferred_fsr_) << '\n';
+}
+
+void HostWindow::loadAppConf() {
+  QFile f(QDir::homePath() + QStringLiteral("/.config/monasphere/conf"));
+  if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+  while (!f.atEnd()) {
+    const QString line = QString::fromUtf8(f.readLine()).trimmed();
+    if (!line.startsWith(QStringLiteral("fsr="))) continue;
+    bool ok = false;
+    const int v = line.mid(4).toInt(&ok);
+    if (ok && v >= 0 && v <= 3) preferred_fsr_ = static_cast<vrp::FsrMode>(v);
+  }
 }
 
 void HostWindow::restoreWindowGeometry() {
@@ -560,24 +599,24 @@ void HostWindow::onShowHmdInfoToggled(bool checked) {
 }
 
 void HostWindow::buildMenus() {
-  auto* ops = menuBar()->addMenu(tr("操作"));
-  ops->addAction(tr("Monado起動"), this, &HostWindow::startMonado);
-  ops->addAction(tr("Monado停止"), this, &HostWindow::stopMonado);
-  connect_menu_ = ops->addMenu(tr("HMD接続"));
+  auto* ops = menuBar()->addMenu(tr("Actions"));
+  ops->addAction(tr("Start Monado"), this, &HostWindow::startMonado);
+  ops->addAction(tr("Stop Monado"), this, &HostWindow::stopMonado);
+  connect_menu_ = ops->addMenu(tr("Connect"));
   connect(connect_menu_, &QMenu::aboutToShow, this, &HostWindow::rebuildConnectDeviceMenu);
-  act_disconnect_ = ops->addAction(tr("切断"), this, &HostWindow::disconnectHeadset);
+  act_disconnect_ = ops->addAction(tr("Disconnect"), this, &HostWindow::disconnectHeadset);
   act_disconnect_->setEnabled(false);
   ops->addSeparator();
-  ops->addAction(tr("終了"), this, &QWidget::close);
+  ops->addAction(tr("Quit"), this, &QWidget::close);
 
-  auto* view = menuBar()->addMenu(tr("表示"));
-  act_show_hmd_info_ = view->addAction(tr("HMD情報"));
+  auto* view = menuBar()->addMenu(tr("View"));
+  act_show_hmd_info_ = view->addAction(tr("HMD info"));
   act_show_hmd_info_->setCheckable(true);
   act_show_hmd_info_->setChecked(true);
   connect(act_show_hmd_info_, &QAction::toggled, this, &HostWindow::onShowHmdInfoToggled);
 
-  auto* settings = menuBar()->addMenu(tr("設定"));
-  audio_menu_ = settings->addMenu(tr("音声出力"));
+  auto* settings = menuBar()->addMenu(tr("Settings"));
+  audio_menu_ = settings->addMenu(tr("Audio"));
   audio_group_ = new QActionGroup(this);
   audio_group_->setExclusive(true);
   connect(audio_menu_, &QMenu::aboutToShow, this, &HostWindow::rebuildAudioMenu);
@@ -590,14 +629,14 @@ void HostWindow::buildMenus() {
   connect(fsr_group_, &QActionGroup::triggered, this, &HostWindow::onFsrAction);
   rebuildFsrMenu();
 
-  hz_menu_ = settings->addMenu(tr("リフレッシュレート"));
+  hz_menu_ = settings->addMenu(tr("Hz"));
   hz_group_ = new QActionGroup(this);
   hz_group_->setExclusive(true);
   connect(hz_menu_, &QMenu::aboutToShow, this, &HostWindow::rebuildHzMenu);
   connect(hz_group_, &QActionGroup::triggered, this, &HostWindow::onHzAction);
   rebuildHzMenu();
 
-  controller_menu_ = settings->addMenu(tr("使用コントローラー"));
+  controller_menu_ = settings->addMenu(tr("Pad"));
   controller_group_ = new QActionGroup(this);
   controller_group_->setExclusive(true);
   struct ProfileItem {
@@ -605,16 +644,16 @@ void HostWindow::buildMenus() {
     const char* label;
   };
   const ProfileItem profiles[] = {
-      {vrp::ControllerProfile::Auto, "自動（全プロファイル）"},
-      {vrp::ControllerProfile::OculusTouch, "PSVR2 Sense / Touch"},
-      {vrp::ControllerProfile::Simple, "Simple Controller"},
-      {vrp::ControllerProfile::MicrosoftMotion, "Microsoft Motion"},
-      {vrp::ControllerProfile::ViveController, "Vive Controller"},
-      {vrp::ControllerProfile::ValveIndex, "Valve Index"},
-      {vrp::ControllerProfile::Gamepad, "ゲームパッド（USB/BT）"},
+      {vrp::ControllerProfile::Auto, QT_TR_NOOP("Auto")},
+      {vrp::ControllerProfile::OculusTouch, QT_TR_NOOP("Touch")},
+      {vrp::ControllerProfile::Simple, QT_TR_NOOP("Simple")},
+      {vrp::ControllerProfile::MicrosoftMotion, QT_TR_NOOP("MS Motion")},
+      {vrp::ControllerProfile::ViveController, QT_TR_NOOP("Vive")},
+      {vrp::ControllerProfile::ValveIndex, QT_TR_NOOP("Index")},
+      {vrp::ControllerProfile::Gamepad, QT_TR_NOOP("Gamepad")},
   };
   for (const auto& p : profiles) {
-    auto* a = controller_menu_->addAction(QString::fromUtf8(p.label));
+    auto* a = controller_menu_->addAction(tr(p.label));
     a->setCheckable(true);
     a->setData(static_cast<int>(p.profile));
     controller_group_->addAction(a);
@@ -622,14 +661,14 @@ void HostWindow::buildMenus() {
   }
   connect(controller_group_, &QActionGroup::triggered, this, &HostWindow::onControllerProfileAction);
 
-  hand_menu_ = settings->addMenu(QStringLiteral("利き手"));
+  hand_menu_ = settings->addMenu(tr("Hand"));
   hand_group_ = new QActionGroup(this);
   hand_group_->setExclusive(true);
-  auto* right = hand_menu_->addAction(QStringLiteral("右手（パッド／決定）"));
+  auto* right = hand_menu_->addAction(tr("Right"));
   right->setCheckable(true);
   right->setData(static_cast<int>(vrp::ControllerHand::Right));
   hand_group_->addAction(right);
-  auto* left = hand_menu_->addAction(QStringLiteral("左手（パッド／決定）"));
+  auto* left = hand_menu_->addAction(tr("Left"));
   left->setCheckable(true);
   left->setData(static_cast<int>(vrp::ControllerHand::Left));
   hand_group_->addAction(left);
@@ -638,19 +677,66 @@ void HostWindow::buildMenus() {
   connect(hand_group_, &QActionGroup::triggered, this, &HostWindow::onHandAction);
   hand_menu_->setEnabled(opt_.controller_profile != vrp::ControllerProfile::Gamepad);
 
-  auto* help = menuBar()->addMenu(tr("ヘルプ"));
-  help->addAction(tr("monaSphereについて"), this, &HostWindow::showAboutDialog);
+  auto* help = menuBar()->addMenu(tr("Help"));
+  help->addAction(tr("About"), this, &HostWindow::showAboutDialog);
 }
 
 void HostWindow::showAboutDialog() {
   const QString text = tr(
-      "<h3>monaSphere</h3>"
-      "<p>Linux ネイティブ VR 動画プレーヤー（OpenXR / Monado）。</p>"
-      "<p>平面・180°/360° 立体視、FSR1、HMD 同期表示に対応。</p>"
-      "<p>ソースライセンス: MIT</p>"
-      "<p>FFmpeg / Qt 等は動的リンク。バイナリ配布時は "
-      "THIRD_PARTY.md および各ライブラリの条項に従ってください。</p>");
-  QMessageBox::about(this, tr("monaSphereについて"), text);
+      "<h3>monaSphere v%1</h3>"
+      "<p>Linux VR video player (OpenXR / Monado)</p>"
+      "<p>Copyright (c) 2026 flex</p>"
+      "<p>GitHub:<br>"
+      "<a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p>"
+      "<p>Source license: MIT</p>"
+      "<p>FFmpeg / Qt and others are linked dynamically. "
+      "See THIRD_PARTY.md when distributing a binary.</p>")
+                           .arg(QStringLiteral("1.0.0"));
+  QString html = text;
+  html.replace(QStringLiteral("<h3>"), QStringLiteral("<h3 style=\"margin:0;\">"));
+  html.replace(QStringLiteral("<p>"), QStringLiteral("<p style=\"margin:0;\">"));
+
+  QDialog dlg(this);
+  dlg.setWindowTitle(tr("About"));
+  dlg.setWindowIcon(windowIcon());
+
+  QTextDocument measure;
+  measure.setDefaultFont(dlg.font());
+  measure.setDocumentMargin(0);
+  measure.setHtml(html);
+  const int text_w = static_cast<int>(measure.idealWidth()) + 2;
+
+  auto* icon = new QLabel(&dlg);
+  const QPixmap pixmap =
+      QPixmap(QStringLiteral(":/icons/monasphere.png")).scaled(128, 128, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+  icon->setPixmap(pixmap);
+  icon->setFixedSize(128, 128);
+
+  auto* body = new QLabel(html, &dlg);
+  body->setTextFormat(Qt::RichText);
+  body->setTextInteractionFlags(Qt::TextBrowserInteraction);
+  body->setOpenExternalLinks(true);
+  body->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+  body->setWordWrap(false);
+  body->setMargin(0);
+  body->setFixedWidth(text_w);
+  if (auto* doc = body->findChild<QTextDocument*>()) doc->setDocumentMargin(0);
+
+  auto* row = new QHBoxLayout();
+  row->setSpacing(8);
+  row->addWidget(icon, 0, Qt::AlignTop);
+  row->addWidget(body, 0, Qt::AlignTop);
+
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, &dlg);
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+
+  auto* layout = new QVBoxLayout(&dlg);
+  layout->setContentsMargins(8, 8, 8, 8);
+  layout->setSpacing(6);
+  layout->setSizeConstraint(QLayout::SetFixedSize);
+  layout->addLayout(row);
+  layout->addWidget(buttons);
+  dlg.exec();
 }
 
 void HostWindow::rebuildConnectDeviceMenu() {
@@ -658,7 +744,7 @@ void HostWindow::rebuildConnectDeviceMenu() {
   connect_menu_->clear();
   const auto devices = listConnectedHmds();
   if (devices.empty()) {
-    auto* none = connect_menu_->addAction(QStringLiteral("（検出なし）"));
+    auto* none = connect_menu_->addAction(tr("(none)"));
     none->setEnabled(false);
     return;
   }
@@ -671,7 +757,7 @@ void HostWindow::rebuildConnectDeviceMenu() {
   }
   if (devices.size() >= 2) {
     connect_menu_->addSeparator();
-    auto* note = connect_menu_->addAction(QStringLiteral("※ 同時接続は非対応（1台にしてください）"));
+    auto* note = connect_menu_->addAction(tr("One HMD only"));
     note->setEnabled(false);
   }
 }
@@ -687,11 +773,11 @@ void HostWindow::rebuildAudioMenu() {
   }
   audio_menu_->clear();
   if (audio_device_ids_.isEmpty()) {
-    auto* none = audio_menu_->addAction(QStringLiteral("（デバイスなし）"));
+    auto* none = audio_menu_->addAction(tr("No device"));
     none->setEnabled(false);
     return;
   }
-  auto* refresh = audio_menu_->addAction(QStringLiteral("一覧を更新"));
+  auto* refresh = audio_menu_->addAction(tr("Reload"));
   connect(refresh, &QAction::triggered, this, [this] {
     refreshAudioDevices(false);
     rebuildAudioMenu();
@@ -720,13 +806,13 @@ void HostWindow::rebuildFsrMenu() {
     const char* label;
   };
   const Item items[] = {
-      {vrp::FsrMode::Off, "オフ"},
-      {vrp::FsrMode::UltraQuality, "Ultra Quality (~1.3x)"},
-      {vrp::FsrMode::Quality, "Quality (~1.5x)"},
-      {vrp::FsrMode::Performance, "Performance (~2.0x)"},
+      {vrp::FsrMode::Off, QT_TR_NOOP("Off")},
+      {vrp::FsrMode::UltraQuality, QT_TR_NOOP("UQ (~1.3x)")},
+      {vrp::FsrMode::Quality, QT_TR_NOOP("Q (~1.5x)")},
+      {vrp::FsrMode::Performance, QT_TR_NOOP("P (~2.0x)")},
   };
   for (const auto& it : items) {
-    auto* a = fsr_menu_->addAction(QString::fromUtf8(it.label));
+    auto* a = fsr_menu_->addAction(tr(it.label));
     a->setCheckable(true);
     a->setData(static_cast<int>(it.mode));
     fsr_group_->addAction(a);
@@ -748,12 +834,12 @@ void HostWindow::rebuildHzMenu() {
     const char* label;
   };
   const Item items[] = {
-      {0, "自動（最高）"},
-      {90, "90 Hz"},
-      {120, "120 Hz"},
+      {0, QT_TR_NOOP("Auto")},
+      {90, QT_TR_NOOP("90 Hz")},
+      {120, QT_TR_NOOP("120 Hz")},
   };
   for (const auto& it : items) {
-    auto* a = hz_menu_->addAction(QString::fromUtf8(it.label));
+    auto* a = hz_menu_->addAction(tr(it.label));
     a->setCheckable(true);
     a->setData(it.hz);
     hz_group_->addAction(a);
@@ -772,13 +858,14 @@ void HostWindow::onAudioDeviceAction(QAction* action) {
   }
   audio_user_override_.store(true);
   audio_reopen_.store(true);
-  appendLog(QStringLiteral("音声出力を手動切替: ") + action->text());
+  appendLog(tr("Audio: %1").arg(action->text()));
 }
 
 void HostWindow::onFsrAction(QAction* action) {
   if (!action) return;
   const auto mode = static_cast<vrp::FsrMode>(action->data().toInt());
   preferred_fsr_ = mode;
+  saveAppConf();
   fsr_req_.store(static_cast<int>(mode));
   appendLog(QStringLiteral("FSR1: %1").arg(QString::fromUtf8(vrp::fsr_mode_name(mode))));
   {
@@ -799,8 +886,7 @@ void HostWindow::onHzAction(QAction* action) {
     if (vr_menu_) vr_menu_->set_preferred_hz(hz);
   }
   requestHudPaint();
-  appendLog(QStringLiteral("希望リフレッシュレート: %1")
-                .arg(hz <= 0 ? QStringLiteral("自動（最高）") : QStringLiteral("%1 Hz").arg(hz)));
+  appendLog(tr("Refresh: %1").arg(hz <= 0 ? tr("Auto") : tr("%1 Hz").arg(hz)));
   applyPreferredRefreshRate(/*from_ui=*/true, /*force_monado_restart=*/true);
 }
 
@@ -823,14 +909,13 @@ void HostWindow::onControllerProfileAction(QAction* action) {
   opt_.controller_profile = static_cast<vrp::ControllerProfile>(action->data().toInt());
   const bool gp = opt_.controller_profile == vrp::ControllerProfile::Gamepad;
   if (hand_menu_) hand_menu_->setEnabled(!gp && connect_ui_enabled_);
-  appendLog(QString("使用コントローラー: %1（再接続で適用）")
-                .arg(QString::fromUtf8(vrp::controller_profile_name(opt_.controller_profile))));
+  appendLog(tr("Pad: %1 (applies on reconnect)").arg(QString::fromUtf8(vrp::controller_profile_name(opt_.controller_profile))));
   if (gp) {
     const auto names = vrp::GamepadInput::list_names();
     if (names.empty()) {
-      appendLog("ゲームパッド未検出（接続してから HMD 接続してください）");
+      appendLog(tr("No gamepad — plug in, then connect HMD"));
     } else {
-      appendLog(QString("検出: %1").arg(QString::fromStdString(names.front())));
+      appendLog(tr("Found: %1").arg(QString::fromStdString(names.front())));
     }
   }
 }
@@ -838,8 +923,7 @@ void HostWindow::onControllerProfileAction(QAction* action) {
 void HostWindow::onHandAction(QAction* action) {
   if (!action) return;
   opt_.controller_hand = static_cast<vrp::ControllerHand>(action->data().toInt());
-  appendLog(QString("利き手: %1（再接続で適用）")
-                .arg(QString::fromUtf8(vrp::controller_hand_name(opt_.controller_hand))));
+  appendLog(tr("Hand: %1 (applies on reconnect)").arg(QString::fromUtf8(vrp::controller_hand_name(opt_.controller_hand))));
 }
 
 void HostWindow::appendLog(const QString& line) {
@@ -847,11 +931,21 @@ void HostWindow::appendLog(const QString& line) {
   log_->appendPlainText(line);
 }
 
+namespace {
+QString UiTr(const QString& s) {
+  if (s.isEmpty()) return s;
+  const QByteArray u = s.toUtf8();
+  return QCoreApplication::translate("HostWindow", u.constData());
+}
+}  // namespace
+
 void HostWindow::setHealth(const QString& health, const QString& detail) {
-  health_label_->setText(detail.isEmpty() ? health : health + " — " + detail);
-  if (health == "正常") {
+  const QString h = UiTr(health);
+  const QString d = UiTr(detail);
+  health_label_->setText(d.isEmpty() ? h : h + QStringLiteral(" — ") + d);
+  if (health == QLatin1String("OK")) {
     health_label_->setStyleSheet("color: #3dd68c; font-weight: 600;");
-  } else if (health == "異常") {
+  } else if (health == QLatin1String("Error")) {
     health_label_->setStyleSheet("color: #ff6b6b; font-weight: 600;");
   } else {
     health_label_->setStyleSheet("color: #e6c15a; font-weight: 600;");
@@ -871,17 +965,18 @@ void HostWindow::applyStatus(const QString& hmd, const QString& session, const Q
   (void)openxr_hz_switchable;
   (void)available_hz;
 
-  const bool hmd_changed = !hmd.isEmpty() && hmd != "未検出" && hmd != last_xr_system_;
-  hmd_label_->setText(QStringLiteral("HMD: %1").arg(hmd.isEmpty() ? QStringLiteral("未検出") : hmd));
+  const bool hmd_changed = !hmd.isEmpty() && hmd != last_xr_system_;
+  if (hmd.isEmpty()) hmd_label_->setText(tr("HMD: none"));
+  else hmd_label_->setText(tr("HMD: %1").arg(hmd));
 
-  // Hold "フレーム遅れ" for 1s so brief stalls remain visible.
   const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
-  QString note = sync_note.isEmpty() ? QStringLiteral("—") : sync_note;
-  if (note.contains(QStringLiteral("遅れ"))) {
-    sync_lag_hold_until_ms_ = now_ms + 1000;
-  } else if (now_ms < sync_lag_hold_until_ms_) {
-    note = QStringLiteral("フレーム遅れ");
-  }
+  const bool incoming_lag = sync_note == QLatin1String("lag");
+  if (incoming_lag) sync_lag_hold_until_ms_ = now_ms + 1000;
+  const bool show_lag = incoming_lag || now_ms < sync_lag_hold_until_ms_;
+  QString note = QStringLiteral("—");
+  if (show_lag) note = tr("lag");
+  else if (sync_note == QLatin1String("OK")) note = tr("sync OK");
+  else if (!sync_note.isEmpty()) note = UiTr(sync_note);
 
   QString hz_text;
   if (display_hz > 0.5) {
@@ -889,23 +984,22 @@ void HostWindow::applyStatus(const QString& hmd, const QString& session, const Q
   } else {
     hz_text = QStringLiteral("- Hz");
   }
-  // Lag when frame_ms > (1000/hz) * 1.15 — show that ceiling beside the measured cost.
   QString ms_text;
   if (frame_ms >= 0.05) {
-    ms_text = QStringLiteral("応答 %1 ms").arg(frame_ms, 0, 'f', 1);
+    ms_text = tr("%1 ms").arg(frame_ms, 0, 'f', 1);
   } else {
-    ms_text = QStringLiteral("応答 -");
+    ms_text = tr("— ms");
   }
   if (display_hz > 0.5) {
     const double limit_ms = (1000.0 / display_hz) * 1.15;
-    ms_text += QStringLiteral("（≤%1）").arg(limit_ms, 0, 'f', 1);
+    ms_text += tr(" (≤%1)").arg(limit_ms, 0, 'f', 1);
   }
   const QString sync = hz_text + QStringLiteral(" — ") + ms_text + QStringLiteral(" — ") + note;
   if (sync_status_label_) {
     sync_status_label_->setText(sync);
-    if (note.contains(QStringLiteral("遅れ"))) {
+    if (show_lag) {
       sync_status_label_->setStyleSheet("color: #ff6b6b; font-weight: 600;");
-    } else if (note.contains(QStringLiteral("OK"))) {
+    } else if (sync_note == QLatin1String("OK")) {
       sync_status_label_->setStyleSheet("color: #3dd68c; font-weight: 600;");
     } else {
       sync_status_label_->setStyleSheet({});
@@ -949,7 +1043,7 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
       idx = audio_device_ids_.indexOf(QString::fromStdString(pick));
       if (idx >= 0) {
         audio_user_override_.store(false);
-        appendLog(QStringLiteral("HMD 音声へ自動切替: ") + audio_device_labels_[idx]);
+        appendLog(tr("Audio → HMD: %1").arg(audio_device_labels_[idx]));
       }
     }
   }
@@ -962,7 +1056,7 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
       if (idx >= 0) break;
     }
     if (idx >= 0 && audio_device_ids_[idx] != prev) {
-      appendLog(QStringLiteral("音声出力をデスクトップへ戻す: ") + audio_device_labels_[idx]);
+      appendLog(tr("Audio → desktop: %1").arg(audio_device_labels_[idx]));
     }
   }
 
@@ -991,7 +1085,7 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
     audio_reopen_.store(true);
   }
   if (hmd_count == 0 && pick_hmd) {
-    appendLog(tr("HMD HDMI 音声が見つかりません"));
+    appendLog(tr("No HMD HDMI audio"));
   }
 }
 
@@ -1011,21 +1105,21 @@ QString HostWindow::selectedAudioDevice() const {
 void HostWindow::reportVideoOpen(const vrp::VideoInfo& info) {
   const QString path = QString::fromStdString(info.path);
   if (!info.ok) {
-    const QString err = QString::fromStdString(info.error.empty() ? "不明なエラー" : info.error);
-    appendLog("再生できません: " + path);
-    appendLog("  理由: " + err);
+    const QString err = QString::fromStdString(info.error.empty() ? "unknown error" : info.error);
+    appendLog(tr("Cannot play: %1").arg(path));
+    appendLog(tr("Reason: %1").arg(err));
     return;
   }
-  appendLog(tr("動画: %1 — %2")
+  appendLog(tr("Video: %1 — %2")
                 .arg(path)
                 .arg(QString::fromStdString(info.summary_line())));
 }
 
 void HostWindow::reportThumbnails(const vrp::ThumbnailStrip& strip) {
   if (strip.ready) {
-    appendLog("シークサムネイル準備完了: " + QString::fromStdString(strip.status));
+    appendLog(tr("Seek thumbs ready: %1").arg(QString::fromStdString(strip.status)));
   } else {
-    appendLog("シークサムネイル失敗: " + QString::fromStdString(strip.status));
+    appendLog(tr("Seek thumbs failed: %1").arg(QString::fromStdString(strip.status)));
   }
 }
 
@@ -1104,20 +1198,20 @@ bool HostWindow::clearStaleMonadoSocket() {
   if (!QFileInfo::exists(path)) return true;
   if (isMonadoIpcLive()) return false;
   if (QFile::remove(path)) {
-    appendLog("古い Monado IPC ソケットを削除しました: " + path);
+    appendLog(tr("Removed stale Monado IPC: %1").arg(path));
     return true;
   }
-  appendLog("古い Monado IPC ソケットを削除できません: " + path);
+  appendLog(tr("Cannot remove Monado IPC: %1").arg(path));
   return false;
 }
 
 bool HostWindow::adoptExternalMonado() {
   if (!isMonadoIpcLive()) return false;
   monado_external_ = true;
-  monado_label_->setText("外部サービス稼働中");
-  setHealth("待機", "既存の Monado を利用します。HMD へ接続してください");
+  monado_label_->setText(tr("External"));
+  setHealth("Wait", "Using existing Monado");
   monado_multi_hmd_logged_ = false;
-  appendLog(tr("外部 Monado を利用中（%1）").arg(monadoIpcPath()));
+  appendLog(tr("Using external Monado (%1)").arg(monadoIpcPath()));
   QTimer::singleShot(300, this, [this] { maybeAutoConnectHeadset(); });
   return true;
 }
@@ -1197,12 +1291,12 @@ bool HostWindow::ensureMonadoModeTable() {
   QProcess probe;
   probe.start(QStringLiteral("vulkaninfo"), {});
   if (!probe.waitForStarted(2000)) {
-    appendLog("vulkaninfo を起動できません（mode 表は Monado ログ待ち）");
+    appendLog(tr("vulkaninfo failed — wait for Monado modes"));
     return false;
   }
   if (!probe.waitForFinished(20000)) {
     probe.kill();
-    appendLog("vulkaninfo がタイムアウト（mode 表は Monado ログ待ち）");
+    appendLog(tr("vulkaninfo timeout — wait for Monado modes"));
     return false;
   }
   const QString out = QString::fromLocal8Bit(probe.readAllStandardOutput()) +
@@ -1281,7 +1375,7 @@ bool HostWindow::ensureMonadoModeTable() {
   flush_block();
 
   if (best_hz.isEmpty()) {
-    appendLog("vulkaninfo から HMD モードを取得できませんでした");
+    appendLog(tr("No HMD modes from vulkaninfo"));
     return false;
   }
   monado_mode_hz_ = best_hz;
@@ -1293,7 +1387,7 @@ bool HostWindow::ensureMonadoModeTable() {
                    .arg(it.key())
                    .arg(it.value(), 0, 'f', 2);
   }
-  appendLog(QString("HMD モード %1 件: %2").arg(monado_mode_hz_.size()).arg(summary.join(QStringLiteral(", "))));
+  appendLog(tr("HMD modes %1: %2").arg(monado_mode_hz_.size()).arg(summary.join(QStringLiteral(", "))));
   return true;
 }
 
@@ -1308,9 +1402,9 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
   }
 
   const QString want_label =
-      preferred_hz_ <= 0 ? QStringLiteral("自動（最高）") : QString("%1 Hz").arg(preferred_hz_);
+      preferred_hz_ <= 0 ? tr("Auto") : tr("%1 Hz").arg(preferred_hz_);
   if (from_ui) {
-    appendLog(QString("希望リフレッシュレート: %1").arg(want_label));
+    appendLog(tr("Refresh: %1").arg(want_label));
   }
 
   // Live OpenXR request (desktop combo / soft path). HMD [再起動] always restarts Monado.
@@ -1327,9 +1421,7 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
             if (!list.isEmpty()) list += ", ";
             list += QString::number(r, 'f', 1);
           }
-          appendLog(QString("OpenXR でリフレッシュレートを要求 → %1（対応: %2）")
-                        .arg(want_label)
-                        .arg(list.isEmpty() ? QStringLiteral("（列挙なし）") : list));
+          appendLog(tr("OpenXR refresh → %1 (rates: %2)").arg(want_label).arg(list.isEmpty() ? tr("none") : list));
           // FB get can lie / lag — verify measured period shortly; fall back to Monado restart.
           const int want = preferred_hz_;
           QTimer::singleShot(1200, this, [this, want] {
@@ -1340,20 +1432,20 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
               if (xr_app_) measured = xr_app_->status().display_hz;
             }
             if (measured > 0.0 && std::fabs(measured - static_cast<double>(want)) > 5.0) {
-              appendLog(QString("OpenXR 要求後も実測 %1 Hz — Monado 再起動にフォールバック")
+              appendLog(tr("Still %1 Hz after OpenXR — restart Monado")
                             .arg(measured, 0, 'f', 1));
               applyPreferredRefreshRate(/*from_ui=*/false, /*force_monado_restart=*/true);
             }
           });
           return;
         }
-        appendLog("OpenXR 動的切替に失敗 — Monado 再起動にフォールバック");
+        appendLog(tr("OpenXR Hz switch failed — restart Monado"));
       } else if (from_ui) {
-        appendLog("ランタイムに XR_FB_display_refresh_rate なし — Monado 再起動にフォールバック");
+        appendLog(tr("No XR_FB_display_refresh_rate — restart Monado"));
       }
     }
   } else {
-    appendLog(QString("リフレッシュレート変更のため Monado / セッションを再起動 → %1").arg(want_label));
+    appendLog(tr("Restart Monado for refresh → %1").arg(want_label));
   }
 
   // Pick DESIRED_MODE while mode table is still available (probe if empty).
@@ -1367,7 +1459,7 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
                     .arg(monado_mode_hz_.value(idx), 0, 'f', 1));
     } else {
       monado_desired_mode_ = -1;
-      appendLog(QString("希望 %1 Hz の mode が未検出 — 再起動後のログで再探索").arg(preferred_hz_));
+      appendLog(tr("No mode for %1 Hz — rescan after restart").arg(preferred_hz_));
       monado_mode_hz_.clear();
       monado_mode_pixels_.clear();
       monado_hz_restarted_ = false;
@@ -1385,19 +1477,19 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
   if (xr_running_.load() || xr_thread_.joinable()) {
     user_suppressed_auto_connect_ = false;  // reconnect after Monado comes back
     if (!shutdownXrSession(8000, /*stop_monado=*/false)) {
-      appendLog("XR 切断タイムアウト（detach）— Monado 再起動を継続");
+      appendLog(tr("XR detach timeout — restart continues"));
       if (xr_thread_.joinable()) xr_thread_.detach();
       xr_running_.store(false);
     }
-    syncDisconnectedUi(QStringLiteral("Hz 変更 — Monado 再起動中"));
+    syncDisconnectedUi(tr("Hz change — restarting"));
   }
 
   if (monado_external_ && preferred_hz_ <= 0) {
-    appendLog("外部 Monado のため自動再起動できません。手動で再起動後に再接続してください");
+    appendLog(tr("External Monado: restart it, then reconnect"));
     return;
   }
   if (monado_external_) {
-    appendLog("外部 Monado を切り離し、DESIRED_MODE 付きで再起動します");
+    appendLog(tr("Drop external Monado and restart with Hz"));
     monado_external_ = false;
   }
 
@@ -1413,19 +1505,19 @@ void HostWindow::maybeRestartMonadoForHz() {
   if (monado_mode_hz_.isEmpty()) return;
   const int idx = findModeIndexForHz(preferred_hz_);
   if (idx < 0) {
-    appendLog(QString("希望 %1 Hz に近い表示モードが見つかりません（ログの mode 一覧を確認）")
+    appendLog(tr("No display mode near %1 Hz")
                   .arg(preferred_hz_));
     monado_hz_restarted_ = true;
     return;
   }
   if (idx == monado_desired_mode_) {
-    appendLog(QString("表示モード %1 ≈ %2 Hz を使用中").arg(idx).arg(monado_mode_hz_.value(idx), 0, 'f', 1));
+    appendLog(tr("Using mode %1 ≈ %2 Hz").arg(idx).arg(monado_mode_hz_.value(idx), 0, 'f', 1));
     monado_hz_restarted_ = true;
     return;
   }
   monado_desired_mode_ = idx;
   monado_hz_restarted_ = true;
-  appendLog(QString("リフレッシュレート合わせのため Monado を再起動（mode %1 ≈ %2 Hz）")
+  appendLog(tr("Restart Monado for Hz (mode %1 ≈ %2 Hz)")
                 .arg(idx)
                 .arg(monado_mode_hz_.value(idx), 0, 'f', 1));
   QMetaObject::invokeMethod(
@@ -1437,7 +1529,7 @@ void HostWindow::maybeRestartMonadoForHz() {
             if (xr_thread_.joinable()) xr_thread_.detach();
             xr_running_.store(false);
           }
-          syncDisconnectedUi(QStringLiteral("Hz 変更 — Monado 再起動中"));
+          syncDisconnectedUi(tr("Hz change — restarting"));
         }
         restartOwnedMonadoForHz();
         QTimer::singleShot(600, this, [this] {
@@ -1452,7 +1544,7 @@ void HostWindow::startMonado() { startOwnedMonado(/*allow_external_adopt=*/true)
 void HostWindow::startOwnedMonado(bool allow_external_adopt) {
   if (monado_->state() != QProcess::NotRunning) {
     if (monado_hz_require_owned_) {
-      appendLog("所有 Monado を DESIRED_MODE 付きで差し替えます");
+      appendLog(tr("Replace owned Monado with Hz mode"));
       monado_intentional_stop_ = true;
       monado_->terminate();
       if (!monado_->waitForFinished(3000)) {
@@ -1464,7 +1556,7 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
       stopSystemdMonadoForOwnedStart();
       // fall through to start fresh
     } else {
-      appendLog("Monado は既に起動しています（このアプリ管理）");
+      appendLog(tr("Monado already running (owned)"));
       monado_hz_require_owned_ = false;
       if (isMonadoIpcLive() && !xr_running_.load() && !user_suppressed_auto_connect_) {
         QTimer::singleShot(300, this, [this] { maybeAutoConnectHeadset(); });
@@ -1481,25 +1573,25 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
 
   // If IPC is still live after our kill, an external service grabbed it — DESIRED_MODE won't apply.
   if (isMonadoIpcLive()) {
-    appendLog("警告: Monado IPC が残存しています。DESIRED_MODE 付きで起動できないため停止を再試行…");
+    appendLog(tr("Monado IPC still up — retry stop for Hz"));
     stopSystemdMonadoForOwnedStart();
     if (isMonadoIpcLive()) {
-      appendLog("エラー: 外部 Monado が占有中。systemctl --user stop monado.socket monado.service を実行してください");
+      appendLog(tr("External Monado holds IPC. Stop monado.socket"));
       if (allow_external_adopt) {
         adoptExternalMonado();
         return;
       }
-      monado_label_->setText("IPC 占有");
-      setHealth("異常", "外部 Monado が Hz 設定を妨げています");
+      monado_label_->setText(tr("IPC busy"));
+      setHealth("Error", "External Monado blocks Hz");
       return;
     }
   }
 
   const QString bin = findMonadoBinary();
   if (bin.isEmpty()) {
-    monado_label_->setText("バイナリなし");
-    setHealth("異常", "monado-service が見つかりません");
-    appendLog("monado-service が PATH / /usr/local/bin / /usr/bin にありません");
+    monado_label_->setText(tr("No binary"));
+    setHealth("Error", "monado-service not found");
+    appendLog(tr("monado-service not in PATH"));
     return;
   }
   if (runtime_json_.isEmpty()) {
@@ -1530,7 +1622,7 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
   monado_->setProcessEnvironment(env);
   monado_->setProgram(bin);
   {
-    QString msg = tr("Monado 起動: %1").arg(bin);
+    QString msg = tr("Start Monado: %1").arg(bin);
     if (monado_desired_mode_ >= 0) {
       msg += QStringLiteral(" mode=%1").arg(monado_desired_mode_);
     }
@@ -1538,32 +1630,32 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
   }
   monado_->start();
   if (!monado_->waitForStarted(3000)) {
-    monado_label_->setText("起動失敗");
-    setHealth("異常", monado_->errorString());
-    appendLog("起動失敗: " + monado_->errorString());
+    monado_label_->setText(tr("Start failed"));
+    setHealth("Error", monado_->errorString());
+    appendLog(tr("Start failed: %1").arg(monado_->errorString()));
     return;
   }
   monado_hz_require_owned_ = false;
-  monado_label_->setText(QString("実行中 pid %1").arg(monado_->processId()));
-  setHealth("待機", "Monado 起動済み。HMD 自動接続を待ちます");
+  monado_label_->setText(tr("Running pid %1").arg(monado_->processId()));
+  setHealth("Wait", "Monado up. Waiting for HMD");
   QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
 }
 
 void HostWindow::stopMonado() {
   signalXrStop();
   if (monado_external_) {
-    appendLog("外部 Monado は停止しません（systemd / 別プロセス管理）");
-    appendLog("必要なら: systemctl --user stop monado.socket monado.service");
+    appendLog(tr("External Monado left running"));
+    appendLog(tr("Or: systemctl --user stop monado.socket monado.service"));
     if (!shutdownXrSession(8000, false)) {
-      appendLog("XR 切断タイムアウト");
+      appendLog(tr("XR disconnect timeout"));
       if (xr_thread_.joinable()) xr_thread_.detach();
       xr_running_.store(false);
     }
     monado_external_ = false;
     if (isMonadoIpcLive()) {
-      monado_label_->setText("外部サービス稼働中");
+      monado_label_->setText(tr("External"));
     } else {
-      monado_label_->setText("停止");
+      monado_label_->setText(tr("Stopped"));
     }
     if (!shutting_down_.load()) {
       setSessionChrome(false);
@@ -1571,14 +1663,14 @@ void HostWindow::stopMonado() {
     return;
   }
   if (monado_ && monado_->state() != QProcess::NotRunning) {
-    appendLog(tr("Monado を停止します"));
+    appendLog(tr("Stopping Monado"));
   }
   if (!shutdownXrSession(8000, true)) {
-    appendLog("XR 切断タイムアウト");
+    appendLog(tr("XR disconnect timeout"));
     if (xr_thread_.joinable()) xr_thread_.detach();
     xr_running_.store(false);
   }
-  monado_label_->setText(QStringLiteral("停止（HMD 接続時に起動）"));
+  monado_label_->setText(tr("Idle"));
   if (!shutting_down_.load()) {
     setSessionChrome(false);
   }
@@ -1631,7 +1723,7 @@ void HostWindow::onMonadoOutput() {
 }
 
 void HostWindow::onMonadoFinished(int code, QProcess::ExitStatus status) {
-  monado_label_->setText(QString("終了 code=%1").arg(code));
+  monado_label_->setText(tr("Exit %1").arg(code));
   appendLog(QString("monado-service exited code=%1 status=%2")
                 .arg(code)
                 .arg(status == QProcess::CrashExit ? "crash" : "normal"));
@@ -1645,16 +1737,16 @@ void HostWindow::onMonadoFinished(int code, QProcess::ExitStatus status) {
     }
     // Retry once after clearing a stale socket (common after crash / hard kill).
     if (QFileInfo::exists(monadoIpcPath())) {
-      appendLog("IPC ソケットが残っている可能性があります。掃除して再試行できます（Monado 起動）");
+      appendLog(tr("Stale IPC socket — clear and retry"));
       clearStaleMonadoSocket();
     }
-    setHealth("異常", "Monado が異常終了しました。ログを確認してください");
+    setHealth("Error", "Monado exited. See log");
   }
 }
 
 void HostWindow::connectHeadset() {
   if (xr_running_.load()) {
-    appendLog("既に HMD セッション中です");
+    appendLog(tr("HMD session already running"));
     monado_auto_connect_in_progress_ = false;
     return;
   }
@@ -1667,16 +1759,16 @@ void HostWindow::connectHeadset() {
   refreshAudioDevices(true);
   // Finished threads stay joinable; assigning again would std::terminate().
   if (xr_thread_.joinable() || xr_running_.load()) {
-    appendLog("前回セッションの終了を待っています…");
+    appendLog(tr("Waiting for previous session…"));
     if (!shutdownXrSession(8000, false)) {
-      appendLog("前回 XR スレッドが応答しないため切り離します");
+      appendLog(tr("Previous XR thread hung — detach"));
       if (xr_thread_.joinable()) xr_thread_.detach();
       xr_running_.store(false);
     }
   }
   if (!ensureMonadoReady()) {
     if (!shutting_down_.load()) {
-      syncDisconnectedUi("Monado が応答しません");
+      syncDisconnectedUi(tr("Monado not responding"));
     }
     monado_auto_connect_in_progress_ = false;
     if (!user_suppressed_auto_connect_) {
@@ -1691,10 +1783,8 @@ void HostWindow::connectHeadset() {
   // Controller / hand already live in opt_ via Settings menu actions.
   xr_stop_.store(false);
   setSessionChrome(true);
-  setHealth("待機", "OpenXR セッションを開始しています");
-  appendLog(QString("OpenXR に接続します（コントローラー=%1 / %2）")
-                .arg(QString::fromUtf8(vrp::controller_profile_name(opt_.controller_profile)))
-                .arg(QString::fromUtf8(vrp::controller_hand_name(opt_.controller_hand))));
+  setHealth("Wait", "Starting OpenXR session");
+  appendLog(tr("Connect OpenXR (pad=%1 / %2)").arg(QString::fromUtf8(vrp::controller_profile_name(opt_.controller_profile))).arg(QString::fromUtf8(vrp::controller_hand_name(opt_.controller_hand))));
   xr_thread_ = std::thread([this] { xrThreadMain(); });
 }
 
@@ -1704,7 +1794,7 @@ void HostWindow::disconnectHeadset() {
   monado_auto_connect_in_progress_ = false;
   disconnectHeadsetSession(/*resume_auto_poll=*/false);
   if (!shutting_down_.load()) {
-    appendLog("HMD セッションを手動切断しました（自動再接続オフ）");
+    appendLog(tr("HMD session closed (auto-connect off)"));
   }
 }
 
@@ -1713,10 +1803,10 @@ void HostWindow::disconnectHeadsetSession(bool resume_auto_poll) {
     // Idle disconnect path: still drop owned Monado if it was left running.
     if (!monado_external_) {
       stopMonadoProcess();
-      if (monado_label_) monado_label_->setText(QStringLiteral("停止（HMD 接続時に起動）"));
+      if (monado_label_) monado_label_->setText(tr("Idle"));
     }
     if (!shutting_down_.load()) {
-      syncDisconnectedUi("未接続");
+      syncDisconnectedUi(tr("Not connected"));
       if (resume_auto_poll && !user_suppressed_auto_connect_) {
         QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
       }
@@ -1725,18 +1815,17 @@ void HostWindow::disconnectHeadsetSession(bool resume_auto_poll) {
   }
   // Stop owned Monado with the XR session so the compositor releases GPU/DRM.
   if (!shutdownXrSession(8000, !monado_external_)) {
-    appendLog("切断タイムアウト: XR スレッドが応答しません（detach）");
+    appendLog(tr("Disconnect timeout — detach XR"));
     VRP_ERR("disconnect: XR join timed out — detaching");
     if (xr_thread_.joinable()) xr_thread_.detach();
     xr_running_.store(false);
     if (!monado_external_) stopMonadoProcess();
   }
   if (!monado_external_ && monado_label_) {
-    monado_label_->setText(QStringLiteral("停止（HMD 接続時に起動）"));
+    monado_label_->setText(tr("Idle"));
   }
   if (!shutting_down_.load()) {
-    syncDisconnectedUi(resume_auto_poll ? QStringLiteral("切断 — 実機の認識を待っています")
-                                        : QStringLiteral("HMD セッション切断済み"));
+    syncDisconnectedUi(resume_auto_poll ? tr("Waiting for HMD") : tr("Session ended"));
     if (resume_auto_poll && !user_suppressed_auto_connect_) {
       QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
     }
@@ -1752,8 +1841,12 @@ void HostWindow::xrThreadMain() {
         this,
         [this, q] {
           if (shutting_down_.load()) return;
-          setHealth("待機", q);
-          appendLog(q);
+          QString shown = UiTr(q);
+          if (q.startsWith(QLatin1String("HMD found: "))) {
+            shown = tr("HMD found: %1").arg(q.mid(11));
+          }
+          setHealth("Wait", shown);
+          appendLog(shown);
         },
         Qt::QueuedConnection);
   };
@@ -1764,18 +1857,17 @@ void HostWindow::xrThreadMain() {
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
       bool logged_wait = false;
       while (!isMonadoIpcLive()) {
-        if (xr_stop_.load()) throw std::runtime_error("接続をキャンセルしました");
+        if (xr_stop_.load()) throw std::runtime_error("Connect cancelled");
         if (std::chrono::steady_clock::now() >= deadline) {
-          throw std::runtime_error(
-              "Monado IPC が応答しません。Monado を起動してから再接続してください");
+          throw std::runtime_error("Monado IPC not responding");
         }
         if (!logged_wait) {
-          report_progress("Monado の起動を待っています…");
+          report_progress("Waiting for Monado…");
           logged_wait = true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
-      if (logged_wait) report_progress("Monado に接続できました");
+      if (logged_wait) report_progress("Monado connected");
     }
 
     vrp::XrVulkanApp xr;
@@ -1799,8 +1891,8 @@ void HostWindow::xrThreadMain() {
         this,
         [this, st] {
           const QString name = QString::fromStdString(st.system_name);
-          applyStatus(name, QString::fromStdString(st.session_state), "待機",
-                      "HMD を認識しました。セッション開始待ち", st.tracking_valid, st.view_width,
+          applyStatus(name, QString::fromStdString(st.session_state), "Wait",
+                      "HMD found. Waiting for session", st.tracking_valid, st.view_width,
                       st.view_height, st.display_hz, st.app_frame_ms,
                       QString::fromStdString(st.sync_note), st.refresh_rate_ext,
                       QString::fromStdString(st.refresh_rates));
@@ -1832,7 +1924,7 @@ void HostWindow::xrThreadMain() {
       } else {
         const QString err = QString::fromStdString(audio.last_error());
         QMetaObject::invokeMethod(
-            this, [this, err] { appendLog("音声デバイス開始失敗: " + err); }, Qt::QueuedConnection);
+            this, [this, err] { appendLog(tr("Audio start failed: %1").arg(err)); }, Qt::QueuedConnection);
       }
     }
     vrp::VideoTexture texture;
@@ -1846,8 +1938,8 @@ void HostWindow::xrThreadMain() {
     QMetaObject::invokeMethod(
         this,
         [this, gpu_nv12] {
-          appendLog(gpu_nv12 ? tr("映像: GPU NV12 ゼロコピー")
-                             : tr("映像: CPU RGBA（VA-API/SW・ゼロコピー未使用）"));
+          appendLog(gpu_nv12 ? tr("Video: GPU NV12")
+                             : tr("Video: CPU RGBA"));
         },
         Qt::QueuedConnection);
     scene.set_texture(texture.view(), texture.sampler());
@@ -1860,14 +1952,26 @@ void HostWindow::xrThreadMain() {
       std::filesystem::path start;
       if (!opt_.video_path.empty()) {
         start = std::filesystem::path(opt_.video_path).parent_path();
-      } else if (const char* home = std::getenv("HOME")) {
-        start = home;
       } else {
-        start = std::filesystem::current_path();
+        const char* home = std::getenv("HOME");
+        const std::filesystem::path conf =
+            std::filesystem::path(home ? home : "") / ".config" / "monasphere" / "conf";
+        std::ifstream in(conf);
+        std::string line;
+        while (std::getline(in, line)) {
+          if (line.rfind("last_dir=", 0) == 0) {
+            start = line.substr(9);
+            break;
+          }
+        }
+        if (start.empty()) {
+          start = home ? std::filesystem::path(home) : std::filesystem::current_path();
+        }
       }
       menu.init(start);
       menu.set_format(opt_.projection, opt_.stereo);
-      menu.set_fsr(fsr.mode());
+      menu.set_fsr(preferred_fsr_);
+      fsr.set_mode(preferred_fsr_);
       menu.set_preferred_hz(preferred_hz_);
     }
     {
@@ -1889,13 +1993,13 @@ void HostWindow::xrThreadMain() {
     if (use_gamepad) {
       if (gamepad.ensure_open()) {
         QMetaObject::invokeMethod(
-            this, [this] { appendLog("入力: ゲームパッド（A決定 B戻る Startメニュー スティック移動）"); },
+            this, [this] { appendLog(tr("Input: gamepad (A OK, B back, Start menu)")); },
             Qt::QueuedConnection);
       } else {
         QMetaObject::invokeMethod(
             this,
             [this] {
-              appendLog("ゲームパッドを開けません（SDL2 / 接続を確認）。HMD ボタンのリセンターのみ有効");
+              appendLog(tr("Gamepad open failed. Recenter only"));
             },
             Qt::QueuedConnection);
       }
@@ -2022,7 +2126,7 @@ void HostWindow::xrThreadMain() {
         QMetaObject::invokeMethod(
             this,
             [this] {
-              appendLog(QString("フォーマット自動判定: %1 / %2")
+              appendLog(tr("Format guess: %1 / %2")
                             .arg(QString::fromUtf8(vrp::projection_name(opt_.projection)))
                             .arg(QString::fromUtf8(vrp::stereo_name(opt_.stereo))));
             },
@@ -2044,12 +2148,12 @@ void HostWindow::xrThreadMain() {
             audio.set_rate(1.f);
             const QString dev = QString::fromStdString(audio.device_name());
             QMetaObject::invokeMethod(
-                this, [this, dev] { appendLog("音声出力 → " + dev); }, Qt::QueuedConnection);
+                this, [this, dev] { appendLog(tr("Audio → %1").arg(dev)); }, Qt::QueuedConnection);
           } else {
             audio.clear_file();  // video-only / demux fail — keep silent device
             const QString err = QString::fromStdString(audio.last_error());
             QMetaObject::invokeMethod(
-                this, [this, err] { appendLog("音声なし: " + err); }, Qt::QueuedConnection);
+                this, [this, err] { appendLog(tr("No audio: %1").arg(err)); }, Qt::QueuedConnection);
           }
         } else {
           audio.clear_file();
@@ -2062,7 +2166,7 @@ void HostWindow::xrThreadMain() {
       if (!open_media(opt_.video_path)) {
         QMetaObject::invokeMethod(
             this,
-            [this] { appendLog("起動時に指定された動画を再生できません。別のファイルを選んでください"); },
+            [this] { appendLog(tr("Startup video failed. Pick another file")); },
             Qt::QueuedConnection);
       } else {
         decoder.play();
@@ -2133,7 +2237,7 @@ void HostWindow::xrThreadMain() {
           if (!open_media(path)) {
             QMetaObject::invokeMethod(
                 this,
-                [this] { appendLog("このセッションでは動画を再生できません（コーデック / ファイルを確認）"); },
+                [this] { appendLog(tr("Cannot play video this session")); },
                 Qt::QueuedConnection);
           } else {
             decoder.play();
@@ -2179,7 +2283,7 @@ void HostWindow::xrThreadMain() {
       if (menu_out.open_video) {
         if (!open_media(menu_out.video_path)) {
           QMetaObject::invokeMethod(
-              this, [this] { appendLog("HMD: 動画を開けませんでした"); }, Qt::QueuedConnection);
+              this, [this] { appendLog(tr("HMD: cannot open video")); }, Qt::QueuedConnection);
         } else {
           decoder.play();
         }
@@ -2212,7 +2316,7 @@ void HostWindow::xrThreadMain() {
         QMetaObject::invokeMethod(
             this,
             [this] {
-              appendLog(QString("HMD フォーマット: %1 / %2")
+              appendLog(tr("HMD format: %1 / %2")
                             .arg(QString::fromUtf8(vrp::projection_name(opt_.projection)))
                             .arg(QString::fromUtf8(vrp::stereo_name(opt_.stereo))));
             },
@@ -2255,6 +2359,7 @@ void HostWindow::xrThreadMain() {
             this,
             [this, mode = menu_out.fsr] {
               preferred_fsr_ = mode;
+              saveAppConf();
               rebuildFsrMenu();
               appendLog(QString("FSR1: %1").arg(QString::fromUtf8(vrp::fsr_mode_name(mode))));
             },
@@ -2343,7 +2448,7 @@ void HostWindow::xrThreadMain() {
         if (!audio.ensure_output(adev)) {
           const QString err = QString::fromStdString(audio.last_error());
           QMetaObject::invokeMethod(
-              this, [this, err] { appendLog("音声デバイス切替失敗: " + err); }, Qt::QueuedConnection);
+              this, [this, err] { appendLog(tr("Audio switch failed: %1").arg(err)); }, Qt::QueuedConnection);
         } else if (!path.empty() && audio.switch_file(path)) {
           audio.seek_to(decoder.position());
           // Only start audio once video is actually playing (not still priming).
@@ -2365,11 +2470,11 @@ void HostWindow::xrThreadMain() {
         if (now - last_status > std::chrono::milliseconds(500)) {
           last_status = now;
           auto cur = xr.status();
-          QString health = "待機";
-          QString detail = "セッション開始待ち";
+          QString health = "Wait";
+          QString detail = "Waiting for session";
           if (cur.session_state == "LOSS_PENDING" || cur.session_state == "EXITING") {
-            health = "異常";
-            detail = "セッション喪失";
+            health = "Error";
+            detail = "Session lost";
             xr_stop_.store(true);
           }
           QMetaObject::invokeMethod(
@@ -2520,7 +2625,7 @@ void HostWindow::xrThreadMain() {
               this,
               [this, hz, want] {
                 if (want > 0 && std::fabs(hz - static_cast<double>(want)) > 5.0) {
-                  appendLog(QString("警告: 希望 %1 Hz だが実測 %2 Hz — DESIRED_MODE / 外部 Monado を確認")
+                  appendLog(tr("Want %1 Hz, measured %2 Hz")
                                 .arg(want)
                                 .arg(hz, 0, 'f', 1));
                   if (!monado_hz_mismatch_retried_) {
@@ -2528,7 +2633,7 @@ void HostWindow::xrThreadMain() {
                     const int idx = findModeIndexForHz(want);
                     if (idx >= 0) {
                       monado_desired_mode_ = idx;
-                      appendLog(QString("実測不一致のため Monado を再起動（mode %1 ≈ %2 Hz）")
+                      appendLog(tr("Hz mismatch — restart Monado (mode %1 ≈ %2 Hz)")
                                     .arg(idx)
                                     .arg(monado_mode_hz_.value(idx), 0, 'f', 1));
                       applyPreferredRefreshRate(/*from_ui=*/false, /*force_monado_restart=*/true);
@@ -2541,15 +2646,15 @@ void HostWindow::xrThreadMain() {
         const bool healthy = cur.session_running && (cur.focused || cur.session_state == "VISIBLE" ||
                                                      cur.session_state == "SYNCHRONIZED" ||
                                                      cur.session_state == "FOCUSED");
-        QString health = "待機";
-        QString detail = "セッション開始待ち";
+        QString health = "Wait";
+        QString detail = "Waiting for session";
         if (cur.session_state == "LOSS_PENDING" || cur.session_state == "EXITING") {
-          health = "異常";
-          detail = "セッション喪失";
+          health = "Error";
+          detail = "Session lost";
           xr_stop_.store(true);
         } else if (healthy) {
-          health = cur.tracking_valid ? "正常" : "待機";
-          detail = cur.tracking_valid ? "描画中" : "姿勢がまだ無効です";
+          health = cur.tracking_valid ? "OK" : "Wait";
+          detail = cur.tracking_valid ? "Drawing" : "Pose not ready";
         }
         if (decoder.is_open() && gpu_nv12) {
           static auto last_vid_dbg = std::chrono::steady_clock::time_point{};
@@ -2566,7 +2671,7 @@ void HostWindow::xrThreadMain() {
                     .arg(decoder.gpu_path_active() ? 1 : 0)
                     .arg(QString::fromStdString(cuda_tex.last_error()));
             QMetaObject::invokeMethod(
-                this, [this, vid] { appendLog("映像DBG: " + vid); }, Qt::QueuedConnection);
+                this, [this, vid] { appendLog(tr("Video DBG: %1").arg(vid)); }, Qt::QueuedConnection);
           }
         }
         // Use this frame's measured ms (not a stale pre-render sample).
@@ -2618,10 +2723,10 @@ void HostWindow::xrThreadMain() {
           this,
           [this, msg] {
             if (shutting_down_.load()) return;
-            appendLog(msg);
+            appendLog(UiTr(msg));
             monado_auto_connect_in_progress_ = false;
             syncDisconnectedUi(msg);
-            setHealth("異常", msg);
+            setHealth("Error", msg);
             if (!user_suppressed_auto_connect_) {
               monado_auto_connect_cooldown_ms_ = QDateTime::currentMSecsSinceEpoch() + 1000;
               QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
@@ -2639,13 +2744,13 @@ void HostWindow::xrThreadMain() {
           // Manual disconnect already synced UI; only handle unexpected session end.
           if (user_suppressed_auto_connect_) {
             if (!connect_ui_enabled_) {
-              syncDisconnectedUi(QStringLiteral("HMD セッション切断済み"));
+              syncDisconnectedUi(tr("Session ended"));
             }
             return;
           }
           if (!connect_ui_enabled_) {
             monado_auto_connect_in_progress_ = false;
-            syncDisconnectedUi(QStringLiteral("切断 — 実機の認識を待っています"));
+            syncDisconnectedUi(tr("Waiting for HMD"));
             QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
           }
         },

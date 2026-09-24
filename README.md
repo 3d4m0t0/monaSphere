@@ -1,181 +1,183 @@
-# VRP — Native Linux VR Video Player
+# monaSphere
 
-C++20 + **Vulkan** + **OpenXR**（Monado）の自前 VR 土台です。アプリ `monasphere`（ソース上は `vrp_player`）で平面／180／360（mono・SBS・OU）のローカル再生を行います。
+Linux 向けのネイティブ VR 動画プレーヤーです。コマンド名は `monasphere` です。
 
-## 依存関係
+OpenXR（Monado）と Vulkan で HMD に映像を出します。
+HMD 映像内にファイルダイアログと再生コントロールの UI を持ち、各種操作が行えます。
+
+**版 1.0.0**
+
+### English
+
+A native VR video player for Linux. The command name is `monasphere`.
+
+Video is presented to the HMD with OpenXR (Monado) and Vulkan.
+The in-HMD UI provides a file dialog, playback controls, and related operations.
+
+**Version 1.0.0**
+
+## AI の利用について
+
+本プロジェクトでは AI 支援 IDE [Cursor](https://cursor.com/) を利用し、生成されたコードやデザインパターンを必要に応じて取り入れています。採用した生成物は、いずれも制作者がレビュー・修正・統合しています。
+
+紹介プログラム経由の登録用リンク（**紹介リンク**）: [cursor.com/referral?code=TI3UQLE9PFH3](https://cursor.com/referral?code=TI3UQLE9PFH3)  
+このリンクから登録すると Cursor 側の紹介特典が適用される場合がありますが、monaSphere の開発・配布とは無関係です。
+
+### English
+
+This project uses the AI-assisted IDE [Cursor](https://cursor.com/). Generated code and design patterns are incorporated where helpful; the maintainer reviews, revises, and integrates all adopted material.
+
+Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://cursor.com/referral?code=TI3UQLE9PFH3). Cursor's referral program may apply at sign-up; this is unrelated to the development or distribution of monaSphere.
+
+## 仕様 / Specification
+
+| 項目 / Item | 内容 / Description |
+|-------------|-------------------|
+| 言語 / Language | C++20 |
+| グラフィックス / Graphics | Vulkan |
+| XR | OpenXR 1.x（ランタイムは Monado を想定 / Monado is the expected runtime） |
+| 入力 / Input | XR コントローラ / ゲームパッド（任意） / XR controllers or gamepad (optional) |
+| 映像 / Video | ローカルファイル（FFmpeg）。未導入時はプレースホルダ表示のみ / Local files via FFmpeg. Placeholder only if FFmpeg is absent |
+| 音声 / Audio | FFmpeg デコード + miniaudio（PulseAudio 連携は任意） / FFmpeg decode + miniaudio (PulseAudio is optional) |
+| UI | Qt 6 Widgets（ホストウィンドウ / host window） |
+
+## 依存するライブラリ / Dependencies
+
+**必須（ビルド） / Required (build)**
+
+| ライブラリ / Library | 用途 / Role |
+|----------------------|-------------|
+| Qt 6（Widgets） | ホスト UI / Host UI |
+| OpenXR Loader | XR セッション / XR session |
+| Vulkan（loader / headers） | 描画 / Rendering |
+| glslangValidator | GLSL → SPIR-V |
+| CMake ≥ 3.16、Ninja（または同等）、C++20 コンパイラ | ビルド / Build |
+
+**推奨（機能利用） / Recommended (features)**
+
+| ライブラリ / Library | 用途 / Role |
+|----------------------|-------------|
+| FFmpeg（libavcodec / libavformat / libavutil / libswscale / libswresample） | 動画・音声デコード / Video and audio decode |
+| SDL2 | ゲームパッド / Gamepad |
+| PulseAudio（libpulse） | 出力デバイス列挙・HMD 向けプロファイル補助 / Output devices and HMD profile helpers |
+
+**同梱（third_party） / Bundled**
+
+| 成分 / Component | 用途 / Role |
+|------------------|-------------|
+| miniaudio | 音声再生 / Audio playback |
+| AMD FidelityFX FSR1（headers） | アップスケール / Upscaling |
+
+実行時の XR ランタイムとして **Monado**（`monado-service`）と `XR_RUNTIME_JSON` の設定が必要です。
+
+At runtime, **Monado** (`monado-service`) and `XR_RUNTIME_JSON` are required.
+
+## 主な機能
+
+- 投影 フラット / 投影 180° / 投影 360°、および mono / SBS / OU
+- HMD 映像内にファイルダイアログと再生コントロール、設定が行える UI
+- HMD 自動検出と Monado 起動（所有プロセス）
+- リフレッシュレート選択（環境の表示モードに依存）
+- FSR1 アップスケール
+- ハードウェアデコード連携（環境により NVDEC / VA-API 等）
+- NVIDIA 環境での CUDA↔Vulkan NV12 経路（条件を満たす場合）
+- XR メニュー、リセンター、コントローラ / ゲームパッド操作
+- ロケール準備（`tr` / `VRP_TR`、詳細は `translations/README.md`）
+
+### English
+
+- Projection: flat / 180° / 360°, and mono / SBS / OU
+- In-HMD UI for the file dialog, playback controls, and settings
+- Automatic HMD detection and owned Monado startup
+- Refresh-rate selection (depends on available display modes)
+- FSR1 upscaling
+- Hardware decode (NVDEC, VA-API, and similar, when available)
+- CUDA↔Vulkan NV12 path on NVIDIA when the requirements are met
+- XR menu, recenter, and controller / gamepad input
+- Locale groundwork (`tr` / `VRP_TR`; see `translations/README.md`)
+
+## 動作環境
+
+- **OS:** Linux（Wayland / X11）
+- **GPU:** Vulkan 対応。ゼロコピー経路はドライバ・拡張に依存
+- **HMD:** Monado がサポートするヘッドセット（例: PSVR2 など。セットアップはディストリ／LVRA の手順に従う）
+- **コーデック:** 実行環境の FFmpeg ビルドに依存（H.265 等はディストリのコーデック方針の影響を受ける）
+
+### English
+
+- **OS:** Linux (Wayland / X11)
+- **GPU:** Vulkan-capable. Zero-copy paths depend on the driver and extensions
+- **HMD:** Headsets supported by Monado (for example PSVR2). Follow distro / LVRA setup notes
+- **Codecs:** Depend on the FFmpeg build in use (H.265 and similar may be omitted by distro policy)
+
+## テスト環境 / Test environment
+
+開発・動作確認に用いている主な環境です。 / The setup used for development and checks:
+
+| 項目 / Item | 内容 / Setup |
+|-------------|--------------|
+| OS | openSUSE Tumbleweed |
+| XR | Monado（`hardware:xr` 等 / and similar） |
+| HMD | PlayStation VR2（互換 PC アダプタ経由 / via a compatible PC adapter） |
+| コントローラー / Controller | USB 接続の DualSense / USB DualSense |
+| GPU | NVIDIA（NVDEC / CUDA 経路を含む確認 / including NVDEC and CUDA paths） |
+| マルチメディア / Multimedia | 開発機の FFmpeg でコーデックを確認 / Codec checks use the development machine's FFmpeg |
+
+他ディストリ（Fedora、Debian/Ubuntu 等）でも同種の依存が揃えばビルド可能です。実機・コーデックの組み合わせは環境差があります。
+
+The project can be built on other distributions (Fedora, Debian/Ubuntu, and similar) when the same dependencies are present. Hardware and codec combinations vary.
+
+## ビルド / Build
+
+依存パッケージの例（ディストリによりパッケージ名は異なります）:
+
+Example packages (names differ by distribution) — openSUSE Tumbleweed:
 
 ```bash
-# Fedora 例
-sudo dnf install cmake ninja-build gcc-c++ pkgconf-pkg-config \
-  openxr-devel vulkan-loader-devel vulkan-headers glslang \
-  ffmpeg-free-devel  # または libavcodec-free-devel 一式
-
-# Debian/Ubuntu 例
-sudo apt install cmake ninja-build g++ pkg-config \
-  libopenxr-dev libvulkan-dev glslang-tools \
-  libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
-  libopenxr1-monado xr-hardware monado-cli
-```
-
-### openSUSE Tumbleweed
-
-ビルド・実行に必要なパッケージは OSS と [hardware:xr](https://build.opensuse.org/project/show/hardware:xr) から入ります（VR 向けの詳細は [LVRA — openSUSE Tumbleweed](https://vronlinux.org/docs/distros/opensuse_tumbleweed/)）。
-
-```bash
-# OpenXR / Monado（未追加なら）
 sudo zypper ar -f \
   https://download.opensuse.org/repositories/hardware:/xr/openSUSE_Tumbleweed/ \
   hardware-xr
 sudo zypper ref
-
-# ビルド依存（OSS）
 sudo zypper in cmake ninja gcc-c++ pkgconf-pkg-config \
-  vulkan-devel vulkan-headers glslang-devel \
+  qt6-widgets-devel vulkan-devel vulkan-headers glslang-devel \
+  OpenXR-SDK-devel libopenxr_loader1 monado \
   ffmpeg-8-libavcodec-devel ffmpeg-8-libavformat-devel \
-  ffmpeg-8-libavutil-devel ffmpeg-8-libswscale-devel
-
-# ランタイム（hardware:xr）
-sudo zypper in OpenXR-SDK-devel libopenxr_loader1 monado
+  ffmpeg-8-libavutil-devel ffmpeg-8-libswscale-devel ffmpeg-8-libswresample-devel \
+  sdl2-devel libpulse-devel
 ```
-
-FFmpeg の版は環境に合わせて `ffmpeg-7-*` / `ffmpeg-9-*` でも可。`pkg-config --exists libavcodec` が通れば十分です。
-
-ベンダー切替（OSS ↔ Packman）とコーデック可否は [ライセンスと FFmpeg](#ライセンスと-ffmpeg) を参照。
-
-Monado 起動後のランタイム指定例:
-
-```bash
-# パッケージ配置の典型パス
-export XR_RUNTIME_JSON=/usr/share/openxr/1/openxr_monado.json
-# ソースインストールの場合は /usr/local/share/openxr/1/openxr_monado.json など
-```
-
-PSVR2 など実機セットアップは Envision + Monado ビルドが楽なことがあります（同上 LVRA を参照）。
-
-FFmpeg が無い場合もビルドできますが、映像はプレースホルダのみです。
-
-## ビルド
 
 ```bash
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
 
-成果物: `build/monasphere`（隣に `build/shaders/*.spv`）
+成果物 / Output: `build/monasphere`（隣接の `build/shaders/*.spv` / SPIR-V under `build/shaders/*.spv`）
 
-## Monado 確認（必読）
-
-```bash
-# ティアリング低減（コンポジタ pacing）— monado-service に付ける
-export XRT_COMPOSITOR_USE_PRESENT_WAIT=1
-export U_PACING_COMP_TIME_FRACTION_PERCENT=90
-
-monado-service &   # または systemd user unit
-monado-cli probe
-XR_RUNTIME_JSON=/usr/share/openxr/1/openxr_monado.json hello_xr -g Vulkan
-```
-
-`monasphere` から Monado を起動する場合は上記 pacing 変数を自動で付与します。  
-既に動いている `monado.service` / 外部プロセスを使う場合は、そのサービス側に同じ変数を設定してください。
-
-## 実行
+実行例 / Run:
 
 ```bash
 export XR_RUNTIME_JSON=/usr/share/openxr/1/openxr_monado.json
-# 手動で monado-service を起動するときも pacing を付けるとティアリングが改善しやすい
-export XRT_COMPOSITOR_USE_PRESENT_WAIT=1
-export U_PACING_COMP_TIME_FRACTION_PERCENT=90
-```
-
-```bash
-# セッション疎通（単色クリア寄り・プレースホルダ）
-./build/monasphere --clear-only
-
-# 平面シネマ
-./build/monasphere -p flat -f 70 /path/to/movie.mp4
-
-# 360° 立体（上下）
+./build/monasphere
+./build/monasphere -p flat /path/to/movie.mp4
 ./build/monasphere -p 360 -l ou /path/to/sphere360.mkv
-
-# 180° SBS
-./build/monasphere -p 180 -l sbs /path/to/sbs180.mp4
 ```
 
-### 操作（コントローラ / HMD）
+パッケージ化の雛形 / Packaging sketch: [`packaging/opensuse/monasphere.spec`](packaging/opensuse/monasphere.spec)
 
-ホスト UI の **使用コントローラー** / **利き手** でプロファイルを選び、**HMD に接続** してください（接続中は変更不可・再接続で適用）。
+配布バイナリは `ffmpeg-*-mini-devel` でのビルドを想定。実行時 FFmpeg は利用者環境に依存。
 
-| プロファイル | 想定 |
-|---|---|
-| PSVR2 Sense / Touch（既定） | Monado が Oculus Touch 相当で出す場合 |
-| **ゲームパッド（USB/BT）** | 通常の Xbox / DualSense 等（SDL2）。A 決定・B 戻る・Start メニュー・左スティック移動 |
-| 自動 | 全 XR プロファイルを suggest |
-| Simple / Vive / Index / MS | 実機に合わせて選択 |
+Distributed binaries are expected to be built against `ffmpeg-*-mini-devel`. The FFmpeg used at runtime depends on the user's system.
 
-| アクション | 割り当て（右手・Touch 例） |
-|---|---|
-| **メニュー表示切替** | 左手 Y |
-| **決定** | 右手 A |
-| **戻る** | 右手 B |
-| **移動** | 右スティック |
-| 再生／一時停止 | 右手 squeeze（メニュー非表示時） |
-| リセンター | **PSVR2 HMD ファンクションボタン** |
+## ライセンス
 
-### リフレッシュレート（90 / 120 Hz）
+- **本ソフトウェアのソース:** [MIT](LICENSE)
+- **第三者成分:** [`THIRD_PARTY.md`](THIRD_PARTY.md)（Qt、FFmpeg、OpenXR、Vulkan、vendored ライブラリ等）
 
-UI の「リフレッシュレート」で選択します。アプリが Monado を起動するとき:
+FFmpeg は動的リンクです。バイナリ配布時はリンク先 FFmpeg のライセンス（LGPL / GPL、ディストリのビルド内容）に従ってください。
 
-1. `XRT_COMPOSITOR_PRINT_MODES=1` でモード一覧を取得  
-2. 希望 Hz に近い index を `XRT_COMPOSITOR_DESIRED_MODE` に設定して再起動  
+### English
 
-外部の `monado.service` を使う場合は、サービス側で `XRT_COMPOSITOR_DESIRED_MODE` を設定してください。
+- **Source of this software:** [MIT](LICENSE)
+- **Third-party components:** [`THIRD_PARTY.md`](THIRD_PARTY.md) (Qt, FFmpeg, OpenXR, Vulkan, vendored libraries, and similar)
 
-### パフォーマンス改善の目安
-
-| 手段 | 効果 |
-|---|---|
-| **CUDA↔Vulkan NV12 ゼロコピー**（NVDEC 時） | ネイティブ 8K を GPU 内転送。CPU RGBA を避ける |
-| Monado pacing（アプリ起動時に自動付与） | ティアリング／遅れの低減 |
-| **90 Hz** を選ぶ | フレーム予算が約 11ms（120Hz は約 8.3ms） |
-| 表示の 4K キャップ | **CPU fallback 時のみ**（CUDA 不可・UUID 不一致など） |
-| 非同期テクスチャアップロード（CPU 経路） | XR ループ内の待ちを削減 |
-
-ゼロコピー要件: 同一 GPU の Vulkan↔CUDA UUID 一致、`VK_KHR_external_memory_fd`、NVIDIA NVDEC。満たさない場合は従来の CPU RGBA（最大約 4K）に落ちます。
-
-## 構成
-
-```
-src/xr/       OpenXR session + Vulkan enable2（再利用ライブラリ）
-src/vk/       （デバイス生成は xr 内。拡張用）
-src/video/    FFmpeg デコード → VkImage
-src/scene/    Flat / equirect 描画
-apps/vrp_player/
-shaders/      GLSL → SPIR-V（CMake でコンパイル）
-```
-
-将来の VR 作品は `vrp_core`（`src/xr` + `src/scene` 等）をリンクして新しい `apps/` を追加する想定です。
-
-## TODO
-
-- **AMD ゼロコピー**: VA-API デコード結果の dma-buf を `VK_EXT_external_memory_dma_buf`（+ DRM modifier）で Vulkan NV12 に import。現行の CUDA↔Vulkan 経路と並列のバックエンドとして追加する。
-  - 診断: `VRP_DEBUG=1 ./build/monasphere` で hwaccel / dma-buf 可否を確認（[`translations/README.md`](translations/README.md)）
-  - 通常ログ: `Video hwaccel: vaapi…`, `display path: VA-API → CPU RGBA…`, `Vulkan dma-buf import: …`
-
-## i18n
-
-UI / ユーザー向けログは `tr()` / `VRP_TR()`（コンテキスト `monaSphere`）。手順は [`translations/README.md`](translations/README.md)。
-
-## ライセンスとパッケージ配布
-
-| 層 | 内容 |
-|----|------|
-| **ソース配布** | MIT（[`LICENSE`](LICENSE)） |
-| **配布バイナリ（確定方針）** | **`ffmpeg-*-mini-devel` でビルド** → パッケージ `License: MIT` |
-| **ユーザー実行（任意）** | **Packman の同 SONAME FFmpeg** に差し替え → H.265 等 |
-| **リンク** | FFmpeg / Qt / OpenXR / Vulkan は動的リンク（FFmpeg は RPM に同梱しない） |
-| **詳細** | 雛形 [`packaging/opensuse/monasphere.spec`](packaging/opensuse/monasphere.spec) / [`THIRD_PARTY.md`](THIRD_PARTY.md) |
-
-コマンド / パッケージ名は **`monasphere`**（Debian の `mona` 定理証明器との衝突回避）。UI ブランドは monaSphere。
-
-Packman の devel でビルドしたバイナリを OSS や「MIT のみ」として配布しないこと。  
-ローカル開発で Packman 実行スタックを使う分には問題ありません。
+FFmpeg is linked dynamically. When distributing a binary, follow the license of the FFmpeg you link (LGPL / GPL, and the distro's build flags).

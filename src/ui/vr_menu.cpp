@@ -115,6 +115,29 @@ void VrMenu::set_fsr(FsrMode m) {
   bump();
 }
 
+void VrMenu::save_last_dir() const {
+  if (place_ != Place::HomeTree && place_ != Place::RemovableTree) return;
+  if (cwd_.empty()) return;
+  const fs::path conf_dir = home_ / ".config" / "monasphere";
+  std::error_code ec;
+  fs::create_directories(conf_dir, ec);
+  std::ofstream out(conf_dir / "conf");
+  if (!out) return;
+  out << "last_dir=" << cwd_.string() << '\n';
+}
+
+std::filesystem::path VrMenu::load_last_dir() const {
+  const fs::path conf = home_ / ".config" / "monasphere" / "conf";
+  std::ifstream in(conf);
+  if (!in) return {};
+  std::string line;
+  while (std::getline(in, line)) {
+    constexpr const char* k = "last_dir=";
+    if (line.rfind(k, 0) == 0) return fs::path(line.substr(9));
+  }
+  return {};
+}
+
 int VrMenu::hz_option_value(int index) {
   switch (index) {
     case 1: return 90;
@@ -198,6 +221,7 @@ void VrMenu::list_directory(const fs::path& dir, bool add_up, const fs::path& up
     Entry e;
     e.path = it.path();
     e.name = it.path().filename().string();
+    if (!e.name.empty() && e.name[0] == '.') continue;
     if (it.is_directory(ec)) {
       e.is_dir = true;
       dirs.push_back(std::move(e));
@@ -476,6 +500,7 @@ void VrMenu::activate() {
       place_ = Place::HomeTree;
       cwd_ = home_;
       refresh_dir();
+      save_last_dir();
       bump();
       return;
     }
@@ -499,6 +524,7 @@ void VrMenu::activate() {
       removable_root_ = e.path;
       cwd_ = e.path;
       refresh_dir();
+      save_last_dir();
       bump();
       return;
     }
@@ -514,6 +540,7 @@ void VrMenu::activate() {
       if (!path_under(e.path, home_) && e.path != home_) return;
       cwd_ = e.path;
       refresh_dir();
+      save_last_dir();
       bump();
       return;
     }
@@ -521,6 +548,7 @@ void VrMenu::activate() {
       if (!path_under(e.path, removable_root_) && e.path != removable_root_) return;
       cwd_ = e.path;
       refresh_dir();
+      save_last_dir();
       bump();
       return;
     }
@@ -573,6 +601,7 @@ void VrMenu::go_back() {
     }
     cwd_ = parent;
     refresh_dir(left);
+    save_last_dir();
     bump();
     return;
   }
@@ -598,6 +627,7 @@ void VrMenu::go_back() {
     }
     cwd_ = parent;
     refresh_dir(left);
+    save_last_dir();
     bump();
   }
 }
@@ -957,39 +987,39 @@ VrMenu::Snapshot VrMenu::snapshot() const {
   s.controls_edit = controls_edit_;
   s.screen = screen_;
   if (controls_visible_) {
-    s.title = media_name_.empty() ? "再生コントロール" : media_name_;
+    s.title = media_name_.empty() ? "Playback" : media_name_;
     switch (controls_edit_) {
       case ControlsEdit::Volume:
-        s.hint = "上下:音量  A/B:決定";
+        s.hint = "Up/Down: vol  A/B: OK";
         break;
       case ControlsEdit::FsrPick:
-        s.hint = "上下:切替  A:閉じる  B:以前の設定に戻す";
+        s.hint = "Up/Down: pick  A: close  B: undo";
         break;
       case ControlsEdit::FormatPick:
-        s.hint = "上下:選択  A:決定  B:キャンセル";
+        s.hint = "Up/Down: pick  A: OK  B: cancel";
         break;
       case ControlsEdit::HzPick:
-        s.hint = "上下:Hz選択  A:決定  B:キャンセル";
+        s.hint = "Up/Down: Hz  A: OK  B: cancel";
         break;
       case ControlsEdit::HzConfirm:
-        s.hint = "A:[再起動]  B:選択に戻る";
+        s.hint = "A: restart  B: back";
         break;
       default:
-        s.hint = "←→:移動  上+A:速く  下+A:遅く  A:実行  B:閉じる  B長押し:×1";
+        s.hint = "L/R: move  Up+A: faster  Down+A: slower  A: OK  B: close";
         break;
     }
   } else if (place_ == Place::Roots) {
-    s.title = "ファイル";
-    s.hint = "A:選択  B:戻る  Start:閉じる";
+    s.title = "Files";
+    s.hint = "A: open  B: back";
   } else if (place_ == Place::RemovableList) {
-    s.title = "リムーバブル";
-    s.hint = "A:選択  B:戻る  Start:閉じる";
+    s.title = "USB";
+    s.hint = "A: open  B: back";
   } else if (place_ == Place::RemovableTree) {
     s.title = cwd_.filename().empty() ? cwd_.string() : cwd_.filename().string();
-    s.hint = "A:選択  B:戻る  Start:閉じる";
+    s.hint = "A: open  B: back";
   } else {
-    s.title = (cwd_ == home_) ? "ホーム" : cwd_.filename().string();
-    s.hint = "A:選択  B:戻る  Start:閉じる";
+    s.title = (cwd_ == home_) ? "Home" : cwd_.filename().string();
+    s.hint = "A: open  B: back";
   }
   s.entries = entries_;
   s.cursor = cursor_;

@@ -67,28 +67,28 @@ void XrVulkanApp::init(std::atomic<bool>* cancel, const std::function<void(const
   };
   auto check_cancel = [&] {
     if (cancel && cancel->load()) {
-      throw std::runtime_error("接続をキャンセルしました");
+      throw std::runtime_error("Connect cancelled");
     }
   };
 
-  note("OpenXR ランタイムに接続しています…");
+  note("Connecting to OpenXR…");
   check_cancel();
   create_instance(cancel, progress);
   check_cancel();
-  note("Vulkan デバイスを初期化しています…");
+  note("Init Vulkan device…");
   create_vulkan(cancel, progress);
   check_cancel();
-  note("OpenXR セッションを作成しています…");
+  note("Creating OpenXR session…");
   create_session();
   check_cancel();
   create_spaces();
   check_cancel();
-  note("スワップチェーンを準備しています…");
+  note("Preparing swapchains…");
   create_swapchains();
   check_cancel();
-  note("コントローラー入力を設定しています…");
+  note("Setting up controllers…");
   create_actions();
-  note("OpenXR + Vulkan の準備が完了しました");
+  note("OpenXR + Vulkan ready");
   VRP_LOG("OpenXR + Vulkan session ready");
 }
 
@@ -234,7 +234,7 @@ void XrVulkanApp::create_instance(std::atomic<bool>* cancel,
   auto last_note = std::chrono::steady_clock::now() - std::chrono::seconds(2);
   for (;;) {
     if (cancel && cancel->load()) {
-      throw std::runtime_error("接続をキャンセルしました（HMD 待機中）");
+      throw std::runtime_error("Connect cancelled (waiting for HMD)");
     }
     const XrResult gr = xrGetSystem(instance_, &sys, &system_);
     if (XR_SUCCEEDED(gr)) break;
@@ -243,12 +243,12 @@ void XrVulkanApp::create_instance(std::atomic<bool>* cancel,
     }
     if (std::chrono::steady_clock::now() >= deadline) {
       throw std::runtime_error(
-          "HMD が 60 秒以内に検出されませんでした（電源・USB・Monado ログを確認）");
+          "HMD not found within 60s (power, USB, Monado log)");
     }
     const auto now = std::chrono::steady_clock::now();
     if (progress && now - last_note >= std::chrono::seconds(1)) {
       last_note = now;
-      progress("HMD の検出を待っています…（電源 ON / 装着）");
+      progress("Waiting for HMD (power on / wear)");
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
@@ -260,7 +260,7 @@ void XrVulkanApp::create_instance(std::atomic<bool>* cancel,
   VRP_LOG("OpenXR system id=%llu name=\"%s\" vendor=0x%x", static_cast<unsigned long long>(system_),
           system_name_.c_str(), vendor_id_);
   if (progress) {
-    progress(std::string("HMD を検出: ") + system_name_);
+    progress(std::string("HMD found: ") + system_name_);
   }
 }
 
@@ -271,7 +271,7 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     if (progress) progress(msg);
   };
   auto check_cancel = [&] {
-    if (cancel && cancel->load()) throw std::runtime_error("接続をキャンセルしました");
+    if (cancel && cancel->load()) throw std::runtime_error("Connect cancelled");
   };
 
   auto xrGetVulkanGraphicsRequirements2KHR = reinterpret_cast<PFN_xrGetVulkanGraphicsRequirements2KHR>(
@@ -283,7 +283,7 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   auto xrCreateVulkanDeviceKHR =
       reinterpret_cast<PFN_xrCreateVulkanDeviceKHR>(load_xr(instance_, "xrCreateVulkanDeviceKHR"));
 
-  note("Vulkan: グラフィックス要件を確認…");
+  note("Vulkan: graphics requirements…");
   check_cancel();
   XrGraphicsRequirementsVulkan2KHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
   check_xr(xrGetVulkanGraphicsRequirements2KHR(instance_, system_, &req), "graphics requirements");
@@ -308,14 +308,14 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   xvici.vulkanCreateInfo = &vici;
   xvici.vulkanAllocator = nullptr;
 
-  note("Vulkan: インスタンスを作成…");
+  note("Vulkan: creating instance…");
   check_cancel();
   VkResult vk_r = VK_SUCCESS;
   check_xr(xrCreateVulkanInstanceKHR(instance_, &xvici, &vk_instance_, &vk_r),
            "xrCreateVulkanInstanceKHR");
   VRP_CHECK(vk_r == VK_SUCCESS, "Vulkan instance create failed");
 
-  note("Vulkan: GPU を選択…");
+  note("Vulkan: picking GPU…");
   check_cancel();
   XrVulkanGraphicsDeviceGetInfoKHR gdgi{XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
   gdgi.systemId = system_;
@@ -380,7 +380,7 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   xvdci.vulkanCreateInfo = &dci;
   xvdci.vulkanAllocator = nullptr;
 
-  note("Vulkan: 論理デバイスを作成…");
+  note("Vulkan: creating device…");
   check_cancel();
   vk_r = VK_SUCCESS;
   check_xr(xrCreateVulkanDeviceKHR(instance_, &xvdci, &device_, &vk_r), "xrCreateVulkanDeviceKHR");
@@ -398,7 +398,7 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     VRP_DBG("AMD path: enable VK_EXT_external_memory_dma_buf on device when wiring VA-API import");
   }
 
-  note("Vulkan: コマンドプールを作成…");
+  note("Vulkan: command pool…");
   check_cancel();
   VkCommandPoolCreateInfo cpci{};
   cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -861,9 +861,9 @@ XrVulkanApp::XrStatus XrVulkanApp::status() const {
   if (s.display_hz > 0 && last_frame_ms_ > 0) {
     const double budget_ms = 1000.0 / s.display_hz;
     if (last_frame_ms_ > budget_ms * 1.15) {
-      s.sync_note = "フレーム遅れ";
+      s.sync_note = "lag";
     } else {
-      s.sync_note = "同期OK";
+      s.sync_note = "OK";
     }
   }
   s.refresh_rate_ext = refresh_rate_ext_;

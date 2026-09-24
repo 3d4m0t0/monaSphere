@@ -1,0 +1,944 @@
+{
+  "translations": [
+    {
+      "context": "HostWindow",
+      "source": "Actions",
+      "translation": "菜单"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start Monado",
+      "translation": "启动 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stop Monado",
+      "translation": "停止 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Connect",
+      "translation": "连接"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Disconnect",
+      "translation": "断开"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Quit",
+      "translation": "退出"
+    },
+    {
+      "context": "HostWindow",
+      "source": "View",
+      "translation": "显示"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD info",
+      "translation": "HMD信息"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Settings",
+      "translation": "设置"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Audio",
+      "translation": "音频"
+    },
+    {
+      "context": "HostWindow",
+      "source": "FSR",
+      "translation": "FSR"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Hz",
+      "translation": "Hz"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Pad",
+      "translation": "手柄"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Hand",
+      "translation": "惯用手"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Help",
+      "translation": "帮助"
+    },
+    {
+      "context": "HostWindow",
+      "source": "About",
+      "translation": "关于"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Status",
+      "translation": "状态"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Sync",
+      "translation": "同步"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD: none",
+      "translation": "HMD: 无"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Error",
+      "translation": "错误"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Monado not responding",
+      "translation": "Monado 无响应"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Monado IPC timed out",
+      "translation": "Monado IPC 超时"
+    },
+    {
+      "context": "HostWindow",
+      "source": "(none)",
+      "translation": "无"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No device",
+      "translation": "无设备"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Reload",
+      "translation": "刷新"
+    },
+    {
+      "context": "HostWindow",
+      "source": "One HMD only",
+      "translation": "仅1台"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Auto",
+      "translation": "自动"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Off",
+      "translation": "关"
+    },
+    {
+      "context": "HostWindow",
+      "source": "UQ (~1.3x)",
+      "translation": "UQ (~1.3x)"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Q (~1.5x)",
+      "translation": "Q (~1.5x)"
+    },
+    {
+      "context": "HostWindow",
+      "source": "P (~2.0x)",
+      "translation": "P (~2.0x)"
+    },
+    {
+      "context": "HostWindow",
+      "source": "90 Hz",
+      "translation": "90 Hz"
+    },
+    {
+      "context": "HostWindow",
+      "source": "120 Hz",
+      "translation": "120 Hz"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Touch",
+      "translation": "Touch"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Simple",
+      "translation": "Simple"
+    },
+    {
+      "context": "HostWindow",
+      "source": "MS Motion",
+      "translation": "MS"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vive",
+      "translation": "Vive"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Index",
+      "translation": "Index"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Gamepad",
+      "translation": "手柄"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Right",
+      "translation": "右手"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Left",
+      "translation": "左手"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Video: GPU NV12",
+      "translation": "视频: GPU NV12"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Video: CPU RGBA",
+      "translation": "视频: CPU RGBA"
+    },
+    {
+      "context": "HostWindow",
+      "source": "<h3>monaSphere v%1</h3><p>Linux VR video player (OpenXR / Monado)</p><p>Copyright (c) 2026 flex</p><p>GitHub:<br><a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p><p>Source license: MIT</p><p>FFmpeg / Qt and others are linked dynamically. See THIRD_PARTY.md when distributing a binary.</p>",
+      "translation": "<h3>monaSphere v%1</h3><p>Linux VR 播放器（OpenXR / Monado）</p><p>Copyright (c) 2026 flex</p><p>GitHub:<br><a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p><p>源代码许可: MIT</p><p>FFmpeg / Qt 为动态链接。分发时请见 THIRD_PARTY.md。</p>"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Flat",
+      "translation": "平面"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Off",
+      "translation": "关"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Vol%1%",
+      "translation": "音量%1%"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Auto",
+      "translation": "自动"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Hz change\nneeds restart",
+      "translation": "更改 Hz\n需要重启"
+    },
+    {
+      "context": "monaSphere",
+      "source": "[Restart]",
+      "translation": "[重启]"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Playback",
+      "translation": "播放"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Files",
+      "translation": "文件"
+    },
+    {
+      "context": "monaSphere",
+      "source": "USB",
+      "translation": "USB"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Home",
+      "translation": "主页"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Up/Down: vol  A/B: OK",
+      "translation": "上下:音量  A/B:确定"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Up/Down: pick  A: close  B: undo",
+      "translation": "上下:选择  A:关闭  B:还原"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Up/Down: pick  A: OK  B: cancel",
+      "translation": "上下:选择  A:确定  B:取消"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Up/Down: Hz  A: OK  B: cancel",
+      "translation": "上下:Hz  A:确定  B:取消"
+    },
+    {
+      "context": "monaSphere",
+      "source": "A: restart  B: back",
+      "translation": "A:重启  B:返回"
+    },
+    {
+      "context": "monaSphere",
+      "source": "L/R: move  Up+A: faster  Down+A: slower  A: OK  B: close",
+      "translation": "左右:移动  上+A:加快  下+A:减慢  A:执行  B:关闭"
+    },
+    {
+      "context": "monaSphere",
+      "source": "A: open  B: back",
+      "translation": "A:打开  B:返回"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Wait",
+      "translation": "等待"
+    },
+    {
+      "context": "HostWindow",
+      "source": "OK",
+      "translation": "正常"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Idle",
+      "translation": "待机"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stopped",
+      "translation": "停止"
+    },
+    {
+      "context": "HostWindow",
+      "source": "External",
+      "translation": "外部"
+    },
+    {
+      "context": "HostWindow",
+      "source": "IPC busy",
+      "translation": "IPC占用"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No binary",
+      "translation": "无程序"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start failed",
+      "translation": "启动失败"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Running pid %1",
+      "translation": "运行 pid %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Exit %1",
+      "translation": "退出 %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Log",
+      "translation": "日志"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD: %1",
+      "translation": "HMD: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "lag",
+      "translation": "延迟"
+    },
+    {
+      "context": "HostWindow",
+      "source": "sync OK",
+      "translation": "同步OK"
+    },
+    {
+      "context": "HostWindow",
+      "source": "%1 ms",
+      "translation": "%1 ms"
+    },
+    {
+      "context": "HostWindow",
+      "source": "— ms",
+      "translation": "— ms"
+    },
+    {
+      "context": "HostWindow",
+      "source": " (≤%1)",
+      "translation": "（≤%1）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "%1 Hz",
+      "translation": "%1 Hz"
+    },
+    {
+      "context": "HostWindow",
+      "source": "none",
+      "translation": "无"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for USB HMD",
+      "translation": "等待 USB HMD"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Multiple HMDs — connect manually",
+      "translation": "多台 HMD — 请手动连接"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Starting Monado…",
+      "translation": "正在启动 Monado…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using existing Monado",
+      "translation": "使用现有 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "External Monado blocks Hz",
+      "translation": "外部 Monado 阻止 Hz"
+    },
+    {
+      "context": "HostWindow",
+      "source": "monado-service not found",
+      "translation": "找不到 monado-service"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Monado up. Waiting for HMD",
+      "translation": "Monado 已启动。等待 HMD"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Monado exited. See log",
+      "translation": "Monado 已退出。请看日志"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Starting OpenXR session",
+      "translation": "正在开始 OpenXR"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for session",
+      "translation": "等待会话"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Session lost",
+      "translation": "会话丢失"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Drawing",
+      "translation": "绘制中"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Pose not ready",
+      "translation": "姿态未就绪"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD found. Waiting for session",
+      "translation": "已发现 HMD。等待会话"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for HMD",
+      "translation": "等待 HMD"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Session ended",
+      "translation": "会话已结束"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Hz change — restarting",
+      "translation": "更改 Hz — 重启中"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Not connected",
+      "translation": "未连接"
+    },
+    {
+      "context": "HostWindow",
+      "source": "XR thread hung — detach",
+      "translation": "XR 线程无响应 — 分离"
+    },
+    {
+      "context": "HostWindow",
+      "source": "USB: HMD unplugged — stop session",
+      "translation": "USB: HMD 拔出 — 停止会话"
+    },
+    {
+      "context": "HostWindow",
+      "source": "USB HMD removed — stop Monado",
+      "translation": "USB HMD 移除 — 停止 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Auto-connect skipped: %1 HMDs",
+      "translation": "跳过自动连接: %1 台 HMD"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Auto-connect: replace external Monado for Hz",
+      "translation": "自动连接: 为 Hz 替换外部 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Auto-connect: %1 is not a real HMD",
+      "translation": "自动连接: %1 不是真机"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Audio: %1",
+      "translation": "音频: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Refresh: %1",
+      "translation": "刷新率: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Pad: %1 (applies on reconnect)",
+      "translation": "手柄: %1（重连后生效）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No gamepad — plug in, then connect HMD",
+      "translation": "无手柄 — 接上后再连 HMD"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Found: %1",
+      "translation": "发现: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Hand: %1 (applies on reconnect)",
+      "translation": "惯用手: %1（重连后生效）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Audio → HMD: %1",
+      "translation": "音频→HMD: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Audio → desktop: %1",
+      "translation": "音频→桌面: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No HMD HDMI audio",
+      "translation": "无 HMD HDMI 音频"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Cannot play: %1",
+      "translation": "无法播放: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Reason: %1",
+      "translation": "原因: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Video: %1 — %2",
+      "translation": "视频: %1 — %2"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Seek thumbs ready: %1",
+      "translation": "seek 缩略图就绪: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Seek thumbs failed: %1",
+      "translation": "seek 缩略图失败: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Removed stale Monado IPC: %1",
+      "translation": "已删除旧 Monado IPC: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Cannot remove Monado IPC: %1",
+      "translation": "无法删除 Monado IPC: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using external Monado (%1)",
+      "translation": "使用外部 Monado（%1）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "vulkaninfo failed — wait for Monado modes",
+      "translation": "vulkaninfo 失败 — 等待模式"
+    },
+    {
+      "context": "HostWindow",
+      "source": "vulkaninfo timeout — wait for Monado modes",
+      "translation": "vulkaninfo 超时 — 等待模式"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No HMD modes from vulkaninfo",
+      "translation": "vulkaninfo 无 HMD 模式"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD modes %1: %2",
+      "translation": "HMD 模式 %1: %2"
+    },
+    {
+      "context": "HostWindow",
+      "source": "OpenXR refresh → %1 (rates: %2)",
+      "translation": "OpenXR 刷新 → %1（支持: %2）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Still %1 Hz after OpenXR — restart Monado",
+      "translation": "仍为 %1 Hz — 重启 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "OpenXR Hz switch failed — restart Monado",
+      "translation": "OpenXR Hz 切换失败 — 重启"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No XR_FB_display_refresh_rate — restart Monado",
+      "translation": "无 XR_FB_display_refresh_rate — 重启"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Restart Monado for refresh → %1",
+      "translation": "为刷新率重启 Monado → %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No mode for %1 Hz — rescan after restart",
+      "translation": "无 %1 Hz 模式 — 重启后再找"
+    },
+    {
+      "context": "HostWindow",
+      "source": "XR detach timeout — restart continues",
+      "translation": "XR 分离超时 — 继续重启"
+    },
+    {
+      "context": "HostWindow",
+      "source": "External Monado: restart it, then reconnect",
+      "translation": "请重启外部 Monado 后再连接"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Drop external Monado and restart with Hz",
+      "translation": "断开外部 Monado 并以 Hz 重启"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No display mode near %1 Hz",
+      "translation": "没有接近 %1 Hz 的模式"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using mode %1 ≈ %2 Hz",
+      "translation": "使用模式 %1 ≈ %2 Hz"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Restart Monado for Hz (mode %1 ≈ %2 Hz)",
+      "translation": "为 Hz 重启 Monado（模式 %1 ≈ %2 Hz）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Replace owned Monado with Hz mode",
+      "translation": "用 Hz 模式替换自有 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Monado already running (owned)",
+      "translation": "Monado 已在运行（本应用）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Monado IPC still up — retry stop for Hz",
+      "translation": "Monado IPC 仍在 — 为 Hz 再停"
+    },
+    {
+      "context": "HostWindow",
+      "source": "External Monado holds IPC. Stop monado.socket",
+      "translation": "外部 Monado 占用 IPC。请停止 socket"
+    },
+    {
+      "context": "HostWindow",
+      "source": "monado-service not in PATH",
+      "translation": "PATH 中无 monado-service"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start Monado: %1",
+      "translation": "启动 Monado: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start failed: %1",
+      "translation": "启动失败: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "External Monado left running",
+      "translation": "外部 Monado 保持运行"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Or: systemctl --user stop monado.socket monado.service",
+      "translation": "或: systemctl --user stop monado.socket monado.service"
+    },
+    {
+      "context": "HostWindow",
+      "source": "XR disconnect timeout",
+      "translation": "XR 断开超时"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stopping Monado",
+      "translation": "正在停止 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stale IPC socket — clear and retry",
+      "translation": "旧 IPC — 清除后重试"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD session already running",
+      "translation": "HMD 会话已在进行"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for previous session…",
+      "translation": "等待上次会话结束…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Previous XR thread hung — detach",
+      "translation": "上次 XR 线程无响应 — 分离"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Connect OpenXR (pad=%1 / %2)",
+      "translation": "连接 OpenXR（手柄=%1 / %2）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD session closed (auto-connect off)",
+      "translation": "HMD 会话已关（自动连接关）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Disconnect timeout — detach XR",
+      "translation": "断开超时 — 分离 XR"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Connect cancelled",
+      "translation": "连接已取消"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Monado IPC not responding",
+      "translation": "Monado IPC 无响应"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for Monado…",
+      "translation": "等待 Monado…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Monado connected",
+      "translation": "已连接 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Audio start failed: %1",
+      "translation": "音频启动失败: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Input: gamepad (A OK, B back, Start menu)",
+      "translation": "输入: 手柄（A 确定 B 返回 Start 菜单）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Gamepad open failed. Recenter only",
+      "translation": "无法打开手柄。仅重置中心"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Format guess: %1 / %2",
+      "translation": "格式估计: %1 / %2"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Audio → %1",
+      "translation": "音频 → %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "No audio: %1",
+      "translation": "无音频: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Startup video failed. Pick another file",
+      "translation": "启动视频无法播放"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Cannot play video this session",
+      "translation": "此会话无法播放视频"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD: cannot open video",
+      "translation": "HMD: 无法打开视频"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD format: %1 / %2",
+      "translation": "HMD 格式: %1 / %2"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Audio switch failed: %1",
+      "translation": "音频切换失败: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Want %1 Hz, measured %2 Hz",
+      "translation": "希望 %1 Hz，实测 %2 Hz"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Hz mismatch — restart Monado (mode %1 ≈ %2 Hz)",
+      "translation": "Hz 不一致 — 重启（模式 %1 ≈ %2 Hz）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Video DBG: %1",
+      "translation": "视频DBG: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD found: %1",
+      "translation": "发现 HMD: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Connecting to OpenXR…",
+      "translation": "正在连接 OpenXR…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Init Vulkan device…",
+      "translation": "初始化 Vulkan 设备…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Creating OpenXR session…",
+      "translation": "创建 OpenXR 会话…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Preparing swapchains…",
+      "translation": "准备交换链…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Setting up controllers…",
+      "translation": "设置控制器…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "OpenXR + Vulkan ready",
+      "translation": "OpenXR + Vulkan 就绪"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Connect cancelled (waiting for HMD)",
+      "translation": "已取消（等待 HMD）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "HMD not found within 60s (power, USB, Monado log)",
+      "translation": "60 秒内无 HMD（电源、USB、日志）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for HMD (power on / wear)",
+      "translation": "等待 HMD（开机 / 佩戴）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan: graphics requirements…",
+      "translation": "Vulkan: 检查需求…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan: creating instance…",
+      "translation": "Vulkan: 创建实例…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan: picking GPU…",
+      "translation": "Vulkan: 选择 GPU…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan: creating device…",
+      "translation": "Vulkan: 创建设备…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan: command pool…",
+      "translation": "Vulkan: 命令池…"
+    }
+  ]
+}

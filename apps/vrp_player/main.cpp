@@ -1,9 +1,11 @@
 #include "common.hpp"
 #include "host_window.hpp"
+#include "i18n.hpp"
 #include "options.hpp"
 
 #include <QApplication>
 #include <QFileInfo>
+#include <QIcon>
 
 #include <cstdlib>
 #include <iostream>
@@ -90,6 +92,8 @@ int main(int argc, char** argv) {
   }
 
   QApplication app(argc, argv);
+  MonasphereInstallTranslations(app);
+  QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/monasphere.png")));
   QApplication::setOrganizationName(QStringLiteral("monaSphere"));
   QApplication::setApplicationName(QStringLiteral("monaSphere"));
   QApplication::setApplicationDisplayName(QStringLiteral("monaSphere"));

@@ -1,23 +1,23 @@
-# Translations (i18n)
+# Translations
 
-User-facing Qt strings use context `monaSphere` via `tr()` / `VRP_TR()`.
+English is the source language. Catalogs are JSON:
 
-```bash
-# From repo root (requires Qt Linguist tools)
-lupdate apps/vrp_player src -ts translations/monaSphere_en.ts
-# Translate, then:
-lrelease translations/monaSphere_en.ts -qm translations/monaSphere_en.qm
+```json
+{"translations":[{"context":"HostWindow","source":"Quit","translation":"終了"}]}
 ```
 
-Load in `main.cpp` when `.qm` files are shipped (not required for Japanese-source builds yet).
+- `en` and `ja` are embedded in the binary.
+- `de`, `fr`, `es`, `ko`, `zh_CN`, `zh_TW` load from
+  `MONASPHERE_TRANSLATIONS_DIR`, `~/.local/share/monasphere/translations`,
+  `../share/monasphere/translations`, or `./translations`.
+- Locale: `MONASPHERE_LANG`, then the system locale, then English.
+- Host menus use context `HostWindow`. HMD HUD strings use context `monaSphere`.
+- Short words are used where a long label would break a chip or status row.
 
-Developer diagnostics stay in English via `VRP_LOG` / `VRP_DBG` (`VRP_DEBUG=1` for verbose).
+Regenerate catalogs after string edits:
 
-## AMD zero-copy checklist (`VRP_DEBUG=1`)
+```bash
+python3 translations/gen_i18n.py
+```
 
-Look for:
-
-- `Video hwaccel: vaapi` — VA-API decode selected
-- `display path: VA-API → CPU RGBA` — no dma-buf import yet (TODO)
-- `Vulkan dma-buf import: available|missing` — `VK_EXT_external_memory_dma_buf`
-- `Vulkan external memory FD` — NVIDIA CUDA path only
+Developer diagnostics stay English (`VRP_LOG` / `VRP_DBG`, `VRP_DEBUG=1`).
