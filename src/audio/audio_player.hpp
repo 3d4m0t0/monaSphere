@@ -44,6 +44,10 @@ class AudioPlayer {
   static std::string prefer_hmd_device(const std::vector<AudioDeviceInfo>& devices,
                                        const std::string& xr_system_hint = {});
 
+  /** Pulse sink WiVRn creates after the headset app connects, or empty. */
+  static std::string find_wivrn_device(const std::vector<AudioDeviceInfo>& devices);
+  static bool is_wivrn_device(const AudioDeviceInfo& device);
+
   /**
    * Keep miniaudio running for the whole HMD session (silence when idle).
    * Creates the device on first call; no-ops if already up on the same sink.

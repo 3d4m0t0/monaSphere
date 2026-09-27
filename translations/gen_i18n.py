@@ -159,6 +159,7 @@ T = {
     "Found: %1": {"ja": "検出: %1", "de": "Gefunden: %1", "fr": "Trouvé : %1", "es": "Hallado: %1", "ko": "검출: %1", "zh_CN": "发现: %1", "zh_TW": "發現: %1"},
     "Hand: %1 (applies on reconnect)": {"ja": "利き手: %1（再接続で適用）", "de": "Hand: %1 (bei Neuverbindung)", "fr": "Main : %1 (à la reconnexion)", "es": "Mano: %1 (al reconectar)", "ko": "손: %1 (재연결 시)", "zh_CN": "惯用手: %1（重连后生效）", "zh_TW": "慣用手: %1（重連後生效）"},
     "Audio → HMD: %1": {"ja": "音声→HMD: %1", "de": "Audio→HMD: %1", "fr": "Audio→HMD : %1", "es": "Audio→HMD: %1", "ko": "오디오→HMD: %1", "zh_CN": "音频→HMD: %1", "zh_TW": "音訊→HMD: %1"},
+    "Audio → WiVRn: %1": {"ja": "音声→WiVRn: %1", "de": "Audio→WiVRn: %1", "fr": "Audio→WiVRn : %1", "es": "Audio→WiVRn: %1", "ko": "오디오→WiVRn: %1", "zh_CN": "音频→WiVRn: %1", "zh_TW": "音訊→WiVRn: %1"},
     "Audio → desktop: %1": {"ja": "音声→デスクトップ: %1", "de": "Audio→Desktop: %1", "fr": "Audio→bureau : %1", "es": "Audio→escritorio: %1", "ko": "오디오→데스크톱: %1", "zh_CN": "音频→桌面: %1", "zh_TW": "音訊→桌面: %1"},
     "No HMD HDMI audio": {"ja": "HMD HDMI 音声なし", "de": "kein HMD-HDMI-Audio", "fr": "pas d'audio HDMI HMD", "es": "sin audio HDMI del HMD", "ko": "HMD HDMI 오디오 없음", "zh_CN": "无 HMD HDMI 音频", "zh_TW": "無 HMD HDMI 音訊"},
     "Cannot play: %1": {"ja": "再生できません: %1", "de": "Wiedergabe fehlgeschlagen: %1", "fr": "Lecture impossible : %1", "es": "No se puede reproducir: %1", "ko": "재생 불가: %1", "zh_CN": "无法播放: %1", "zh_TW": "無法播放: %1"},

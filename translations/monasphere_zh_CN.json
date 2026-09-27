@@ -682,6 +682,11 @@
     },
     {
       "context": "HostWindow",
+      "source": "Audio → WiVRn: %1",
+      "translation": "音频→WiVRn: %1"
+    },
+    {
+      "context": "HostWindow",
       "source": "Audio → desktop: %1",
       "translation": "音频→桌面: %1"
     },

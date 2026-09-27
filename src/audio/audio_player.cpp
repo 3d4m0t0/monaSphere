@@ -633,6 +633,23 @@ std::string AudioPlayer::prefer_hmd_device(const std::vector<AudioDeviceInfo>& d
   return best_name;
 }
 
+bool AudioPlayer::is_wivrn_device(const AudioDeviceInfo& device) {
+  if (device.name == "default") return false;
+  auto lower = [](std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+  };
+  const std::string blob = lower(device.name + " " + device.description);
+  return blob.find("wivrn") != std::string::npos;
+}
+
+std::string AudioPlayer::find_wivrn_device(const std::vector<AudioDeviceInfo>& devices) {
+  for (const auto& d : devices) {
+    if (is_wivrn_device(d)) return d.name;
+  }
+  return {};
+}
+
 bool AudioPlayer::open(const std::string& path, const std::string& device_name) {
   if (!ensure_output(device_name)) return false;
   return switch_file(path);

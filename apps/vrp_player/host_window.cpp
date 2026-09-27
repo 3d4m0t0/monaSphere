@@ -568,12 +568,14 @@ void HostWindow::buildUi() {
   QTimer* hmd_menu_timer = new QTimer(this);
   connect(hmd_menu_timer, &QTimer::timeout, this, [this] {
     if (!xr_running_.load()) rebuildConnectDeviceMenu();
+    if (usingWivrn() && !audio_user_override_.load()) refreshAudioDevices(false);
   });
   hmd_menu_timer->start(2000);
 
   restoreWindowGeometry();
   loadAppConf();
   syncRuntimeRadios();
+  if (usingWivrn()) refreshAudioDevices(false);
   rebuildFsrMenu();
 }
 
@@ -1134,25 +1136,40 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
   (void)tv_count;
 
   int idx = -1;
+  // WiVRn's virtual sink appears only after the headset app connects.
+  const bool want_wivrn = usingWivrn() && !audio_user_override_.load();
+  const std::string wivrn_pick = want_wivrn ? vrp::AudioPlayer::find_wivrn_device(devices) : std::string{};
+  if (!wivrn_pick.empty()) {
+    idx = audio_device_ids_.indexOf(QString::fromStdString(wivrn_pick));
+    if (idx >= 0 && audio_device_ids_[idx] != prev) {
+      appendLog(tr("Audio → WiVRn: %1").arg(audio_device_labels_[idx]));
+    }
+  }
+
   // Only auto-pick HMD HDMI while connecting/connected — not after disconnect.
-  const bool pick_hmd =
-      prefer_hmd || (xr_running_.load() && !last_xr_system_.isEmpty() && !audio_user_override_.load());
-  if (pick_hmd && !audio_user_override_.load()) {
+  const bool pick_hmd = !want_wivrn && (prefer_hmd || (xr_running_.load() && !last_xr_system_.isEmpty() &&
+                                                       !audio_user_override_.load()));
+  if (idx < 0 && pick_hmd && !audio_user_override_.load()) {
     const std::string pick =
         vrp::AudioPlayer::prefer_hmd_device(devices, last_xr_system_.toStdString());
     if (!pick.empty()) {
       idx = audio_device_ids_.indexOf(QString::fromStdString(pick));
       if (idx >= 0) {
         audio_user_override_.store(false);
-        appendLog(tr("Audio → HMD: %1").arg(audio_device_labels_[idx]));
+        if (audio_device_ids_[idx] != prev) {
+          appendLog(tr("Audio → HMD: %1").arg(audio_device_labels_[idx]));
+        }
       }
     }
   }
 
-  // After disconnect: prefer a non-HMD sink so PSVR2 HDMI does not stick.
-  if (idx < 0 && !pick_hmd) {
+  const bool wivrn_sink_gone =
+      want_wivrn && wivrn_pick.empty() && prev.contains(QStringLiteral("wivrn"), Qt::CaseInsensitive);
+  // After disconnect: prefer a non-HMD sink so PSVR2 HDMI / WiVRn does not stick.
+  if (idx < 0 && !pick_hmd && (!want_wivrn || wivrn_sink_gone)) {
     for (const auto& d : devices) {
       if (d.kind == vrp::AudioRouteKind::HmdHdmi) continue;
+      if (vrp::AudioPlayer::is_wivrn_device(d)) continue;
       idx = audio_device_ids_.indexOf(QString::fromStdString(d.name));
       if (idx >= 0) break;
     }
@@ -1166,7 +1183,8 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
     if (prev_idx >= 0) {
       bool prev_is_hmd = false;
       for (const auto& d : devices) {
-        if (QString::fromStdString(d.name) == prev && d.kind == vrp::AudioRouteKind::HmdHdmi) {
+        if (QString::fromStdString(d.name) == prev &&
+            (d.kind == vrp::AudioRouteKind::HmdHdmi || vrp::AudioPlayer::is_wivrn_device(d))) {
           prev_is_hmd = true;
           break;
         }
@@ -1181,6 +1199,9 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
   {
     std::lock_guard<std::mutex> lock(audio_mu_);
     audio_device_ = selected_audio_device_.toStdString();
+  }
+  if (selected_audio_device_ != prev && xr_running_.load()) {
+    audio_reopen_.store(true);
   }
   if (pick_hmd && hmd_count > 0) {
     audio_reopen_.store(true);
@@ -1309,8 +1330,14 @@ void HostWindow::setRuntimeKind(bool wivrn) {
   saveAppConf();
   appendLog(usingWivrn() ? tr("Runtime: WiVRn") : tr("Runtime: Monado"));
   if (usingWivrn()) {
+    audio_user_override_.store(false);
+    refreshAudioDevices(false);
     if (!shutting_down_.load()) startOwnedWivrn(/*allow_external_adopt=*/true);
     return;
+  }
+  if (selected_audio_device_.contains(QStringLiteral("wivrn"), Qt::CaseInsensitive)) {
+    audio_user_override_.store(false);
+    refreshAudioDevices(false);
   }
   if (!shutting_down_.load() && !xr_running_.load()) {
     setHealth("Wait", QStringLiteral("Waiting for USB HMD"));
