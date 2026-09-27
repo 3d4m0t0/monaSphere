@@ -9,7 +9,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
 find_package(PkgConfig REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network GuiPrivate)
 pkg_check_modules(OPENXR REQUIRED openxr)
 pkg_check_modules(VULKAN REQUIRED vulkan)
 
@@ -163,7 +163,7 @@ add_executable(vrp_player
   apps/vrp_player/hud_paint.hpp
 )
 set_target_properties(vrp_player PROPERTIES OUTPUT_NAME monasphere)
-target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets)
+target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets Qt6::Network Qt6::GuiPrivate ${CMAKE_DL_LIBS})
 target_include_directories(vrp_player PRIVATE ${CMAKE_SOURCE_DIR}/apps/vrp_player)
 add_dependencies(vrp_player vrp_shaders)
 

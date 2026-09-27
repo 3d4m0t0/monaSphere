@@ -4,8 +4,12 @@
 #include "options.hpp"
 
 #include <QApplication>
+#include <QDir>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QIcon>
+#include <QLocalServer>
+#include <QLocalSocket>
 
 #include <cstdlib>
 #include <iostream>
@@ -79,6 +83,57 @@ QString find_shader_dir() {
   return "shaders";
 }
 
+QString instanceSocketName() {
+  QString dir = qEnvironmentVariable("XDG_RUNTIME_DIR");
+  if (dir.isEmpty()) dir = QDir::temp().absolutePath();
+  return dir + QStringLiteral("/monasphere.sock");
+}
+
+QByteArray startupActivationToken() {
+  const char* token = std::getenv("XDG_ACTIVATION_TOKEN");
+  return token ? QByteArray(token) : QByteArray();
+}
+
+bool notifyPrimary(const QString& name, const QByteArray& activation_token) {
+  QLocalSocket sock;
+  sock.connectToServer(name);
+  if (!sock.waitForConnected(400)) return false;
+  QByteArray msg = QByteArrayLiteral("raise");
+  if (!activation_token.isEmpty()) {
+    msg += ' ';
+    msg += activation_token;
+  }
+  msg += '\n';
+  sock.write(msg);
+  sock.flush();
+  sock.waitForBytesWritten(400);
+  return true;
+}
+
+/**
+ * True when this process should open the window.
+ * *server is set when this process owns the single-instance socket.
+ */
+bool claimInstance(QApplication& app, QLocalServer** server, const QByteArray& activation_token) {
+  *server = nullptr;
+  const QString name = instanceSocketName();
+  if (notifyPrimary(name, activation_token)) return false;
+  QLocalServer::removeServer(name);
+  auto* created = new QLocalServer(&app);
+  created->setSocketOptions(QLocalServer::UserAccessOption);
+  if (!created->listen(name)) {
+    if (notifyPrimary(name, activation_token)) {
+      delete created;
+      return false;
+    }
+    VRP_ERR("single-instance socket: %s", created->errorString().toUtf8().constData());
+    delete created;
+    return true;
+  }
+  *server = created;
+  return true;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -91,17 +146,40 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  const QByteArray activation_token = startupActivationToken();
+
   QApplication app(argc, argv);
+  QLocalServer* instance = nullptr;
+  if (!claimInstance(app, &instance, activation_token)) return 0;
   MonasphereInstallTranslations(app);
   QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/monasphere.png")));
   QApplication::setOrganizationName(QStringLiteral("monaSphere"));
   QApplication::setApplicationName(QStringLiteral("monaSphere"));
   QApplication::setApplicationDisplayName(QStringLiteral("monaSphere"));
+  QGuiApplication::setDesktopFileName(QStringLiteral("monasphere"));
   if (!show_ui) {
     // Still use the host window but auto-connect; window remains the control surface.
     show_ui = true;
   }
   HostWindow window(opt, find_shader_dir());
+  if (instance) {
+    QObject::connect(instance, &QLocalServer::newConnection, &window, [instance, &window] {
+      while (QLocalSocket* sock = instance->nextPendingConnection()) {
+        if (sock->bytesAvailable() == 0) sock->waitForReadyRead(100);
+        const QByteArray line = sock->readAll();
+        QString token;
+        const int space = line.indexOf(' ');
+        const int nl = line.indexOf('\n');
+        if (space >= 0 && (nl < 0 || space < nl)) {
+          const int end = nl < 0 ? line.size() : nl;
+          token = QString::fromUtf8(line.mid(space + 1, end - space - 1)).trimmed();
+        }
+        window.presentToFront(token);
+        sock->disconnectFromServer();
+        sock->deleteLater();
+      }
+    });
+  }
   window.show();
   // Do not force --no-ui auto-connect here; the host UI auto-connects when Monado is ready
   // and exactly one known HMD is present.

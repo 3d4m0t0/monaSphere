@@ -19,6 +19,8 @@ BuildRequires:  ninja
 BuildRequires:  gcc-c++
 BuildRequires:  pkgconfig
 BuildRequires:  pkgconfig(Qt6Widgets)
+BuildRequires:  pkgconfig(Qt6Network)
+BuildRequires:  cmake(Qt6GuiPrivate)
 BuildRequires:  pkgconfig(openxr)
 BuildRequires:  pkgconfig(vulkan)
 BuildRequires:  pkgconfig(sdl2)

@@ -45,6 +45,10 @@
 #include <QStandardPaths>
 #include <QThread>
 #include <QTimer>
+#include <QWindow>
+#include <QtGui/qpa/qplatformwindow_p.h>
+
+#include <dlfcn.h>
 #include <QCloseEvent>
 #include <QDir>
 #include <QFile>
@@ -53,6 +57,7 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QMap>
 #include <QRegularExpression>
 
@@ -986,6 +991,45 @@ void HostWindow::onHandAction(QAction* action) {
 void HostWindow::appendLog(const QString& line) {
   if (shutting_down_.load() || !log_) return;
   log_->appendPlainText(line);
+}
+
+void HostWindow::presentToFront(const QString& activation_token) {
+  if (shutting_down_.load()) return;
+  if (isMinimized()) showNormal();
+  show();
+  raise();
+
+  QWindow* handle = windowHandle();
+  bool activated = false;
+  if (handle && QGuiApplication::platformName() == QLatin1String("wayland") && !activation_token.isEmpty()) {
+    // QWaylandWindow stores the token and the next requestActivate() spends it on
+    // xdg_activation_v1. A token requested by the already-focused app is rejected.
+    auto* native = handle->nativeInterface<QNativeInterface::Private::QWaylandWindow>();
+    using SetToken = void (*)(void*, const QString&);
+    static auto set_token = [] {
+      void* lib = dlopen("libQt6WaylandClient.so.6", RTLD_LAZY | RTLD_GLOBAL);
+      if (!lib) return static_cast<SetToken>(nullptr);
+      return reinterpret_cast<SetToken>(
+          dlsym(lib, "_ZN15QtWaylandClient14QWaylandWindow21setXdgActivationTokenERK7QString"));
+    }();
+    if (native && set_token) {
+      set_token(native, activation_token);
+      handle->requestActivate();
+      activated = true;
+      VRP_LOG("Wayland activate with launcher token");
+    } else {
+      VRP_LOG("Wayland activation token was not applied (window=%d symbol=%d)", native ? 1 : 0,
+              set_token ? 1 : 0);
+    }
+  }
+  if (!activated) {
+    activateWindow();
+    if (handle) handle->requestActivate();
+    if (QGuiApplication::platformName() == QLatin1String("wayland")) {
+      VRP_LOG("Wayland activate without XDG_ACTIVATION_TOKEN");
+    }
+  }
+  appendLog(tr("Already running — brought to front"));
 }
 
 namespace {

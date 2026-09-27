@@ -41,6 +41,8 @@ class HostWindow : public QMainWindow {
 
  public slots:
   void appendLog(const QString& line);
+  /** Unminimize and focus this window. On Wayland, activation_token is required. */
+  void presentToFront(const QString& activation_token = {});
   void applyStatus(const QString& hmd, const QString& session, const QString& health,
                    const QString& detail, bool tracking, int width, int height, double display_hz,
                    double frame_ms, const QString& sync_note, bool openxr_hz_switchable = false,

@@ -54,6 +54,7 @@ ROWS = [
     ("HostWindow", "Video: GPU NV12", {"ja": "映像: GPU NV12", "de": "Video: GPU NV12", "fr": "Vidéo : GPU NV12", "es": "Vídeo: GPU NV12", "ko": "영상: GPU NV12", "zh_CN": "视频: GPU NV12", "zh_TW": "視訊: GPU NV12"}),
     ("HostWindow", "Video: CPU RGBA", {"ja": "映像: CPU RGBA", "de": "Video: CPU RGBA", "fr": "Vidéo : CPU RGBA", "es": "Vídeo: CPU RGBA", "ko": "영상: CPU RGBA", "zh_CN": "视频: CPU RGBA", "zh_TW": "視訊: CPU RGBA"}),
     ("HostWindow", "Video: VA-API dma-buf", {"ja": "映像: VA-API dma-buf", "de": "Video: VA-API dma-buf", "fr": "Vidéo : VA-API dma-buf", "es": "Vídeo: VA-API dma-buf", "ko": "영상: VA-API dma-buf", "zh_CN": "视频: VA-API dma-buf", "zh_TW": "視訊: VA-API dma-buf"}),
+    ("HostWindow", "Already running — brought to front", {"ja": "起動済み — 最前面に表示", "de": "Läuft schon — nach vorn", "fr": "Déjà lancé — au premier plan", "es": "Ya en marcha — al frente", "ko": "이미 실행 중 — 맨 앞으로", "zh_CN": "已在运行 — 置于最前", "zh_TW": "已在執行 — 帶到最前"}),
     ("HostWindow",
      "<h3>monaSphere v%1</h3><p>Linux VR video player (OpenXR / Monado)</p><p>Copyright (c) 2026 flex</p><p>GitHub:<br><a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p><p>Source license: MIT</p><p>FFmpeg / Qt and others are linked dynamically. See THIRD_PARTY.md when distributing a binary.</p>",
      {
