@@ -68,7 +68,6 @@ class HostWindow : public QMainWindow {
   void onAudioDeviceAction(QAction* action);
   void onFsrAction(QAction* action);
   void onHzAction(QAction* action);
-  void onShowHmdInfoToggled(bool checked);
   void showAboutDialog();
   void onRuntimeChosen(bool wivrn);
 
@@ -82,7 +81,6 @@ class HostWindow : public QMainWindow {
   void saveWindowGeometry() const;
   void loadAppConf();
   void saveAppConf() const;
-  void applyHmdInfoVisibility(bool visible);
   void setSessionChrome(bool session_active);
   void setHealth(const QString& health, const QString& detail);
   void reportVideoOpen(const vrp::VideoInfo& info);
@@ -133,7 +131,7 @@ class HostWindow : public QMainWindow {
   void applyMonadoPacingEnv(QProcessEnvironment& env) const;
   void maybeRestartMonadoForHz();
   int findModeIndexForHz(int hz) const;
-  /** Fill mode table via vulkaninfo (HMD display) and/or QSettings cache — before Monado start. */
+  /** Fill mode table via vulkaninfo (HMD display) and/or monasphere.conf — before Monado start. */
   bool ensureMonadoModeTable();
   void saveMonadoModeTable() const;
   void loadMonadoModeTable();
@@ -196,8 +194,10 @@ class HostWindow : public QMainWindow {
   QMenu* hz_menu_ = nullptr;
   QMenu* controller_menu_ = nullptr;
   QMenu* hand_menu_ = nullptr;
+  QAction* act_gamepad_ = nullptr;
   QAction* act_disconnect_ = nullptr;
-  QAction* act_show_hmd_info_ = nullptr;
+  /** SDL gamepad route. Independent of the OpenXR pad profile. */
+  std::atomic<bool> gamepad_enabled_{true};
   QActionGroup* controller_group_ = nullptr;
   QActionGroup* hand_group_ = nullptr;
   QActionGroup* audio_group_ = nullptr;

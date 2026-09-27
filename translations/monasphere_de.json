@@ -42,11 +42,6 @@
     },
     {
       "context": "HostWindow",
-      "source": "View",
-      "translation": "Ansicht"
-    },
-    {
-      "context": "HostWindow",
       "source": "HMD info",
       "translation": "HMD-Info"
     },
@@ -204,6 +199,21 @@
       "context": "HostWindow",
       "source": "Gamepad",
       "translation": "Pad"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad",
+      "translation": "SDL-Pad"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad on",
+      "translation": "SDL-Pad an"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad off",
+      "translation": "SDL-Pad aus"
     },
     {
       "context": "HostWindow",

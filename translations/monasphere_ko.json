@@ -42,11 +42,6 @@
     },
     {
       "context": "HostWindow",
-      "source": "View",
-      "translation": "보기"
-    },
-    {
-      "context": "HostWindow",
       "source": "HMD info",
       "translation": "HMD 정보"
     },
@@ -204,6 +199,21 @@
       "context": "HostWindow",
       "source": "Gamepad",
       "translation": "패드"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad",
+      "translation": "SDL 패드"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad on",
+      "translation": "SDL 패드 켬"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad off",
+      "translation": "SDL 패드 끔"
     },
     {
       "context": "HostWindow",

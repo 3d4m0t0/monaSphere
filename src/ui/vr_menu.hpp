@@ -187,8 +187,9 @@ class VrMenu {
   float step_rate(float cur, int dir) const;
   /** Playback-controls rate: 0.5 … 2.0 */
   float step_playback_rate(float cur, int dir) const;
-  void load_dir_volume();
-  void save_dir_volume() const;
+  void load_volume();
+  void save_volume() const;
+  std::filesystem::path user_conf_path() const;
   void close_controls_edit();
   static bool is_video_ext(const std::filesystem::path& p);
 
@@ -217,7 +218,7 @@ class VrMenu {
   bool playing_ = false;
   double position_sec_ = 0;
   double duration_sec_ = 0;
-  float volume_ = 1.f;
+  float volume_ = 0.2f;
   float rate_ = 1.f;
   FsrMode fsr_ = FsrMode::Quality;
   int preferred_hz_ = 0;   // 0 = auto

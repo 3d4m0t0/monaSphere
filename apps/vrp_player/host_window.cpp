@@ -39,9 +39,7 @@
 #include <QPixmap>
 #include <QPlainTextEdit>
 #include <QProcess>
-#include <QSettings>
 #include <QSplitter>
-#include <QStatusBar>
 #include <QStandardPaths>
 #include <QThread>
 #include <QTimer>
@@ -52,6 +50,8 @@
 #include <QCloseEvent>
 #include <QDir>
 #include <QFile>
+#include <QHash>
+#include <QSet>
 #include <QTextStream>
 #include <QVBoxLayout>
 #include <QDir>
@@ -532,10 +532,9 @@ void HostWindow::buildUi() {
   sync_status_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
   form->addRow(tr("Status"), health_label_);
   form->addRow(tr("Sync"), sync_status_label_);
-
-  // Status bar: HMD name only (表示 → HMD情報).
   hmd_label_ = new QLabel(tr("HMD: none"));
-  statusBar()->addWidget(hmd_label_, 1);
+  hmd_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  form->addRow(tr("HMD info"), hmd_label_);
 
   log_ = new QPlainTextEdit();
   log_->setReadOnly(true);
@@ -557,11 +556,6 @@ void HostWindow::buildUi() {
 
   setCentralWidget(root);
 
-  QSettings s(QStringLiteral("monaSphere"), QStringLiteral("monaSphere"));
-  const bool show_hmd = s.value(QStringLiteral("ui/showHmdInfo"), true).toBool();
-  if (act_show_hmd_info_) act_show_hmd_info_->setChecked(show_hmd);
-  applyHmdInfoVisibility(show_hmd);
-
   setSessionChrome(false);
   refreshAudioDevices();
   rebuildConnectDeviceMenu();
@@ -579,60 +573,222 @@ void HostWindow::buildUi() {
   rebuildFsrMenu();
 }
 
-void HostWindow::saveAppConf() const {
-  const QString dir = QDir::homePath() + QStringLiteral("/.config/monasphere");
-  QDir().mkpath(dir);
-  QFile f(dir + QStringLiteral("/conf"));
-  QString last_dir;
-  if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-    while (!f.atEnd()) {
-      const QString line = QString::fromUtf8(f.readLine()).trimmed();
-      if (line.startsWith(QStringLiteral("last_dir="))) last_dir = line.mid(9);
+namespace {
+
+QString monasphereConfPath() {
+  return QDir::homePath() + QStringLiteral("/.config/monasphere/monasphere.conf");
+}
+
+// Insert keys that are absent. Existing lines stay as they are.
+void ensureMonasphereConfKeys(const QHash<QString, QString>& defaults) {
+  const QString path = monasphereConfPath();
+  QDir().mkpath(QDir::homePath() + QStringLiteral("/.config/monasphere"));
+  QStringList lines;
+  QSet<QString> seen;
+  QFile in(path);
+  if (in.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    while (!in.atEnd()) {
+      const QString line = QString::fromUtf8(in.readLine()).trimmed();
+      if (line.isEmpty()) continue;
+      lines << line;
+      const int eq = line.indexOf(QLatin1Char('='));
+      if (eq > 0) seen.insert(line.left(eq));
     }
-    f.close();
+    in.close();
   }
-  if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) return;
-  QTextStream out(&f);
-  if (!last_dir.isEmpty()) out << "last_dir=" << last_dir << '\n';
-  out << "fsr=" << static_cast<int>(preferred_fsr_) << '\n';
-  out << "runtime=" << (usingWivrn() ? "wivrn" : "monado") << '\n';
+  bool added = lines.isEmpty() && !QFile::exists(path);
+  for (auto it = defaults.cbegin(); it != defaults.cend(); ++it) {
+    if (seen.contains(it.key())) continue;
+    lines << it.key() + QLatin1Char('=') + it.value();
+    added = true;
+  }
+  if (!added) return;
+  QFile out(path);
+  if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) return;
+  QTextStream ts(&out);
+  for (const QString& line : lines) ts << line << '\n';
+}
+
+void setMonasphereConfKey(const QString& key, const QString& value) {
+  ensureMonasphereConfKeys({{key, value}});
+  const QString path = monasphereConfPath();
+  QStringList lines;
+  bool replaced = false;
+  QFile in(path);
+  if (in.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    while (!in.atEnd()) {
+      const QString line = QString::fromUtf8(in.readLine()).trimmed();
+      if (line.isEmpty()) continue;
+      if (line.startsWith(key + QLatin1Char('='))) {
+        lines << key + QLatin1Char('=') + value;
+        replaced = true;
+      } else {
+        lines << line;
+      }
+    }
+    in.close();
+  }
+  if (!replaced) lines << key + QLatin1Char('=') + value;
+  QFile out(path);
+  if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) return;
+  QTextStream ts(&out);
+  for (const QString& line : lines) ts << line << '\n';
+}
+
+QString monasphereConfValue(const QString& key) {
+  QFile in(monasphereConfPath());
+  if (!in.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
+  const QString prefix = key + QLatin1Char('=');
+  while (!in.atEnd()) {
+    const QString line = QString::fromUtf8(in.readLine()).trimmed();
+    if (line.startsWith(prefix)) return line.mid(prefix.size());
+  }
+  return {};
+}
+
+// Read a value already stored by Qt. Does not create monaSphere.conf.
+QString legacyQtValue(const QString& group, const QString& key) {
+  const QStringList paths{
+      QDir::homePath() + QStringLiteral("/.config/monasphere/monaSphere.conf"),
+      QDir::homePath() + QStringLiteral("/.config/monaSphere/monaSphere.conf"),
+  };
+  const QString prefix = key + QLatin1Char('=');
+  for (const QString& path : paths) {
+    QFile in(path);
+    if (!in.open(QIODevice::ReadOnly | QIODevice::Text)) continue;
+    QString section;
+    while (!in.atEnd()) {
+      const QString line = QString::fromUtf8(in.readLine()).trimmed();
+      if (line.startsWith(QLatin1Char('[')) && line.endsWith(QLatin1Char(']'))) {
+        section = line.mid(1, line.size() - 2);
+        continue;
+      }
+      if (section != group || !line.startsWith(prefix)) continue;
+      QString value = line.mid(prefix.size()).trimmed();
+      if (value.size() >= 2 && value.startsWith(QLatin1Char('"')) && value.endsWith(QLatin1Char('"'))) {
+        value = value.mid(1, value.size() - 2);
+      }
+      if (value.startsWith(QLatin1String("@ByteArray(")) && value.endsWith(QLatin1Char(')'))) {
+        value = value.mid(11, value.size() - 12);
+      }
+      return value;
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
+void HostWindow::saveAppConf() const {
+  setMonasphereConfKey(QStringLiteral("fsr"), QString::number(static_cast<int>(preferred_fsr_)));
+  setMonasphereConfKey(QStringLiteral("runtime"), usingWivrn() ? QStringLiteral("wivrn") : QStringLiteral("monado"));
 }
 
 void HostWindow::loadAppConf() {
-  QFile f(QDir::homePath() + QStringLiteral("/.config/monasphere/conf"));
-  if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return;
-  while (!f.atEnd()) {
-    const QString line = QString::fromUtf8(f.readLine()).trimmed();
+  int fsr_migrated = -1;
+  QString runtime_migrated;
+  QString last_dir_migrated;
+  const QString legacy = QDir::homePath() + QStringLiteral("/.config/monasphere/conf");
+  QFile f(legacy);
+  if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    while (!f.atEnd()) {
+      const QString line = QString::fromUtf8(f.readLine()).trimmed();
+      if (line.startsWith(QStringLiteral("fsr="))) {
+        bool ok = false;
+        const int v = line.mid(4).toInt(&ok);
+        if (ok && v >= 0 && v <= 3) fsr_migrated = v;
+      } else if (line.startsWith(QStringLiteral("runtime="))) {
+        runtime_migrated = line.mid(8);
+      } else if (line.startsWith(QStringLiteral("last_dir="))) {
+        last_dir_migrated = line.mid(9);
+      }
+    }
+    f.close();
+  }
+
+  QHash<QString, QString> defaults{
+      {QStringLiteral("volume"), QStringLiteral("0.2")},
+      {QStringLiteral("fsr"),
+       QString::number(fsr_migrated >= 0 ? fsr_migrated : static_cast<int>(vrp::FsrMode::Quality))},
+      {QStringLiteral("hz"), QStringLiteral("0")},
+      {QStringLiteral("runtime"),
+       runtime_migrated == QLatin1String("wivrn") ? QStringLiteral("wivrn") : QStringLiteral("monado")},
+      {QStringLiteral("pad"), QStringLiteral("auto")},
+      {QStringLiteral("hand"), QStringLiteral("right")},
+      {QStringLiteral("gamepad"), QStringLiteral("1")},
+  };
+  if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
+  ensureMonasphereConfKeys(defaults);
+  bool migrated = QFile::exists(monasphereConfPath()) && last_dir_migrated.isEmpty();
+  QFile check(monasphereConfPath());
+  if (!migrated && check.open(QIODevice::ReadOnly | QIODevice::Text)) {
+    while (!check.atEnd()) {
+      const QString line = QString::fromUtf8(check.readLine()).trimmed();
+      if (line.startsWith(QStringLiteral("last_dir="))) {
+        migrated = true;
+        break;
+      }
+    }
+  }
+  if (migrated) QFile::remove(legacy);
+
+  QFile user(monasphereConfPath());
+  if (!user.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+  bool legacy_pad_gamepad = false;
+  bool saw_gamepad_key = false;
+  while (!user.atEnd()) {
+    const QString line = QString::fromUtf8(user.readLine()).trimmed();
     if (line.startsWith(QStringLiteral("fsr="))) {
       bool ok = false;
       const int v = line.mid(4).toInt(&ok);
       if (ok && v >= 0 && v <= 3) preferred_fsr_ = static_cast<vrp::FsrMode>(v);
+    } else if (line.startsWith(QStringLiteral("hz="))) {
+      bool ok = false;
+      const int v = line.mid(3).toInt(&ok);
+      if (ok && (v == 0 || v == 90 || v == 120)) preferred_hz_ = v;
     } else if (line.startsWith(QStringLiteral("runtime="))) {
       runtime_kind_.store(line.mid(8) == QLatin1String("wivrn") ? 1 : 0);
+    } else if (line.startsWith(QStringLiteral("pad="))) {
+      const QString v = line.mid(4);
+      if (v == QLatin1String("auto")) opt_.controller_profile = vrp::ControllerProfile::Auto;
+      else if (v == QLatin1String("simple")) opt_.controller_profile = vrp::ControllerProfile::Simple;
+      else if (v == QLatin1String("oculus_touch")) opt_.controller_profile = vrp::ControllerProfile::OculusTouch;
+      else if (v == QLatin1String("ms_motion")) opt_.controller_profile = vrp::ControllerProfile::MicrosoftMotion;
+      else if (v == QLatin1String("vive")) opt_.controller_profile = vrp::ControllerProfile::ViveController;
+      else if (v == QLatin1String("index")) opt_.controller_profile = vrp::ControllerProfile::ValveIndex;
+      else if (v == QLatin1String("gamepad")) {
+        legacy_pad_gamepad = true;
+        opt_.controller_profile = vrp::ControllerProfile::Auto;
+      }
+    } else if (line.startsWith(QStringLiteral("gamepad="))) {
+      saw_gamepad_key = true;
+      gamepad_enabled_.store(line.mid(8) != QLatin1String("0"));
+    } else if (line.startsWith(QStringLiteral("hand="))) {
+      opt_.controller_hand = line.mid(5) == QLatin1String("left") ? vrp::ControllerHand::Left
+                                                                  : vrp::ControllerHand::Right;
     }
+  }
+  user.close();
+  if (legacy_pad_gamepad) {
+    if (!saw_gamepad_key) gamepad_enabled_.store(true);
+    setMonasphereConfKey(QStringLiteral("pad"), QStringLiteral("auto"));
+    setMonasphereConfKey(QStringLiteral("gamepad"), gamepad_enabled_.load() ? QStringLiteral("1") : QStringLiteral("0"));
   }
 }
 
 void HostWindow::restoreWindowGeometry() {
-  QSettings s(QStringLiteral("monaSphere"), QStringLiteral("monaSphere"));
-  const QByteArray geo = s.value(QStringLiteral("ui/geometry")).toByteArray();
+  QString stored = monasphereConfValue(QStringLiteral("geometry"));
+  if (stored.isEmpty()) {
+    stored = legacyQtValue(QStringLiteral("ui"), QStringLiteral("geometry"));
+    if (!stored.isEmpty()) setMonasphereConfKey(QStringLiteral("geometry"), stored);
+  }
+  const QByteArray geo = QByteArray::fromBase64(stored.toLatin1());
   if (!geo.isEmpty() && restoreGeometry(geo)) return;
   resize(640, 480);
 }
 
 void HostWindow::saveWindowGeometry() const {
-  QSettings s(QStringLiteral("monaSphere"), QStringLiteral("monaSphere"));
-  s.setValue(QStringLiteral("ui/geometry"), saveGeometry());
-}
-
-void HostWindow::applyHmdInfoVisibility(bool visible) {
-  if (statusBar()) statusBar()->setVisible(visible);
-}
-
-void HostWindow::onShowHmdInfoToggled(bool checked) {
-  QSettings s(QStringLiteral("monaSphere"), QStringLiteral("monaSphere"));
-  s.setValue(QStringLiteral("ui/showHmdInfo"), checked);
-  applyHmdInfoVisibility(checked);
+  setMonasphereConfKey(QStringLiteral("geometry"), QString::fromLatin1(saveGeometry().toBase64()));
 }
 
 void HostWindow::buildMenus() {
@@ -666,12 +822,6 @@ void HostWindow::buildMenus() {
   act_disconnect_->setEnabled(false);
   ops->addSeparator();
   ops->addAction(tr("Quit"), this, &QWidget::close);
-
-  auto* view = menuBar()->addMenu(tr("View"));
-  act_show_hmd_info_ = view->addAction(tr("HMD info"));
-  act_show_hmd_info_->setCheckable(true);
-  act_show_hmd_info_->setChecked(true);
-  connect(act_show_hmd_info_, &QAction::toggled, this, &HostWindow::onShowHmdInfoToggled);
 
   auto* settings = menuBar()->addMenu(tr("Settings"));
   audio_menu_ = settings->addMenu(tr("Audio"));
@@ -708,7 +858,6 @@ void HostWindow::buildMenus() {
       {vrp::ControllerProfile::MicrosoftMotion, QT_TR_NOOP("MS Motion")},
       {vrp::ControllerProfile::ViveController, QT_TR_NOOP("Vive")},
       {vrp::ControllerProfile::ValveIndex, QT_TR_NOOP("Index")},
-      {vrp::ControllerProfile::Gamepad, QT_TR_NOOP("Gamepad")},
   };
   for (const auto& p : profiles) {
     auto* a = controller_menu_->addAction(tr(p.label));
@@ -733,7 +882,15 @@ void HostWindow::buildMenus() {
   if (opt_.controller_hand == vrp::ControllerHand::Left) left->setChecked(true);
   else right->setChecked(true);
   connect(hand_group_, &QActionGroup::triggered, this, &HostWindow::onHandAction);
-  hand_menu_->setEnabled(opt_.controller_profile != vrp::ControllerProfile::Gamepad);
+
+  act_gamepad_ = settings->addAction(tr("SDL gamepad"));
+  act_gamepad_->setCheckable(true);
+  act_gamepad_->setChecked(gamepad_enabled_.load());
+  connect(act_gamepad_, &QAction::toggled, this, [this](bool on) {
+    gamepad_enabled_.store(on);
+    setMonasphereConfKey(QStringLiteral("gamepad"), on ? QStringLiteral("1") : QStringLiteral("0"));
+    appendLog(on ? tr("SDL gamepad on") : tr("SDL gamepad off"));
+  });
 
   auto* help = menuBar()->addMenu(tr("Help"));
   help->addAction(tr("About"), this, &HostWindow::showAboutDialog);
@@ -943,6 +1100,7 @@ void HostWindow::onHzAction(QAction* action) {
   if (!action) return;
   const int hz = action->data().toInt();
   preferred_hz_ = hz;
+  setMonasphereConfKey(QStringLiteral("hz"), QString::number(hz));
   monado_hz_restarted_ = false;
   monado_hz_mismatch_retried_ = false;
   {
@@ -962,31 +1120,22 @@ void HostWindow::setSessionChrome(bool session_active) {
   }
   if (act_disconnect_) act_disconnect_->setEnabled(session_active);
   if (controller_menu_) controller_menu_->setEnabled(!session_active);
-  if (hand_menu_) {
-    hand_menu_->setEnabled(!session_active &&
-                           opt_.controller_profile != vrp::ControllerProfile::Gamepad);
-  }
+  if (hand_menu_) hand_menu_->setEnabled(!session_active);
 }
 
 void HostWindow::onControllerProfileAction(QAction* action) {
   if (!action) return;
   opt_.controller_profile = static_cast<vrp::ControllerProfile>(action->data().toInt());
-  const bool gp = opt_.controller_profile == vrp::ControllerProfile::Gamepad;
-  if (hand_menu_) hand_menu_->setEnabled(!gp && connect_ui_enabled_);
+  setMonasphereConfKey(QStringLiteral("pad"),
+                       QString::fromUtf8(vrp::controller_profile_name(opt_.controller_profile)));
   appendLog(tr("Pad: %1 (applies on reconnect)").arg(QString::fromUtf8(vrp::controller_profile_name(opt_.controller_profile))));
-  if (gp) {
-    const auto names = vrp::GamepadInput::list_names();
-    if (names.empty()) {
-      appendLog(tr("No gamepad — plug in, then connect HMD"));
-    } else {
-      appendLog(tr("Found: %1").arg(QString::fromStdString(names.front())));
-    }
-  }
 }
 
 void HostWindow::onHandAction(QAction* action) {
   if (!action) return;
   opt_.controller_hand = static_cast<vrp::ControllerHand>(action->data().toInt());
+  setMonasphereConfKey(QStringLiteral("hand"),
+                       QString::fromUtf8(vrp::controller_hand_name(opt_.controller_hand)));
   appendLog(tr("Hand: %1 (applies on reconnect)").arg(QString::fromUtf8(vrp::controller_hand_name(opt_.controller_hand))));
 }
 
@@ -1542,8 +1691,11 @@ int HostWindow::findModeIndexForHz(int hz) const {
 }
 
 void HostWindow::loadMonadoModeTable() {
-  QSettings s(QStringLiteral("monaSphere"), QStringLiteral("monaSphere"));
-  const QString raw = s.value(QStringLiteral("monado/mode_table")).toString();
+  QString raw = monasphereConfValue(QStringLiteral("modes"));
+  if (raw.isEmpty()) {
+    raw = legacyQtValue(QStringLiteral("monado"), QStringLiteral("mode_table"));
+    if (!raw.isEmpty()) setMonasphereConfKey(QStringLiteral("modes"), raw);
+  }
   if (raw.isEmpty()) return;
   monado_mode_hz_.clear();
   monado_mode_pixels_.clear();
@@ -1568,8 +1720,7 @@ void HostWindow::saveMonadoModeTable() const {
                  .arg(it.value(), 0, 'f', 3)
                  .arg(monado_mode_pixels_.value(it.key(), 0));
   }
-  QSettings s(QStringLiteral("monaSphere"), QStringLiteral("monaSphere"));
-  s.setValue(QStringLiteral("monado/mode_table"), parts.join(';'));
+  setMonasphereConfKey(QStringLiteral("modes"), parts.join(';'));
 }
 
 bool HostWindow::ensureMonadoModeTable() {
@@ -2291,7 +2442,7 @@ void HostWindow::xrThreadMain() {
       } else {
         const char* home = std::getenv("HOME");
         const std::filesystem::path conf =
-            std::filesystem::path(home ? home : "") / ".config" / "monasphere" / "conf";
+            std::filesystem::path(home ? home : "") / ".config" / "monasphere" / "monasphere.conf";
         std::ifstream in(conf);
         std::string line;
         while (std::getline(in, line)) {
@@ -2305,6 +2456,7 @@ void HostWindow::xrThreadMain() {
         }
       }
       menu.init(start);
+      audio.set_volume(menu.volume());
       menu.set_format(opt_.projection, opt_.stereo);
       menu.set_fsr(preferred_fsr_);
       fsr.set_mode(preferred_fsr_);
@@ -2324,22 +2476,9 @@ void HostWindow::xrThreadMain() {
     requestHudPaint();
 
     vrp::GamepadInput gamepad;
-    const bool use_gamepad = opt_.controller_profile == vrp::ControllerProfile::Gamepad;
+    bool gamepad_was = false;
+    bool gamepad_logged = false;
     std::string last_gamepad_name;
-    if (use_gamepad) {
-      if (gamepad.ensure_open()) {
-        QMetaObject::invokeMethod(
-            this, [this] { appendLog(tr("Input: gamepad (A OK, B back, Start menu)")); },
-            Qt::QueuedConnection);
-      } else {
-        QMetaObject::invokeMethod(
-            this,
-            [this] {
-              appendLog(tr("Gamepad open failed. Recenter only"));
-            },
-            Qt::QueuedConnection);
-      }
-    }
 
     std::atomic<bool> preview_busy{false};
     std::string preview_path_done;
@@ -2585,25 +2724,46 @@ void HostWindow::xrThreadMain() {
       }
 
       auto input = xr.poll_actions();
-      if (use_gamepad) {
-        const auto gp = gamepad.poll();
-        if (gp.present) {
-          last_gamepad_name = gp.name;
-          input.stick_x = gp.stick_x;
-          input.stick_y = gp.stick_y;
-          input.confirm = input.confirm || gp.confirm;
-          input.confirm_held = input.confirm_held || gp.confirm_held;
-          input.back = input.back || gp.back;
-          input.back_held = input.back_held || gp.back_held;
-          input.menu_toggle = input.menu_toggle || gp.menu_toggle;
-          input.seek_back = input.seek_back || gp.seek_back;
-          input.seek_forward = input.seek_forward || gp.seek_forward;
-          input.seek_scrubbing = input.seek_scrubbing || gp.seek_scrubbing;
-          input.recenter = input.recenter || gp.recenter;
-        } else {
-          last_gamepad_name.clear();
+      const bool want_gamepad = gamepad_enabled_.load();
+      if (want_gamepad) {
+        if (gamepad.ensure_open()) {
+          if (!gamepad_logged) {
+            gamepad_logged = true;
+            QMetaObject::invokeMethod(
+                this, [this] { appendLog(tr("Input: gamepad (A OK, B back, Start menu)")); },
+                Qt::QueuedConnection);
+          }
+          const auto gp = gamepad.poll();
+          if (gp.present) {
+            last_gamepad_name = gp.name;
+            // Leave the HMD stick alone while the gamepad stick is centered.
+            if (std::fabs(gp.stick_x) > 0.15f || std::fabs(gp.stick_y) > 0.15f) {
+              input.stick_x = gp.stick_x;
+              input.stick_y = gp.stick_y;
+            }
+            input.confirm = input.confirm || gp.confirm;
+            input.confirm_held = input.confirm_held || gp.confirm_held;
+            input.back = input.back || gp.back;
+            input.back_held = input.back_held || gp.back_held;
+            input.menu_toggle = input.menu_toggle || gp.menu_toggle;
+            input.seek_back = input.seek_back || gp.seek_back;
+            input.seek_forward = input.seek_forward || gp.seek_forward;
+            input.seek_scrubbing = input.seek_scrubbing || gp.seek_scrubbing;
+            input.recenter = input.recenter || gp.recenter;
+          } else {
+            last_gamepad_name.clear();
+          }
+        } else if (!gamepad_logged) {
+          gamepad_logged = true;
+          QMetaObject::invokeMethod(
+              this, [this] { appendLog(tr("Gamepad open failed. Recenter only")); }, Qt::QueuedConnection);
         }
+      } else if (gamepad_was) {
+        gamepad.close();
+        gamepad_logged = false;
+        last_gamepad_name.clear();
       }
+      gamepad_was = want_gamepad;
       decoder.set_seek_scrubbing(input.seek_scrubbing);
 
       vrp::VrMenu::PadInput pad;
@@ -2714,6 +2874,7 @@ void HostWindow::xrThreadMain() {
             this,
             [this, want] {
               preferred_hz_ = want;
+              setMonasphereConfKey(QStringLiteral("hz"), QString::number(want));
               rebuildHzMenu();
               applyPreferredRefreshRate(/*from_ui=*/true, /*force_monado_restart=*/true);
             },

@@ -109,7 +109,7 @@ class AudioPlayer {
   bool open_ = false;
   bool has_audio_ = false;
   bool playing_ = false;
-  float volume_ = 1.f;
+  float volume_ = 0.2f;
   float rate_ = 1.f;
   /** Target used by begin_seek_prefill; compared in enable_after_seek. */
   double pending_prefill_sec_ = -1.0;

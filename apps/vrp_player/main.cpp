@@ -153,7 +153,7 @@ int main(int argc, char** argv) {
   if (!claimInstance(app, &instance, activation_token)) return 0;
   MonasphereInstallTranslations(app);
   QApplication::setWindowIcon(QIcon(QStringLiteral(":/icons/monasphere.png")));
-  QApplication::setOrganizationName(QStringLiteral("monaSphere"));
+  QApplication::setOrganizationName(QStringLiteral("monasphere"));
   QApplication::setApplicationName(QStringLiteral("monaSphere"));
   QApplication::setApplicationDisplayName(QStringLiteral("monaSphere"));
   QGuiApplication::setDesktopFileName(QStringLiteral("monasphere"));

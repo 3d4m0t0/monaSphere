@@ -22,6 +22,31 @@ fs::path resolve_home() {
   return fs::current_path();
 }
 
+void upsert_conf_key(const fs::path& conf, const std::string& key, const std::string& value) {
+  std::error_code ec;
+  fs::create_directories(conf.parent_path(), ec);
+  const std::string prefix = key + "=";
+  std::vector<std::string> lines;
+  bool replaced = false;
+  {
+    std::ifstream in(conf);
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.empty()) continue;
+      if (line.rfind(prefix, 0) == 0) {
+        if (!replaced) lines.push_back(prefix + value);
+        replaced = true;
+      } else {
+        lines.push_back(line);
+      }
+    }
+  }
+  if (!replaced) lines.push_back(prefix + value);
+  std::ofstream out(conf, std::ios::trunc);
+  if (!out) return;
+  for (const std::string& line : lines) out << line << '\n';
+}
+
 }  // namespace
 
 bool VrMenu::is_video_ext(const fs::path& p) {
@@ -64,6 +89,7 @@ void VrMenu::init(const fs::path& start_dir) {
     cwd_ = home_;
   }
   removable_root_.clear();
+  load_volume();
   refresh_dir();
   bump();
 }
@@ -73,7 +99,6 @@ void VrMenu::set_media(const std::string& path, double duration_sec) {
   media_name_ = fs::path(path).filename().string();
   duration_sec_ = duration_sec;
   rate_ = 1.f;
-  load_dir_volume();
   bump();
 }
 
@@ -124,16 +149,11 @@ void VrMenu::set_fsr(FsrMode m) {
 void VrMenu::save_last_dir() const {
   if (place_ != Place::HomeTree && place_ != Place::RemovableTree) return;
   if (cwd_.empty()) return;
-  const fs::path conf_dir = home_ / ".config" / "monasphere";
-  std::error_code ec;
-  fs::create_directories(conf_dir, ec);
-  std::ofstream out(conf_dir / "conf");
-  if (!out) return;
-  out << "last_dir=" << cwd_.string() << '\n';
+  upsert_conf_key(user_conf_path(), "last_dir", cwd_.string());
 }
 
 std::filesystem::path VrMenu::load_last_dir() const {
-  const fs::path conf = home_ / ".config" / "monasphere" / "conf";
+  const fs::path conf = user_conf_path();
   std::ifstream in(conf);
   if (!in) return {};
   std::string line;
@@ -456,12 +476,13 @@ float VrMenu::step_playback_rate(float cur, int dir) const {
   return kSteps[idx];
 }
 
-void VrMenu::load_dir_volume() {
-  if (media_path_.empty()) return;
-  const fs::path conf = media_path_.parent_path() / ".conf";
-  std::error_code ec;
-  if (!fs::is_regular_file(conf, ec)) return;
-  std::ifstream in(conf);
+fs::path VrMenu::user_conf_path() const {
+  return home_ / ".config" / "monasphere" / "monasphere.conf";
+}
+
+void VrMenu::load_volume() {
+  volume_ = 0.2f;
+  std::ifstream in(user_conf_path());
   if (!in) return;
   std::string line;
   while (std::getline(in, line)) {
@@ -474,13 +495,22 @@ void VrMenu::load_dir_volume() {
   }
 }
 
-void VrMenu::save_dir_volume() const {
-  if (media_path_.empty()) return;
-  const fs::path dir = media_path_.parent_path();
-  if (dir.empty()) return;
-  const fs::path conf = dir / ".conf";
+void VrMenu::save_volume() const {
+  const fs::path conf = user_conf_path();
+  std::error_code ec;
+  fs::create_directories(conf.parent_path(), ec);
+  std::vector<std::string> kept;
+  {
+    std::ifstream in(conf);
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.rfind("volume=", 0) == 0 || line.empty()) continue;
+      kept.push_back(line);
+    }
+  }
   std::ofstream out(conf, std::ios::trunc);
   if (!out) return;
+  for (const std::string& line : kept) out << line << '\n';
   out << "volume=" << volume_ << '\n';
 }
 
@@ -751,7 +781,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         const int step = (pct < 10) ? 1 : 5;
         out.volume_delta = (dy < 0) ? (step / 100.f) : -(step / 100.f);
         volume_ = std::clamp(volume_ + out.volume_delta, 0.f, 1.f);
-        save_dir_volume();
+        save_volume();
         bump();
         nav_cooldown_ = 0.12f;
         return;

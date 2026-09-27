@@ -42,11 +42,6 @@
     },
     {
       "context": "HostWindow",
-      "source": "View",
-      "translation": "表示"
-    },
-    {
-      "context": "HostWindow",
       "source": "HMD info",
       "translation": "HMD情報"
     },
@@ -204,6 +199,21 @@
       "context": "HostWindow",
       "source": "Gamepad",
       "translation": "パッド"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad",
+      "translation": "ゲームパッド"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad on",
+      "translation": "ゲームパッド オン"
+    },
+    {
+      "context": "HostWindow",
+      "source": "SDL gamepad off",
+      "translation": "ゲームパッド オフ"
     },
     {
       "context": "HostWindow",
