@@ -362,9 +362,13 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     dev_exts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     external_memory_fd_ = true;
   }
-  // Probe only for AMD VA-API→Vulkan zero-copy TODO (not enabled on device yet).
   const bool dma_buf = has_ext(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-  const bool drm_mod = has_ext("VK_EXT_image_drm_format_modifier");
+  const bool drm_mod = has_ext(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+  if (dma_buf && drm_mod && external_memory_fd_) {
+    dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    dev_exts.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+    dma_buf_import_ = true;
+  }
 
   VkDeviceCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -392,10 +396,11 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   } else {
     VRP_LOG("Vulkan external memory FD: no");
   }
-  VRP_LOG("Vulkan dma-buf import: %s%s", dma_buf ? "available" : "missing",
-          dma_buf && drm_mod ? " (+DRM modifiers)" : (dma_buf ? " (no DRM modifiers)" : ""));
-  if (dma_buf) {
-    VRP_DBG("AMD path: enable VK_EXT_external_memory_dma_buf on device when wiring VA-API import");
+  if (dma_buf_import_) {
+    VRP_LOG("Vulkan dma-buf import: enabled (VA-API NV12)");
+  } else {
+    VRP_LOG("Vulkan dma-buf import: %s%s", dma_buf ? "available" : "missing",
+            dma_buf && drm_mod ? " (+DRM modifiers, not enabled)" : "");
   }
 
   note("Vulkan: command pool…");

@@ -88,6 +88,8 @@ class XrVulkanApp {
   VkRenderPass color_pass() const { return color_pass_; }
   std::mutex& queue_mutex() { return queue_mu_; }
   bool external_memory_fd() const { return external_memory_fd_; }
+  /** VK_EXT_external_memory_dma_buf and VK_EXT_image_drm_format_modifier are enabled. */
+  bool dma_buf_import() const { return dma_buf_import_; }
   const std::vector<ViewSwapchain>& swapchains() const { return swapchains_; }
   std::vector<ViewSwapchain>& swapchains() { return swapchains_; }
 
@@ -186,6 +188,7 @@ class XrVulkanApp {
   VkRenderPass color_pass_ = VK_NULL_HANDLE;
   std::mutex queue_mu_;
   bool external_memory_fd_ = false;
+  bool dma_buf_import_ = false;
 
   std::vector<ViewSwapchain> swapchains_;
   std::array<XrViewConfigurationView, 2> config_views_{};

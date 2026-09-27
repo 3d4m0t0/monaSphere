@@ -9,6 +9,7 @@
 #include "scene/scene_renderer.hpp"
 #include "ui/vr_menu.hpp"
 #include "video/cuda_nv12_texture.hpp"
+#include "video/vaapi_nv12_texture.hpp"
 #include "video/video_decoder.hpp"
 #include "xr/xr_vulkan_app.hpp"
 
@@ -2187,17 +2188,23 @@ void HostWindow::xrThreadMain() {
     }
     vrp::VideoTexture texture;
     vrp::CudaNv12Texture cuda_tex;
+    vrp::VaapiNv12Texture vaapi_tex;
     vrp::VideoFrame pending_upload;
     texture.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
     const bool gpu_nv12 =
         cuda_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
                       xr.external_memory_fd());
+    const bool vaapi_nv12 =
+        vaapi_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
+                       xr.dma_buf_import());
     decoder.set_cuda_texture(gpu_nv12 ? &cuda_tex : nullptr);
+    decoder.set_vaapi_texture(vaapi_nv12 ? &vaapi_tex : nullptr);
     QMetaObject::invokeMethod(
         this,
-        [this, gpu_nv12] {
-          appendLog(gpu_nv12 ? tr("Video: GPU NV12")
-                             : tr("Video: CPU RGBA"));
+        [this, gpu_nv12, vaapi_nv12] {
+          if (gpu_nv12) appendLog(tr("Video: GPU NV12"));
+          else if (vaapi_nv12) appendLog(tr("Video: VA-API dma-buf"));
+          else appendLog(tr("Video: CPU RGBA"));
         },
         Qt::QueuedConnection);
     scene.set_texture(texture.view(), texture.sampler());
@@ -2291,7 +2298,9 @@ void HostWindow::xrThreadMain() {
       }).detach();
     };
 
+    bool vaapi_hud_pending = true;
     auto open_media = [&](const std::string& path) {
+      vaapi_hud_pending = true;
       // Keep miniaudio alive and muted so silence keeps flushing HMD/Pulse during the switch.
       // Closing the device mid-switch is what left the previous file's audio in the sink.
       if (audio.is_open()) audio.mute_output();
@@ -2309,6 +2318,7 @@ void HostWindow::xrThreadMain() {
       // Unbind NV12 descriptors first, then free Vulkan/CUDA memory under the import context.
       scene.set_texture(texture.view(), texture.sampler());
       cuda_tex.reset_slots(decoder.cuda_context());
+      vaapi_tex.reset();
       decoder.close();
 
       const bool ok = decoder.open(path);
@@ -2794,6 +2804,26 @@ void HostWindow::xrThreadMain() {
           }
           vrp::VideoFrame discard;
           (void)decoder.update(dt, discard);
+        } else if (decoder.vaapi_path_active()) {
+          nv12_mode = vaapi_tex.full_range() ? 2 : 1;
+          src_y = vaapi_tex.y_view();
+          src_uv = vaapi_tex.uv_view();
+          src_samp = vaapi_tex.sampler();
+          src_w = vaapi_tex.width();
+          src_h = vaapi_tex.height();
+          if (vaapi_tex.poll_present()) {
+            (void)scene.wait_previous_submit(10'000'000ull);
+            video_updated = true;
+          }
+          if ((video_updated || force_fsr_refresh) && !fsr.enabled() && src_y && src_samp) {
+            scene.set_nv12_texture(src_y, src_uv, src_samp, vaapi_tex.full_range());
+          }
+          if (vaapi_hud_pending) {
+            menu.set_output_note("0-copy NV12");
+            vaapi_hud_pending = false;
+          }
+          vrp::VideoFrame discard;
+          (void)decoder.update(dt, discard);
         } else {
           vrp::VideoFrame frame;
           if (decoder.update(dt, frame) && !frame.rgba.empty()) {
@@ -2969,6 +2999,7 @@ void HostWindow::xrThreadMain() {
     VRP_LOG("teardown: decoder closed");
     fsr.shutdown();
     cuda_tex.shutdown();
+    vaapi_tex.shutdown();
     hud_tex.shutdown();
     texture.shutdown();
     scene.shutdown();

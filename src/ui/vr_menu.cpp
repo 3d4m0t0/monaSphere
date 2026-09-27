@@ -94,6 +94,12 @@ void VrMenu::set_media_info(const std::string& video_codec, const std::string& r
   bump();
 }
 
+void VrMenu::set_output_note(const std::string& output_note) {
+  if (info_output_note_ == output_note) return;
+  info_output_note_ = output_note;
+  bump();
+}
+
 void VrMenu::set_playback(bool playing, double position_sec) {
   playing_ = playing;
   position_sec_ = position_sec;

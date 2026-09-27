@@ -19,6 +19,7 @@
 namespace vrp {
 
 class CudaNv12Texture;
+class VaapiNv12Texture;
 
 struct VideoFrame {
   int width = 0;
@@ -115,7 +116,11 @@ class VideoDecoder {
 
   /** Attach CUDA↔Vulkan target before open(). nullptr = CPU RGBA path. */
   void set_cuda_texture(CudaNv12Texture* tex) { cuda_tex_ = tex; }
+  void set_vaapi_texture(VaapiNv12Texture* tex) { vaapi_tex_ = tex; }
+  /** NVDEC → Vulkan NV12 is the active display path. */
   bool gpu_path_active() const;
+  /** VA-API dma-buf import has produced a frame the XR thread can sample. */
+  bool vaapi_path_active() const;
 
   /** Cancel in-flight seek-thumbnail worker (non-blocking). */
   void stop_thumbnail_build();
@@ -156,6 +161,7 @@ class VideoDecoder {
   double frame_duration_ = 1.0 / 30.0;
   VideoInfo info_;
   CudaNv12Texture* cuda_tex_ = nullptr;
+  VaapiNv12Texture* vaapi_tex_ = nullptr;
 
   struct FFmpegState;
   std::unique_ptr<FFmpegState> ff_;

@@ -101,6 +101,7 @@ add_library(vrp_core STATIC
   src/video/video_decoder.cpp
   src/video/cuda_minimal.cpp
   src/video/cuda_nv12_texture.cpp
+  src/video/vaapi_nv12_texture.cpp
   src/audio/audio_player.cpp
   src/scene/scene_renderer.cpp
   src/scene/fsr1_upscaler.cpp

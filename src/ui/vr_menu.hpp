@@ -123,6 +123,7 @@ class VrMenu {
                        const std::string& bitrate, const std::string& audio_codec,
                        const std::string& audio_rate, const std::string& audio_channels,
                        const std::string& hwaccel, const std::string& output_note);
+  void set_output_note(const std::string& output_note);
   void set_playback(bool playing, double position_sec);
   void set_volume(float v);
   float volume() const { return volume_; }

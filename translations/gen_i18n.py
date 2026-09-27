@@ -53,6 +53,7 @@ ROWS = [
     ("HostWindow", "Left", {"ja": "左手", "de": "Links", "fr": "Gauche", "es": "Izq.", "ko": "왼손", "zh_CN": "左手", "zh_TW": "左手"}),
     ("HostWindow", "Video: GPU NV12", {"ja": "映像: GPU NV12", "de": "Video: GPU NV12", "fr": "Vidéo : GPU NV12", "es": "Vídeo: GPU NV12", "ko": "영상: GPU NV12", "zh_CN": "视频: GPU NV12", "zh_TW": "視訊: GPU NV12"}),
     ("HostWindow", "Video: CPU RGBA", {"ja": "映像: CPU RGBA", "de": "Video: CPU RGBA", "fr": "Vidéo : CPU RGBA", "es": "Vídeo: CPU RGBA", "ko": "영상: CPU RGBA", "zh_CN": "视频: CPU RGBA", "zh_TW": "視訊: CPU RGBA"}),
+    ("HostWindow", "Video: VA-API dma-buf", {"ja": "映像: VA-API dma-buf", "de": "Video: VA-API dma-buf", "fr": "Vidéo : VA-API dma-buf", "es": "Vídeo: VA-API dma-buf", "ko": "영상: VA-API dma-buf", "zh_CN": "视频: VA-API dma-buf", "zh_TW": "視訊: VA-API dma-buf"}),
     ("HostWindow",
      "<h3>monaSphere v%1</h3><p>Linux VR video player (OpenXR / Monado)</p><p>Copyright (c) 2026 flex</p><p>GitHub:<br><a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p><p>Source license: MIT</p><p>FFmpeg / Qt and others are linked dynamically. See THIRD_PARTY.md when distributing a binary.</p>",
      {

@@ -227,6 +227,11 @@
     },
     {
       "context": "HostWindow",
+      "source": "Video: VA-API dma-buf",
+      "translation": "Vidéo : VA-API dma-buf"
+    },
+    {
+      "context": "HostWindow",
       "source": "<h3>monaSphere v%1</h3><p>Linux VR video player (OpenXR / Monado)</p><p>Copyright (c) 2026 flex</p><p>GitHub:<br><a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p><p>Source license: MIT</p><p>FFmpeg / Qt and others are linked dynamically. See THIRD_PARTY.md when distributing a binary.</p>",
       "translation": "<h3>monaSphere v%1</h3><p>Lecteur VR Linux (OpenXR / Monado)</p><p>Copyright (c) 2026 flex</p><p>GitHub:<br><a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p><p>Licence source : MIT</p><p>FFmpeg / Qt liés dynamiquement. Voir THIRD_PARTY.md.</p>"
     },

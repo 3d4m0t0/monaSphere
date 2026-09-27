@@ -1,6 +1,7 @@
 #include "video/video_decoder.hpp"
 
 #include "video/cuda_nv12_texture.hpp"
+#include "video/vaapi_nv12_texture.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -400,6 +401,11 @@ bool VideoDecoder::gpu_path_active() const {
          info_.hwaccel.find("cuda") != std::string::npos;
 }
 
+bool VideoDecoder::vaapi_path_active() const {
+  return vaapi_tex_ && vaapi_tex_->has_valid_frame() && info_.hwaccel_active &&
+         info_.hwaccel.find("vaapi") != std::string::npos;
+}
+
 void VideoDecoder::choose_display_size() {
   display_w_ = width_;
   display_h_ = height_;
@@ -413,8 +419,9 @@ void VideoDecoder::choose_display_size() {
     return;
   }
   if (info_.hwaccel.find("vaapi") != std::string::npos) {
-    // TODO(amd-vaapi-zerocopy): dma-buf → VK_EXT_external_memory_dma_buf NV12.
-    info_.display_note = "VA-API → CPU RGBA (AMD zero-copy pending)";
+    info_.display_note = (vaapi_tex_ && vaapi_tex_->enabled())
+                             ? "VA-API dma-buf import (CPU RGBA if it fails)"
+                             : "VA-API → CPU RGBA";
   }
   constexpr int kMaxPixels = 3840 * 2160;
   const int64_t pixels = static_cast<int64_t>(width_) * height_;
@@ -856,9 +863,7 @@ bool VideoDecoder::open(const std::string& path) {
     return false;
   }
 
-  // Prefer NVDEC (cuda) then VAAPI. Fall back to software.
-  // TODO(amd-vaapi-zerocopy): After VA-API decode, import dma-buf into Vulkan
-  // (VK_EXT_external_memory_dma_buf + DRM modifiers) for zero-copy NV12.
+  // Prefer NVDEC (cuda) then VAAPI. VA-API frames try dma-buf import; otherwise CPU RGBA.
   bool hw_ok = false;
   const AVHWDeviceType try_types[] = {AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_VDPAU,
                                       AV_HWDEVICE_TYPE_NONE};
@@ -906,11 +911,9 @@ bool VideoDecoder::open(const std::string& path) {
     info_.hwaccel = hw_type_label(type);
     info_.hwaccel_active = true;
     hw_ok = true;
-    if (type == AV_HWDEVICE_TYPE_VAAPI) {
-      VRP_LOG("Video hwaccel: %s (pix_fmt=%d) — AMD zero-copy via dma-buf not wired yet",
-              info_.hwaccel.c_str(), static_cast<int>(hw_pix));
-    } else {
-      VRP_LOG("Video hwaccel: %s (pix_fmt=%d)", info_.hwaccel.c_str(), static_cast<int>(hw_pix));
+    VRP_LOG("Video hwaccel: %s (pix_fmt=%d)", info_.hwaccel.c_str(), static_cast<int>(hw_pix));
+    if (type == AV_HWDEVICE_TYPE_VAAPI && vaapi_tex_ && vaapi_tex_->enabled()) {
+      VRP_LOG("VA-API: dma-buf import armed (CPU RGBA if the modifier cannot be sampled)");
     }
     break;
   }
@@ -1286,6 +1289,17 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba) {
         out.width = width_;
         out.height = height_;
         return true;
+      }
+
+      if (ff_->hw_device_ctx && ff_->frame->format == AV_PIX_FMT_VAAPI && vaapi_tex_ && vaapi_tex_->enabled()) {
+        const bool full = ff_->codec && ff_->codec->color_range == AVCOL_RANGE_JPEG;
+        if (vaapi_tex_->try_import(ff_->frame, full)) {
+          out.width = width_;
+          out.height = height_;
+          out.gpu = true;
+          out.full_range = vaapi_tex_->full_range();
+          return true;
+        }
       }
 
       AVFrame* src = ff_->frame;
