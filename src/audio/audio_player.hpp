@@ -78,16 +78,10 @@ class AudioPlayer {
   void pause();
   /** Soft-mute + flush ring; device keeps running and outputs silence to the HMD. */
   void mute_output();
-  /**
-   * After video seek: seek demux + start filling the ring while still muted.
-   * Call enable_after_seek(video_pts) when the first post-seek video frame is ready.
-   */
-  void begin_seek_prefill(double sec);
-  /**
-   * Unmute after begin_seek_prefill. Pass the first decoded video PTS — audio is
-   * realigned when video landed on an earlier keyframe (otherwise sound leads).
-   */
-  void enable_after_seek(double video_pts_sec);
+  /** Seek to sec and stay silent. Video is held on the matching still. */
+  void park_at(double sec);
+  /** Seek to sec, prefill, then unmute. Call start_presentation() immediately after. */
+  void arm_at(double sec);
   /** Seek to 0 + mute; device stays up (silence) until the next play(). */
   void stop();
   void toggle();
@@ -111,8 +105,6 @@ class AudioPlayer {
   bool playing_ = false;
   float volume_ = 0.2f;
   float rate_ = 1.f;
-  /** Target used by begin_seek_prefill; compared in enable_after_seek. */
-  double pending_prefill_sec_ = -1.0;
   std::string device_name_;
   std::string last_error_;
 

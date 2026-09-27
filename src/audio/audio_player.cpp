@@ -408,6 +408,8 @@ struct AudioPlayer::State {
   std::atomic<int> callback_in_rb{0};
   std::atomic<bool> seek_req{false};
   std::atomic<double> seek_sec{0.0};
+  /** Drop decoded audio that ends before this timeline (backward seek preroll). -1 = off. */
+  double discard_until_sec = -1.0;
   std::atomic<uint64_t> seek_epoch{0};
   std::atomic<uint64_t> seek_done_epoch{0};
   std::atomic<uint64_t> underrun_frames{0};
@@ -984,6 +986,7 @@ void AudioPlayer::start_thread() {
         }
         avcodec_flush_buffers(st_->codec);
         flush_swr();
+        st_->discard_until_sec = sec;
         // Host already muted output before posting seek_req; reset is exclusive here.
         if (st_->rb_ok) st_->clear_ring_exclusive();
         st_->seek_done_epoch.store(st_->seek_epoch.load(std::memory_order_relaxed),
@@ -1042,6 +1045,25 @@ void AudioPlayer::start_thread() {
       av_packet_unref(st_->packet);
 
       while (avcodec_receive_frame(st_->codec, st_->frame) == 0) {
+        int skip_in = 0;
+        if (st_->discard_until_sec >= 0.0) {
+          double pts = -1.0;
+          const int64_t stamp = st_->frame->best_effort_timestamp != AV_NOPTS_VALUE
+                                    ? st_->frame->best_effort_timestamp
+                                    : st_->frame->pts;
+          if (stamp != AV_NOPTS_VALUE) pts = static_cast<double>(stamp) * av_q2d(st_->time_base);
+          const double dur = st_->frame->sample_rate > 0
+                                 ? st_->frame->nb_samples / static_cast<double>(st_->frame->sample_rate)
+                                 : 0.0;
+          if (pts >= 0.0 && pts + dur < st_->discard_until_sec - 0.005) continue;
+          // Keep the overlapping frame, but drop the samples that sit before the
+          // video PTS. Playing them makes audio lead by one packet after a keyframe seek.
+          if (pts >= 0.0 && pts < st_->discard_until_sec && st_->frame->sample_rate > 0) {
+            skip_in = static_cast<int>(std::lround((st_->discard_until_sec - pts) * st_->frame->sample_rate));
+            if (skip_in >= st_->frame->nb_samples) skip_in = st_->frame->nb_samples;
+          }
+          st_->discard_until_sec = -1.0;
+        }
         const int out_samples = swr_get_out_samples(st_->swr, st_->frame->nb_samples) + 256;
         buf.resize(static_cast<size_t>(std::max(out_samples, 0) * st_->out_channels));
         uint8_t* outs[1] = {reinterpret_cast<uint8_t*>(buf.data())};
@@ -1050,19 +1072,27 @@ void AudioPlayer::start_thread() {
                         const_cast<const uint8_t**>(st_->frame->extended_data), st_->frame->nb_samples);
         if (converted <= 0 || !st_->rb_ok) continue;
 
+        int skip_out = 0;
+        if (skip_in > 0 && st_->frame->sample_rate > 0 && st_->out_rate > 0) {
+          skip_out = static_cast<int>(std::lround(
+              skip_in * (static_cast<double>(st_->out_rate) / st_->frame->sample_rate)));
+          if (skip_out > converted) skip_out = converted;
+        }
+        if (skip_out >= converted) continue;
+
         float rate = std::clamp(st_->rate.load(), 0.5f, 20.f);
         std::vector<int16_t> timed;
-        const int16_t* play_src = buf.data();
-        int play_frames = converted;
+        const int16_t* play_src = buf.data() + static_cast<size_t>(skip_out * st_->out_channels);
+        int play_frames = converted - skip_out;
         if (std::fabs(rate - 1.f) > 0.01f) {
-          const int out_n = std::max(1, static_cast<int>(std::lround(converted / rate)));
+          const int out_n = std::max(1, static_cast<int>(std::lround(play_frames / rate)));
           timed.resize(static_cast<size_t>(out_n * st_->out_channels));
           for (int o = 0; o < out_n; ++o) {
             int src_i = static_cast<int>(std::lround(o * rate));
-            if (src_i >= converted) src_i = converted - 1;
+            if (src_i >= play_frames) src_i = play_frames - 1;
             for (int c = 0; c < st_->out_channels; ++c) {
               timed[static_cast<size_t>(o * st_->out_channels + c)] =
-                  buf[static_cast<size_t>(src_i * st_->out_channels + c)];
+                  buf[static_cast<size_t>((skip_out + src_i) * st_->out_channels + c)];
             }
           }
           play_src = timed.data();
@@ -1196,42 +1226,19 @@ void AudioPlayer::mute_output() {
   quiesce_and_flush();
 }
 
-void AudioPlayer::begin_seek_prefill(double sec) {
+void AudioPlayer::park_at(double sec) {
   if (!st_ || !has_audio_) return;
   playing_ = false;
-  pending_prefill_sec_ = sec;
   quiesce_and_flush();
   seek_demux_wait(sec);
-  // Fill while video catches up — output stays muted until enable_after_seek().
-  st_->playing.store(true, std::memory_order_release);
 }
 
-void AudioPlayer::enable_after_seek(double video_pts_sec) {
+void AudioPlayer::arm_at(double sec) {
   if (!st_ || !has_audio_) return;
-  // Video seek is keyframe-backed: first frame PTS is often earlier than the seek
-  // target we prefilled. If we unmute on the target timeline, audio leads the picture
-  // (same scenes = same GOP gaps). Realign to the decoded video PTS when drifted.
-  constexpr double kAlignEps = 0.04;  // ~2.4 frames @ 60fps
-  const bool need_realign =
-      pending_prefill_sec_ < 0.0 || std::fabs(video_pts_sec - pending_prefill_sec_) > kAlignEps;
-  if (need_realign) {
-    st_->output_live.store(false, std::memory_order_release);
-    st_->playing.store(false, std::memory_order_release);
-    for (int i = 0; i < 100; ++i) {
-      if (!st_->writer_in_rb.load(std::memory_order_acquire) &&
-          st_->callback_in_rb.load(std::memory_order_acquire) == 0)
-        break;
-      std::this_thread::sleep_for(std::chrono::microseconds(200));
-    }
-    seek_demux_wait(video_pts_sec);
-  }
-  pending_prefill_sec_ = -1.0;
-#if defined(VRP_HAS_MINIAUDIO)
-  const bool need_wait = need_realign || !st_->rb_ok || ma_pcm_rb_available_read(&st_->rb) < 2400;
-#else
-  const bool need_wait = true;
-#endif
-  (void)prefill_and_enable_output(need_wait);
+  playing_ = false;
+  quiesce_and_flush();
+  seek_demux_wait(sec);
+  (void)prefill_and_enable_output(true);
 }
 
 void AudioPlayer::pause() {

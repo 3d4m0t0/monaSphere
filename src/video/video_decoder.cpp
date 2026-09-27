@@ -563,7 +563,6 @@ void VideoDecoder::demux_loop() {
     if (priming_.load() && !hold) {
       const size_t need = priming_need_bytes_.load();
       if (prefetch_enough(need > 0 ? need : prefetch_resume_bytes_)) {
-        playing_.store(true);
         priming_.store(false);
         playback_started_.store(true);
       }
@@ -655,6 +654,7 @@ bool VideoDecoder::pop_video_packet() {
 void VideoDecoder::decode_loop() {
   using clock = std::chrono::steady_clock;
   auto next_deadline = clock::now();
+  bool was_playing = false;
   VideoFrame scratch;
   while (!decode_stop_.load()) {
     if (!open_.load()) {
@@ -664,6 +664,7 @@ void VideoDecoder::decode_loop() {
     }
     // When paused, still process seeks and decode one frame for A/V resync / scrub preview.
     if (!playing_.load() && !seek_req_.load() && !awaiting_frame_after_seek_) {
+      was_playing = false;
       next_deadline = clock::now();
       std::this_thread::sleep_for(std::chrono::milliseconds(4));
       continue;
@@ -704,6 +705,11 @@ void VideoDecoder::decode_loop() {
     const auto now = clock::now();
     const double rate = std::clamp(static_cast<double>(rate_.load()), 0.5, 20.0);
     const double step = frame_duration_ / rate;
+    const bool playing_now = playing_.load();
+    // A pause leaves next_deadline in the past. Catch-up drops would skip the
+    // frames queued after a paused seek while audio stays on the still frame.
+    if (playing_now && !was_playing) next_deadline = now;
+    was_playing = playing_now;
     if (rate_reset_deadline_.exchange(false, std::memory_order_acq_rel)) {
       next_deadline = now;
     }
@@ -734,6 +740,7 @@ void VideoDecoder::decode_loop() {
       }
       if (awaiting_frame_after_seek_) {
         awaiting_frame_after_seek_ = false;
+        seek_busy_.store(false);
         av_resync_.store(true);
         // Start pacing from this frame's presentation time.
         next_deadline = clock::now() + std::chrono::duration_cast<clock::duration>(
@@ -1054,6 +1061,7 @@ bool VideoDecoder::open(const std::string& path) {
   playing_.store(false);
   priming_.store(false);
   playback_started_.store(false);
+  seek_busy_.store(false);
   seek_scrubbing_.store(false);
   looped_.store(false);
   prefetch_target_bytes_ = prefetch_bytes_for_seconds(2.0, info_.bitrate);
@@ -1072,6 +1080,7 @@ bool VideoDecoder::open(const std::string& path) {
 void VideoDecoder::halt_decode() {
   pause();
   seek_req_.store(false);
+  seek_busy_.store(false);
   awaiting_frame_after_seek_ = false;
   stop_decode_thread();
 }
@@ -1101,6 +1110,7 @@ void VideoDecoder::close() {
   playback_started_.store(false);
   seek_scrubbing_.store(false);
   seek_req_.store(false);
+  seek_busy_.store(false);
   awaiting_frame_after_seek_ = false;
   open_.store(false);
 #if defined(VRP_HAS_FFMPEG)
@@ -1151,10 +1161,15 @@ void VideoDecoder::play() {
   seek_scrubbing_.store(false);
   begin_priming(prefetch_target_bytes_);  // fill full ~2s before start
   if (prefetch_enough(prefetch_target_bytes_)) {
-    playing_.store(true);
     priming_.store(false);
     playback_started_.store(true);
   }
+}
+
+void VideoDecoder::start_presentation() {
+  if (!open_.load() || playing_.load()) return;
+  priming_.store(false);
+  playing_.store(true);
 }
 
 void VideoDecoder::pause() {
@@ -1178,12 +1193,16 @@ void VideoDecoder::seek_to(double sec) {
   if (!open_.load()) return;
   if (duration_sec_ > 0) sec = std::clamp(sec, 0.0, duration_sec_);
   else if (sec < 0) sec = 0;
+  // Freeze presentation until the host has armed audio at the landed frame.
+  // Otherwise video runs while audio is still seeking and the offset sticks.
+  playing_.store(false);
+  priming_.store(false);
+  playback_started_.store(false);
+  seek_busy_.store(true);
   seek_target_.store(sec);
   position_sec_.store(sec);
   seek_req_.store(true);
-  av_resync_.store(false);  // wait for the next decoded frame
-  // Do not begin_priming on single L/R seeks — that muted audio until ~1s refill.
-  // Key-repeat scrubbing still uses set_seek_scrubbing() for hold/resume fill.
+  av_resync_.store(false);
 }
 
 bool VideoDecoder::consume_av_resync() { return av_resync_.exchange(false); }
@@ -1212,6 +1231,8 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba) {
   while (!decode_stop_.load() && !demux_pause_.load()) {
     if (!pop_video_packet()) {
       if (demux_eof_.load()) {
+        playing_.store(false);
+        seek_busy_.store(true);
         seek_target_.store(0);
         seek_req_.store(true);
         looped_.store(true);

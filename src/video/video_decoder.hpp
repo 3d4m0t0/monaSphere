@@ -126,6 +126,8 @@ class VideoDecoder {
   void stop_thumbnail_build();
 
   void play();
+  /** Begin presenting frames. Called after audio is armed for this start. */
+  void start_presentation();
   void pause();
   void toggle();
   void seek_relative(double delta_sec);
@@ -134,6 +136,8 @@ class VideoDecoder {
   void set_seek_scrubbing(bool active);
   /** True once after the first decoded frame following a seek (for A/V resync). */
   bool consume_av_resync();
+  /** True until that post-seek frame is decoded. Playback must not start before then. */
+  bool seek_in_flight() const { return seek_busy_.load(); }
   /** True once when priming finished filling and playback started. */
   bool consume_playback_started();
   /** True once after an end-of-stream auto-loop (seek to 0). Clears on read. */
@@ -181,6 +185,7 @@ class VideoDecoder {
   std::atomic<bool> playback_started_{false};
   std::atomic<size_t> priming_need_bytes_{0};  // threshold for current priming
   bool awaiting_frame_after_seek_ = false;  // decode thread only
+  std::atomic<bool> seek_busy_{false};
 
   // Packet read-ahead: max ~2s; seek / scrub-end resume at ~1s.
   std::thread demux_thread_;

@@ -2640,6 +2640,11 @@ void HostWindow::xrThreadMain() {
       return ok;
     };
 
+    // True while the user wants picture and sound together. A seek freezes video
+    // until audio is armed at the landed frame, then presentation starts.
+    bool play_wanted = false;
+    bool was_scrubbing = false;
+
     if (!opt_.video_path.empty() && !opt_.clear_only) {
       if (!open_media(opt_.video_path)) {
         QMetaObject::invokeMethod(
@@ -2647,8 +2652,8 @@ void HostWindow::xrThreadMain() {
             [this] { appendLog(tr("Startup video failed. Pick another file")); },
             Qt::QueuedConnection);
       } else {
+        play_wanted = true;
         decoder.play();
-        // Audio starts when consume_playback_started fires (prefetch full).
       }
     }
 
@@ -2669,20 +2674,21 @@ void HostWindow::xrThreadMain() {
         // Keep A/V in lockstep — independent toggles desync after audio reopen.
         const bool active = decoder.is_playing() || decoder.is_priming();
         if (!active) {
-          audio.seek_to(decoder.position());
+          play_wanted = true;
           decoder.play();
         } else {
+          play_wanted = false;
           decoder.pause();
           audio.pause();
         }
       }
       if (cmd == 2) {
         decoder.seek_relative(-10.0);
-        if (audio.is_open()) audio.begin_seek_prefill(decoder.position());
+        audio.pause();
       }
       if (cmd == 3) {
         decoder.seek_relative(10.0);
-        if (audio.is_open()) audio.begin_seek_prefill(decoder.position());
+        audio.pause();
       }
       if (cmd == 4) {
         xr.recenter();
@@ -2718,6 +2724,7 @@ void HostWindow::xrThreadMain() {
                 [this] { appendLog(tr("Cannot play video this session")); },
                 Qt::QueuedConnection);
           } else {
+            play_wanted = true;
             decoder.play();
           }
         }
@@ -2784,6 +2791,7 @@ void HostWindow::xrThreadMain() {
           QMetaObject::invokeMethod(
               this, [this] { appendLog(tr("HMD: cannot open video")); }, Qt::QueuedConnection);
         } else {
+          play_wanted = true;
           decoder.play();
         }
         requestHudPaint();
@@ -2791,11 +2799,11 @@ void HostWindow::xrThreadMain() {
         // Do not also handle raw input.confirm this frame — open_video closes the menu while
         // confirm is still true and would immediately pause.
         if (decoder.is_playing() || decoder.is_priming()) {
+          play_wanted = false;
           decoder.pause();
           audio.pause();
         } else {
-          // Align audio demuxer before priming; device already runs silence while muted.
-          if (audio.is_open()) audio.seek_to(decoder.position());
+          play_wanted = true;
           decoder.play();
         }
       }
@@ -2823,14 +2831,16 @@ void HostWindow::xrThreadMain() {
         requestHudPaint();
       }
       if (menu_out.play) {
-        audio.seek_to(decoder.position());
+        play_wanted = true;
         decoder.play();
       }
       if (menu_out.pause) {
+        play_wanted = false;
         decoder.pause();
         audio.pause();
       }
       if (menu_out.stop) {
+        play_wanted = false;
         decoder.pause();
         decoder.seek_to(0.0);
         // Must seek audio demuxer to 0 as well — pause alone leaves decode at the stop point,
@@ -2841,11 +2851,12 @@ void HostWindow::xrThreadMain() {
         decoder.set_rate(menu_out.rate);
         audio.set_rate(menu_out.rate);
         menu.set_rate(menu_out.rate);
-        // Resync audio demuxer to video timeline — rate alone leaves decode ahead of playhead.
-        if (audio.is_open()) {
-          const bool keep = decoder.is_playing() || decoder.is_priming();
-          audio.seek_to(decoder.position());
-          if (keep) audio.play();
+        // Rate change is a pause plus the normal play start, so audio is armed
+        // with the picture instead of catching up afterwards.
+        if (play_wanted && (decoder.is_playing() || decoder.is_priming())) {
+          decoder.pause();
+          audio.pause();
+          decoder.play();
         }
         requestHudPaint();
       }
@@ -2886,29 +2897,36 @@ void HostWindow::xrThreadMain() {
         menu.set_volume(audio.volume());
         requestHudPaint();
       }
-      // LB / RB / [<][>] seek — mute + start audio demux prefill while video seeks.
-      if (input.seek_back || menu_out.seek_back) {
-        decoder.seek_relative(-10.0);
-        if (audio.is_open()) audio.begin_seek_prefill(decoder.position());
+      // A seek is a pause. Playback, when it should continue, goes through play()
+      // and the single start below — the same path as the play button.
+      const bool scrubbing = input.seek_scrubbing || menu_out.seek_scrubbing;
+      const bool seek_now = input.seek_back || menu_out.seek_back || input.seek_forward ||
+                            menu_out.seek_forward || menu_out.seek_start;
+      if (input.seek_back || menu_out.seek_back) decoder.seek_relative(-10.0);
+      if (input.seek_forward || menu_out.seek_forward) decoder.seek_relative(10.0);
+      if (menu_out.seek_start) decoder.seek_to(0.0);
+      if (seek_now) audio.pause();
+      bool resume_posted = false;
+      // Key-repeat stays paused. Releasing the key is the end of the seek.
+      if (was_scrubbing && !scrubbing && !seek_now && play_wanted && !decoder.seek_in_flight() &&
+          !decoder.is_playing() && !decoder.is_priming()) {
+        decoder.play();
+        resume_posted = true;
       }
-      if (input.seek_forward || menu_out.seek_forward) {
-        decoder.seek_relative(10.0);
-        if (audio.is_open()) audio.begin_seek_prefill(decoder.position());
-      }
-      if (menu_out.seek_start) {
-        decoder.seek_to(0.0);
-        if (audio.is_open()) audio.begin_seek_prefill(decoder.position());
+      was_scrubbing = scrubbing;
+
+      if (decoder.consume_av_resync()) {
+        const bool resume = play_wanted && !scrubbing && !resume_posted;
+        if (resume) decoder.play();
+        else if (!play_wanted || scrubbing) audio.park_at(decoder.position());
       }
 
-      // Video caught up after seek → align audio to the decoded frame PTS, then unmute.
-      if (decoder.consume_av_resync() && audio.is_open()) {
-        audio.enable_after_seek(decoder.position());
-      }
-
-      // Prefetch filled after play() → start audio with video.
-      if (decoder.consume_playback_started() && audio.is_open()) {
-        audio.seek_to(decoder.position());
-        audio.play();
+      // Sole start: audible audio, then the first new frame. Seek-in-flight waits
+      // so we arm at the landed PTS rather than the requested time.
+      if (decoder.consume_playback_started() && play_wanted && !scrubbing && !decoder.is_playing() &&
+          !decoder.seek_in_flight()) {
+        if (audio.is_open()) audio.arm_at(decoder.position());
+        decoder.start_presentation();
       }
 
       if (input.recenter) {
@@ -2923,10 +2941,7 @@ void HostWindow::xrThreadMain() {
         if (st_hz.display_hz > 0.0) menu.set_display_hz(static_cast<float>(st_hz.display_hz));
       }
       // Video end-of-stream loop → keep audio on the same timeline (avoids post-repeat silence).
-      if (decoder.consume_looped() && audio.is_open() && decoder.is_playing()) {
-        audio.seek_to(0.0);
-        if (!audio.is_playing()) audio.play();
-      }
+      if (decoder.consume_looped() && audio.is_open() && decoder.seek_in_flight()) audio.mute_output();
       if (menu.visible() || menu.controls_visible()) {
         request_preview(menu.highlighted_video_path());
         static auto last_hud_paint = std::chrono::steady_clock::time_point{};
@@ -2937,7 +2952,6 @@ void HostWindow::xrThreadMain() {
       }
 
       if (audio_reopen_.exchange(false) && !opt_.mute) {
-        const bool keep_playing = decoder.is_playing() || decoder.is_priming();
         std::string adev;
         {
           std::lock_guard<std::mutex> lock(audio_mu_);
@@ -2950,10 +2964,13 @@ void HostWindow::xrThreadMain() {
           QMetaObject::invokeMethod(
               this, [this, err] { appendLog(tr("Audio switch failed: %1").arg(err)); }, Qt::QueuedConnection);
         } else if (!path.empty() && audio.switch_file(path)) {
-          audio.seek_to(decoder.position());
-          // Only start audio once video is actually playing (not still priming).
-          if (keep_playing && decoder.is_playing()) audio.play();
-          else audio.pause();
+          if (play_wanted && !decoder.seek_in_flight()) {
+            decoder.pause();
+            audio.pause();
+            decoder.play();
+          } else {
+            audio.park_at(decoder.position());
+          }
           const QString dev = QString::fromStdString(audio.device_name());
           QMetaObject::invokeMethod(
               this, [this, dev] { (void)dev; }, Qt::QueuedConnection);
