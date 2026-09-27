@@ -30,6 +30,8 @@
 #include <QMenuBar>
 #include <QAction>
 #include <QActionGroup>
+#include <QRadioButton>
+#include <QWidgetAction>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QIcon>
@@ -68,6 +70,7 @@
 
 HostWindow::HostWindow(vrp::PlayerOptions opt, QString shader_dir, QWidget* parent)
     : QMainWindow(parent), opt_(std::move(opt)), shader_dir_(std::move(shader_dir)) {
+  loadAppConf();
   runtime_json_ = findRuntimeJson();
   if (!runtime_json_.isEmpty()) {
     qputenv("XR_RUNTIME_JSON", runtime_json_.toUtf8());
@@ -88,9 +91,12 @@ HostWindow::HostWindow(vrp::PlayerOptions opt, QString shader_dir, QWidget* pare
   connect(monado_, &QProcess::finished, this, &HostWindow::onMonadoFinished);
   // Do not start Monado at launch — start on HMD connect, stop on disconnect (lighter idle/exit).
   monado_label_->setText(tr("Idle"));
-  setHealth("Wait", tr("Waiting for USB HMD"));
+  setHealth("Wait", usingWivrn() ? QStringLiteral("Waiting for headset")
+                                 : QStringLiteral("Waiting for USB HMD"));
   loadMonadoModeTable();
-  QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
+  if (!usingWivrn()) {
+    QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
+  }
 }
 
 HostWindow::~HostWindow() {
@@ -151,7 +157,24 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
   return true;
 }
 
+bool HostWindow::usingWivrn() const { return runtime_kind_.load() == 1; }
+
 bool HostWindow::ensureMonadoReady() {
+  if (usingWivrn()) {
+    if (!isWivrnServerLive()) startOwnedWivrn(/*allow_external_adopt=*/true);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (!isWivrnServerLive() && std::chrono::steady_clock::now() < deadline) {
+      QThread::msleep(100);
+      QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 50);
+    }
+    if (!isWivrnServerLive()) {
+      setHealth("Error", "WiVRn not responding");
+      appendLog(tr("WiVRn not responding"));
+      return false;
+    }
+    if (!runtime_json_.isEmpty()) qputenv("XR_RUNTIME_JSON", runtime_json_.toUtf8());
+    return true;
+  }
   if (isMonadoIpcLive()) {
     if (!monado_external_ && (!monado_ || monado_->state() == QProcess::NotRunning)) {
       (void)adoptExternalMonado();
@@ -235,6 +258,7 @@ bool HostWindow::isPlaceholderHmdName(const QString& system_name) {
 
 void HostWindow::maybeAutoConnectHeadset() {
   if (shutting_down_.load()) return;
+  if (usingWivrn()) return;
 
   // While XR is up, keep watching USB. Monado often does not emit LOSS_PENDING on unplug.
   if (xr_running_.load()) {
@@ -543,6 +567,7 @@ void HostWindow::buildUi() {
 
   restoreWindowGeometry();
   loadAppConf();
+  syncRuntimeRadios();
   rebuildFsrMenu();
 }
 
@@ -562,6 +587,7 @@ void HostWindow::saveAppConf() const {
   QTextStream out(&f);
   if (!last_dir.isEmpty()) out << "last_dir=" << last_dir << '\n';
   out << "fsr=" << static_cast<int>(preferred_fsr_) << '\n';
+  out << "runtime=" << (usingWivrn() ? "wivrn" : "monado") << '\n';
 }
 
 void HostWindow::loadAppConf() {
@@ -569,10 +595,13 @@ void HostWindow::loadAppConf() {
   if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return;
   while (!f.atEnd()) {
     const QString line = QString::fromUtf8(f.readLine()).trimmed();
-    if (!line.startsWith(QStringLiteral("fsr="))) continue;
-    bool ok = false;
-    const int v = line.mid(4).toInt(&ok);
-    if (ok && v >= 0 && v <= 3) preferred_fsr_ = static_cast<vrp::FsrMode>(v);
+    if (line.startsWith(QStringLiteral("fsr="))) {
+      bool ok = false;
+      const int v = line.mid(4).toInt(&ok);
+      if (ok && v >= 0 && v <= 3) preferred_fsr_ = static_cast<vrp::FsrMode>(v);
+    } else if (line.startsWith(QStringLiteral("runtime="))) {
+      runtime_kind_.store(line.mid(8) == QLatin1String("wivrn") ? 1 : 0);
+    }
   }
 }
 
@@ -600,8 +629,29 @@ void HostWindow::onShowHmdInfoToggled(bool checked) {
 
 void HostWindow::buildMenus() {
   auto* ops = menuBar()->addMenu(tr("Actions"));
-  ops->addAction(tr("Start Monado"), this, &HostWindow::startMonado);
-  ops->addAction(tr("Stop Monado"), this, &HostWindow::stopMonado);
+
+  auto* runtime_row = new QWidget;
+  auto* runtime_layout = new QHBoxLayout(runtime_row);
+  runtime_layout->setContentsMargins(12, 4, 8, 4);
+  runtime_layout->setSpacing(12);
+  runtime_monado_rb_ = new QRadioButton(QStringLiteral("Monado"), runtime_row);
+  runtime_wivrn_rb_ = new QRadioButton(QStringLiteral("WiVRn"), runtime_row);
+  runtime_monado_rb_->setChecked(true);
+  runtime_layout->addWidget(runtime_monado_rb_);
+  runtime_layout->addWidget(runtime_wivrn_rb_);
+  runtime_layout->addStretch(1);
+  auto* runtime_action = new QWidgetAction(ops);
+  runtime_action->setDefaultWidget(runtime_row);
+  ops->addAction(runtime_action);
+  connect(runtime_monado_rb_, &QRadioButton::toggled, this, [this](bool on) {
+    if (on) onRuntimeChosen(false);
+  });
+  connect(runtime_wivrn_rb_, &QRadioButton::toggled, this, [this](bool on) {
+    if (on) onRuntimeChosen(true);
+  });
+
+  act_start_runtime_ = ops->addAction(tr("Start Monado"), this, &HostWindow::startMonado);
+  act_stop_runtime_ = ops->addAction(tr("Stop Monado"), this, &HostWindow::stopMonado);
   connect_menu_ = ops->addMenu(tr("Connect"));
   connect(connect_menu_, &QMenu::aboutToShow, this, &HostWindow::rebuildConnectDeviceMenu);
   act_disconnect_ = ops->addAction(tr("Disconnect"), this, &HostWindow::disconnectHeadset);
@@ -742,6 +792,12 @@ void HostWindow::showAboutDialog() {
 void HostWindow::rebuildConnectDeviceMenu() {
   if (!connect_menu_) return;
   connect_menu_->clear();
+  if (usingWivrn()) {
+    auto* a = connect_menu_->addAction(tr("WiVRn headset"));
+    a->setEnabled(connect_ui_enabled_);
+    connect(a, &QAction::triggered, this, [this] { connectHeadset(); });
+    return;
+  }
   const auto devices = listConnectedHmds();
   if (devices.empty()) {
     auto* none = connect_menu_->addAction(tr("(none)"));
@@ -1143,6 +1199,82 @@ void HostWindow::beginThumbnailBuild(const std::string& path) {
   });
 }
 
+void HostWindow::onRuntimeChosen(bool wivrn) {
+  if (runtime_ui_guard_) return;
+  setRuntimeKind(wivrn);
+}
+
+void HostWindow::syncRuntimeRadios() {
+  runtime_ui_guard_ = true;
+  if (runtime_monado_rb_) runtime_monado_rb_->setChecked(!usingWivrn());
+  if (runtime_wivrn_rb_) runtime_wivrn_rb_->setChecked(usingWivrn());
+  runtime_ui_guard_ = false;
+  refreshRuntimeActions();
+}
+
+void HostWindow::refreshRuntimeActions() {
+  if (!act_start_runtime_ || !act_stop_runtime_) return;
+  if (usingWivrn()) {
+    act_start_runtime_->setText(tr("Start WiVRn"));
+    act_stop_runtime_->setText(tr("Stop WiVRn"));
+  } else {
+    act_start_runtime_->setText(tr("Start Monado"));
+    act_stop_runtime_->setText(tr("Stop Monado"));
+  }
+}
+
+void HostWindow::releaseRuntimeForSwitch() {
+  if (xr_running_.load() || xr_thread_.joinable()) {
+    appendLog(tr("Disconnecting HMD before runtime switch"));
+    if (!shutdownXrSession(8000, /*stop_monado=*/false)) {
+      if (xr_thread_.joinable()) xr_thread_.detach();
+      xr_running_.store(false);
+    }
+    if (!shutting_down_.load()) syncDisconnectedUi(tr("Session ended"));
+  }
+  last_usb_hmd_count_ = -1;
+
+  // Leave an already-running monado-service / wivrn-server (and its user unit) alone.
+  if (monado_external_ || !monado_ || monado_->state() == QProcess::NotRunning) return;
+
+  appendLog(usingWivrn() ? tr("Stopping WiVRn") : tr("Stopping Monado"));
+  stopMonadoProcess();
+  if (monado_label_) monado_label_->setText(tr("Stopped"));
+}
+
+void HostWindow::setRuntimeKind(bool wivrn) {
+  const int next = wivrn ? 1 : 0;
+  if (runtime_kind_.load() == next) {
+    refreshRuntimeActions();
+    return;
+  }
+  releaseRuntimeForSwitch();
+  runtime_kind_.store(next);
+  rebuildConnectDeviceMenu();
+  runtime_json_ = findRuntimeJson();
+  if (!runtime_json_.isEmpty()) {
+    qputenv("XR_RUNTIME_JSON", runtime_json_.toUtf8());
+    if (runtime_label_) runtime_label_->setText(runtime_json_);
+  } else {
+    qunsetenv("XR_RUNTIME_JSON");
+    if (runtime_label_) runtime_label_->clear();
+  }
+  if (usingWivrn()) qunsetenv("XRT_COMPOSITOR_DESIRED_MODE");
+  refreshRuntimeActions();
+  saveAppConf();
+  appendLog(usingWivrn() ? tr("Runtime: WiVRn") : tr("Runtime: Monado"));
+  if (usingWivrn()) {
+    if (!shutting_down_.load()) startOwnedWivrn(/*allow_external_adopt=*/true);
+    return;
+  }
+  if (!shutting_down_.load() && !xr_running_.load()) {
+    setHealth("Wait", QStringLiteral("Waiting for USB HMD"));
+  }
+  if (!user_suppressed_auto_connect_ && !shutting_down_.load()) {
+    QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
+  }
+}
+
 QString HostWindow::findMonadoBinary() const {
   const QString from_path = QStandardPaths::findExecutable("monado-service");
   if (!from_path.isEmpty()) return from_path;
@@ -1153,9 +1285,33 @@ QString HostWindow::findMonadoBinary() const {
   return {};
 }
 
+QString HostWindow::findWivrnBinary() const {
+  const QString from_path = QStandardPaths::findExecutable(QStringLiteral("wivrn-server"));
+  if (!from_path.isEmpty()) return from_path;
+  const char* extra[] = {"/usr/local/bin/wivrn-server", "/usr/bin/wivrn-server", nullptr};
+  for (int i = 0; extra[i]; ++i) {
+    if (QFileInfo::exists(extra[i])) return extra[i];
+  }
+  return {};
+}
+
 QString HostWindow::findRuntimeJson() const {
+  if (usingWivrn()) {
+    const char* paths[] = {
+        "/usr/local/share/openxr/1/openxr_wivrn.json",
+        "/usr/share/openxr/1/openxr_wivrn.json",
+        nullptr,
+    };
+    for (int i = 0; paths[i]; ++i) {
+      if (QFileInfo::exists(paths[i])) return paths[i];
+    }
+    return {};
+  }
   const QByteArray env = qgetenv("XR_RUNTIME_JSON");
-  if (!env.isEmpty() && QFileInfo::exists(env)) return QString::fromUtf8(env);
+  if (!env.isEmpty() && QFileInfo::exists(env) &&
+      !QString::fromUtf8(env).contains(QStringLiteral("wivrn"))) {
+    return QString::fromUtf8(env);
+  }
   const char* paths[] = {
       "/usr/local/share/openxr/1/openxr_monado.json",
       "/usr/share/openxr/1/openxr_monado.json",
@@ -1214,6 +1370,68 @@ bool HostWindow::adoptExternalMonado() {
   appendLog(tr("Using external Monado (%1)").arg(monadoIpcPath()));
   QTimer::singleShot(300, this, [this] { maybeAutoConnectHeadset(); });
   return true;
+}
+
+bool HostWindow::isWivrnServerLive() const {
+  if (monado_ && monado_->state() != QProcess::NotRunning) return true;
+  QProcess probe;
+  probe.start(QStringLiteral("pgrep"), {QStringLiteral("-x"), QStringLiteral("wivrn-server")});
+  if (!probe.waitForFinished(800)) return false;
+  return probe.exitCode() == 0;
+}
+
+bool HostWindow::adoptExternalWivrn() {
+  if (monado_ && monado_->state() != QProcess::NotRunning) return true;
+  if (!isWivrnServerLive()) return false;
+  monado_external_ = true;
+  monado_label_->setText(tr("External"));
+  setHealth("Wait", "Using existing WiVRn");
+  appendLog(tr("Using external WiVRn"));
+  appendLog(tr("Start the headset app, then Connect"));
+  return true;
+}
+
+void HostWindow::startOwnedWivrn(bool allow_external_adopt) {
+  if (monado_->state() != QProcess::NotRunning) {
+    appendLog(tr("WiVRn already running"));
+    return;
+  }
+  if (allow_external_adopt && adoptExternalWivrn()) return;
+
+  const QString bin = findWivrnBinary();
+  if (bin.isEmpty()) {
+    monado_label_->setText(tr("No binary"));
+    setHealth("Error", "wivrn-server not found");
+    appendLog(tr("wivrn-server not in PATH"));
+    return;
+  }
+  runtime_json_ = findRuntimeJson();
+  if (runtime_json_.isEmpty()) {
+    appendLog(tr("openxr_wivrn.json not found"));
+  }
+  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  env.remove(QStringLiteral("XRT_COMPOSITOR_DESIRED_MODE"));
+  qunsetenv("XRT_COMPOSITOR_DESIRED_MODE");
+  if (!runtime_json_.isEmpty()) {
+    env.insert(QStringLiteral("XR_RUNTIME_JSON"), runtime_json_);
+    qputenv("XR_RUNTIME_JSON", runtime_json_.toUtf8());
+    runtime_label_->setText(runtime_json_);
+  }
+  monado_external_ = false;
+  monado_->setProcessEnvironment(env);
+  monado_->setProgram(bin);
+  monado_->setArguments({});
+  appendLog(tr("Start WiVRn: %1").arg(bin));
+  monado_->start();
+  if (!monado_->waitForStarted(3000)) {
+    monado_label_->setText(tr("Start failed"));
+    setHealth("Error", monado_->errorString());
+    appendLog(tr("Start failed: %1").arg(monado_->errorString()));
+    return;
+  }
+  monado_label_->setText(tr("Running pid %1").arg(monado_->processId()));
+  setHealth("Wait", "WiVRn up. Waiting for headset");
+  appendLog(tr("Start the headset app, then Connect"));
 }
 
 void HostWindow::applyMonadoPacingEnv(QProcessEnvironment& env) const {
@@ -1392,6 +1610,27 @@ bool HostWindow::ensureMonadoModeTable() {
 }
 
 void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_restart) {
+  if (usingWivrn()) {
+    if (QThread::currentThread() != thread()) {
+      QMetaObject::invokeMethod(
+          this, [this, from_ui] { applyPreferredRefreshRate(from_ui, false); }, Qt::QueuedConnection);
+      return;
+    }
+    if (from_ui) {
+      appendLog(tr("Refresh: %1").arg(preferred_hz_ <= 0 ? tr("Auto") : tr("%1 Hz").arg(preferred_hz_)));
+    }
+    std::lock_guard<std::mutex> lock(xr_app_mu_);
+    if (xr_app_ && xr_app_->has_display_refresh_rate_ext()) {
+      const float pref = preferred_hz_ <= 0 ? 0.f : static_cast<float>(preferred_hz_);
+      xr_app_->set_preferred_display_refresh_hz(pref);
+      if (!xr_app_->request_display_refresh_rate(pref)) {
+        appendLog(tr("OpenXR Hz switch failed"));
+      }
+    } else if (from_ui || force_monado_restart) {
+      appendLog(tr("WiVRn refresh follows the headset"));
+    }
+    return;
+  }
   // XR thread must not join itself via disconnect / Monado stop.
   if (QThread::currentThread() != thread()) {
     const bool ui = from_ui;
@@ -1542,6 +1781,10 @@ void HostWindow::maybeRestartMonadoForHz() {
 void HostWindow::startMonado() { startOwnedMonado(/*allow_external_adopt=*/true); }
 
 void HostWindow::startOwnedMonado(bool allow_external_adopt) {
+  if (usingWivrn()) {
+    startOwnedWivrn(allow_external_adopt);
+    return;
+  }
   if (monado_->state() != QProcess::NotRunning) {
     if (monado_hz_require_owned_) {
       appendLog(tr("Replace owned Monado with Hz mode"));
@@ -1644,26 +1887,28 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
 void HostWindow::stopMonado() {
   signalXrStop();
   if (monado_external_) {
-    appendLog(tr("External Monado left running"));
-    appendLog(tr("Or: systemctl --user stop monado.socket monado.service"));
+    if (usingWivrn()) {
+      appendLog(tr("External WiVRn left running"));
+      appendLog(tr("Or: systemctl --user stop wivrn.service"));
+    } else {
+      appendLog(tr("External Monado left running"));
+      appendLog(tr("Or: systemctl --user stop monado.socket monado.service"));
+    }
     if (!shutdownXrSession(8000, false)) {
       appendLog(tr("XR disconnect timeout"));
       if (xr_thread_.joinable()) xr_thread_.detach();
       xr_running_.store(false);
     }
     monado_external_ = false;
-    if (isMonadoIpcLive()) {
-      monado_label_->setText(tr("External"));
-    } else {
-      monado_label_->setText(tr("Stopped"));
-    }
+    const bool still_up = usingWivrn() ? isWivrnServerLive() : isMonadoIpcLive();
+    monado_label_->setText(still_up ? tr("External") : tr("Stopped"));
     if (!shutting_down_.load()) {
       setSessionChrome(false);
     }
     return;
   }
   if (monado_ && monado_->state() != QProcess::NotRunning) {
-    appendLog(tr("Stopping Monado"));
+    appendLog(usingWivrn() ? tr("Stopping WiVRn") : tr("Stopping Monado"));
   }
   if (!shutdownXrSession(8000, true)) {
     appendLog(tr("XR disconnect timeout"));
@@ -1700,8 +1945,15 @@ void HostWindow::onMonadoOutput() {
       skip_usb_addr_noise_cont = true;
       continue;
     }
-    const auto m = mode_re.match(line);
     const QString lower = line.toLower();
+    if (usingWivrn()) {
+      if (lower.contains(QStringLiteral("error")) || lower.contains(QStringLiteral("warn")) ||
+          lower.contains(QStringLiteral("fail"))) {
+        appendLog(line);
+      }
+      continue;
+    }
+    const auto m = mode_re.match(line);
     const bool interesting =
         m.hasMatch() || lower.contains(QStringLiteral("error")) || lower.contains(QStringLiteral("warn")) ||
         lower.contains(QStringLiteral("fail")) || lower.contains(QStringLiteral("desired_mode"));
@@ -1724,13 +1976,18 @@ void HostWindow::onMonadoOutput() {
 
 void HostWindow::onMonadoFinished(int code, QProcess::ExitStatus status) {
   monado_label_->setText(tr("Exit %1").arg(code));
-  appendLog(QString("monado-service exited code=%1 status=%2")
+  appendLog(QString("%1 exited code=%2 status=%3")
+                .arg(usingWivrn() ? QStringLiteral("wivrn-server") : QStringLiteral("monado-service"))
                 .arg(code)
                 .arg(status == QProcess::CrashExit ? "crash" : "normal"));
   if (monado_intentional_stop_ || shutting_down_.load()) {
     return;
   }
   if (code != 0) {
+    if (usingWivrn()) {
+      setHealth("Error", "WiVRn exited. See log");
+      return;
+    }
     if (isMonadoIpcLive()) {
       adoptExternalMonado();
       return;
@@ -1768,7 +2025,7 @@ void HostWindow::connectHeadset() {
   }
   if (!ensureMonadoReady()) {
     if (!shutting_down_.load()) {
-      syncDisconnectedUi(tr("Monado not responding"));
+      syncDisconnectedUi(usingWivrn() ? tr("WiVRn not responding") : tr("Monado not responding"));
     }
     monado_auto_connect_in_progress_ = false;
     if (!user_suppressed_auto_connect_) {
@@ -1853,7 +2110,8 @@ void HostWindow::xrThreadMain() {
 
   try {
     // Wait for Monado compositor IPC before touching OpenXR (avoids hung xrCreateInstance).
-    {
+    // WiVRn has no monado_comp_ipc; the server process is enough, then xrGetSystem waits for the headset.
+    if (!usingWivrn()) {
       const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
       bool logged_wait = false;
       while (!isMonadoIpcLive()) {

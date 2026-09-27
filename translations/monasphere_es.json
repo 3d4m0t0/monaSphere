@@ -17,6 +17,16 @@
     },
     {
       "context": "HostWindow",
+      "source": "Start WiVRn",
+      "translation": "WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stop WiVRn",
+      "translation": "Parar WiVRn"
+    },
+    {
+      "context": "HostWindow",
       "source": "Connect",
       "translation": "Conectar"
     },
@@ -404,6 +414,111 @@
       "context": "HostWindow",
       "source": "Waiting for USB HMD",
       "translation": "Esperando HMD USB"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for headset",
+      "translation": "Esperando visor"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn not responding",
+      "translation": "WiVRn no responde"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Runtime: WiVRn",
+      "translation": "Runtime: WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Runtime: Monado",
+      "translation": "Runtime: Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Disconnecting HMD before runtime switch",
+      "translation": "Desconectar HMD antes de cambiar"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn headset",
+      "translation": "Visor WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using external WiVRn",
+      "translation": "WiVRn existente"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using existing WiVRn",
+      "translation": "WiVRn existente"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start the headset app, then Connect",
+      "translation": "Abre la app del visor y conecta"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn already running",
+      "translation": "WiVRn ya está en marcha"
+    },
+    {
+      "context": "HostWindow",
+      "source": "wivrn-server not found",
+      "translation": "no está wivrn-server"
+    },
+    {
+      "context": "HostWindow",
+      "source": "wivrn-server not in PATH",
+      "translation": "wivrn-server no está en PATH"
+    },
+    {
+      "context": "HostWindow",
+      "source": "openxr_wivrn.json not found",
+      "translation": "no está openxr_wivrn.json"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start WiVRn: %1",
+      "translation": "WiVRn: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn up. Waiting for headset",
+      "translation": "WiVRn listo. Esperando visor"
+    },
+    {
+      "context": "HostWindow",
+      "source": "External WiVRn left running",
+      "translation": "WiVRn externo sigue activo"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Or: systemctl --user stop wivrn.service",
+      "translation": "O: systemctl --user stop wivrn.service"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stopping WiVRn",
+      "translation": "Deteniendo WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn exited. See log",
+      "translation": "WiVRn salió. Ver registro"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn refresh follows the headset",
+      "translation": "Hz de WiVRn sigue al visor"
+    },
+    {
+      "context": "HostWindow",
+      "source": "OpenXR Hz switch failed",
+      "translation": "Fallo al cambiar Hz OpenXR"
     },
     {
       "context": "HostWindow",

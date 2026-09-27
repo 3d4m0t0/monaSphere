@@ -17,6 +17,16 @@
     },
     {
       "context": "HostWindow",
+      "source": "Start WiVRn",
+      "translation": "WiVRn起動"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stop WiVRn",
+      "translation": "WiVRn停止"
+    },
+    {
+      "context": "HostWindow",
       "source": "Connect",
       "translation": "接続"
     },
@@ -404,6 +414,111 @@
       "context": "HostWindow",
       "source": "Waiting for USB HMD",
       "translation": "USB HMD を待っています"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for headset",
+      "translation": "ヘッドセット待ち"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn not responding",
+      "translation": "WiVRn 無応答"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Runtime: WiVRn",
+      "translation": "ランタイム: WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Runtime: Monado",
+      "translation": "ランタイム: Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Disconnecting HMD before runtime switch",
+      "translation": "切替前に HMD を切断"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn headset",
+      "translation": "WiVRn ヘッドセット"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using external WiVRn",
+      "translation": "起動済みの WiVRn を使用"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using existing WiVRn",
+      "translation": "既存の WiVRn を使用"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start the headset app, then Connect",
+      "translation": "ヘッドセット側を起動してから接続"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn already running",
+      "translation": "WiVRn は起動済み"
+    },
+    {
+      "context": "HostWindow",
+      "source": "wivrn-server not found",
+      "translation": "wivrn-server がありません"
+    },
+    {
+      "context": "HostWindow",
+      "source": "wivrn-server not in PATH",
+      "translation": "wivrn-server が PATH にありません"
+    },
+    {
+      "context": "HostWindow",
+      "source": "openxr_wivrn.json not found",
+      "translation": "openxr_wivrn.json がありません"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start WiVRn: %1",
+      "translation": "WiVRn起動: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn up. Waiting for headset",
+      "translation": "WiVRn 起動済み。ヘッドセット待ち"
+    },
+    {
+      "context": "HostWindow",
+      "source": "External WiVRn left running",
+      "translation": "外部 WiVRn は起動したまま"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Or: systemctl --user stop wivrn.service",
+      "translation": "または: systemctl --user stop wivrn.service"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stopping WiVRn",
+      "translation": "WiVRn 停止中"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn exited. See log",
+      "translation": "WiVRn が終了。ログを確認"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn refresh follows the headset",
+      "translation": "WiVRn の Hz はヘッドセットに従う"
+    },
+    {
+      "context": "HostWindow",
+      "source": "OpenXR Hz switch failed",
+      "translation": "OpenXR の Hz 切替に失敗"
     },
     {
       "context": "HostWindow",

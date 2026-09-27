@@ -17,6 +17,16 @@
     },
     {
       "context": "HostWindow",
+      "source": "Start WiVRn",
+      "translation": "啟動 WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stop WiVRn",
+      "translation": "停止 WiVRn"
+    },
+    {
+      "context": "HostWindow",
       "source": "Connect",
       "translation": "連接"
     },
@@ -404,6 +414,111 @@
       "context": "HostWindow",
       "source": "Waiting for USB HMD",
       "translation": "等待 USB HMD"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for headset",
+      "translation": "等待頭戴裝置"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn not responding",
+      "translation": "WiVRn 無回應"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Runtime: WiVRn",
+      "translation": "執行環境: WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Runtime: Monado",
+      "translation": "執行環境: Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Disconnecting HMD before runtime switch",
+      "translation": "切換前中斷 HMD"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn headset",
+      "translation": "WiVRn 頭戴裝置"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using external WiVRn",
+      "translation": "使用現有 WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Using existing WiVRn",
+      "translation": "使用現有 WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start the headset app, then Connect",
+      "translation": "先開啟頭戴應用，再連接"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn already running",
+      "translation": "WiVRn 已在執行"
+    },
+    {
+      "context": "HostWindow",
+      "source": "wivrn-server not found",
+      "translation": "找不到 wivrn-server"
+    },
+    {
+      "context": "HostWindow",
+      "source": "wivrn-server not in PATH",
+      "translation": "PATH 中沒有 wivrn-server"
+    },
+    {
+      "context": "HostWindow",
+      "source": "openxr_wivrn.json not found",
+      "translation": "找不到 openxr_wivrn.json"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Start WiVRn: %1",
+      "translation": "啟動 WiVRn: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn up. Waiting for headset",
+      "translation": "WiVRn 已啟動。等待頭戴裝置"
+    },
+    {
+      "context": "HostWindow",
+      "source": "External WiVRn left running",
+      "translation": "外部 WiVRn 保持執行"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Or: systemctl --user stop wivrn.service",
+      "translation": "或: systemctl --user stop wivrn.service"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Stopping WiVRn",
+      "translation": "正在停止 WiVRn"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn exited. See log",
+      "translation": "WiVRn 已結束。請看日誌"
+    },
+    {
+      "context": "HostWindow",
+      "source": "WiVRn refresh follows the headset",
+      "translation": "WiVRn 的 Hz 跟隨頭戴裝置"
+    },
+    {
+      "context": "HostWindow",
+      "source": "OpenXR Hz switch failed",
+      "translation": "OpenXR Hz 切換失敗"
     },
     {
       "context": "HostWindow",

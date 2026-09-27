@@ -19,6 +19,7 @@ class QPlainTextEdit;
 class QMenu;
 class QAction;
 class QActionGroup;
+class QRadioButton;
 
 namespace vrp {
 class XrVulkanApp;
@@ -67,6 +68,7 @@ class HostWindow : public QMainWindow {
   void onHzAction(QAction* action);
   void onShowHmdInfoToggled(bool checked);
   void showAboutDialog();
+  void onRuntimeChosen(bool wivrn);
 
  private:
   /** Start owned monado-service. If allow_adopt is false, never attach to a pre-existing IPC
@@ -110,7 +112,17 @@ class HostWindow : public QMainWindow {
   void requestHudPaint();
   void paintHudNow();
   QString findMonadoBinary() const;
+  QString findWivrnBinary() const;
   QString findRuntimeJson() const;
+  bool usingWivrn() const;
+  void setRuntimeKind(bool wivrn);
+  /** Disconnect an active HMD session, then stop only the runtime process this app started. */
+  void releaseRuntimeForSwitch();
+  void syncRuntimeRadios();
+  void refreshRuntimeActions();
+  bool isWivrnServerLive() const;
+  bool adoptExternalWivrn();
+  void startOwnedWivrn(bool allow_external_adopt);
   QString monadoIpcPath() const;
   bool isMonadoIpcLive() const;
   bool clearStaleMonadoSocket();
@@ -168,6 +180,13 @@ class HostWindow : public QMainWindow {
   QLabel* health_label_ = nullptr;
   QLabel* sync_status_label_ = nullptr;
   QPlainTextEdit* log_ = nullptr;
+
+  QRadioButton* runtime_monado_rb_ = nullptr;
+  QRadioButton* runtime_wivrn_rb_ = nullptr;
+  QAction* act_start_runtime_ = nullptr;
+  QAction* act_stop_runtime_ = nullptr;
+  bool runtime_ui_guard_ = false;
+  std::atomic<int> runtime_kind_{0};  // 0 Monado, 1 WiVRn
 
   QMenu* connect_menu_ = nullptr;
   QMenu* audio_menu_ = nullptr;
