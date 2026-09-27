@@ -7,7 +7,7 @@
 
 Name:           monasphere
 Version:        1.0.0
-Release:        1
+Release:        dev.20260927
 Summary:        Native Linux VR video player (OpenXR / Vulkan)
 License:        MIT
 Group:          Productivity/Multimedia/Video/Players
@@ -68,6 +68,8 @@ same SONAME on the user's system. This package does not promise a codec set.
 %{_datadir}/applications/monasphere.desktop
 
 %changelog
+* Sun Sep 27 2026 flex - 1.0.0-dev.20260927
+- WiVRn connect and AMD VA-API zero-copy added. Not yet verified.
 * Thu Sep 24 2026 flex - 1.0.0-1
 - Package monasphere 1.0.0.
 - Build with ffmpeg mini. Runtime codecs follow the installed FFmpeg SONAME.

@@ -5,7 +5,9 @@ Linux 向けのネイティブ VR 動画プレーヤーです。コマンド名�
 OpenXR（Monado）と Vulkan で HMD に映像を出します。
 HMD 映像内にファイルダイアログと再生コントロールの UI を持ち、各種操作が行えます。
 
-**版 1.0.0**
+**版 1.0.0-dev.20260927**
+
+二重起動の抑制を追加。WiVRn 接続と AMD 向け VA-API ゼロコピーを追加（動作確認はまだ）。
 
 ### English
 
@@ -14,7 +16,9 @@ A native VR video player for Linux. The command name is `monasphere`.
 Video is presented to the HMD with OpenXR (Monado) and Vulkan.
 The in-HMD UI provides a file dialog, playback controls, and related operations.
 
-**Version 1.0.0**
+**Version 1.0.0-dev.20260927**
+
+Single-instance launch added. WiVRn connect and AMD VA-API zero-copy added (not yet verified).
 
 ## AI の利用について
 
