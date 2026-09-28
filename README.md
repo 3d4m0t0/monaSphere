@@ -9,6 +9,7 @@ HMD 映像内にファイルダイアログと再生コントロールの UI を
 
 1.0.0-dev.20260927 からの更新:
 
+- Qt の GuiPrivate が使えない環境でもビルドできるようにした。使える環境では Wayland の前面表示を維持
 - 設定ファイルの扱いが誤っていたのを修正。設定は `monasphere.conf` にまとめた
 - シーク動作を改善
 - 保存したリフレッシュレートを、起動時に反映できていなかったのを修正
@@ -26,6 +27,7 @@ The in-HMD UI provides a file dialog, playback controls, and related operations.
 
 Changes since 1.0.0-dev.20260927:
 
+- The build succeeds when Qt GuiPrivate is unavailable. Wayland focus is kept where that API is usable
 - Fixed incorrect settings-file handling. Settings are kept in `monasphere.conf`
 - Seek behavior improved
 - Fixed the saved refresh rate not being applied at startup
