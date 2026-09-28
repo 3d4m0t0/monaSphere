@@ -23,7 +23,7 @@ class VrMenu {
   /** Sub-UI while playback controls are open. */
   enum class ControlsEdit : uint8_t {
     None = 0,
-    Volume = 1,      // A on volume → up/down adjusts
+    Volume = 1,      // up/down adjusts; A keeps it, B restores and closes
     FsrPick = 2,     // A on FSR → list; cursor applies live; A close / B revert
     FormatPick = 3,
     HzPick = 4,      // Auto / 90 / 120
@@ -214,6 +214,7 @@ class VrMenu {
   ProjectionMode pick_proj_ = ProjectionMode::Flat;
   StereoLayout pick_stereo_ = StereoLayout::Mono;
   FsrMode pick_fsr_ = FsrMode::Off;
+  float pick_volume_ = 0.2f;
 
   bool playing_ = false;
   double position_sec_ = 0;

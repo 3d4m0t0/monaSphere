@@ -689,7 +689,8 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
       back_held_sec_ = 0.f;
     } else {
       back_held_sec_ += dt;
-      if (!back_long_fired_ && controls_visible_ && controls_edit_ == ControlsEdit::None &&
+      // Rate reset stays available with the controls hidden. The file dialog uses B to go back.
+      if (!back_long_fired_ && !visible_ && controls_edit_ == ControlsEdit::None &&
           back_held_sec_ >= kBackLongPressSec) {
         back_long_fired_ = true;
         back_long_reset = true;
@@ -734,6 +735,11 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         bump();
         return out;
       }
+      if (controls_edit_ == ControlsEdit::Volume && volume_ != pick_volume_) {
+        out.volume_delta = pick_volume_ - volume_;
+        volume_ = pick_volume_;
+        save_volume();
+      }
       if (controls_edit_ == ControlsEdit::FsrPick && fsr_ != pick_fsr_) {
         // Restore mode from when the picker opened.
         fsr_ = pick_fsr_;
@@ -766,6 +772,15 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   }
 
   if (!visible_ && !controls_visible_) {
+    const bool stick_up = in.nav_up || in.stick_y > 0.55f;
+    const bool stick_down = in.nav_down || in.stick_y < -0.55f;
+    if (confirm && (stick_up != stick_down)) {
+      rate_ = step_playback_rate(rate_, stick_up ? +1 : -1);
+      out.rate_changed = true;
+      out.rate = rate_;
+      bump();
+      return out;
+    }
     if (confirm) {
       out.play_toggle = true;
     }
@@ -963,6 +978,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         }
         case kVolume:
           controls_edit_ = ControlsEdit::Volume;
+          pick_volume_ = volume_;
           break;
         case kFormat:
           controls_edit_ = ControlsEdit::FormatPick;

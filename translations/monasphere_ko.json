@@ -257,6 +257,11 @@
     },
     {
       "context": "monaSphere",
+      "source": "mono",
+      "translation": "모노"
+    },
+    {
+      "context": "monaSphere",
       "source": "Off",
       "translation": "끔"
     },
@@ -334,6 +339,121 @@
       "context": "monaSphere",
       "source": "A: open  B: back",
       "translation": "A: 열기  B: 뒤로"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Controls",
+      "translation": "조작"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Close",
+      "translation": "닫기"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Execute",
+      "translation": "실행"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Decide",
+      "translation": "결정"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Back",
+      "translation": "뒤로"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Cancel",
+      "translation": "취소"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Undo",
+      "translation": "되돌림"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Restart",
+      "translation": "재시작"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Faster",
+      "translation": "빠르게"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Slower",
+      "translation": "느리게"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Select",
+      "translation": "선택"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Volume",
+      "translation": "음량"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Start long-press",
+      "translation": "스타트 길게"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Recenter",
+      "translation": "리센터"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Start",
+      "translation": "스타트"
+    },
+    {
+      "context": "monaSphere",
+      "source": "File dialog",
+      "translation": "파일 창"
+    },
+    {
+      "context": "monaSphere",
+      "source": "button",
+      "translation": "버튼"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Playback controls",
+      "translation": "재생 조작"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Play or pause",
+      "translation": "재생/일시정지"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Seek",
+      "translation": "탐색"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Playback speed",
+      "translation": "재생 속도"
+    },
+    {
+      "context": "monaSphere",
+      "source": "long-press",
+      "translation": "길게"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Speed ×1",
+      "translation": "속도 1배"
     },
     {
       "context": "HostWindow",
@@ -942,8 +1062,18 @@
     },
     {
       "context": "HostWindow",
-      "source": "Input: gamepad (A OK, B back, Start menu)",
-      "translation": "입력: 패드 (A 결정 B 뒤로 Start 메뉴)"
+      "source": "SDL gamepad: %1 (%2)",
+      "translation": "SDL 패드: %1 (%2)"
+    },
+    {
+      "context": "HostWindow",
+      "source": "unknown connection",
+      "translation": "연결 불명"
+    },
+    {
+      "context": "HostWindow",
+      "source": "virtual",
+      "translation": "가상"
     },
     {
       "context": "HostWindow",

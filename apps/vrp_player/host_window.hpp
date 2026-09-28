@@ -77,6 +77,8 @@ class HostWindow : public QMainWindow {
   void startOwnedMonado(bool allow_external_adopt);
   void buildUi();
   void buildMenus();
+  /** Menu label: recognized SDL controller name, or the default when none is open. */
+  void refreshGamepadActionLabel();
   void restoreWindowGeometry();
   void saveWindowGeometry() const;
   void loadAppConf();
@@ -111,6 +113,8 @@ class HostWindow : public QMainWindow {
   void closeEvent(QCloseEvent* event) override;
   void requestHudPaint();
   void paintHudNow();
+  void showControlsHelp();
+  void hideControlsHelp();
   QString findMonadoBinary() const;
   QString findWivrnBinary() const;
   QString findRuntimeJson() const;
@@ -130,6 +134,8 @@ class HostWindow : public QMainWindow {
   QString selectedAudioDevice() const;
   void applyMonadoPacingEnv(QProcessEnvironment& env) const;
   void maybeRestartMonadoForHz();
+  /** Set DESIRED_MODE from hz= before the first compositor start. */
+  void resolvePreferredDisplayMode();
   int findModeIndexForHz(int hz) const;
   /** Fill mode table via vulkaninfo (HMD display) and/or monasphere.conf — before Monado start. */
   bool ensureMonadoModeTable();
@@ -151,13 +157,20 @@ class HostWindow : public QMainWindow {
   vrp::XrVulkanApp* xr_app_ = nullptr;  // non-owning; set only while XR thread runs
   std::mutex menu_mu_;
   vrp::VrMenu* vr_menu_ = nullptr;
+  std::atomic<bool> controls_help_{false};
+  std::atomic<int64_t> controls_help_until_ms_{0};
+  /** B that closed the help card is still down. Do not treat its release as a controls toggle. */
+  bool help_swallow_back_ = false;
   std::atomic<uint64_t> hud_paint_req_{0};
   std::atomic<uint64_t> hud_paint_done_{0};
   std::mutex hud_pixels_mu_;
   std::vector<uint8_t> hud_pixels_;
+  /** 0 none, 1 help, 2 file dialog, 3 playback controls. Guarded by hud_pixels_mu_. */
+  int hud_pixels_kind_ = 0;
   int hud_w_ = 1280;
   int hud_h_ = 720;
   uint64_t hud_pixels_gen_ = 0;
+  uint64_t hud_paint_serial_ = 0;
   std::atomic<bool> xr_stop_{false};
   std::atomic<bool> xr_running_{false};
   std::atomic<int> cmd_{0};  // 1 play, 2 seek-, 3 seek+, 4 recenter
@@ -198,6 +211,12 @@ class HostWindow : public QMainWindow {
   QAction* act_disconnect_ = nullptr;
   /** SDL gamepad route. Independent of the OpenXR pad profile. */
   std::atomic<bool> gamepad_enabled_{true};
+  /** XR thread holds SDL. The UI must not init/quit the subsystem then. */
+  std::atomic<bool> gamepad_sdl_owned_{false};
+  /** Confirm/back glyphs: PlayStation ×/○ while a Sony HMD or pad is connected. */
+  std::atomic<bool> face_sony_{false};
+  std::mutex gamepad_name_mu_;
+  QString gamepad_seen_name_;
   QActionGroup* controller_group_ = nullptr;
   QActionGroup* hand_group_ = nullptr;
   QActionGroup* audio_group_ = nullptr;

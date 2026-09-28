@@ -937,14 +937,14 @@ XrPosef yaw_position_pose(const XrPosef& head) {
 
 }  // namespace
 
-void XrVulkanApp::recenter() {
+bool XrVulkanApp::recenter() {
   if (!session_ || !view_space_ || !local_space_) {
     VRP_ERR("recenter: session/spaces not ready");
-    return;
+    return false;
   }
   if (last_display_time_ == 0) {
     VRP_ERR("recenter: no predicted display time yet（HMD 接続後に再度）");
-    return;
+    return false;
   }
 
   // Always locate against the identity LOCAL space — locating in app_space_ after a prior
@@ -953,14 +953,14 @@ void XrVulkanApp::recenter() {
   const XrResult lr = xrLocateSpace(view_space_, local_space_, last_display_time_, &loc);
   if (XR_FAILED(lr)) {
     VRP_ERR("recenter: xrLocateSpace failed (%d)", static_cast<int>(lr));
-    return;
+    return false;
   }
   const auto flags = loc.locationFlags;
   if ((flags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) == 0 ||
       (flags & XR_SPACE_LOCATION_POSITION_VALID_BIT) == 0) {
     VRP_ERR("recenter: head pose invalid (flags=0x%llx)",
             static_cast<unsigned long long>(flags));
-    return;
+    return false;
   }
 
   // New LOCAL origin at head position, yaw-only (keep horizon level for video).
@@ -977,15 +977,15 @@ void XrVulkanApp::recenter() {
   check_xr(xrCreateReferenceSpace(session_, &rsci, &app_space_), "recenter space");
   tracking_origin_inited_ = true;
   VRP_LOG("Recentered (LOCAL at head yaw/position)");
+  return true;
 }
 
-void XrVulkanApp::maybe_init_tracking_origin() {
-  if (tracking_origin_inited_ || !session_running_ || !session_focused_) return;
-  if (!tracking_valid_ || last_display_time_ == 0) return;
-  recenter();
-  if (tracking_origin_inited_) {
-    VRP_LOG("Tracking origin initialized (first valid head pose)");
-  }
+bool XrVulkanApp::maybe_init_tracking_origin() {
+  if (tracking_origin_inited_ || !session_running_ || !session_focused_) return false;
+  if (!tracking_valid_ || last_display_time_ == 0) return false;
+  if (!recenter()) return false;
+  VRP_LOG("Tracking origin initialized (first valid head pose)");
+  return true;
 }
 
 XrVulkanApp::InputState XrVulkanApp::poll_actions() {

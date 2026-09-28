@@ -257,10 +257,12 @@ void SceneRenderer::set_hud_texture(VkImageView view, VkSampler sampler, bool vi
   vkUpdateDescriptorSets(device_, 2, w, 0, nullptr);
 }
 
-void SceneRenderer::set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w) {
+void SceneRenderer::set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w,
+                                   float y_offset_m) {
   if (half_width_m > 0.05f) hud_half_w_ = half_width_m;
   if (distance_m > 0.3f) hud_distance_ = distance_m;
   if (aspect_h_over_w > 0.2f) hud_aspect_ = aspect_h_over_w;
+  hud_y_ = y_offset_m;
 }
 
 bool SceneRenderer::wait_previous_submit(uint64_t timeout_ns) {
@@ -566,6 +568,7 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     const float half_h = hud_half_w_ * hud_aspect_;
     hud_model.m[0] = hud_half_w_;
     hud_model.m[5] = half_h;
+    hud_model.m[13] = hud_y_;
     hud_model.m[14] = -hud_distance_;
     PushConstants hpc{};
     hpc.mvp = Mat4::mul(proj, Mat4::mul(view_mat, hud_model));

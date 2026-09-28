@@ -13,6 +13,8 @@ class GamepadInput {
   struct State {
     bool present = false;
     std::string name;
+    /** "USB", "Bluetooth", "virtual", or empty when the bus is unknown. */
+    std::string connection;
     float stick_x = 0.f;
     float stick_y = 0.f;  // +up
     bool confirm = false;  // A edge
@@ -25,6 +27,8 @@ class GamepadInput {
     bool seek_forward = false; // RB
     /** True while LB/RB key-repeat is active (after initial delay, until release). */
     bool seek_scrubbing = false;
+    /** PlayStation face buttons: confirm is ×, back is ○. */
+    bool sony_face = false;
   };
 
   GamepadInput();

@@ -257,6 +257,11 @@
     },
     {
       "context": "monaSphere",
+      "source": "mono",
+      "translation": "单声道"
+    },
+    {
+      "context": "monaSphere",
       "source": "Off",
       "translation": "关"
     },
@@ -334,6 +339,121 @@
       "context": "monaSphere",
       "source": "A: open  B: back",
       "translation": "A:打开  B:返回"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Controls",
+      "translation": "操作"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Close",
+      "translation": "关闭"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Execute",
+      "translation": "执行"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Decide",
+      "translation": "确定"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Back",
+      "translation": "返回"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Cancel",
+      "translation": "取消"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Undo",
+      "translation": "还原"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Restart",
+      "translation": "重启"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Faster",
+      "translation": "加快"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Slower",
+      "translation": "减慢"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Select",
+      "translation": "选择"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Volume",
+      "translation": "音量"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Start long-press",
+      "translation": "开始键长按"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Recenter",
+      "translation": "重置中心"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Start",
+      "translation": "开始键"
+    },
+    {
+      "context": "monaSphere",
+      "source": "File dialog",
+      "translation": "文件窗口 显示切换"
+    },
+    {
+      "context": "monaSphere",
+      "source": "button",
+      "translation": "键"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Playback controls",
+      "translation": "播放控制 显示切换"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Play or pause",
+      "translation": "播放/暂停"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Seek",
+      "translation": "跳转"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Playback speed",
+      "translation": "播放速度"
+    },
+    {
+      "context": "monaSphere",
+      "source": "long-press",
+      "translation": "长按"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Speed ×1",
+      "translation": "播放速度1倍"
     },
     {
       "context": "HostWindow",
@@ -942,8 +1062,18 @@
     },
     {
       "context": "HostWindow",
-      "source": "Input: gamepad (A OK, B back, Start menu)",
-      "translation": "输入: 手柄（A 确定 B 返回 Start 菜单）"
+      "source": "SDL gamepad: %1 (%2)",
+      "translation": "SDL 手柄: %1（%2）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "unknown connection",
+      "translation": "连接不明"
+    },
+    {
+      "context": "HostWindow",
+      "source": "virtual",
+      "translation": "虚拟"
     },
     {
       "context": "HostWindow",

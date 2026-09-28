@@ -257,6 +257,11 @@
     },
     {
       "context": "monaSphere",
+      "source": "mono",
+      "translation": "Mono"
+    },
+    {
+      "context": "monaSphere",
       "source": "Off",
       "translation": "Aus"
     },
@@ -334,6 +339,121 @@
       "context": "monaSphere",
       "source": "A: open  B: back",
       "translation": "A: öffnen  B: zurück"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Controls",
+      "translation": "Bedienung"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Close",
+      "translation": "Schließen"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Execute",
+      "translation": "Ausführen"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Decide",
+      "translation": "OK"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Back",
+      "translation": "Zurück"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Cancel",
+      "translation": "Abbrechen"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Undo",
+      "translation": "Zurück"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Restart",
+      "translation": "Neustart"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Faster",
+      "translation": "Schneller"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Slower",
+      "translation": "Langsamer"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Select",
+      "translation": "Wahl"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Volume",
+      "translation": "Lautstärke"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Start long-press",
+      "translation": "Start lang"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Recenter",
+      "translation": "Recenter"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Start",
+      "translation": "Start"
+    },
+    {
+      "context": "monaSphere",
+      "source": "File dialog",
+      "translation": "Dateidialog"
+    },
+    {
+      "context": "monaSphere",
+      "source": "button",
+      "translation": "Taste"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Playback controls",
+      "translation": "Wiedergabe"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Play or pause",
+      "translation": "Play/Pause"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Seek",
+      "translation": "Spulen"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Playback speed",
+      "translation": "Tempo"
+    },
+    {
+      "context": "monaSphere",
+      "source": "long-press",
+      "translation": "lang"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Speed ×1",
+      "translation": "Tempo ×1"
     },
     {
       "context": "HostWindow",
@@ -942,8 +1062,18 @@
     },
     {
       "context": "HostWindow",
-      "source": "Input: gamepad (A OK, B back, Start menu)",
-      "translation": "Eingabe: Pad (A OK, B zurück, Start Menü)"
+      "source": "SDL gamepad: %1 (%2)",
+      "translation": "SDL-Pad: %1 (%2)"
+    },
+    {
+      "context": "HostWindow",
+      "source": "unknown connection",
+      "translation": "Verbindung unbekannt"
+    },
+    {
+      "context": "HostWindow",
+      "source": "virtual",
+      "translation": "virtuell"
     },
     {
       "context": "HostWindow",

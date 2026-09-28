@@ -318,7 +318,14 @@ void HostWindow::maybeAutoConnectHeadset() {
 
   // Start Monado only when a single USB HMD is present (probe sees the real device).
   if (!isMonadoIpcLive()) {
+    // Restart just spawned our process; the socket appears after USB init.
+    // Calling start again only logs "already running" once per pending timer.
+    if (monado_ && monado_->state() != QProcess::NotRunning) {
+      QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
+      return;
+    }
     setHealth("Wait", "Starting Monado…");
+    resolvePreferredDisplayMode();
     if (monado_hz_require_owned_ || (preferred_hz_ > 0 && monado_desired_mode_ >= 0)) {
       startOwnedMonado(/*allow_external_adopt=*/false);
     } else {
@@ -327,9 +334,11 @@ void HostWindow::maybeAutoConnectHeadset() {
     return;
   }
 
-  // Prefer owned process when DESIRED_MODE must apply — don't silently adopt systemd.
-  if (monado_hz_require_owned_ &&
-      (!monado_ || monado_->state() == QProcess::NotRunning || monado_external_)) {
+  // A leftover compositor was not started with this hz=. Replace it before connecting.
+  resolvePreferredDisplayMode();
+  if (preferred_hz_ > 0 && monado_desired_mode_ >= 0 &&
+      (monado_hz_require_owned_ || monado_external_ || !monado_ ||
+       monado_->state() == QProcess::NotRunning)) {
     appendLog(tr("Auto-connect: replace external Monado for Hz"));
     restartOwnedMonadoForHz();
     return;
@@ -377,6 +386,20 @@ void HostWindow::syncDisconnectedUi(const QString& detail) {
   rebuildConnectDeviceMenu();
 }
 
+void HostWindow::showControlsHelp() {
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+  controls_help_until_ms_.store(ms + 12000);
+  controls_help_.store(true);
+  requestHudPaint();
+}
+
+void HostWindow::hideControlsHelp() {
+  if (!controls_help_.exchange(false)) return;
+  requestHudPaint();
+}
+
 void HostWindow::requestHudPaint() {
   hud_paint_req_.fetch_add(1);
   QMetaObject::invokeMethod(this, [this] { paintHudNow(); }, Qt::QueuedConnection);
@@ -391,14 +414,26 @@ void HostWindow::paintHudNow() {
   }
   if (!menu) return;
   const auto snap = menu->snapshot();
-  if (!snap.visible && !snap.controls_visible) {
+  const bool help = controls_help_.load();
+  const int kind = help ? 1 : snap.visible ? 2 : snap.controls_visible ? 3 : 0;
+  if (kind == 0) {
     std::lock_guard<std::mutex> lock(hud_pixels_mu_);
     hud_pixels_.clear();
+    hud_pixels_kind_ = 0;
     hud_pixels_gen_ = snap.gen;
     hud_paint_done_.store(snap.gen);
     return;
   }
-  QImage img = vrp::paint_vr_menu(snap, hud_w_, hud_h_);
+  int seconds_left = 0;
+  if (help) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    const int64_t left_ms = controls_help_until_ms_.load() - ms;
+    seconds_left = left_ms <= 0 ? 0 : static_cast<int>((left_ms + 999) / 1000);
+  }
+  QImage img = help ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load())
+                    : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load());
   if (img.format() != QImage::Format_RGBA8888) img = img.convertToFormat(QImage::Format_RGBA8888);
   {
     std::lock_guard<std::mutex> lock(hud_pixels_mu_);
@@ -407,7 +442,8 @@ void HostWindow::paintHudNow() {
       std::memcpy(hud_pixels_.data() + static_cast<size_t>(y * hud_w_ * 4), img.constScanLine(y),
                   static_cast<size_t>(hud_w_ * 4));
     }
-    hud_pixels_gen_ = snap.gen;
+    hud_pixels_kind_ = kind;
+    hud_pixels_gen_ = ++hud_paint_serial_;
   }
   hud_paint_done_.store(snap.gen);
 }
@@ -891,9 +927,25 @@ void HostWindow::buildMenus() {
     setMonasphereConfKey(QStringLiteral("gamepad"), on ? QStringLiteral("1") : QStringLiteral("0"));
     appendLog(on ? tr("SDL gamepad on") : tr("SDL gamepad off"));
   });
+  connect(settings, &QMenu::aboutToShow, this, [this] { refreshGamepadActionLabel(); });
 
   auto* help = menuBar()->addMenu(tr("Help"));
   help->addAction(tr("About"), this, &HostWindow::showAboutDialog);
+}
+
+void HostWindow::refreshGamepadActionLabel() {
+  if (!act_gamepad_) return;
+  QString name;
+  if (gamepad_sdl_owned_.load()) {
+    std::lock_guard<std::mutex> lock(gamepad_name_mu_);
+    name = gamepad_seen_name_;
+  } else {
+    const auto names = vrp::GamepadInput::list_names();
+    if (!names.empty()) name = QString::fromStdString(names.front());
+  }
+  if (name.isEmpty()) name = tr("SDL gamepad");
+  else name.replace(QLatin1Char('&'), QStringLiteral("&&"));
+  act_gamepad_->setText(name);
 }
 
 void HostWindow::showAboutDialog() {
@@ -1108,7 +1160,6 @@ void HostWindow::onHzAction(QAction* action) {
     if (vr_menu_) vr_menu_->set_preferred_hz(hz);
   }
   requestHudPaint();
-  appendLog(tr("Refresh: %1").arg(hz <= 0 ? tr("Auto") : tr("%1 Hz").arg(hz)));
   applyPreferredRefreshRate(/*from_ui=*/true, /*force_monado_restart=*/true);
 }
 
@@ -1671,6 +1722,13 @@ void HostWindow::applyMonadoPacingEnv(QProcessEnvironment& env) const {
   }
 }
 
+void HostWindow::resolvePreferredDisplayMode() {
+  if (usingWivrn() || preferred_hz_ <= 0 || monado_desired_mode_ >= 0) return;
+  if (monado_mode_hz_.isEmpty()) ensureMonadoModeTable();
+  const int idx = findModeIndexForHz(preferred_hz_);
+  if (idx >= 0) monado_desired_mode_ = idx;
+}
+
 int HostWindow::findModeIndexForHz(int hz) const {
   if (hz <= 0 || monado_mode_hz_.isEmpty()) return -1;
   int best = -1;
@@ -2030,8 +2088,11 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
       return;
     }
   }
+  resolvePreferredDisplayMode();
   // When DESIRED_MODE must stick, never attach to a pre-existing service.
-  if (monado_hz_require_owned_) allow_external_adopt = false;
+  if (monado_hz_require_owned_ || (preferred_hz_ > 0 && monado_desired_mode_ >= 0)) {
+    allow_external_adopt = false;
+  }
   if (allow_external_adopt && adoptExternalMonado()) return;
 
   clearStaleMonadoSocket();
@@ -2479,6 +2540,7 @@ void HostWindow::xrThreadMain() {
     bool gamepad_was = false;
     bool gamepad_logged = false;
     std::string last_gamepad_name;
+    std::string last_gamepad_connection;
 
     std::atomic<bool> preview_busy{false};
     std::string preview_path_done;
@@ -2664,6 +2726,7 @@ void HostWindow::xrThreadMain() {
     bool force_fsr_refresh = true;
 
     while (!xr_stop_.load() && xr.pump_events()) {
+      bool help_shown = false;
       auto now = std::chrono::steady_clock::now();
       double dt = std::chrono::duration<double>(now - last).count();
       last = now;
@@ -2690,8 +2753,9 @@ void HostWindow::xrThreadMain() {
         decoder.seek_relative(10.0);
         audio.pause();
       }
-      if (cmd == 4) {
-        xr.recenter();
+      if (cmd == 4 && xr.recenter()) {
+        showControlsHelp();
+        help_shown = true;
       }
 
       const int p = proj_req_.exchange(-1);
@@ -2731,18 +2795,34 @@ void HostWindow::xrThreadMain() {
       }
 
       auto input = xr.poll_actions();
+      bool pad_sony = false;
       const bool want_gamepad = gamepad_enabled_.load();
       if (want_gamepad) {
+        gamepad_sdl_owned_.store(true);
         if (gamepad.ensure_open()) {
-          if (!gamepad_logged) {
-            gamepad_logged = true;
-            QMetaObject::invokeMethod(
-                this, [this] { appendLog(tr("Input: gamepad (A OK, B back, Start menu)")); },
-                Qt::QueuedConnection);
-          }
           const auto gp = gamepad.poll();
           if (gp.present) {
+            if (gp.name != last_gamepad_name || gp.connection != last_gamepad_connection) {
+              const QString name = QString::fromStdString(gp.name);
+              const QString how = QString::fromStdString(gp.connection);
+              QMetaObject::invokeMethod(
+                  this,
+                  [this, name, how] {
+                    const QString shown = name.isEmpty() ? tr("SDL gamepad") : name;
+                    QString method = how;
+                    if (method.isEmpty()) method = tr("unknown connection");
+                    else if (method == QLatin1String("virtual")) method = tr("virtual");
+                    appendLog(tr("SDL gamepad: %1 (%2)").arg(shown, method));
+                  },
+                  Qt::QueuedConnection);
+            }
             last_gamepad_name = gp.name;
+            last_gamepad_connection = gp.connection;
+            pad_sony = gp.sony_face;
+            {
+              std::lock_guard<std::mutex> lock(gamepad_name_mu_);
+              gamepad_seen_name_ = QString::fromStdString(gp.name);
+            }
             // Leave the HMD stick alone while the gamepad stick is centered.
             if (std::fabs(gp.stick_x) > 0.15f || std::fabs(gp.stick_y) > 0.15f) {
               input.stick_x = gp.stick_x;
@@ -2759,28 +2839,64 @@ void HostWindow::xrThreadMain() {
             input.recenter = input.recenter || gp.recenter;
           } else {
             last_gamepad_name.clear();
+            last_gamepad_connection.clear();
+            std::lock_guard<std::mutex> lock(gamepad_name_mu_);
+            gamepad_seen_name_.clear();
           }
-        } else if (!gamepad_logged) {
-          gamepad_logged = true;
-          QMetaObject::invokeMethod(
-              this, [this] { appendLog(tr("Gamepad open failed. Recenter only")); }, Qt::QueuedConnection);
+        } else {
+          last_gamepad_name.clear();
+          last_gamepad_connection.clear();
+          {
+            std::lock_guard<std::mutex> lock(gamepad_name_mu_);
+            gamepad_seen_name_.clear();
+          }
+          if (!gamepad_logged) {
+            gamepad_logged = true;
+            QMetaObject::invokeMethod(
+                this, [this] { appendLog(tr("Gamepad open failed. Recenter only")); }, Qt::QueuedConnection);
+          }
         }
       } else if (gamepad_was) {
         gamepad.close();
+        gamepad_sdl_owned_.store(false);
         gamepad_logged = false;
         last_gamepad_name.clear();
+        last_gamepad_connection.clear();
+        std::lock_guard<std::mutex> lock(gamepad_name_mu_);
+        gamepad_seen_name_.clear();
       }
       gamepad_was = want_gamepad;
+      {
+        bool hmd_sony = false;
+        const auto st = xr.status();
+        if (st.vendor_id == 0x054Cu) {
+          hmd_sony = true;
+        } else {
+          std::string n = st.system_name;
+          for (char& c : n) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+          }
+          hmd_sony = n.find("playstation") != std::string::npos || n.find("psvr") != std::string::npos;
+        }
+        const bool sony = hmd_sony || pad_sony;
+        if (face_sony_.exchange(sony) != sony) requestHudPaint();
+      }
       decoder.set_seek_scrubbing(input.seek_scrubbing);
 
       vrp::VrMenu::PadInput pad;
-      pad.stick_x = input.stick_x;
-      pad.stick_y = input.stick_y;
-      pad.confirm = input.confirm;
-      pad.confirm_held = input.confirm_held;
-      pad.back = input.back;
-      pad.back_held = input.back_held;
-      pad.menu_toggle = input.menu_toggle;
+      if (help_swallow_back_ && !input.back_held && !input.back) help_swallow_back_ = false;
+      // While the help card is up, B only closes it. Its release must not open playback controls.
+      if (!controls_help_.load()) {
+        pad.stick_x = input.stick_x;
+        pad.stick_y = input.stick_y;
+        pad.confirm = input.confirm;
+        pad.confirm_held = input.confirm_held;
+        pad.menu_toggle = input.menu_toggle;
+        if (!help_swallow_back_) {
+          pad.back = input.back;
+          pad.back_held = input.back_held;
+        }
+      }
       const bool menu_was = menu.visible();
       const bool controls_was = menu.controls_visible();
       const auto menu_out = menu.update(pad, static_cast<float>(dt));
@@ -2929,8 +3045,9 @@ void HostWindow::xrThreadMain() {
         decoder.start_presentation();
       }
 
-      if (input.recenter) {
-        xr.recenter();
+      if (input.recenter && xr.recenter()) {
+        showControlsHelp();
+        help_shown = true;
       }
 
       menu.set_playback(decoder.is_playing() || decoder.is_priming(), decoder.position());
@@ -3025,7 +3142,34 @@ void HostWindow::xrThreadMain() {
         (void)xrEndFrame(xr.session(), &ei);
         break;
       }
-      xr.maybe_init_tracking_origin();
+      if (xr.maybe_init_tracking_origin()) {
+        showControlsHelp();
+        help_shown = true;
+      }
+      {
+        const auto now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        const int64_t left_ms = controls_help_until_ms_.load() - now_ms;
+        const int sec = left_ms <= 0 ? 0 : static_cast<int>((left_ms + 999) / 1000);
+        static int help_drawn_sec = -1;
+        if (!controls_help_.load()) {
+          help_drawn_sec = -1;
+        } else if (help_shown) {
+          help_drawn_sec = sec;
+        } else if (sec != help_drawn_sec) {
+          help_drawn_sec = sec;
+          requestHudPaint();
+        }
+        if (!help_shown && controls_help_.load()) {
+          const bool used = input.confirm || input.back || input.menu_toggle || input.seek_back ||
+                            input.seek_forward || std::fabs(input.stick_x) > 0.55f ||
+                            std::fabs(input.stick_y) > 0.55f;
+          if (used || now_ms >= controls_help_until_ms_.load()) {
+            if (input.back || input.back_held) help_swallow_back_ = true;
+            hideControlsHelp();
+          }
+        }
+      }
 
       // Only wait when rebinding — avoid stalling every XR frame.
       if (!opt_.clear_only && decoder.is_open()) {
@@ -3107,7 +3251,11 @@ void HostWindow::xrThreadMain() {
       // HMD menu panel texture
       {
         static uint64_t uploaded_gen = 0;
+        // 0 none, 1 help, 2 file dialog, 3 playback controls.
+        static int shown_kind = 0;
+        static int upload_kind = 0;
         vrp::VideoFrame hud_frame;
+        int frame_kind = 0;
         bool have = false;
         {
           std::lock_guard<std::mutex> lock(hud_pixels_mu_);
@@ -3115,31 +3263,43 @@ void HostWindow::xrThreadMain() {
             hud_frame.width = hud_w_;
             hud_frame.height = hud_h_;
             hud_frame.rgba = hud_pixels_;
+            frame_kind = hud_pixels_kind_;
             uploaded_gen = hud_pixels_gen_;
             have = true;
-          } else if (hud_pixels_.empty() && !menu.visible() && !menu.controls_visible()) {
-            scene.set_hud_texture(VK_NULL_HANDLE, VK_NULL_HANDLE, false);
           }
         }
-        if (have) {
+        const bool help_on = controls_help_.load();
+        const int want_kind = help_on ? 1 : menu.visible() ? 2 : menu.controls_visible() ? 3 : 0;
+        // Finish the previous upload before starting another, so the completed image
+        // keeps the kind it was uploaded with.
+        if (hud_tex.poll_present()) shown_kind = upload_kind;
+        if (have && frame_kind == want_kind && want_kind != 0) {
           (void)scene.wait_previous_submit(5'000'000ull);
-          if (hud_tex.try_upload(hud_frame)) {
-            /* wait for present */
-          }
+          if (hud_tex.try_upload(hud_frame)) upload_kind = want_kind;
         }
-        const bool hud_on = menu.visible() || menu.controls_visible();
-        // HMD UI distance is fixed; only panel size/aspect differ by mode.
+        // The HUD mesh is already 16:9. Aspect 1 keeps texture pixels square;
+        // 1.05 matches the file dialog (slightly taller than the pixel grid).
         constexpr float kHudDistanceM = 1.5f;
-        if (menu.visible()) {
-          // Narrower + taller panel for file manager.
-          scene.set_hud_layout(0.48f, kHudDistanceM, 1.05f);
-        } else if (menu.controls_visible()) {
-          scene.set_hud_layout(0.72f, kHudDistanceM, 720.f / 1280.f);
-        }
-        if (hud_tex.poll_present()) {
-          scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), hud_on);
+        constexpr float kHudAspect = 1.05f;
+        auto apply_layout = [&](int kind) {
+          if (kind == 1 || kind == 2) {
+            scene.set_hud_layout(0.70f, kHudDistanceM, kHudAspect);
+          } else if (kind == 3) {
+            // Keep the bar's bottom edge where it was before the aspect correction.
+            constexpr float kControlsHalfW = 0.72f;
+            constexpr float kOldAspect = 720.f / 1280.f;
+            const float y = kControlsHalfW * (kHudAspect - kOldAspect);
+            scene.set_hud_layout(kControlsHalfW, kHudDistanceM, kHudAspect, y);
+          }
+        };
+        // A different panel's image is still the one on the GPU. Hide until the new one presents.
+        if (want_kind != 0 && shown_kind == want_kind) {
+          apply_layout(want_kind);
+          scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), true);
         } else {
-          scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), hud_on && hud_tex.width() > 0);
+          if (shown_kind != 0) apply_layout(shown_kind);
+          scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), false);
+          if (want_kind == 0) shown_kind = 0;
         }
       }
 

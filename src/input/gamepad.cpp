@@ -2,6 +2,8 @@
 
 #include "common.hpp"
 
+#include <fstream>
+
 #if defined(VRP_HAS_SDL2)
 #include <SDL.h>
 #endif
@@ -10,6 +12,47 @@ namespace vrp {
 
 namespace {
 constexpr auto kStartLongPress = std::chrono::milliseconds(700);
+
+#if defined(VRP_HAS_SDL2)
+std::string connection_from_bustype(unsigned bus) {
+  switch (bus) {
+    case 0x03:
+      return "USB";
+    case 0x05:
+      return "Bluetooth";
+    case 0x06:
+    case 0xff:
+      return "virtual";
+    default:
+      return {};
+  }
+}
+
+std::string gamepad_connection(SDL_GameController* gc) {
+  if (!gc) return {};
+  if (const char* path = SDL_GameControllerPath(gc)) {
+    const char* slash = std::strrchr(path, '/');
+    const char* base = slash ? slash + 1 : path;
+    const bool evdev = std::strncmp(base, "event", 5) == 0;
+    const bool js = std::strncmp(base, "js", 2) == 0;
+    if (evdev || js) {
+      std::ifstream in(std::string("/sys/class/input/") + base + "/device/id/bustype");
+      unsigned bus = 0;
+      if (in >> std::hex >> bus) {
+        if (const std::string how = connection_from_bustype(bus); !how.empty()) return how;
+      }
+    }
+  }
+  if (SDL_Joystick* joy = SDL_GameControllerGetJoystick(gc)) {
+    const SDL_JoystickGUID guid = SDL_JoystickGetGUID(joy);
+    const unsigned bus = static_cast<unsigned>(guid.data[0]) |
+                         (static_cast<unsigned>(guid.data[1]) << 8);
+    if (const std::string how = connection_from_bustype(bus); !how.empty()) return how;
+    if (SDL_JoystickCurrentPowerLevel(joy) == SDL_JOYSTICK_POWER_WIRED) return "USB";
+  }
+  return {};
+}
+#endif
 }
 
 GamepadInput::GamepadInput() {
@@ -70,7 +113,8 @@ bool GamepadInput::ensure_open() {
     controller_ = gc;
     device_index_ = i;
     const char* name = SDL_GameControllerName(gc);
-    VRP_LOG("Gamepad opened: %s (index %d)", name ? name : "(unnamed)", i);
+    const std::string how = gamepad_connection(gc);
+    VRP_LOG("Gamepad opened: %s (%s)", name ? name : "(unnamed)", how.empty() ? "unknown" : how.c_str());
     return true;
   }
   return false;
@@ -101,6 +145,10 @@ GamepadInput::State GamepadInput::poll() {
   auto* gc = static_cast<SDL_GameController*>(controller_);
   st.present = true;
   if (const char* name = SDL_GameControllerName(gc)) st.name = name;
+  st.connection = gamepad_connection(gc);
+  const SDL_GameControllerType pad_type = SDL_GameControllerGetType(gc);
+  st.sony_face = pad_type == SDL_CONTROLLER_TYPE_PS3 || pad_type == SDL_CONTROLLER_TYPE_PS4 ||
+                 pad_type == SDL_CONTROLLER_TYPE_PS5 || SDL_GameControllerGetVendor(gc) == 0x054C;
 
   auto axis = [&](SDL_GameControllerAxis a) -> float {
     const Sint16 v = SDL_GameControllerGetAxis(gc, a);

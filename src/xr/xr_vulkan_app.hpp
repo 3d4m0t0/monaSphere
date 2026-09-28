@@ -94,9 +94,10 @@ class XrVulkanApp {
   std::vector<ViewSwapchain>& swapchains() { return swapchains_; }
 
   // Place LOCAL origin at current head (yaw+position). Call after a successful begin_frame.
-  void recenter();
+  // False when the session or the head pose is not ready.
+  bool recenter();
   /** Auto-recenter once when head tracking first becomes valid (session focus). */
-  void maybe_init_tracking_origin();
+  bool maybe_init_tracking_origin();
   XrTime last_display_time() const { return last_display_time_; }
 
   struct XrStatus {

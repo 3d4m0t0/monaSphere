@@ -25,8 +25,9 @@ class SceneRenderer {
   void set_nv12_texture(VkImageView y, VkImageView uv, VkSampler sampler, bool full_range = false);
   /** HUD panel (RGBA). Empty view clears overlay. */
   void set_hud_texture(VkImageView view, VkSampler sampler, bool visible);
-  /** World size of the HUD quad (half-width meters, distance meters, height/width aspect). */
-  void set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w = 0.f);
+  /** World size of the HUD quad. y_offset_m shifts the quad up. */
+  void set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w = 0.f,
+                      float y_offset_m = 0.f);
   /** Wait for previous eye submit. Returns false on timeout (do not rewrite descriptors). */
   bool wait_previous_submit(uint64_t timeout_ns = 8'000'000ull);
 
@@ -84,7 +85,8 @@ class SceneRenderer {
   bool hud_visible_ = false;
   float hud_distance_ = 1.5f;
   float hud_half_w_ = 0.55f;
-  float hud_aspect_ = 720.f / 1280.f;
+  float hud_aspect_ = 1.05f;
+  float hud_y_ = 0.f;
   VkFence submit_fence_ = VK_NULL_HANDLE;
 };
 
