@@ -103,6 +103,8 @@ class HostWindow : public QMainWindow {
   /** USB 上の既知 HMD 一覧 / 台数。 */
   std::vector<UsbHmdInfo> listConnectedHmds() const;
   int countConnectedHmds() const;
+  /** PSVR2 (054c:0ee8) が USB にある。 */
+  bool psvr2UsbPresent() const;
   /**
    * デスクトップの直接表示一覧に HMD が出るまで Monado を起動しない。
    * Wayland なら DRM リース、Wayland が無い X11 なら RandR の non-desktop。
@@ -118,6 +120,9 @@ class HostWindow : public QMainWindow {
   /** この HMD は Monado が直接表示で出す種類か。 */
   bool connectedHmdUsesDrmLease() const;
   bool displayLeaseMatches(const DrmLeaseProbeResult& probe) const;
+  /** PSVR2: Monado の画面取り込み完了後、少し待ってから OpenXR へ進む。 */
+  bool deferUntilPsvr2CompositorSettled();
+  void notePsvr2DisplayGrabbed(const QString& line);
   /** USB をポーリングし、実機 HMD 1 台＋Monado 準備で自動接続。 */
   void maybeAutoConnectHeadset();
   /** 自動接続後の OpenXR system 名を検証（Simulated なら切断して再待機）。 */
@@ -265,6 +270,9 @@ class HostWindow : public QMainWindow {
   bool display_direct_is_x11_ = false;
   /** 表示環境（Wayland / X11）をこの接続サイクルで一度出した。 */
   bool display_env_logged_ = false;
+  bool psvr2_grab_wait_logged_ = false;
+  /** Monado がスワップチェーンまたは最初のフレームまで進んだ時刻。0 は未了。 */
+  qint64 psvr2_compositor_ready_ms_ = 0;
   bool monado_intentional_stop_ = false;  // terminate/kill 時の finished を異常扱いしない
   int last_usb_hmd_count_ = -1;
   qint64 monado_auto_connect_cooldown_ms_ = 0;

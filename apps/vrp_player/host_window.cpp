@@ -257,6 +257,13 @@ std::vector<UsbHmdInfo> HostWindow::listConnectedHmds() const {
   return out;
 }
 
+bool HostWindow::psvr2UsbPresent() const {
+  for (const auto& h : listConnectedHmds()) {
+    if (h.vid == 0x054c && h.pid == 0x0ee8) return true;
+  }
+  return false;
+}
+
 bool HostWindow::connectedHmdUsesDrmLease() const {
   if (usingWivrn()) return false;
   bool any = false;
@@ -405,6 +412,41 @@ bool HostWindow::restartMonadoAfterDisplayLatch() {
   return true;
 }
 
+void HostWindow::notePsvr2DisplayGrabbed(const QString& line) {
+  if (psvr2_compositor_ready_ms_ > 0 || !psvr2UsbPresent()) return;
+  const bool grabbed = line.contains(QStringLiteral("Started vblank event thread")) ||
+                       line.contains(QStringLiteral("Not using vblank event thread")) ||
+                       line.contains(QStringLiteral("Compositor probably missed frame"));
+  if (!grabbed) return;
+  psvr2_compositor_ready_ms_ = QDateTime::currentMSecsSinceEpoch();
+  appendLog(tr("PSVR2 display grabbed"));
+}
+
+bool HostWindow::deferUntilPsvr2CompositorSettled() {
+  // An already-running external compositor grabbed the display before we connected.
+  if (!psvr2UsbPresent() || monado_external_) {
+    psvr2_grab_wait_logged_ = false;
+    return false;
+  }
+  // Let NVIDIA finish the modeset before the app's vkCreateInstance.
+  constexpr qint64 kSettleMs = 2000;
+  const qint64 now = QDateTime::currentMSecsSinceEpoch();
+  if (psvr2_compositor_ready_ms_ <= 0 || now - psvr2_compositor_ready_ms_ < kSettleMs) {
+    if (!psvr2_grab_wait_logged_) {
+      psvr2_grab_wait_logged_ = true;
+      appendLog(tr("Waiting for Monado to grab the PSVR2 display"));
+    }
+    setHealth("Wait", psvr2_compositor_ready_ms_ > 0 ? "PSVR2 display grabbed"
+                                                     : "Waiting for PSVR2 display grab");
+    if (!user_suppressed_auto_connect_) {
+      QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
+    }
+    return true;
+  }
+  psvr2_grab_wait_logged_ = false;
+  return false;
+}
+
 bool HostWindow::isPlaceholderHmdName(const QString& system_name) {
   const QString n = system_name.trimmed().toLower();
   if (n.isEmpty() || n == QStringLiteral("(unknown hmd)") || n == QStringLiteral("未検出")) return true;
@@ -446,6 +488,8 @@ void HostWindow::maybeAutoConnectHeadset() {
     display_lease_restart_ = false;
     display_direct_is_x11_ = false;
     display_env_logged_ = false;
+    psvr2_grab_wait_logged_ = false;
+    psvr2_compositor_ready_ms_ = 0;
     if (prev == 1 && !monado_external_ && monado_ && monado_->state() != QProcess::NotRunning) {
       appendLog(tr("USB HMD removed — stop Monado"));
       stopMonadoProcess();
@@ -472,7 +516,7 @@ void HostWindow::maybeAutoConnectHeadset() {
   }
 
   // Wayland direct mode reads the compositor lease list once. An empty list
-  // falls back to a desktop window for the life of that process. X11 uses RandR.
+  // falls back to a desktop window for the life of that process.
   if (deferUntilDisplayLeaseReady()) return;
   if (restartMonadoAfterDisplayLatch()) return;
 
@@ -503,6 +547,8 @@ void HostWindow::maybeAutoConnectHeadset() {
     restartOwnedMonadoForHz();
     return;
   }
+
+  if (deferUntilPsvr2CompositorSettled()) return;
 
   monado_auto_connect_in_progress_ = true;
   connectHeadset();
@@ -625,6 +671,8 @@ void HostWindow::stopMonadoProcess() {
   }
   monado_intentional_stop_ = false;
   clearStaleMonadoSocket();
+  psvr2_compositor_ready_ms_ = 0;
+  psvr2_grab_wait_logged_ = false;
 }
 
 void HostWindow::stopSystemdMonadoForOwnedStart() {
@@ -2310,6 +2358,8 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
   monado_multi_hmd_logged_ = false;
   monado_simulated_reject_logged_ = false;
   monado_auto_connect_cooldown_ms_ = 0;
+  psvr2_compositor_ready_ms_ = 0;
+  psvr2_grab_wait_logged_ = false;
   monado_->setProcessEnvironment(env);
   monado_->setProgram(bin);
   {
@@ -2393,6 +2443,7 @@ void HostWindow::onMonadoOutput() {
       skip_usb_addr_noise_cont = true;
       continue;
     }
+    notePsvr2DisplayGrabbed(trimmed);
     const QString lower = line.toLower();
     if (usingWivrn()) {
       if (lower.contains(QStringLiteral("error")) || lower.contains(QStringLiteral("warn")) ||
@@ -2467,6 +2518,10 @@ void HostWindow::connectHeadset() {
     monado_auto_connect_in_progress_ = false;
     return;
   }
+  if (isMonadoIpcLive() && deferUntilPsvr2CompositorSettled()) {
+    monado_auto_connect_in_progress_ = false;
+    return;
+  }
   // Prefer HMD headphones when starting a session (user can still override in the combo).
   audio_user_override_.store(false);
   refreshAudioDevices(true);
@@ -2488,6 +2543,10 @@ void HostWindow::connectHeadset() {
       monado_auto_connect_cooldown_ms_ = QDateTime::currentMSecsSinceEpoch() + 2000;
       QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
     }
+    return;
+  }
+  if (deferUntilPsvr2CompositorSettled()) {
+    monado_auto_connect_in_progress_ = false;
     return;
   }
   if (!runtime_json_.isEmpty()) {

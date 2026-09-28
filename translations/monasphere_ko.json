@@ -1187,6 +1187,21 @@
     },
     {
       "context": "HostWindow",
+      "source": "Waiting for Monado to grab the PSVR2 display",
+      "translation": "Monado가 PSVR2 화면을 잡을 때까지 대기"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for PSVR2 display grab",
+      "translation": "PSVR2 화면 점유 대기"
+    },
+    {
+      "context": "HostWindow",
+      "source": "PSVR2 display grabbed",
+      "translation": "PSVR2 화면을 잡음"
+    },
+    {
+      "context": "HostWindow",
       "source": "Display lease not ready — waiting",
       "translation": "화면 리스 미준비 — 대기"
     },

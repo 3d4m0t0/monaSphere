@@ -1187,6 +1187,21 @@
     },
     {
       "context": "HostWindow",
+      "source": "Waiting for Monado to grab the PSVR2 display",
+      "translation": "等待 Monado 接管 PSVR2 画面"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for PSVR2 display grab",
+      "translation": "等待接管 PSVR2 画面"
+    },
+    {
+      "context": "HostWindow",
+      "source": "PSVR2 display grabbed",
+      "translation": "已接管 PSVR2 画面"
+    },
+    {
+      "context": "HostWindow",
       "source": "Display lease not ready — waiting",
       "translation": "画面租约未就绪 — 等待"
     },
