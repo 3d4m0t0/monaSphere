@@ -44,9 +44,10 @@
 #include <QThread>
 #include <QTimer>
 #include <QWindow>
+#if defined(VRP_HAS_QT_GUI_PRIVATE)
 #include <QtGui/qpa/qplatformwindow_p.h>
-
 #include <dlfcn.h>
+#endif
 #include <QCloseEvent>
 #include <QDir>
 #include <QFile>
@@ -1204,6 +1205,7 @@ void HostWindow::presentToFront(const QString& activation_token) {
   QWindow* handle = windowHandle();
   bool activated = false;
   if (handle && QGuiApplication::platformName() == QLatin1String("wayland") && !activation_token.isEmpty()) {
+#if defined(VRP_HAS_QT_GUI_PRIVATE)
     // QWaylandWindow stores the token and the next requestActivate() spends it on
     // xdg_activation_v1. A token requested by the already-focused app is rejected.
     auto* native = handle->nativeInterface<QNativeInterface::Private::QWaylandWindow>();
@@ -1223,6 +1225,9 @@ void HostWindow::presentToFront(const QString& activation_token) {
       VRP_LOG("Wayland activation token was not applied (window=%d symbol=%d)", native ? 1 : 0,
               set_token ? 1 : 0);
     }
+#else
+    VRP_LOG("Wayland activation token ignored (Qt GuiPrivate not available)");
+#endif
   }
   if (!activated) {
     activateWindow();

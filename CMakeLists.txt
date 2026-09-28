@@ -9,7 +9,36 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
 find_package(PkgConfig REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network GuiPrivate)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+# Wayland single-instance focus uses a Qt private type. Skip it when the
+# private component or that type is missing, so older distro Qt still builds.
+set(VRP_HAS_QT_GUI_PRIVATE OFF)
+find_package(Qt6 QUIET COMPONENTS GuiPrivate)
+if(Qt6GuiPrivate_FOUND)
+  set(_qt_probe_dir ${CMAKE_BINARY_DIR}/cmake_probe)
+  file(MAKE_DIRECTORY ${_qt_probe_dir})
+  file(WRITE ${_qt_probe_dir}/qt_wayland_activate.cpp
+[=[
+#include <QtGui/qpa/qplatformwindow_p.h>
+#include <QWindow>
+int main() {
+  QWindow* w = nullptr;
+  auto* native = w->nativeInterface<QNativeInterface::Private::QWaylandWindow>();
+  return native ? 1 : 0;
+}
+]=])
+  try_compile(VRP_HAS_QT_GUI_PRIVATE
+    ${_qt_probe_dir}/build
+    ${_qt_probe_dir}/qt_wayland_activate.cpp
+    CMAKE_FLAGS -DCMAKE_CXX_STANDARD=17
+    LINK_LIBRARIES Qt6::Gui Qt6::GuiPrivate
+  )
+endif()
+if(VRP_HAS_QT_GUI_PRIVATE)
+  message(STATUS "Qt6 GuiPrivate usable — Wayland activation token enabled")
+else()
+  message(STATUS "Qt6 GuiPrivate unavailable — building without Wayland activation token")
+endif()
 pkg_check_modules(OPENXR REQUIRED openxr)
 pkg_check_modules(VULKAN REQUIRED vulkan)
 
@@ -163,7 +192,11 @@ add_executable(vrp_player
   apps/vrp_player/hud_paint.hpp
 )
 set_target_properties(vrp_player PROPERTIES OUTPUT_NAME monasphere)
-target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets Qt6::Network Qt6::GuiPrivate ${CMAKE_DL_LIBS})
+target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets Qt6::Network ${CMAKE_DL_LIBS})
+if(VRP_HAS_QT_GUI_PRIVATE)
+  target_compile_definitions(vrp_player PRIVATE VRP_HAS_QT_GUI_PRIVATE=1)
+  target_link_libraries(vrp_player PRIVATE Qt6::GuiPrivate)
+endif()
 target_include_directories(vrp_player PRIVATE ${CMAKE_SOURCE_DIR}/apps/vrp_player)
 add_dependencies(vrp_player vrp_shaders)
 
