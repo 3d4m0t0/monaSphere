@@ -7,7 +7,7 @@
 
 Name:           monasphere
 Version:        1.0.0
-Release:        dev.20260927
+Release:        dev.20260928
 Summary:        Native Linux VR video player (OpenXR / Vulkan)
 License:        MIT
 Group:          Productivity/Multimedia/Video/Players
@@ -68,6 +68,11 @@ same SONAME on the user's system. This package does not promise a codec set.
 %{_datadir}/applications/monasphere.desktop
 
 %changelog
+* Mon Sep 28 2026 flex - 1.0.0-dev.20260928
+- Fixed settings-file handling. Settings stay in monasphere.conf.
+- Seek behavior improved. The saved refresh rate is applied at startup.
+- An SDL gamepad can be used in addition to the HMD controllers.
+- Recenter shows a control guide. The UI uses the desktop font, with other small adjustments.
 * Sun Sep 27 2026 flex - 1.0.0-dev.20260927
 - WiVRn connect and AMD VA-API zero-copy added. Not yet verified.
 * Thu Sep 24 2026 flex - 1.0.0-1

@@ -958,7 +958,7 @@ void HostWindow::showAboutDialog() {
       "<p>Source license: MIT</p>"
       "<p>FFmpeg / Qt and others are linked dynamically. "
       "See THIRD_PARTY.md when distributing a binary.</p>")
-                           .arg(QStringLiteral("1.0.0-dev.20260927"));
+                           .arg(QStringLiteral("1.0.0-dev.20260928"));
   QString html = text;
   html.replace(QStringLiteral("<h3>"), QStringLiteral("<h3 style=\"margin:0;\">"));
   html.replace(QStringLiteral("<p>"), QStringLiteral("<p style=\"margin:0;\">"));
