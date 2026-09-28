@@ -1187,6 +1187,56 @@
     },
     {
       "context": "HostWindow",
+      "source": "Display lease not ready — waiting",
+      "translation": "画面租约未就绪 — 等待"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for display lease",
+      "translation": "等待画面租约"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Display lease: %1",
+      "translation": "画面租约: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Display lease ready — restart Monado",
+      "translation": "画面租约就绪 — 重启 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "X11 direct display not ready — waiting",
+      "translation": "X11 直接显示未就绪 — 等待"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for X11 direct display",
+      "translation": "等待 X11 直接显示"
+    },
+    {
+      "context": "HostWindow",
+      "source": "X11 direct display: %1",
+      "translation": "X11 直接显示: %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "X11 direct display ready — restart Monado",
+      "translation": "X11 直接显示就绪 — 重启 Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Display environment: Wayland",
+      "translation": "显示环境: Wayland"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Display environment: X11",
+      "translation": "显示环境: X11"
+    },
+    {
+      "context": "HostWindow",
       "source": "Vulkan: graphics requirements…",
       "translation": "Vulkan: 检查需求…"
     },

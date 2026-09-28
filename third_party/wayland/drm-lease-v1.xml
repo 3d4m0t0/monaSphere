@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="drm_lease_v1">
+  <copyright>
+    Copyright © 2018 NXP
+    Copyright © 2019-2020 Collabora, Ltd.
+    Copyright © 2020 Simon Ser
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <interface name="wp_drm_lease_device_v1" version="1">
+    <description summary="lease device">
+      A DRM lease device advertises non-desktop connectors the compositor can
+      lease. A client may bind this global only to read that list.
+    </description>
+
+    <request name="create_lease_request">
+      <description summary="create a lease request object">
+        Creates a lease request object.
+      </description>
+      <arg name="id" type="new_id" interface="wp_drm_lease_request_v1"/>
+    </request>
+
+    <request name="release">
+      <description summary="release this object">
+        The client will no longer use this object.
+      </description>
+    </request>
+
+    <event name="drm_fd">
+      <description summary="open a non-master fd for this DRM node">
+        The compositor has opened a DRM node for this device.
+      </description>
+      <arg name="fd" type="fd"/>
+    </event>
+
+    <event name="connector">
+      <description summary="advertise a leasable connector">
+        A connector is available for lease.
+      </description>
+      <arg name="id" type="new_id" interface="wp_drm_lease_connector_v1"/>
+    </event>
+
+    <event name="done">
+      <description summary="end of a connector batch">
+        All currently available connectors have been sent.
+      </description>
+    </event>
+
+    <event name="released">
+      <description summary="compositor released the device">
+        The compositor is done with this device.
+      </description>
+    </event>
+  </interface>
+
+  <interface name="wp_drm_lease_connector_v1" version="1">
+    <description summary="a leasable DRM connector">
+      A connector advertised by wp_drm_lease_device_v1.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy this object">
+        The client will no longer use this connector.
+      </description>
+    </request>
+
+    <event name="name">
+      <description summary="connector name">
+        The name of the connector.
+      </description>
+      <arg name="name" type="string"/>
+    </event>
+
+    <event name="description">
+      <description summary="connector description">
+        A human-readable description.
+      </description>
+      <arg name="description" type="string"/>
+    </event>
+
+    <event name="connector_id">
+      <description summary="DRM connector id">
+        The kernel connector id.
+      </description>
+      <arg name="conn_id" type="uint"/>
+    </event>
+
+    <event name="done">
+      <description summary="all properties have been sent">
+        Static properties of this connector have been sent.
+      </description>
+    </event>
+
+    <event name="withdrawn">
+      <description summary="connector is no longer leasable">
+        The compositor has removed this connector from the lease list.
+      </description>
+    </event>
+  </interface>
+
+  <interface name="wp_drm_lease_request_v1" version="1">
+    <description summary="DRM lease request">
+      A batch of connectors to lease.
+    </description>
+
+    <request name="request_connector">
+      <description summary="add a connector to the lease">
+        Indicates that the client would like to lease the given connector.
+      </description>
+      <arg name="connector" type="object" interface="wp_drm_lease_connector_v1"/>
+    </request>
+
+    <request name="submit">
+      <description summary="submit the lease request">
+        Submits the lease request.
+      </description>
+      <arg name="id" type="new_id" interface="wp_drm_lease_v1"/>
+    </request>
+  </interface>
+
+  <interface name="wp_drm_lease_v1" version="1">
+    <description summary="a DRM lease">
+      A granted DRM lease.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the lease">
+        The client will no longer use this lease.
+      </description>
+    </request>
+
+    <event name="lease_fd">
+      <description summary="shares the DRM file descriptor">
+        The leased DRM file descriptor.
+      </description>
+      <arg name="leased_fd" type="fd"/>
+    </event>
+
+    <event name="finished">
+      <description summary="lease revoked">
+        The compositor has revoked the lease.
+      </description>
+    </event>
+  </interface>
+</protocol>

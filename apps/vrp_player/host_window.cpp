@@ -1,6 +1,7 @@
 #include "host_window.hpp"
 #include "hud_paint.hpp"
 #include "i18n.hpp"
+#include "x11_direct_probe.hpp"
 
 #include "audio/audio_player.hpp"
 #include "common.hpp"
@@ -256,6 +257,154 @@ std::vector<UsbHmdInfo> HostWindow::listConnectedHmds() const {
   return out;
 }
 
+bool HostWindow::connectedHmdUsesDrmLease() const {
+  if (usingWivrn()) return false;
+  bool any = false;
+  for (const auto& h : listConnectedHmds()) {
+    if (h.vid == 0x2833 && (h.pid == 0x0186 || h.pid == 0x0183)) continue;
+    if (h.vid == 0x3318) continue;
+    any = true;
+    break;
+  }
+  return any;
+}
+
+namespace {
+
+bool leaseTextHas(const DrmLeaseConnectorInfo& connector, const char* needle) {
+  const QString n = QString::fromUtf8(needle);
+  return QString::fromStdString(connector.name).contains(n, Qt::CaseInsensitive) ||
+         QString::fromStdString(connector.description).contains(n, Qt::CaseInsensitive);
+}
+
+QString leaseListText(const DrmLeaseProbeResult& probe) {
+  QStringList parts;
+  for (const auto& connector : probe.connectors) {
+    parts << QStringLiteral("%1 (%2)")
+                 .arg(QString::fromStdString(connector.name),
+                      QString::fromStdString(connector.description));
+  }
+  return parts.join(QStringLiteral(", "));
+}
+
+}  // namespace
+
+bool HostWindow::displayLeaseMatches(const DrmLeaseProbeResult& probe) const {
+  if (probe.connectors.empty()) return false;
+  bool want_psvr2 = false;
+  bool want_psvr1 = false;
+  for (const auto& h : listConnectedHmds()) {
+    if (h.vid == 0x054c && (h.pid == 0x0ee8 || h.pid == 0x0cde)) want_psvr2 = true;
+    if (h.vid == 0x054c && h.pid == 0x09af) want_psvr1 = true;
+  }
+  if (want_psvr2) {
+    for (const auto& connector : probe.connectors) {
+      if (leaseTextHas(connector, "PS VR2") || leaseTextHas(connector, "4000x2040")) return true;
+    }
+    return false;
+  }
+  if (want_psvr1) {
+    for (const auto& connector : probe.connectors) {
+      const bool vr =
+          leaseTextHas(connector, "PS VR") || leaseTextHas(connector, "PlayStation VR");
+      if (vr && !leaseTextHas(connector, "PS VR2")) return true;
+    }
+    return false;
+  }
+  return true;
+}
+
+void HostWindow::noteDisplayEnvironment(bool x11) {
+  if (display_env_logged_) return;
+  display_env_logged_ = true;
+  appendLog(x11 ? tr("Display environment: X11") : tr("Display environment: Wayland"));
+}
+
+bool HostWindow::holdDirectDisplay(bool x11, bool ready, bool list_empty, const QString& listed) {
+  display_direct_is_x11_ = x11;
+  if (!ready) {
+    display_lease_ready_logged_ = false;
+    if (isMonadoIpcLive() || (monado_ && monado_->state() != QProcess::NotRunning)) {
+      display_lease_restart_ = true;
+    }
+    if (!display_lease_wait_logged_) {
+      display_lease_wait_logged_ = true;
+      if (list_empty) {
+        appendLog(x11 ? tr("X11 direct display not ready — waiting")
+                      : tr("Display lease not ready — waiting"));
+      } else {
+        appendLog((x11 ? tr("X11 direct display: %1") : tr("Display lease: %1")).arg(listed));
+      }
+    }
+    setHealth("Wait", x11 ? "Waiting for X11 direct display" : "Waiting for display lease");
+    if (!user_suppressed_auto_connect_) {
+      QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
+    }
+    return true;
+  }
+
+  display_lease_wait_logged_ = false;
+  if (!display_lease_ready_logged_) {
+    display_lease_ready_logged_ = true;
+    appendLog((x11 ? tr("X11 direct display: %1") : tr("Display lease: %1")).arg(listed));
+  }
+  return false;
+}
+
+bool HostWindow::deferUntilDisplayLeaseReady() {
+  if (!connectedHmdUsesDrmLease()) {
+    display_lease_wait_logged_ = false;
+    display_lease_ready_logged_ = false;
+    display_lease_restart_ = false;
+    display_direct_is_x11_ = false;
+    display_env_logged_ = false;
+    return false;
+  }
+  const DrmLeaseProbeResult probe = probeDrmLeaseConnectors();
+  if (probe.kind == DrmLeaseProbeKind::Ok) {
+    noteDisplayEnvironment(false);
+    return holdDirectDisplay(false, displayLeaseMatches(probe), probe.connectors.empty(),
+                             leaseListText(probe));
+  }
+  // Wayland is connected but has no lease protocol. Monado then opens a Wayland
+  // window, so an X11 list would not be the one it reads.
+  if (probe.kind == DrmLeaseProbeKind::NoProtocol) {
+    noteDisplayEnvironment(false);
+    display_lease_wait_logged_ = false;
+    display_lease_ready_logged_ = false;
+    display_lease_restart_ = false;
+    display_direct_is_x11_ = false;
+    return false;
+  }
+
+  const X11DirectProbeResult x11 = probeX11DirectOutputs();
+  if (x11.kind != X11DirectProbeKind::Ok) {
+    display_lease_wait_logged_ = false;
+    display_lease_ready_logged_ = false;
+    display_lease_restart_ = false;
+    display_direct_is_x11_ = false;
+    return false;
+  }
+  DrmLeaseProbeResult as_lease;
+  as_lease.kind = DrmLeaseProbeKind::Ok;
+  as_lease.connectors = x11.outputs;
+  noteDisplayEnvironment(true);
+  return holdDirectDisplay(true, displayLeaseMatches(as_lease), x11.outputs.empty(),
+                           leaseListText(as_lease));
+}
+
+bool HostWindow::restartMonadoAfterDisplayLatch() {
+  if (!display_lease_restart_) return false;
+  const bool up = isMonadoIpcLive() || (monado_ && monado_->state() != QProcess::NotRunning);
+  const bool x11 = display_direct_is_x11_;
+  display_lease_restart_ = false;
+  if (!up) return false;
+  appendLog(x11 ? tr("X11 direct display ready — restart Monado")
+                : tr("Display lease ready — restart Monado"));
+  restartOwnedMonadoForHz();
+  return true;
+}
+
 bool HostWindow::isPlaceholderHmdName(const QString& system_name) {
   const QString n = system_name.trimmed().toLower();
   if (n.isEmpty() || n == QStringLiteral("(unknown hmd)") || n == QStringLiteral("未検出")) return true;
@@ -292,6 +441,11 @@ void HostWindow::maybeAutoConnectHeadset() {
   // HMD unplugged before/after session: release owned compositor (keep manually-started
   // Monado if USB never showed an HMD — debug「Monado 起動」).
   if (n == 0) {
+    display_lease_wait_logged_ = false;
+    display_lease_ready_logged_ = false;
+    display_lease_restart_ = false;
+    display_direct_is_x11_ = false;
+    display_env_logged_ = false;
     if (prev == 1 && !monado_external_ && monado_ && monado_->state() != QProcess::NotRunning) {
       appendLog(tr("USB HMD removed — stop Monado"));
       stopMonadoProcess();
@@ -316,6 +470,11 @@ void HostWindow::maybeAutoConnectHeadset() {
     QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
     return;
   }
+
+  // Wayland direct mode reads the compositor lease list once. An empty list
+  // falls back to a desktop window for the life of that process. X11 uses RandR.
+  if (deferUntilDisplayLeaseReady()) return;
+  if (restartMonadoAfterDisplayLatch()) return;
 
   // Start Monado only when a single USB HMD is present (probe sees the real device).
   if (!isMonadoIpcLive()) {
@@ -2299,6 +2458,14 @@ void HostWindow::connectHeadset() {
   // Manual connect re-enables auto-reconnect after future unexpected drops.
   if (!monado_auto_connect_in_progress_) {
     user_suppressed_auto_connect_ = false;
+  }
+  if (deferUntilDisplayLeaseReady()) {
+    monado_auto_connect_in_progress_ = false;
+    return;
+  }
+  if (restartMonadoAfterDisplayLatch()) {
+    monado_auto_connect_in_progress_ = false;
+    return;
   }
   // Prefer HMD headphones when starting a session (user can still override in the combo).
   audio_user_override_.store(false);

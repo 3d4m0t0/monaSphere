@@ -29,6 +29,10 @@ BuildRequires:  glslang-devel
 BuildRequires:  ffmpeg-8-mini-devel
 BuildRequires:  pkgconfig(libpulse)
 BuildRequires:  pkgconfig(libpulse-simple)
+BuildRequires:  pkgconfig(wayland-client)
+BuildRequires:  pkgconfig(wayland-scanner)
+BuildRequires:  pkgconfig(xcb)
+BuildRequires:  pkgconfig(xcb-randr)
 
 # SONAME caps. Any libav* build that provides these SONAMEs can satisfy them.
 Requires:       libavcodec.so.62()(64bit)

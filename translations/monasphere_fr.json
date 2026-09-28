@@ -1187,6 +1187,56 @@
     },
     {
       "context": "HostWindow",
+      "source": "Display lease not ready — waiting",
+      "translation": "Bail d'écran pas prêt — attente"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for display lease",
+      "translation": "Attente bail d'écran"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Display lease: %1",
+      "translation": "Bail d'écran : %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Display lease ready — restart Monado",
+      "translation": "Bail d'écran prêt — relance Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "X11 direct display not ready — waiting",
+      "translation": "Affichage direct X11 pas prêt — attente"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for X11 direct display",
+      "translation": "Attente affichage direct X11"
+    },
+    {
+      "context": "HostWindow",
+      "source": "X11 direct display: %1",
+      "translation": "Affichage direct X11 : %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "X11 direct display ready — restart Monado",
+      "translation": "Affichage direct X11 prêt — relance Monado"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Display environment: Wayland",
+      "translation": "Environnement d'affichage : Wayland"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Display environment: X11",
+      "translation": "Environnement d'affichage : X11"
+    },
+    {
+      "context": "HostWindow",
       "source": "Vulkan: graphics requirements…",
       "translation": "Vulkan : prérequis…"
     },

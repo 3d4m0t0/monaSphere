@@ -15,6 +15,8 @@ monaSphere ソース自体は [MIT](LICENSE) です。コマンド名は `monasp
 | Qt 6 Widgets | LGPL-2.1/3 + Qt exception | |
 | OpenXR loader | Apache-2.0 | |
 | Vulkan loader | Apache-2.0 | |
+| Wayland client (`libwayland-client`) | MIT | DRM リース一覧の確認。プロトコル定義は `third_party/wayland/drm-lease-v1.xml` |
+| XCB / XCB RandR | MIT | X11 の non-desktop 出力の確認 |
 | miniaudio（vendored） | Public Domain または MIT-0 | `third_party/miniaudio/` |
 | AMD FidelityFX FSR1（vendored headers） | MIT | `third_party/fsr1/` |
 

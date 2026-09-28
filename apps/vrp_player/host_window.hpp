@@ -1,5 +1,6 @@
 #pragma once
 
+#include "drm_lease_probe.hpp"
 #include "options.hpp"
 #include "video/video_decoder.hpp"
 
@@ -102,6 +103,21 @@ class HostWindow : public QMainWindow {
   /** USB 上の既知 HMD 一覧 / 台数。 */
   std::vector<UsbHmdInfo> listConnectedHmds() const;
   int countConnectedHmds() const;
+  /**
+   * デスクトップの直接表示一覧に HMD が出るまで Monado を起動しない。
+   * Wayland なら DRM リース、Wayland が無い X11 なら RandR の non-desktop。
+   * true のとき呼び出し側はこの回の接続をやめる。
+   */
+  bool deferUntilDisplayLeaseReady();
+  /** 直接表示の一覧が未準備なら待つ。true のときこの回の接続をやめる。 */
+  bool holdDirectDisplay(bool x11, bool ready, bool list_empty, const QString& listed);
+  /** 採用した表示環境を一度だけログへ出す。 */
+  void noteDisplayEnvironment(bool x11);
+  /** リース一覧が空のあいだに起動した Monado を、コネクタが出たら一度作り直す。 */
+  bool restartMonadoAfterDisplayLatch();
+  /** この HMD は Monado が直接表示で出す種類か。 */
+  bool connectedHmdUsesDrmLease() const;
+  bool displayLeaseMatches(const DrmLeaseProbeResult& probe) const;
   /** USB をポーリングし、実機 HMD 1 台＋Monado 準備で自動接続。 */
   void maybeAutoConnectHeadset();
   /** 自動接続後の OpenXR system 名を検証（Simulated なら切断して再待機）。 */
@@ -241,6 +257,14 @@ class HostWindow : public QMainWindow {
   bool monado_auto_connect_in_progress_ = false;
   bool monado_multi_hmd_logged_ = false;
   bool monado_simulated_reject_logged_ = false;
+  bool display_lease_wait_logged_ = false;
+  bool display_lease_ready_logged_ = false;
+  /** 一覧が空のあいだに Monado が既に居た。出力が出たら一度作り直す。 */
+  bool display_lease_restart_ = false;
+  /** 今の待ちが X11 RandR 側か。再起動ログの文面に使う。 */
+  bool display_direct_is_x11_ = false;
+  /** 表示環境（Wayland / X11）をこの接続サイクルで一度出した。 */
+  bool display_env_logged_ = false;
   bool monado_intentional_stop_ = false;  // terminate/kill 時の finished を異常扱いしない
   int last_usb_hmd_count_ = -1;
   qint64 monado_auto_connect_cooldown_ms_ = 0;

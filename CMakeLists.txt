@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(VRP LANGUAGES CXX)
+project(VRP LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -41,6 +41,9 @@ else()
 endif()
 pkg_check_modules(OPENXR REQUIRED openxr)
 pkg_check_modules(VULKAN REQUIRED vulkan)
+pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
+pkg_check_modules(XCB_RANDR REQUIRED xcb xcb-randr)
+find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
 
 find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 
@@ -181,6 +184,21 @@ if(VRP_HAS_MINIAUDIO)
   target_link_libraries(vrp_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
 endif()
 
+set(DRM_LEASE_XML ${CMAKE_SOURCE_DIR}/third_party/wayland/drm-lease-v1.xml)
+set(DRM_LEASE_HEADER ${CMAKE_BINARY_DIR}/drm-lease-v1-client-protocol.h)
+set(DRM_LEASE_CODE ${CMAKE_BINARY_DIR}/drm-lease-v1-protocol.c)
+add_custom_command(
+  OUTPUT ${DRM_LEASE_HEADER}
+  COMMAND ${WAYLAND_SCANNER} client-header ${DRM_LEASE_XML} ${DRM_LEASE_HEADER}
+  DEPENDS ${DRM_LEASE_XML}
+  VERBATIM
+)
+add_custom_command(
+  OUTPUT ${DRM_LEASE_CODE}
+  COMMAND ${WAYLAND_SCANNER} private-code ${DRM_LEASE_XML} ${DRM_LEASE_CODE}
+  DEPENDS ${DRM_LEASE_XML}
+  VERBATIM
+)
 add_executable(vrp_player
   apps/vrp_player/main.cpp
   apps/vrp_player/i18n.cpp
@@ -188,11 +206,21 @@ add_executable(vrp_player
   apps/vrp_player/i18n.qrc
   apps/vrp_player/host_window.cpp
   apps/vrp_player/host_window.hpp
+  apps/vrp_player/drm_lease_probe.cpp
+  apps/vrp_player/drm_lease_probe.hpp
+  apps/vrp_player/x11_direct_probe.cpp
+  apps/vrp_player/x11_direct_probe.hpp
   apps/vrp_player/hud_paint.cpp
   apps/vrp_player/hud_paint.hpp
+  ${DRM_LEASE_HEADER}
+  ${DRM_LEASE_CODE}
 )
 set_target_properties(vrp_player PROPERTIES OUTPUT_NAME monasphere)
-target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets Qt6::Network ${CMAKE_DL_LIBS})
+target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets Qt6::Network
+                      ${WAYLAND_CLIENT_LIBRARIES} ${XCB_RANDR_LIBRARIES} ${CMAKE_DL_LIBS})
+target_include_directories(vrp_player PRIVATE ${CMAKE_BINARY_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS}
+                           ${XCB_RANDR_INCLUDE_DIRS})
+target_compile_options(vrp_player PRIVATE ${WAYLAND_CLIENT_CFLAGS_OTHER} ${XCB_RANDR_CFLAGS_OTHER})
 if(VRP_HAS_QT_GUI_PRIVATE)
   target_compile_definitions(vrp_player PRIVATE VRP_HAS_QT_GUI_PRIVATE=1)
   target_link_libraries(vrp_player PRIVATE Qt6::GuiPrivate)
