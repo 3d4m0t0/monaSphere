@@ -1187,6 +1187,21 @@
     },
     {
       "context": "HostWindow",
+      "source": "PSVR2 display not ready — waiting",
+      "translation": "Pantalla PSVR2 no lista — esperando"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for PSVR2 display",
+      "translation": "Esperando pantalla PSVR2"
+    },
+    {
+      "context": "HostWindow",
+      "source": "PSVR2 display ready — restart Monado",
+      "translation": "Pantalla PSVR2 lista — reiniciar Monado"
+    },
+    {
+      "context": "HostWindow",
       "source": "Waiting for Monado to grab the PSVR2 display",
       "translation": "Esperando a que Monado tome la pantalla PSVR2"
     },

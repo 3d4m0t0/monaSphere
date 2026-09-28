@@ -264,6 +264,67 @@ bool HostWindow::psvr2UsbPresent() const {
   return false;
 }
 
+bool HostWindow::psvr2PanelReady() const {
+  const QDir drm(QStringLiteral("/sys/class/drm"));
+  if (!drm.exists()) return false;
+  for (const QString& name : drm.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+    if (!name.contains(QLatin1Char('-'))) continue;
+    const QString base = drm.filePath(name);
+    QFile status(base + QStringLiteral("/status"));
+    if (!status.open(QIODevice::ReadOnly)) continue;
+    if (status.readAll().trimmed() != "connected") continue;
+
+    QFile modes(base + QStringLiteral("/modes"));
+    if (!modes.open(QIODevice::ReadOnly)) continue;
+    bool mode_ok = false;
+    const QString text = QString::fromUtf8(modes.readAll());
+    for (const QString& line : text.split(QLatin1Char('\n'))) {
+      if (line.startsWith(QStringLiteral("4000x2040"))) {
+        mode_ok = true;
+        break;
+      }
+    }
+    if (!mode_ok) continue;
+
+    QFile edid(base + QStringLiteral("/edid"));
+    if (!edid.open(QIODevice::ReadOnly)) return true;
+    const QByteArray raw = edid.read(128);
+    if (raw.size() < 10) return true;
+    const unsigned id = (static_cast<unsigned char>(raw[8]) << 8) |
+                        static_cast<unsigned char>(raw[9]);
+    const char mfg[4] = {static_cast<char>(((id >> 10) & 31) + 'A' - 1),
+                         static_cast<char>(((id >> 5) & 31) + 'A' - 1),
+                         static_cast<char>((id & 31) + 'A' - 1), '\0'};
+    if (QLatin1String(mfg) == QLatin1String("SNY")) return true;
+  }
+  return false;
+}
+
+bool HostWindow::deferUntilPsvr2PanelReady() {
+  if (!psvr2UsbPresent()) {
+    psvr2_display_wait_logged_ = false;
+    psvr2_restart_after_panel_ = false;
+    return false;
+  }
+  if (!psvr2PanelReady()) {
+    if (isMonadoIpcLive() || (monado_ && monado_->state() != QProcess::NotRunning)) {
+      psvr2_restart_after_panel_ = true;
+    }
+    if (!psvr2_display_wait_logged_) {
+      psvr2_display_wait_logged_ = true;
+      appendLog(tr("PSVR2 display not ready — waiting"));
+    }
+    setHealth("Wait", "Waiting for PSVR2 display");
+    if (!user_suppressed_auto_connect_) {
+      QTimer::singleShot(500, this, [this] { maybeAutoConnectHeadset(); });
+    }
+    return true;
+  }
+
+  psvr2_display_wait_logged_ = false;
+  return false;
+}
+
 bool HostWindow::connectedHmdUsesDrmLease() const {
   if (usingWivrn()) return false;
   bool any = false;
@@ -401,13 +462,16 @@ bool HostWindow::deferUntilDisplayLeaseReady() {
 }
 
 bool HostWindow::restartMonadoAfterDisplayLatch() {
-  if (!display_lease_restart_) return false;
+  if (!psvr2_restart_after_panel_ && !display_lease_restart_) return false;
   const bool up = isMonadoIpcLive() || (monado_ && monado_->state() != QProcess::NotRunning);
+  const bool lease = display_lease_restart_;
   const bool x11 = display_direct_is_x11_;
+  psvr2_restart_after_panel_ = false;
   display_lease_restart_ = false;
   if (!up) return false;
-  appendLog(x11 ? tr("X11 direct display ready — restart Monado")
-                : tr("Display lease ready — restart Monado"));
+  appendLog(lease ? (x11 ? tr("X11 direct display ready — restart Monado")
+                         : tr("Display lease ready — restart Monado"))
+                  : tr("PSVR2 display ready — restart Monado"));
   restartOwnedMonadoForHz();
   return true;
 }
@@ -483,6 +547,8 @@ void HostWindow::maybeAutoConnectHeadset() {
   // HMD unplugged before/after session: release owned compositor (keep manually-started
   // Monado if USB never showed an HMD — debug「Monado 起動」).
   if (n == 0) {
+    psvr2_display_wait_logged_ = false;
+    psvr2_restart_after_panel_ = false;
     display_lease_wait_logged_ = false;
     display_lease_ready_logged_ = false;
     display_lease_restart_ = false;
@@ -515,6 +581,9 @@ void HostWindow::maybeAutoConnectHeadset() {
     return;
   }
 
+  // PSVR2: do not start Monado until the panel lists 4000×2040. The distortion mesh
+  // is read once at device create and cannot be rebuilt later.
+  if (deferUntilPsvr2PanelReady()) return;
   // Wayland direct mode reads the compositor lease list once. An empty list
   // falls back to a desktop window for the life of that process.
   if (deferUntilDisplayLeaseReady()) return;
@@ -2509,6 +2578,10 @@ void HostWindow::connectHeadset() {
   // Manual connect re-enables auto-reconnect after future unexpected drops.
   if (!monado_auto_connect_in_progress_) {
     user_suppressed_auto_connect_ = false;
+  }
+  if (deferUntilPsvr2PanelReady()) {
+    monado_auto_connect_in_progress_ = false;
+    return;
   }
   if (deferUntilDisplayLeaseReady()) {
     monado_auto_connect_in_progress_ = false;

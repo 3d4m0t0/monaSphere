@@ -105,6 +105,13 @@ class HostWindow : public QMainWindow {
   int countConnectedHmds() const;
   /** PSVR2 (054c:0ee8) が USB にある。 */
   bool psvr2UsbPresent() const;
+  /** DRM 上に Sony の 4000×2040 が出ている。歪みメッシュを読む前の起動確認。 */
+  bool psvr2PanelReady() const;
+  /**
+   * PSVR2 のパネルが未準備なら Monado 起動と接続を遅らせる。
+   * true のとき呼び出し側はこの回の接続をやめる。
+   */
+  bool deferUntilPsvr2PanelReady();
   /**
    * デスクトップの直接表示一覧に HMD が出るまで Monado を起動しない。
    * Wayland なら DRM リース、Wayland が無い X11 なら RandR の non-desktop。
@@ -115,7 +122,7 @@ class HostWindow : public QMainWindow {
   bool holdDirectDisplay(bool x11, bool ready, bool list_empty, const QString& listed);
   /** 採用した表示環境を一度だけログへ出す。 */
   void noteDisplayEnvironment(bool x11);
-  /** リース一覧が空のあいだに起動した Monado を、コネクタが出たら一度作り直す。 */
+  /** パネル準備前やリース一覧が空のあいだに起動した Monado を、準備後に一度作り直す。 */
   bool restartMonadoAfterDisplayLatch();
   /** この HMD は Monado が直接表示で出す種類か。 */
   bool connectedHmdUsesDrmLease() const;
@@ -262,6 +269,9 @@ class HostWindow : public QMainWindow {
   bool monado_auto_connect_in_progress_ = false;
   bool monado_multi_hmd_logged_ = false;
   bool monado_simulated_reject_logged_ = false;
+  bool psvr2_display_wait_logged_ = false;
+  /** パネル未準備のあいだに Monado が既に居た。準備できたら一度作り直す。 */
+  bool psvr2_restart_after_panel_ = false;
   bool display_lease_wait_logged_ = false;
   bool display_lease_ready_logged_ = false;
   /** 一覧が空のあいだに Monado が既に居た。出力が出たら一度作り直す。 */
