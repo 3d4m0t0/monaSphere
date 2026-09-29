@@ -64,9 +64,7 @@ QString fmt_time(double sec) {
   return QString("%1:%2").arg(m).arg(r, 2, 10, QChar('0'));
 }
 
-void draw_row(HudCanvas& c, const QRect& r, const QString& text, const QFont& font, bool selected,
-              bool dim = false) {
-  if (selected) c.fill(r.adjusted(8, 2, -8, -2), QColor(40, 120, 200, 220));
+void draw_row(HudCanvas& c, const QRect& r, const QString& text, const QFont& font, bool dim = false) {
   c.text(r.adjusted(24, 0, -16, 0), text, font, dim ? QColor(160, 170, 180) : QColor(240, 245, 250),
          Qt::AlignVCenter | Qt::AlignLeft);
 }
@@ -86,7 +84,6 @@ void draw_folder_icon(QPainter& p, const QRect& cell, bool selected) {
 }
 
 void draw_row_with_folder(HudCanvas& c, const QRect& r, const QString& text, const QFont& font, bool selected) {
-  if (selected) c.fill(r.adjusted(8, 2, -8, -2), QColor(40, 120, 200, 220));
   const int icon = std::min(22, r.height() - 8);
   const QRect icon_r(r.left() + 14, r.center().y() - icon / 2, icon, icon);
   c.paint_cached(hud_key({1, static_cast<uint64_t>(icon), selected ? 1ull : 0ull}), icon_r, icon, icon,
@@ -853,16 +850,26 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
     constexpr int kScrollGap = 8;
     int list_w = content_w - 24;
     if (show_scroll) list_w -= kScrollW + kScrollGap;
-    const int start = snap.scroll;
-    const int end = std::min(static_cast<int>(snap.entries.size()), start + max_rows);
+    const QRect view(list_x, list_top, list_w, max_rows * row_h);
+    canvas.set_clip(view);
+    if (count > 0) {
+      const float hy =
+          static_cast<float>(list_top) + (snap.focus - snap.scroll_f) * static_cast<float>(row_h);
+      canvas.fill(QRect(list_x + 8, static_cast<int>(std::lround(hy)) + 2, list_w - 16, row_h - 4),
+                  QColor(40, 120, 200, 220));
+    }
+    const int start = std::max(0, static_cast<int>(std::floor(snap.scroll_f)));
+    const int end = std::min(count, static_cast<int>(std::ceil(snap.scroll_f + static_cast<float>(max_rows))));
     for (int i = start; i < end; ++i) {
       const auto& e = snap.entries[static_cast<size_t>(i)];
-      const QRect row(list_x, list_top + (i - start) * row_h, list_w, row_h);
-      const bool sel = (i == snap.cursor);
+      const float yf =
+          static_cast<float>(list_top) + (static_cast<float>(i) - snap.scroll_f) * static_cast<float>(row_h);
+      const QRect row(list_x, static_cast<int>(std::lround(yf)), list_w, row_h);
       const QString name = QString::fromStdString(e.name);
-      if (e.is_dir && !e.is_special) draw_row_with_folder(canvas, row, name, body_font, sel);
-      else draw_row(canvas, row, name, body_font, sel);
+      if (e.is_dir && !e.is_special) draw_row_with_folder(canvas, row, name, body_font, i == snap.cursor);
+      else draw_row(canvas, row, name, body_font);
     }
+    canvas.set_clip({});
 
     if (show_scroll) {
       const QRect track(list_x + list_w + kScrollGap, list_top + 2, kScrollW, max_rows * row_h - 4);
@@ -873,7 +880,7 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
                             p.drawRoundedRect(QRectF(0.5, 0.5, track.width() - 1, track.height() - 1), 6, 6);
                           });
       const int span = std::max(1, count - max_rows);
-      const float pos = std::clamp(static_cast<float>(snap.scroll) / static_cast<float>(span), 0.f, 1.f);
+      const float pos = std::clamp(snap.scroll_f / static_cast<float>(span), 0.f, 1.f);
       const int thumb_h =
           std::min(track.height() - 4, std::max(56, track.height() * max_rows / std::max(count, 1)));
       const int travel = std::max(0, track.height() - thumb_h);

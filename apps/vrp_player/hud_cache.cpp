@@ -44,6 +44,7 @@ HudCanvas::HudCanvas(int atlas_w, int atlas_h)
 void HudCanvas::begin(int panel_w, int panel_h) {
   panel_w_ = panel_w;
   panel_h_ = panel_h;
+  clip_ = {};
   verts_.clear();
   if (!overflow_) return;
   overflow_ = false;
@@ -62,6 +63,8 @@ void HudCanvas::begin(int panel_w, int panel_h) {
   row_h_ = 0;
   ++gen_;
 }
+
+void HudCanvas::set_clip(const QRect& clip) { clip_ = clip; }
 
 HudPaintResult HudCanvas::take() {
   HudPaintResult result;
@@ -135,6 +138,27 @@ HudCanvas::Sprite HudCanvas::solid(const QColor& color) {
 void HudCanvas::push_quad(float x, float y, float w, float h, float u0, float v0, float u1, float v1) {
   constexpr uint32_t kMaxVerts = 2048 * 6;
   if (w <= 0.f || h <= 0.f || panel_w_ <= 0 || panel_h_ <= 0) return;
+  if (!clip_.isEmpty()) {
+    const float cx = static_cast<float>(clip_.x());
+    const float cy = static_cast<float>(clip_.y());
+    const float cw = static_cast<float>(clip_.width());
+    const float ch = static_cast<float>(clip_.height());
+    const float x1 = std::max(x, cx);
+    const float y1 = std::max(y, cy);
+    const float x2 = std::min(x + w, cx + cw);
+    const float y2 = std::min(y + h, cy + ch);
+    if (x2 <= x1 || y2 <= y1) return;
+    const float du = (u1 - u0) / w;
+    const float dv = (v1 - v0) / h;
+    u0 += (x1 - x) * du;
+    u1 -= (x + w - x2) * du;
+    v0 += (y1 - y) * dv;
+    v1 -= (y + h - y2) * dv;
+    x = x1;
+    y = y1;
+    w = x2 - x1;
+    h = y2 - y1;
+  }
   if (verts_.size() + 6 > kMaxVerts) return;
   constexpr float kMeshHalfW = 16.f / 9.f;
   const float pw = static_cast<float>(panel_w_);

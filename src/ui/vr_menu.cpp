@@ -339,9 +339,61 @@ void VrMenu::list_removable_mounts() {
   entries_.insert(entries_.end(), unique.begin(), unique.end());
 }
 
+void VrMenu::sync_list_pose() {
+  focus_f_ = static_cast<float>(cursor_);
+  scroll_f_ = static_cast<float>(scroll_);
+  list_target_ = cursor_;
+  list_gliding_ = false;
+}
+
+void VrMenu::step_list_row(int dir) {
+  if (entries_.empty() || dir == 0) return;
+  const int n = static_cast<int>(entries_.size());
+  if (!list_gliding_) list_target_ = std::clamp(static_cast<int>(std::lround(focus_f_)), 0, n - 1);
+  const int next = std::clamp(list_target_ + dir, 0, n - 1);
+  if (next == list_target_ && std::fabs(focus_f_ - static_cast<float>(list_target_)) < 0.001f) return;
+  list_target_ = next;
+  list_gliding_ = true;
+}
+
+void VrMenu::advance_list_glide(float dt) {
+  if (!list_gliding_ || entries_.empty()) return;
+  const float step = std::min(dt, 0.05f) / std::max(list_row_secs_, 0.001f);
+  const float target = static_cast<float>(list_target_);
+  if (std::fabs(focus_f_ - target) <= step) {
+    focus_f_ = target;
+    list_gliding_ = false;
+  } else {
+    focus_f_ += std::copysign(step, target - focus_f_);
+  }
+  clamp_list_window();
+  bump();
+}
+
+void VrMenu::clamp_list_window() {
+  const int n = static_cast<int>(entries_.size());
+  if (n <= 0) {
+    focus_f_ = 0.f;
+    scroll_f_ = 0.f;
+    cursor_ = 0;
+    scroll_ = 0;
+    return;
+  }
+  focus_f_ = std::clamp(focus_f_, 0.f, static_cast<float>(n - 1));
+  cursor_ = std::clamp(static_cast<int>(std::lround(focus_f_)), 0, n - 1);
+  const float max_scroll = static_cast<float>(std::max(0, n - kVisibleRows));
+  if (focus_f_ < scroll_f_) scroll_f_ = focus_f_;
+  if (focus_f_ > scroll_f_ + static_cast<float>(kVisibleRows - 1)) {
+    scroll_f_ = focus_f_ - static_cast<float>(kVisibleRows - 1);
+  }
+  scroll_f_ = std::clamp(scroll_f_, 0.f, max_scroll);
+  scroll_ = std::clamp(static_cast<int>(std::floor(scroll_f_ + 1e-4f)), 0, static_cast<int>(max_scroll));
+}
+
 void VrMenu::refresh_dir(const std::string& select_name) {
   cursor_ = 0;
   scroll_ = 0;
+  sync_list_pose();
   entries_.clear();
 
   if (place_ == Place::Roots) {
@@ -389,6 +441,7 @@ void VrMenu::select_entry_named(const std::string& name) {
       cursor_ = i;
       if (cursor_ < scroll_) scroll_ = cursor_;
       if (cursor_ >= scroll_ + kVisibleRows) scroll_ = cursor_ - kVisibleRows + 1;
+      sync_list_pose();
       return;
     }
   }
@@ -415,6 +468,7 @@ void VrMenu::move_cursor(int delta) {
   cursor_ = std::clamp(cursor_ + delta, 0, static_cast<int>(entries_.size()) - 1);
   if (cursor_ < scroll_) scroll_ = cursor_;
   if (cursor_ >= scroll_ + kVisibleRows) scroll_ = cursor_ - kVisibleRows + 1;
+  sync_list_pose();
   bump();
 }
 
@@ -427,6 +481,7 @@ void VrMenu::page_cursor(int dir) {
   scroll_ = std::clamp(scroll_ + dir * page, 0, max_scroll);
   if (cursor_ < scroll_) cursor_ = scroll_;
   if (cursor_ >= scroll_ + page) cursor_ = std::min(n - 1, scroll_ + page - 1);
+  sync_list_pose();
   bump();
 }
 
@@ -876,7 +931,8 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   const bool nav_left = in.nav_left || in.stick_x < -0.55f;
   const bool nav_right = in.nav_right || in.stick_x > 0.55f;
   if (visible_ && !controls_visible_ && screen_ == Screen::Browser) {
-    // File list: one step, a pause, then repeat while held. Left/right turn a page.
+    const bool was_gliding = list_gliding_;
+    // Digital up/down: one step, a pause, then repeat. The highlight slides over that same interval.
     auto pump_repeat = [&](AxisRepeat& axis, int dir, float initial, float interval, auto&& fire) {
       if (dir == 0) {
         axis = {};
@@ -898,11 +954,35 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         fire(dir);
       }
     };
-    const int row_dir = (nav_up && !nav_down) ? -1 : (nav_down && !nav_up) ? 1 : 0;
+    // Cross key stays at the slow repeat. Stick tilt is 1×, then 2×, then 3× at full deflection.
+    constexpr float kInitial = 0.40f;
+    constexpr float kRepeat = 0.055f;
+    constexpr float kDead = 0.20f;
+    int scale = 1;
+    int row_dir = (in.nav_up && !in.nav_down) ? -1 : (in.nav_down && !in.nav_up) ? 1 : 0;
+    if (row_dir == 0) {
+      const float mag = std::fabs(in.stick_y);
+      if (mag > kDead) {
+        const float t = std::clamp((mag - kDead) / (1.f - kDead), 0.f, 1.f);
+        scale = t < (1.f / 3.f) ? 1 : t < (2.f / 3.f) ? 2 : 3;
+        row_dir = in.stick_y > 0.f ? -1 : 1;
+      }
+    }
+    if (row_dir != 0) list_row_secs_ = kRepeat / static_cast<float>(scale);
     const int page_dir = (nav_left && !nav_right) ? -1 : (nav_right && !nav_left) ? 1 : 0;
-    pump_repeat(list_row_repeat_, row_dir, 0.40f, 0.055f, [&](int d) { move_cursor(d); });
-    pump_repeat(list_page_repeat_, page_dir, 0.40f, 0.22f, [&](int d) { page_cursor(d); });
+    pump_repeat(list_row_repeat_, row_dir, kInitial, kRepeat / static_cast<float>(scale),
+                [&](int d) { step_list_row(d); });
+    pump_repeat(list_page_repeat_, page_dir, kInitial, 0.22f, [&](int d) { page_cursor(d); });
+    advance_list_glide(dt);
+    list_glide_paint_ = was_gliding || list_gliding_;
   } else {
+    if (list_gliding_) {
+      focus_f_ = static_cast<float>(list_target_);
+      clamp_list_window();
+      bump();
+    }
+    list_gliding_ = false;
+    list_glide_paint_ = false;
     list_row_repeat_ = {};
     list_page_repeat_ = {};
     if (nav_up) nav(-1, 0);
@@ -1136,6 +1216,8 @@ VrMenu::Snapshot VrMenu::snapshot() const {
   s.entries = entries_;
   s.cursor = cursor_;
   s.scroll = scroll_;
+  s.focus = focus_f_;
+  s.scroll_f = scroll_f_;
   s.projection = projection_;
   s.stereo = stereo_;
   s.stereo_full = stereo_full_;

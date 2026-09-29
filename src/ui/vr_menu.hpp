@@ -76,6 +76,9 @@ class VrMenu {
     std::vector<Entry> entries;
     int cursor = 0;
     int scroll = 0;
+    /** Continuous selection and list origin, in rows. Digital moves snap these to integers. */
+    float focus = 0.f;
+    float scroll_f = 0.f;
     ProjectionMode projection = ProjectionMode::Flat;
     StereoLayout stereo = StereoLayout::Mono;
     bool stereo_full = true;
@@ -184,6 +187,8 @@ class VrMenu {
   /** Browser row under the cursor, including directories. Empty outside the file list. */
   std::string highlighted_row_id() const;
   std::string highlighted_video_path() const;
+  /** The file-list highlight is sliding between rows. The HUD should repaint every frame. */
+  bool list_gliding() const { return list_glide_paint_; }
 
   /** Rows shown in the file list. Page left/right moves by this many. */
   static constexpr int kVisibleRows = 17;
@@ -210,6 +215,10 @@ class VrMenu {
 
   void refresh_dir(const std::string& select_name = {});
   void move_cursor(int delta);
+  void step_list_row(int dir);
+  void advance_list_glide(float dt);
+  void sync_list_pose();
+  void clamp_list_window();
   void activate();
   void go_back();
   void bump();
@@ -242,6 +251,14 @@ class VrMenu {
   std::vector<Entry> entries_;
   int cursor_ = 0;
   int scroll_ = 0;
+  float focus_f_ = 0.f;
+  float scroll_f_ = 0.f;
+  int list_target_ = 0;
+  /** Seconds to slide one row. Digital repeat is 0.055; analog uses 1×, 2×, or 3× that. */
+  float list_row_secs_ = 0.055f;
+  bool list_gliding_ = false;
+  /** True on a glide frame and the frame it arrives, so the last position is painted. */
+  bool list_glide_paint_ = false;
   struct AxisRepeat {
     int dir = 0;
     float held = 0.f;

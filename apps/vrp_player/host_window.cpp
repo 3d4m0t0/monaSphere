@@ -676,11 +676,22 @@ void HostWindow::hideControlsHelp() {
 }
 
 void HostWindow::requestHudPaint() {
-  hud_paint_req_.fetch_add(1);
+  hud_paint_req_.fetch_add(1, std::memory_order_relaxed);
+  bool expected = false;
+  if (!hud_paint_queued_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
   QMetaObject::invokeMethod(this, [this] { paintHudNow(); }, Qt::QueuedConnection);
 }
 
 void HostWindow::paintHudNow() {
+  const uint64_t seen = hud_paint_req_.load(std::memory_order_acquire);
+  struct Done {
+    HostWindow* self;
+    uint64_t seen;
+    ~Done() {
+      self->hud_paint_queued_.store(false, std::memory_order_release);
+      if (self->hud_paint_req_.load(std::memory_order_acquire) != seen) self->requestHudPaint();
+    }
+  } done{this, seen};
   if (shutting_down_.load()) return;
   vrp::VrMenu* menu = nullptr;
   {
@@ -3129,6 +3140,10 @@ void HostWindow::xrThreadMain() {
 
       auto input = xr.poll_actions();
       bool pad_sony = false;
+      bool pad_nav_up = false;
+      bool pad_nav_down = false;
+      bool pad_nav_left = false;
+      bool pad_nav_right = false;
       const bool want_gamepad = gamepad_enabled_.load();
       if (want_gamepad) {
         gamepad_sdl_owned_.store(true);
@@ -3156,7 +3171,12 @@ void HostWindow::xrThreadMain() {
               std::lock_guard<std::mutex> lock(gamepad_name_mu_);
               gamepad_seen_name_ = QString::fromStdString(gp.name);
             }
+            pad_nav_up = gp.nav_up;
+            pad_nav_down = gp.nav_down;
+            pad_nav_left = gp.nav_left;
+            pad_nav_right = gp.nav_right;
             // Leave the HMD stick alone while the gamepad stick is centered.
+            // A cross-key press is nav_*, not a stick at ±1.
             if (std::fabs(gp.stick_x) > 0.15f || std::fabs(gp.stick_y) > 0.15f) {
               input.stick_x = gp.stick_x;
               input.stick_y = gp.stick_y;
@@ -3222,6 +3242,10 @@ void HostWindow::xrThreadMain() {
       if (!controls_help_.load()) {
         pad.stick_x = input.stick_x;
         pad.stick_y = input.stick_y;
+        pad.nav_up = pad_nav_up;
+        pad.nav_down = pad_nav_down;
+        pad.nav_left = pad_nav_left;
+        pad.nav_right = pad_nav_right;
         pad.confirm = input.confirm;
         pad.confirm_held = input.confirm_held;
         pad.menu_toggle = input.menu_toggle;
@@ -3408,6 +3432,7 @@ void HostWindow::xrThreadMain() {
           }
           requestHudPaint();
         }
+        if (menu.list_gliding()) requestHudPaint();
         if (!preview_hi.empty() && now - preview_wait_since >= std::chrono::milliseconds(450)) {
           request_preview(preview_hi);
         }

@@ -150,6 +150,7 @@ GamepadInput::State GamepadInput::poll() {
   st.sony_face = pad_type == SDL_CONTROLLER_TYPE_PS3 || pad_type == SDL_CONTROLLER_TYPE_PS4 ||
                  pad_type == SDL_CONTROLLER_TYPE_PS5 || SDL_GameControllerGetVendor(gc) == 0x054C;
 
+  // Stick full-scale (±32767) stays analog. The cross key is the dpad buttons, not that sample.
   auto axis = [&](SDL_GameControllerAxis a) -> float {
     const Sint16 v = SDL_GameControllerGetAxis(gc, a);
     constexpr float dead = 8000.f;
@@ -157,14 +158,12 @@ GamepadInput::State GamepadInput::poll() {
     return static_cast<float>(v) / 32767.f;
   };
 
-  float sx = axis(SDL_CONTROLLER_AXIS_LEFTX);
-  float sy = -axis(SDL_CONTROLLER_AXIS_LEFTY);
-  if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT)) sx = -1.f;
-  if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)) sx = 1.f;
-  if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP)) sy = 1.f;
-  if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_DOWN)) sy = -1.f;
-  st.stick_x = sx;
-  st.stick_y = sy;
+  st.stick_x = axis(SDL_CONTROLLER_AXIS_LEFTX);
+  st.stick_y = -axis(SDL_CONTROLLER_AXIS_LEFTY);
+  st.nav_left = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0;
+  st.nav_right = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
+  st.nav_up = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;
+  st.nav_down = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_DOWN) != 0;
 
   auto edge = [](bool now, bool& prev) {
     const bool e = now && !prev;

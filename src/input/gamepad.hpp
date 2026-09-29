@@ -17,6 +17,11 @@ class GamepadInput {
     std::string connection;
     float stick_x = 0.f;
     float stick_y = 0.f;  // +up
+    /** Cross key buttons. Kept off the stick axis so a full tilt stays the fast analog glide. */
+    bool nav_up = false;
+    bool nav_down = false;
+    bool nav_left = false;
+    bool nav_right = false;
     bool confirm = false;  // A edge
     bool confirm_held = false;  // A level
     bool back = false;     // B edge

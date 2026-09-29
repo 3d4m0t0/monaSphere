@@ -192,6 +192,8 @@ class HostWindow : public QMainWindow {
   bool help_swallow_back_ = false;
   std::atomic<uint64_t> hud_paint_req_{0};
   std::atomic<uint64_t> hud_paint_done_{0};
+  /** A paint is queued or running. Further requests coalesce into one follow-up. */
+  std::atomic<bool> hud_paint_queued_{false};
   std::mutex hud_pixels_mu_;
   /** GPU atlas RGBA. Uploaded only when hud_atlas_gen_ changes. */
   std::vector<uint8_t> hud_pixels_;

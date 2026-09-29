@@ -37,6 +37,8 @@ class HudCanvas {
 
   void begin(int panel_w, int panel_h);
   HudPaintResult take();
+  /** Pixel clip for subsequent quads. An empty rect clears it. */
+  void set_clip(const QRect& clip);
 
   void fill(const QRect& r, const QColor& color);
   /** Horizontal 3-slice so a changing width does not rasterize again. */
@@ -70,6 +72,7 @@ class HudCanvas {
   int atlas_h_ = 0;
   int panel_w_ = 1280;
   int panel_h_ = 720;
+  QRect clip_{};
   int pen_x_ = 1;
   int pen_y_ = 1;
   int row_h_ = 0;
