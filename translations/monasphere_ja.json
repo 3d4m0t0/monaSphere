@@ -262,6 +262,16 @@
     },
     {
       "context": "monaSphere",
+      "source": "Half",
+      "translation": "ハーフ"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Full",
+      "translation": "フル"
+    },
+    {
+      "context": "monaSphere",
       "source": "Off",
       "translation": "切"
     },

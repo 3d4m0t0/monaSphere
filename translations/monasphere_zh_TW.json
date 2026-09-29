@@ -262,6 +262,16 @@
     },
     {
       "context": "monaSphere",
+      "source": "Half",
+      "translation": "半幅"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Full",
+      "translation": "全幅"
+    },
+    {
+      "context": "monaSphere",
       "source": "Off",
       "translation": "關"
     },

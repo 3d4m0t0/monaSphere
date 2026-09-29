@@ -70,6 +70,8 @@ ROWS = [
      }),
     ("monaSphere", "Flat", {"ja": "フラット", "de": "Flach", "fr": "Plat", "es": "Plano", "ko": "평면", "zh_CN": "平面", "zh_TW": "平面"}),
     ("monaSphere", "mono", {"ja": "モノラル", "de": "Mono", "fr": "Mono", "es": "Mono", "ko": "모노", "zh_CN": "单声道", "zh_TW": "單聲道"}),
+    ("monaSphere", "Half", {"ja": "ハーフ", "de": "Halb", "fr": "Demi", "es": "Medio", "ko": "하프", "zh_CN": "半幅", "zh_TW": "半幅"}),
+    ("monaSphere", "Full", {"ja": "フル", "de": "Voll", "fr": "Plein", "es": "Completo", "ko": "풀", "zh_CN": "全幅", "zh_TW": "全幅"}),
     ("monaSphere", "Off", {"ja": "切", "de": "Aus", "fr": "Off", "es": "Off", "ko": "끔", "zh_CN": "关", "zh_TW": "關"}),
     ("monaSphere", "Vol%1%", {"ja": "音量%1%", "de": "Vol%1%", "fr": "Vol%1%", "es": "Vol%1%", "ko": "Vol%1%", "zh_CN": "音量%1%", "zh_TW": "音量%1%"}),
     ("monaSphere", "Auto", {"ja": "自動", "de": "Auto", "fr": "Auto", "es": "Auto", "ko": "자동", "zh_CN": "自动", "zh_TW": "自動"}),

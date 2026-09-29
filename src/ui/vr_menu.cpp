@@ -207,10 +207,26 @@ void VrMenu::set_display_hz(float hz) {
   bump();
 }
 
-void VrMenu::set_format(ProjectionMode proj, StereoLayout stereo) {
+void VrMenu::set_format(ProjectionMode proj, StereoLayout stereo, bool stereo_full) {
   projection_ = proj;
   stereo_ = stereo;
+  stereo_full_ = stereo_full;
   bump();
+}
+
+int VrMenu::format_option_count() const { return format_menu_count(projection_); }
+
+void VrMenu::apply_format_index(int index) {
+  switch (format_menu_at(projection_, index)) {
+    case FormatChoice::Flat: projection_ = ProjectionMode::Flat; break;
+    case FormatChoice::Deg180: projection_ = ProjectionMode::Deg180; break;
+    case FormatChoice::Deg360: projection_ = ProjectionMode::Deg360; break;
+    case FormatChoice::Mono: stereo_ = StereoLayout::Mono; break;
+    case FormatChoice::Sbs: stereo_ = StereoLayout::Sbs; break;
+    case FormatChoice::Ou: stereo_ = StereoLayout::OverUnder; break;
+    case FormatChoice::Full: stereo_full_ = true; break;
+    case FormatChoice::Half: stereo_full_ = false; break;
+  }
 }
 
 void VrMenu::set_preview(std::vector<uint8_t> rgba, int w, int h) {
@@ -385,7 +401,8 @@ void VrMenu::close_controls_edit() {
 
 void VrMenu::move_cursor(int delta) {
   if (screen_ == Screen::Format) {
-    format_cursor_ = (format_cursor_ + delta + 8) % 8;
+    const int n = format_option_count();
+    format_cursor_ = (format_cursor_ + delta + n) % n;
     bump();
     return;
   }
@@ -516,11 +533,7 @@ void VrMenu::save_volume() const {
 
 void VrMenu::activate() {
   if (screen_ == Screen::Format) {
-    if (format_cursor_ < 4) {
-      projection_ = static_cast<ProjectionMode>(format_cursor_);
-    } else {
-      stereo_ = static_cast<StereoLayout>(format_cursor_ - 4);
-    }
+    apply_format_index(format_cursor_);
     bump();
     return;
   }
@@ -811,7 +824,8 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         return;
       }
       if (controls_edit_ == ControlsEdit::FormatPick && dy != 0) {
-        picker_cursor_ = (picker_cursor_ + (dy < 0 ? -1 : 1) + 6) % 6;
+        const int n = format_option_count();
+        picker_cursor_ = (picker_cursor_ + (dy < 0 ? -1 : 1) + n) % n;
         bump();
         nav_cooldown_ = 0.15f;
         return;
@@ -903,15 +917,13 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         return out;
       }
       if (controls_edit_ == ControlsEdit::FormatPick) {
-        if (picker_cursor_ < 3) {
-          projection_ = static_cast<ProjectionMode>(picker_cursor_);
-        } else {
-          stereo_ = static_cast<StereoLayout>(picker_cursor_ - 3);
-        }
+        const bool keep_open = format_menu_at(projection_, picker_cursor_) == FormatChoice::Flat;
+        apply_format_index(picker_cursor_);
         out.apply_format = true;
         out.projection = projection_;
         out.stereo = stereo_;
-        close_controls_edit();
+        out.stereo_full = stereo_full_;
+        if (!keep_open) close_controls_edit();
         bump();
         return out;
       }
@@ -1024,6 +1036,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
       out.apply_format = true;
       out.projection = projection_;
       out.stereo = stereo_;
+      out.stereo_full = stereo_full_;
     }
   }
 
@@ -1078,6 +1091,7 @@ VrMenu::Snapshot VrMenu::snapshot() const {
   s.scroll = scroll_;
   s.projection = projection_;
   s.stereo = stereo_;
+  s.stereo_full = stereo_full_;
   s.format_cursor = format_cursor_;
   s.transport_cursor = transport_cursor_;
   s.picker_cursor = picker_cursor_;

@@ -505,6 +505,62 @@ QString stereo_label(StereoLayout s) {
   return QStringLiteral("?");
 }
 
+bool flat_pack_choices(const VrMenu::Snapshot& snap) {
+  return snap.projection == ProjectionMode::Flat && snap.stereo != StereoLayout::Mono;
+}
+
+QString format_choice_label(FormatChoice choice) {
+  switch (choice) {
+    case FormatChoice::Flat: return proj_label(ProjectionMode::Flat);
+    case FormatChoice::Deg180: return QStringLiteral("180°");
+    case FormatChoice::Deg360: return QStringLiteral("360°");
+    case FormatChoice::Mono: return stereo_label(StereoLayout::Mono);
+    case FormatChoice::Sbs: return stereo_label(StereoLayout::Sbs);
+    case FormatChoice::Ou: return stereo_label(StereoLayout::OverUnder);
+    case FormatChoice::Full: return VRP_TR("Full");
+    case FormatChoice::Half: return VRP_TR("Half");
+  }
+  return QStringLiteral("?");
+}
+
+bool format_choice_active(const VrMenu::Snapshot& snap, FormatChoice choice) {
+  switch (choice) {
+    case FormatChoice::Flat: return snap.projection == ProjectionMode::Flat;
+    case FormatChoice::Deg180: return snap.projection == ProjectionMode::Deg180;
+    case FormatChoice::Deg360: return snap.projection == ProjectionMode::Deg360;
+    case FormatChoice::Mono: return snap.stereo == StereoLayout::Mono;
+    case FormatChoice::Sbs: return snap.stereo == StereoLayout::Sbs;
+    case FormatChoice::Ou: return snap.stereo == StereoLayout::OverUnder;
+    case FormatChoice::Full: return snap.stereo_full;
+    case FormatChoice::Half: return !snap.stereo_full;
+  }
+  return false;
+}
+
+bool format_row_mark(const VrMenu::Snapshot& snap, FormatChoice choice) {
+  if (!format_choice_active(snap, choice)) return false;
+  return choice == FormatChoice::Deg180 || choice == FormatChoice::Deg360 || choice == FormatChoice::Mono ||
+         choice == FormatChoice::Sbs || choice == FormatChoice::Ou || choice == FormatChoice::Full ||
+         choice == FormatChoice::Half;
+}
+
+void paint_format_row(QPainter& p, const QRect& row, const QString& label, bool selected, bool checked) {
+  if (selected) {
+    p.setBrush(QColor(40, 120, 200, 220));
+    p.setPen(Qt::NoPen);
+    p.drawRoundedRect(row, 4, 4);
+  }
+  p.setPen(selected ? QColor(255, 255, 255) : QColor(210, 220, 235));
+  if (checked) p.drawText(QRect(row.x() + 2, row.y(), 18, row.height()), Qt::AlignCenter, QStringLiteral("✓"));
+  p.drawText(row.adjusted(22, 0, -6, 0), Qt::AlignVCenter | Qt::AlignLeft, label);
+}
+
+QString stereo_chip_label(const VrMenu::Snapshot& snap) {
+  QString s = stereo_label(snap.stereo);
+  if (flat_pack_choices(snap)) s += QLatin1Char(' ') + (snap.stereo_full ? VRP_TR("Full") : VRP_TR("Half"));
+  return s;
+}
+
 void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int width, int height,
                              const QFont& body_font, const QFont& hint_font) {
   const bool has_info = !snap.info_video_codec.empty() || !snap.info_res.empty() ||
@@ -522,7 +578,7 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
   const int chip_h = 48;
   constexpr int kBtns = 6;
   const int vol_w = 100;
-  const int fmt_w = 112;
+  const int fmt_w = 156;
   const int fsr_w = 88;
   const int hz_w = 80;
   const int group_gap = 6;
@@ -577,7 +633,7 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
   x += vol_w + gap;
 
   const QRect fmt_r(x, y, fmt_w, chip_h);
-  draw_mode_chip(p, fmt_r, proj_label(snap.projection), stereo_label(snap.stereo), sel == 7,
+  draw_mode_chip(p, fmt_r, proj_label(snap.projection), stereo_chip_label(snap), sel == 7,
                  snap.controls_edit == VrMenu::ControlsEdit::FormatPick);
   x += fmt_w + gap;
 
@@ -668,7 +724,7 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
              snap.controls_edit == VrMenu::ControlsEdit::HzPick) {
     const bool fsr = snap.controls_edit == VrMenu::ControlsEdit::FsrPick;
     const bool hz = snap.controls_edit == VrMenu::ControlsEdit::HzPick;
-    const int n = fsr ? 4 : (hz ? 3 : 6);
+    const int n = fsr ? 4 : (hz ? 3 : format_menu_count(snap.projection));
     const int row_h = 34;
     const int box_w = fsr ? 140 : (hz ? 120 : 168);
     const int box_h = 12 + n * row_h;
@@ -691,10 +747,12 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
           case 2: label = QStringLiteral("120Hz"); break;
           default: label = VRP_TR("Auto"); break;
         }
-      } else if (i < 3) {
-        label = proj_label(static_cast<ProjectionMode>(i));
       } else {
-        label = stereo_label(static_cast<StereoLayout>(i - 3));
+        const FormatChoice choice = format_menu_at(snap.projection, i);
+        const QRect row(box.x() + 6, box.y() + 6 + i * row_h, box.width() - 12, row_h - 4);
+        const bool mark = format_row_mark(snap, choice);
+        paint_format_row(p, row, format_choice_label(choice), i == snap.picker_cursor, mark);
+        continue;
       }
       const QRect row(box.x() + 6, box.y() + 6 + i * row_h, box.width() - 12, row_h - 4);
       const bool on = (i == snap.picker_cursor);
@@ -843,18 +901,15 @@ QImage paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height, bool s
     }
   } else if (snap.screen == VrMenu::Screen::Format) {
     p.setFont(body_font);
-    const char* labels[] = {QT_TR_NOOP("Flat"), "180°", "360°", "mono", "SBS", "OU"};
-    for (int i = 0; i < 6; ++i) {
-      bool on = false;
-      if (i == 0) on = snap.projection == ProjectionMode::Flat;
-      if (i == 1) on = snap.projection == ProjectionMode::Deg180;
-      if (i == 2) on = snap.projection == ProjectionMode::Deg360;
-      if (i == 3) on = snap.stereo == StereoLayout::Mono;
-      if (i == 4) on = snap.stereo == StereoLayout::Sbs;
-      if (i == 5) on = snap.stereo == StereoLayout::OverUnder;
-      QString t = (i == 0 || i == 3) ? VRP_TR(labels[i]) : QString::fromUtf8(labels[i]);
-      if (on) t += QStringLiteral("  ✓");
-      draw_row(p, QRect(side + 24, 80 + i * 48, content_w - 48, 44), t, i == snap.format_cursor);
+    const int n = format_menu_count(snap.projection);
+    for (int i = 0; i < n; ++i) {
+      const FormatChoice choice = format_menu_at(snap.projection, i);
+      const bool mark = format_row_mark(snap, choice);
+      const QRect row(side + 24, 80 + i * 44, content_w - 48, 40);
+      if (i == snap.format_cursor) p.fillRect(row.adjusted(8, 2, -8, -2), QColor(40, 120, 200, 220));
+      p.setPen(QColor(240, 245, 250));
+      if (mark) p.drawText(QRect(row.x() + 8, row.y(), 22, row.height()), Qt::AlignCenter, QStringLiteral("✓"));
+      p.drawText(row.adjusted(32, 0, -16, 0), Qt::AlignVCenter | Qt::AlignLeft, format_choice_label(choice));
     }
   }
 

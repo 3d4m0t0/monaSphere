@@ -2822,7 +2822,7 @@ void HostWindow::xrThreadMain() {
       }
       menu.init(start);
       audio.set_volume(menu.volume());
-      menu.set_format(opt_.projection, opt_.stereo);
+      menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
       menu.set_fsr(preferred_fsr_);
       fsr.set_mode(preferred_fsr_);
       menu.set_preferred_hz(preferred_hz_);
@@ -2902,7 +2902,7 @@ void HostWindow::xrThreadMain() {
       QMetaObject::invokeMethod(
           this, [this, info] { reportVideoOpen(info); }, Qt::QueuedConnection);
       if (ok) {
-        vrp::detect_format_from_filename(path, opt_.projection, opt_.stereo);
+        vrp::detect_format_from_filename(path, opt_.projection, opt_.stereo, opt_.stereo_full);
         scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
 
         // Compact HUD fields (映像 / 音声 / 出力) — keep short for panel width.
@@ -2955,24 +2955,21 @@ void HostWindow::xrThreadMain() {
         menu.set_media_info(vcodec, res, fps, bitrate, acodec, arate, ach, hw, out_note);
         menu.set_preferred_hz(preferred_hz_);
         menu.set_display_hz(static_cast<float>(xr.status().display_hz));
-        menu.set_format(opt_.projection, opt_.stereo);
+        menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
         audio.set_volume(menu.volume());
         decoder.set_rate(1.f);
         audio.set_rate(1.f);
         menu.set_rate(1.f);
-        {
-          float aspect = (info.height > 0) ? static_cast<float>(info.width) / static_cast<float>(info.height)
-                                           : (16.f / 9.f);
-          if (opt_.stereo == vrp::StereoLayout::Sbs) aspect *= 0.5f;
-          else if (opt_.stereo == vrp::StereoLayout::OverUnder) aspect *= 2.f;
-          scene.set_content_aspect(aspect);
-        }
+        scene.set_content_aspect(vrp::frame_display_aspect(static_cast<float>(info.width),
+                                                           static_cast<float>(info.height), opt_.stereo,
+                                                           opt_.stereo_full));
         QMetaObject::invokeMethod(
             this,
             [this] {
               appendLog(tr("Format guess: %1 / %2")
                             .arg(QString::fromUtf8(vrp::projection_name(opt_.projection)))
-                            .arg(QString::fromUtf8(vrp::stereo_name(opt_.stereo))));
+                            .arg(QString::fromUtf8(
+                                vrp::stereo_detect_name(opt_.stereo, opt_.stereo_full))));
             },
             Qt::QueuedConnection);
         requestHudPaint();
@@ -3068,6 +3065,12 @@ void HostWindow::xrThreadMain() {
         if (p >= 0) opt_.projection = static_cast<vrp::ProjectionMode>(p);
         if (s >= 0) opt_.stereo = static_cast<vrp::StereoLayout>(s);
         scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
+        if (decoder.is_open()) {
+          const auto& info = decoder.info();
+          scene.set_content_aspect(vrp::frame_display_aspect(static_cast<float>(info.width),
+                                                             static_cast<float>(info.height), opt_.stereo,
+                                                             opt_.stereo_full));
+        }
       }
 
       const int fsr_pick = fsr_req_.exchange(-1);
@@ -3230,22 +3233,22 @@ void HostWindow::xrThreadMain() {
       if (menu_out.apply_format) {
         opt_.projection = menu_out.projection;
         opt_.stereo = menu_out.stereo;
+        opt_.stereo_full = menu_out.stereo_full;
         scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
-        menu.set_format(opt_.projection, opt_.stereo);
+        menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
         if (decoder.is_open()) {
           const auto& info = decoder.info();
-          float aspect = (info.height > 0) ? static_cast<float>(info.width) / static_cast<float>(info.height)
-                                           : (16.f / 9.f);
-          if (opt_.stereo == vrp::StereoLayout::Sbs) aspect *= 0.5f;
-          else if (opt_.stereo == vrp::StereoLayout::OverUnder) aspect *= 2.f;
-          scene.set_content_aspect(aspect);
+          scene.set_content_aspect(vrp::frame_display_aspect(static_cast<float>(info.width),
+                                                             static_cast<float>(info.height), opt_.stereo,
+                                                             opt_.stereo_full));
         }
         QMetaObject::invokeMethod(
             this,
             [this] {
               appendLog(tr("HMD format: %1 / %2")
                             .arg(QString::fromUtf8(vrp::projection_name(opt_.projection)))
-                            .arg(QString::fromUtf8(vrp::stereo_name(opt_.stereo))));
+                            .arg(QString::fromUtf8(
+                                vrp::stereo_detect_name(opt_.stereo, opt_.stereo_full))));
             },
             Qt::QueuedConnection);
         requestHudPaint();

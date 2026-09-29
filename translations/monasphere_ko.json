@@ -262,6 +262,16 @@
     },
     {
       "context": "monaSphere",
+      "source": "Half",
+      "translation": "하프"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Full",
+      "translation": "풀"
+    },
+    {
+      "context": "monaSphere",
       "source": "Off",
       "translation": "끔"
     },

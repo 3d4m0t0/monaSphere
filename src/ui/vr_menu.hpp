@@ -11,6 +11,33 @@
 
 namespace vrp {
 
+/** Playback format list. Flat keeps the list open and inserts full/half directly under itself. */
+enum class FormatChoice : uint8_t {
+  Flat = 0,
+  Deg180,
+  Deg360,
+  Mono,
+  Sbs,
+  Ou,
+  Full,
+  Half,
+};
+
+inline int format_menu_count(ProjectionMode projection) {
+  return projection == ProjectionMode::Flat ? 8 : 6;
+}
+
+inline FormatChoice format_menu_at(ProjectionMode projection, int index) {
+  static constexpr FormatChoice kFlat[] = {
+      FormatChoice::Flat, FormatChoice::Full, FormatChoice::Half, FormatChoice::Deg180,
+      FormatChoice::Deg360, FormatChoice::Mono, FormatChoice::Sbs, FormatChoice::Ou};
+  static constexpr FormatChoice kOther[] = {FormatChoice::Flat, FormatChoice::Deg180, FormatChoice::Deg360,
+                                            FormatChoice::Mono, FormatChoice::Sbs, FormatChoice::Ou};
+  const int n = format_menu_count(projection);
+  if (index < 0 || index >= n) return FormatChoice::Flat;
+  return (projection == ProjectionMode::Flat ? kFlat : kOther)[index];
+}
+
 /**
  * In-HMD UI:
  *  - Menu (Start/Guide): file browser
@@ -51,6 +78,7 @@ class VrMenu {
     int scroll = 0;
     ProjectionMode projection = ProjectionMode::Flat;
     StereoLayout stereo = StereoLayout::Mono;
+    bool stereo_full = true;
     int format_cursor = 0;
     int transport_cursor = 0;
     int picker_cursor = 0;  // within FSR / format popup
@@ -84,6 +112,8 @@ class VrMenu {
     bool apply_format = false;
     ProjectionMode projection = ProjectionMode::Flat;
     StereoLayout stereo = StereoLayout::Mono;
+    /** Flat SBS/OU packing. Ignored by 180° and 360°. */
+    bool stereo_full = true;
     bool play = false;
     bool pause = false;
     bool stop = false;
@@ -140,7 +170,7 @@ class VrMenu {
   static int hz_option_value(int index);
   static int hz_option_index(int hz);
   static const char* hz_option_label(int index);
-  void set_format(ProjectionMode proj, StereoLayout stereo);
+  void set_format(ProjectionMode proj, StereoLayout stereo, bool stereo_full);
   void set_preview(std::vector<uint8_t> rgba, int w, int h);
   void clear_preview();
   void notify_changed() { bump(); }
@@ -192,6 +222,8 @@ class VrMenu {
   std::filesystem::path user_conf_path() const;
   void close_controls_edit();
   static bool is_video_ext(const std::filesystem::path& p);
+  int format_option_count() const;
+  void apply_format_index(int index);
 
   bool visible_ = true;
   bool controls_visible_ = false;
@@ -208,6 +240,7 @@ class VrMenu {
 
   ProjectionMode projection_ = ProjectionMode::Flat;
   StereoLayout stereo_ = StereoLayout::Mono;
+  bool stereo_full_ = true;
   int format_cursor_ = 0;
   int transport_cursor_ = kPlayPause;
   int picker_cursor_ = 0;
