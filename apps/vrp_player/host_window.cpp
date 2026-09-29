@@ -701,7 +701,7 @@ void HostWindow::paintHudNow() {
   if (!menu) return;
   const auto snap = menu->snapshot();
   const bool help = controls_help_.load();
-  const int kind = help ? 1 : snap.visible ? 2 : snap.controls_visible ? 3 : 0;
+  const int kind = help ? 1 : snap.visible ? 2 : snap.controls_visible ? 3 : snap.seek_bar_only ? 4 : 0;
   if (kind == 0) {
     std::lock_guard<std::mutex> lock(hud_pixels_mu_);
     hud_verts_.clear();
@@ -3234,7 +3234,7 @@ void HostWindow::xrThreadMain() {
         const bool sony = hmd_sony || pad_sony;
         if (face_sony_.exchange(sony) != sony) requestHudPaint();
       }
-      decoder.set_seek_scrubbing(input.seek_scrubbing);
+      decoder.set_seek_scrubbing(input.seek_scrubbing && !menu.visible());
 
       vrp::VrMenu::PadInput pad;
       if (help_swallow_back_ && !input.back_held && !input.back) help_swallow_back_ = false;
@@ -3257,7 +3257,7 @@ void HostWindow::xrThreadMain() {
       const bool menu_was = menu.visible();
       const bool controls_was = menu.controls_visible();
       const auto menu_out = menu.update(pad, static_cast<float>(dt));
-      if (menu_out.seek_scrubbing) decoder.set_seek_scrubbing(true);
+      if (menu_out.seek_scrubbing && !menu.visible()) decoder.set_seek_scrubbing(true);
       if (menu.visible() != menu_was || menu.controls_visible() != controls_was) requestHudPaint();
       if (menu_out.open_video) {
         if (!open_media(menu_out.video_path)) {
@@ -3372,12 +3372,14 @@ void HostWindow::xrThreadMain() {
       }
       // A seek is a pause. Playback, when it should continue, goes through play()
       // and the single start below — the same path as the play button.
-      const bool scrubbing = input.seek_scrubbing || menu_out.seek_scrubbing;
-      const bool seek_now = input.seek_back || menu_out.seek_back || input.seek_forward ||
-                            menu_out.seek_forward || menu_out.seek_start;
-      if (input.seek_back || menu_out.seek_back) decoder.seek_relative(-10.0);
-      if (input.seek_forward || menu_out.seek_forward) decoder.seek_relative(10.0);
-      if (menu_out.seek_start) decoder.seek_to(0.0);
+      const bool file_ui = menu.visible();
+      const bool scrubbing = !file_ui && (input.seek_scrubbing || menu_out.seek_scrubbing);
+      const bool seek_now = !file_ui && (input.seek_back || menu_out.seek_back || input.seek_forward ||
+                                         menu_out.seek_forward || menu_out.seek_start || menu_out.stick_seek);
+      if (!file_ui && (input.seek_back || menu_out.seek_back)) decoder.seek_relative(-10.0);
+      if (!file_ui && (input.seek_forward || menu_out.seek_forward)) decoder.seek_relative(10.0);
+      if (!file_ui && menu_out.stick_seek) decoder.seek_to(menu_out.stick_seek_sec);
+      if (!file_ui && menu_out.seek_start) decoder.seek_to(0.0);
       if (seek_now) audio.pause();
       bool resume_posted = false;
       // Key-repeat stays paused. Releasing the key is the end of the seek.
@@ -3416,7 +3418,15 @@ void HostWindow::xrThreadMain() {
       }
       // Video end-of-stream loop → keep audio on the same timeline (avoids post-repeat silence).
       if (decoder.consume_looped() && audio.is_open() && decoder.seek_in_flight()) audio.mute_output();
-      if (menu.visible() || menu.controls_visible()) {
+      menu.note_seek_bar(!menu.visible() && !menu.controls_visible() &&
+                         (scrubbing || seek_now || menu.seek_gliding()));
+      static bool seek_overlay_was = false;
+      const bool seek_overlay = menu.seek_bar_only();
+      if (seek_overlay != seek_overlay_was) {
+        requestHudPaint();
+        seek_overlay_was = seek_overlay;
+      }
+      if (menu.visible() || menu.controls_visible() || seek_overlay) {
         // Decode a thumbnail only after the highlight has stayed put.
         const std::string preview_hi = menu.highlighted_video_path();
         const std::string row_hi = menu.highlighted_row_id();
@@ -3432,7 +3442,7 @@ void HostWindow::xrThreadMain() {
           }
           requestHudPaint();
         }
-        if (menu.list_gliding()) requestHudPaint();
+        if (menu.list_gliding() || menu.seek_gliding()) requestHudPaint();
         if (!preview_hi.empty() && now - preview_wait_since >= std::chrono::milliseconds(450)) {
           request_preview(preview_hi);
         }
@@ -3655,7 +3665,7 @@ void HostWindow::xrThreadMain() {
           }
         }
         const bool help_on = controls_help_.load();
-        const int want_kind = help_on ? 1 : menu.visible() ? 2 : menu.controls_visible() ? 3 : 0;
+        const int want_kind = help_on ? 1 : menu.visible() ? 2 : menu.controls_visible() ? 3 : menu.seek_bar_only() ? 4 : 0;
         if (hud_tex.poll_present() && inflight_atlas != 0) {
           resident_atlas = inflight_atlas;
           atlas_resize = false;
@@ -3673,7 +3683,7 @@ void HostWindow::xrThreadMain() {
         auto apply_layout = [&](int kind) {
           if (kind == 1 || kind == 2) {
             scene.set_hud_layout(0.70f, kHudDistanceM, kHudAspect);
-          } else if (kind == 3) {
+          } else if (kind == 3 || kind == 4) {
             constexpr float kControlsHalfW = 0.72f;
             constexpr float kOldAspect = 720.f / 1280.f;
             const float y = kControlsHalfW * (kHudAspect - kOldAspect);

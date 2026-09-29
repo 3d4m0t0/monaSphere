@@ -69,6 +69,8 @@ class VrMenu {
     uint64_t gen = 0;
     bool visible = false;
     bool controls_visible = false;
+    /** Seek bar alone, while playback controls are hidden. */
+    bool seek_bar_only = false;
     Screen screen = Screen::Browser;
     ControlsEdit controls_edit = ControlsEdit::None;
     std::string title;
@@ -125,6 +127,9 @@ class VrMenu {
     bool seek_forward = false;
     bool seek_start = false;  // [|<] cue to 0
     bool seek_scrubbing = false;  // A hold-repeat on [<]/[>]
+    /** Stick seek target in seconds. Valid when stick_seek is set. LB/RB stay ±10s. */
+    bool stick_seek = false;
+    double stick_seek_sec = 0;
     float volume_delta = 0.f;
     bool rate_changed = false;
     float rate = 1.f;
@@ -182,6 +187,9 @@ class VrMenu {
 
   bool visible() const { return visible_; }
   bool controls_visible() const { return controls_visible_; }
+  bool seek_bar_only() const { return seek_bar_only_; }
+  /** Seeking keeps the bar up. It hides about two seconds after seeking stops. */
+  void note_seek_bar(bool active);
   Screen screen() const { return screen_; }
   Snapshot snapshot() const;
   /** Browser row under the cursor, including directories. Empty outside the file list. */
@@ -189,6 +197,8 @@ class VrMenu {
   std::string highlighted_video_path() const;
   /** The file-list highlight is sliding between rows. The HUD should repaint every frame. */
   bool list_gliding() const { return list_glide_paint_; }
+  /** The seek bar is sliding between stick-seek targets. */
+  bool seek_gliding() const { return seek_glide_paint_; }
 
   /** Rows shown in the file list. Page left/right moves by this many. */
   static constexpr int kVisibleRows = 17;
@@ -242,6 +252,8 @@ class VrMenu {
 
   bool visible_ = true;
   bool controls_visible_ = false;
+  bool seek_bar_only_ = false;
+  std::chrono::steady_clock::time_point seek_bar_until_{};
   ControlsEdit controls_edit_ = ControlsEdit::None;
   Screen screen_ = Screen::Browser;
   Place place_ = Place::Roots;
@@ -281,6 +293,15 @@ class VrMenu {
   bool playing_ = false;
   double position_sec_ = 0;
   double duration_sec_ = 0;
+  /** Shown seek-bar time while a stick seek glides. Decoder time stays in position_sec_. */
+  double seek_bar_sec_ = 0;
+  double seek_target_sec_ = 0;
+  double seek_step_sec_ = 5;
+  bool seek_gliding_ = false;
+  bool seek_glide_paint_ = false;
+  /** Keep the bar on the commanded time. A decoded keyframe is earlier and must not pull it back. */
+  bool seek_bar_hold_ = false;
+  AxisRepeat stick_seek_repeat_{};
   float volume_ = 0.2f;
   float rate_ = 1.f;
   FsrMode fsr_ = FsrMode::Quality;

@@ -571,20 +571,74 @@ QString stereo_chip_label(const VrMenu::Snapshot& snap) {
   return s;
 }
 
+struct PlaybackPanel {
+  int panel_x = 0;
+  int panel_y = 0;
+  int panel_w = 0;
+  int panel_h = 0;
+  int pad = 12;
+  int scrub_y = 0;
+  QRect bar;
+  QRect time;
+  bool has_info = false;
+  int info_h = 0;
+};
+
+PlaybackPanel playback_panel(const VrMenu::Snapshot& snap, int width, int height) {
+  PlaybackPanel p;
+  p.has_info = !snap.info_video_codec.empty() || !snap.info_res.empty() || !snap.info_audio_codec.empty();
+  p.info_h = p.has_info ? 72 : 0;
+  constexpr int kFootH = 40;
+  constexpr int kBtn = 48;
+  constexpr int kButtonsOff = 32;
+  const int scrub_off = kButtonsOff + kBtn + 14;
+  const int above_foot = p.has_info ? (scrub_off + 18 + (p.info_h - 8)) : (scrub_off + 16);
+  p.panel_h = above_foot + kFootH;
+  p.panel_y = height - p.panel_h;
+  constexpr int kGap = 4;
+  constexpr int kBtns = 6;
+  constexpr int kVolW = 100;
+  constexpr int kFmtW = 156;
+  constexpr int kFsrW = 88;
+  constexpr int kHzW = 80;
+  constexpr int kGroupGap = 6;
+  const int row_w = kBtn * kBtns + kGap * (kBtns - 1) + kGroupGap + kVolW + kGap + kFmtW + kGap + kFsrW +
+                    kGap + kHzW;
+  p.panel_w = row_w + p.pad * 2;
+  p.panel_x = std::max(0, (width - p.panel_w) / 2);
+  p.scrub_y = p.panel_y + kButtonsOff + kBtn + 14;
+  constexpr int kTimeW = 110;
+  p.bar = QRect(p.panel_x + p.pad, p.scrub_y, p.panel_w - p.pad * 2 - kTimeW - 8, 10);
+  p.time = QRect(p.panel_x + p.panel_w - p.pad - kTimeW, p.scrub_y - 6, kTimeW, 22);
+  return p;
+}
+
+void paint_scrub_bar(HudCanvas& c, const VrMenu::Snapshot& snap, const QRect& bar, const QRect& time,
+                     const QFont& hint_font) {
+  c.rounded(bar, QColor(30, 36, 48, 200), 3);
+  double t = 0;
+  if (snap.duration_sec > 0) t = snap.position_sec / snap.duration_sec;
+  t = std::clamp(t, 0.0, 1.0);
+  const int fill_w = std::max(0, static_cast<int>(bar.width() * t));
+  if (fill_w > 0) c.rounded(QRect(bar.x(), bar.y(), fill_w, bar.height()), QColor(50, 160, 255, 230), 3);
+  c.text(time, fmt_time(snap.position_sec) + QStringLiteral(" / ") + fmt_time(snap.duration_sec), hint_font,
+         QColor(200, 210, 220), Qt::AlignRight | Qt::AlignVCenter);
+}
+
 void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int width, int height,
                              const QFont& body_font, const QFont& hint_font) {
-  const bool has_info = !snap.info_video_codec.empty() || !snap.info_res.empty() ||
-                        !snap.info_audio_codec.empty();
-  const int info_h = has_info ? 72 : 0;
-  const int foot_h = 40;
-  const int btn = 48;
-  const int buttons_off = 32;
-  const int scrub_off = buttons_off + btn + 14;
-  const int above_foot = has_info ? (scrub_off + 18 + (info_h - 8)) : (scrub_off + 16);
-  const int panel_h = above_foot + foot_h;
-  const int top = height - panel_h;
+  const PlaybackPanel panel = playback_panel(snap, width, height);
+  const bool has_info = panel.has_info;
+  const int info_h = panel.info_h;
+  const int top = panel.panel_y;
+  const int panel_x = panel.panel_x;
+  const int panel_w = panel.panel_w;
+  const int panel_h = panel.panel_h;
+  const int pad = panel.pad;
 
   const int gap = 4;
+  const int btn = 48;
+  const int foot_h = 40;
   const int chip_h = 48;
   constexpr int kBtns = 6;
   const int vol_w = 100;
@@ -592,11 +646,6 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
   const int fsr_w = 88;
   const int hz_w = 80;
   const int group_gap = 6;
-  const int row_w = btn * kBtns + gap * (kBtns - 1) + group_gap + vol_w + gap + fmt_w + gap +
-                    fsr_w + gap + hz_w;
-  const int pad = 12;
-  const int panel_w = row_w + pad * 2;
-  const int panel_x = std::max(0, (width - panel_w) / 2);
   c.rounded(QRect(panel_x, top, panel_w, panel_h), QColor(16, 20, 30, 235), 8);
 
   const QString fname = snap.media_name.empty() ? VRP_TR(snap.title.c_str())
@@ -653,19 +702,9 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
             snap.controls_edit == VrMenu::ControlsEdit::HzPick ||
                 snap.controls_edit == VrMenu::ControlsEdit::HzConfirm);
 
-  // Seek bar + time within panel
-  const int scrub_y = y + btn + 14;
-  const int time_w = 110;
-  const QRect bar(panel_x + pad, scrub_y, panel_w - pad * 2 - time_w - 8, 10);
-  c.rounded(bar, QColor(30, 36, 48, 200), 3);
-  double t = 0;
-  if (snap.duration_sec > 0) t = snap.position_sec / snap.duration_sec;
-  t = std::clamp(t, 0.0, 1.0);
-  const int fill_w = std::max(0, static_cast<int>(bar.width() * t));
-  if (fill_w > 0) c.rounded(QRect(bar.x(), bar.y(), fill_w, bar.height()), QColor(50, 160, 255, 230), 3);
-  c.text(QRect(panel_x + panel_w - pad - time_w, scrub_y - 6, time_w, 22),
-         fmt_time(snap.position_sec) + QStringLiteral(" / ") + fmt_time(snap.duration_sec), hint_font,
-         QColor(200, 210, 220), Qt::AlignRight | Qt::AlignVCenter);
+  // Seek bar + time within panel. The standalone bar uses this same rect.
+  const int scrub_y = panel.scrub_y;
+  paint_scrub_bar(c, snap, panel.bar, panel.time, hint_font);
 
   if (has_info) {
     const int info_top = scrub_y + 18;
@@ -813,15 +852,25 @@ QImage paint_file_thumb(const VrMenu::Snapshot& snap) {
   return img;
 }
 
+void paint_seek_bar_only(HudCanvas& c, const VrMenu::Snapshot& snap, int width, int height,
+                          const QFont& hint_font) {
+  const PlaybackPanel panel = playback_panel(snap, width, height);
+  c.rounded(QRect(panel.panel_x, panel.scrub_y - 10, panel.panel_w, 36), QColor(16, 20, 30, 220), 8);
+  paint_scrub_bar(c, snap, panel.bar, panel.time, hint_font);
+}
+
 HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height, bool sony_face) {
   sony_face_buttons = sony_face;
   HudCanvas& canvas = shared_hud_canvas();
   canvas.begin(width, height);
-  if (!snap.visible && !snap.controls_visible) return canvas.take();
-
   const QFont title_font = deUiFont(22, QFont::DemiBold);
   const QFont body_font = deUiFont(16, QFont::Normal);
   const QFont hint_font = deUiFont(13, QFont::Normal);
+
+  if (!snap.visible && !snap.controls_visible) {
+    if (snap.seek_bar_only) paint_seek_bar_only(canvas, snap, width, height, hint_font);
+    return canvas.take();
+  }
 
   if (snap.controls_visible) {
     paint_playback_controls(canvas, snap, width, height, body_font, hint_font);

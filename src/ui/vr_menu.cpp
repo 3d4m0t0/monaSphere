@@ -99,6 +99,12 @@ void VrMenu::set_media(const std::string& path, double duration_sec) {
   media_name_ = fs::path(path).filename().string();
   duration_sec_ = duration_sec;
   rate_ = 1.f;
+  seek_bar_sec_ = 0;
+  seek_target_sec_ = 0;
+  seek_gliding_ = false;
+  seek_glide_paint_ = false;
+  seek_bar_hold_ = false;
+  stick_seek_repeat_ = {};
   bump();
 }
 
@@ -119,6 +125,17 @@ void VrMenu::set_media_info(const std::string& video_codec, const std::string& r
   bump();
 }
 
+void VrMenu::note_seek_bar(bool active) {
+  if (visible_ || controls_visible_) {
+    seek_bar_only_ = false;
+    seek_bar_until_ = {};
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (active) seek_bar_until_ = now + std::chrono::seconds(2);
+  seek_bar_only_ = now < seek_bar_until_;
+}
+
 void VrMenu::set_output_note(const std::string& output_note) {
   if (info_output_note_ == output_note) return;
   info_output_note_ = output_note;
@@ -127,7 +144,36 @@ void VrMenu::set_output_note(const std::string& output_note) {
 
 void VrMenu::set_playback(bool playing, double position_sec) {
   playing_ = playing;
+  const double prev = position_sec_;
   position_sec_ = position_sec;
+  const bool stick_busy = seek_gliding_ || stick_seek_repeat_.dir != 0;
+  if (stick_busy) {
+    seek_bar_hold_ = true;
+    bump();
+    return;
+  }
+  const bool looped = duration_sec_ > 1.0 && prev > duration_sec_ * 0.5 && position_sec < 1.0;
+  if (looped) {
+    seek_bar_hold_ = false;
+    seek_bar_sec_ = position_sec;
+    bump();
+    return;
+  }
+  // After a seek the decoder reports the previous keyframe, which is behind the bar.
+  if (position_sec + 0.35 < seek_bar_sec_) {
+    seek_bar_hold_ = true;
+    bump();
+    return;
+  }
+  if (seek_bar_hold_) {
+    if (playing && position_sec + 0.05 >= seek_bar_sec_) {
+      seek_bar_hold_ = false;
+      seek_bar_sec_ = position_sec;
+    }
+    bump();
+    return;
+  }
+  seek_bar_sec_ = position_sec;
   bump();
 }
 
@@ -851,7 +897,99 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     return out;
   }
 
+  // Stick left/right seeks. LB/RB stay ±10s. The bar glides across each step.
+  auto stick_seek = [&]() {
+    const bool was_gliding = seek_gliding_;
+    if (media_path_.empty()) {
+      stick_seek_repeat_ = {};
+      if (seek_gliding_) {
+        seek_bar_sec_ = seek_target_sec_;
+        seek_gliding_ = false;
+      }
+      seek_glide_paint_ = was_gliding;
+      return;
+    }
+    constexpr float kInitial = 0.40f;
+    constexpr float kRepeat = 0.12f;
+    constexpr float kDead = 0.20f;
+    constexpr double kSteps[] = {5, 10, 15, 30, 60, 120};
+    int dir = 0;
+    const float mag = std::fabs(in.stick_x);
+    if (mag > kDead) {
+      const float t = std::clamp((mag - kDead) / (1.f - kDead), 0.f, 1.f);
+      const int band = std::min(5, static_cast<int>(t * 6.f));
+      seek_step_sec_ = kSteps[band];
+      dir = in.stick_x > 0.f ? 1 : -1;
+    }
+    auto pump = [&](int step_dir) {
+      if (step_dir == 0) {
+        stick_seek_repeat_ = {};
+        return;
+      }
+      auto fire = [&](int d) {
+        const double limit = duration_sec_ > 0 ? duration_sec_ : 1.0e9;
+        const double next =
+            std::clamp(seek_target_sec_ + static_cast<double>(d) * seek_step_sec_, 0.0, limit);
+        if (std::fabs(next - seek_target_sec_) < 0.001) return;
+        seek_target_sec_ = next;
+        seek_gliding_ = true;
+        seek_bar_hold_ = true;
+        out.stick_seek = true;
+        out.stick_seek_sec = next;
+      };
+      if (step_dir != stick_seek_repeat_.dir) {
+        if (stick_seek_repeat_.dir == 0) {
+          if (!seek_gliding_ && !seek_bar_hold_) seek_bar_sec_ = position_sec_;
+          seek_target_sec_ = seek_bar_sec_;
+          seek_bar_hold_ = true;
+        }
+        stick_seek_repeat_.dir = step_dir;
+        stick_seek_repeat_.held = 0.f;
+        stick_seek_repeat_.repeating = false;
+        fire(step_dir);
+        return;
+      }
+      stick_seek_repeat_.held += dt;
+      const float need = stick_seek_repeat_.repeating ? kRepeat : kInitial;
+      if (stick_seek_repeat_.held >= need) {
+        stick_seek_repeat_.held -= need;
+        if (stick_seek_repeat_.held > kRepeat) stick_seek_repeat_.held = 0.f;
+        stick_seek_repeat_.repeating = true;
+        fire(step_dir);
+      }
+    };
+    const bool was_held = stick_seek_repeat_.dir != 0;
+    pump(dir);
+    if (dir == 0) {
+      // Centered stick: stop on the bar's current time. Do not finish the step.
+      if (was_gliding || (was_held && std::fabs(seek_bar_sec_ - seek_target_sec_) > 0.05)) {
+        seek_gliding_ = false;
+        seek_target_sec_ = seek_bar_sec_;
+        seek_bar_hold_ = true;
+        out.stick_seek = true;
+        out.stick_seek_sec = seek_bar_sec_;
+        bump();
+      }
+    } else {
+      out.seek_scrubbing = true;
+      if (seek_gliding_) {
+        const double move =
+            (seek_step_sec_ / static_cast<double>(kRepeat)) * static_cast<double>(std::min(dt, 0.05f));
+        const double delta = seek_target_sec_ - seek_bar_sec_;
+        if (std::fabs(delta) <= move) {
+          seek_bar_sec_ = seek_target_sec_;
+          seek_gliding_ = false;
+        } else {
+          seek_bar_sec_ += std::copysign(move, delta);
+        }
+        bump();
+      }
+    }
+    seek_glide_paint_ = was_gliding || seek_gliding_;
+  };
+
   if (!visible_ && !controls_visible_) {
+    stick_seek();
     const bool stick_up = in.nav_up || in.stick_y > 0.55f;
     const bool stick_down = in.nav_down || in.stick_y < -0.55f;
     if (confirm && (stick_up != stick_down)) {
@@ -931,6 +1069,12 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   const bool nav_left = in.nav_left || in.stick_x < -0.55f;
   const bool nav_right = in.nav_right || in.stick_x > 0.55f;
   if (visible_ && !controls_visible_ && screen_ == Screen::Browser) {
+    stick_seek_repeat_ = {};
+    if (seek_gliding_) {
+      seek_bar_sec_ = seek_target_sec_;
+      seek_gliding_ = false;
+    }
+    seek_glide_paint_ = false;
     const bool was_gliding = list_gliding_;
     // Digital up/down: one step, a pause, then repeat. The highlight slides over that same interval.
     auto pump_repeat = [&](AxisRepeat& axis, int dir, float initial, float interval, auto&& fire) {
@@ -987,8 +1131,15 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     list_page_repeat_ = {};
     if (nav_up) nav(-1, 0);
     if (nav_down) nav(1, 0);
-    if (nav_left) nav(0, -1);
-    if (nav_right) nav(0, 1);
+    // Format keeps stick left/right for the row. Elsewhere the stick seeks.
+    if (visible_ && screen_ == Screen::Format) {
+      if (nav_left) nav(0, -1);
+      if (nav_right) nav(0, 1);
+    } else {
+      if (in.nav_left) nav(0, -1);
+      if (in.nav_right) nav(0, 1);
+      stick_seek();
+    }
   }
 
   if (controls_visible_ && (screen_ == Screen::Player || !visible_)) {
@@ -1176,6 +1327,7 @@ VrMenu::Snapshot VrMenu::snapshot() const {
   s.gen = gen_;
   s.visible = visible_;
   s.controls_visible = controls_visible_;
+  s.seek_bar_only = seek_bar_only_;
   s.controls_edit = controls_edit_;
   s.screen = screen_;
   if (controls_visible_) {
@@ -1225,7 +1377,7 @@ VrMenu::Snapshot VrMenu::snapshot() const {
   s.transport_cursor = transport_cursor_;
   s.picker_cursor = picker_cursor_;
   s.playing = playing_;
-  s.position_sec = position_sec_;
+  s.position_sec = (seek_gliding_ || seek_bar_hold_) ? seek_bar_sec_ : position_sec_;
   s.duration_sec = duration_sec_;
   s.media_name = media_name_;
   s.info_video_codec = info_video_codec_;
