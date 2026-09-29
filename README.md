@@ -68,6 +68,8 @@ Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://curs
 | Qt 6（Widgets） | ホスト UI / Host UI |
 | OpenXR Loader | XR セッション / XR session |
 | Vulkan（loader / headers） | 描画 / Rendering |
+| Wayland client、wayland-scanner | DRM リース一覧（MIT） / DRM lease list (MIT) |
+| XCB、XCB RandR | X11 の non-desktop 出力（MIT） / X11 non-desktop outputs (MIT) |
 | glslangValidator | GLSL → SPIR-V |
 | CMake ≥ 3.16、Ninja（または同等）、C++20 コンパイラ | ビルド / Build |
 
@@ -85,6 +87,7 @@ Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://curs
 |------------------|-------------|
 | miniaudio | 音声再生 / Audio playback |
 | AMD FidelityFX FSR1（headers） | アップスケール / Upscaling |
+| wp_drm_lease_v1（`third_party/wayland/drm-lease-v1.xml`） | DRM リース一覧の定義（MIT） / DRM lease list definition (MIT) |
 
 実行時の XR ランタイムとして **Monado**（`monado-service`）と `XR_RUNTIME_JSON` の設定が必要です。
 
@@ -161,7 +164,7 @@ sudo zypper in cmake ninja gcc-c++ pkgconf-pkg-config \
   OpenXR-SDK-devel libopenxr_loader1 monado \
   ffmpeg-8-libavcodec-devel ffmpeg-8-libavformat-devel \
   ffmpeg-8-libavutil-devel ffmpeg-8-libswscale-devel ffmpeg-8-libswresample-devel \
-  sdl2-devel libpulse-devel
+  sdl2-devel libpulse-devel wayland-devel libxcb-devel
 ```
 
 ```bash
@@ -189,13 +192,15 @@ Distributed binaries are expected to be built against `ffmpeg-*-mini-devel`. The
 ## ライセンス
 
 - **本ソフトウェアのソース:** [MIT](LICENSE)
-- **第三者成分:** [`THIRD_PARTY.md`](THIRD_PARTY.md)（Qt、FFmpeg、OpenXR、Vulkan、vendored ライブラリ等）
+- **第三者成分:** [`THIRD_PARTY.md`](THIRD_PARTY.md)（Qt、FFmpeg、OpenXR、Vulkan、Wayland、XCB、vendored ライブラリ等）
+- **直接表示の確認:** Wayland client と XCB / XCB RandR は MIT で動的リンクする。リース一覧の定義 [`third_party/wayland/drm-lease-v1.xml`](third_party/wayland/drm-lease-v1.xml) は MIT で同梱し、著作権表示はそのファイルに残す
 
 FFmpeg は動的リンクです。バイナリ配布時はリンク先 FFmpeg のライセンス（LGPL / GPL、ディストリのビルド内容）に従ってください。
 
 ### English
 
 - **Source of this software:** [MIT](LICENSE)
-- **Third-party components:** [`THIRD_PARTY.md`](THIRD_PARTY.md) (Qt, FFmpeg, OpenXR, Vulkan, vendored libraries, and similar)
+- **Third-party components:** [`THIRD_PARTY.md`](THIRD_PARTY.md) (Qt, FFmpeg, OpenXR, Vulkan, Wayland, XCB, vendored libraries, and similar)
+- **Direct-mode checks:** Wayland client and XCB / XCB RandR are MIT and linked dynamically. The lease-list definition [`third_party/wayland/drm-lease-v1.xml`](third_party/wayland/drm-lease-v1.xml) is bundled under MIT, and its copyright notice stays in that file
 
 FFmpeg is linked dynamically. When distributing a binary, follow the license of the FFmpeg you link (LGPL / GPL, and the distro's build flags).
