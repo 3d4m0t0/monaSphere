@@ -693,9 +693,9 @@ void HostWindow::paintHudNow() {
   const int kind = help ? 1 : snap.visible ? 2 : snap.controls_visible ? 3 : 0;
   if (kind == 0) {
     std::lock_guard<std::mutex> lock(hud_pixels_mu_);
-    hud_pixels_.clear();
+    hud_verts_.clear();
     hud_pixels_kind_ = 0;
-    hud_pixels_gen_ = snap.gen;
+    hud_pixels_gen_ = ++hud_paint_serial_;
     hud_paint_done_.store(snap.gen);
     return;
   }
@@ -707,20 +707,23 @@ void HostWindow::paintHudNow() {
     const int64_t left_ms = controls_help_until_ms_.load() - ms;
     seconds_left = left_ms <= 0 ? 0 : static_cast<int>((left_ms + 999) / 1000);
   }
-  QImage img = help ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load())
-                    : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load());
-  if (img.format() != QImage::Format_RGBA8888) img = img.convertToFormat(QImage::Format_RGBA8888);
+  const vrp::HudPaintResult hud =
+      help ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load())
+           : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load());
   QImage thumb = (!help && snap.visible) ? vrp::paint_file_thumb(snap) : QImage();
   if (!thumb.isNull() && thumb.format() != QImage::Format_RGBA8888) {
     thumb = thumb.convertToFormat(QImage::Format_RGBA8888);
   }
   {
     std::lock_guard<std::mutex> lock(hud_pixels_mu_);
-    hud_pixels_.resize(static_cast<size_t>(hud_w_ * hud_h_ * 4));
-    for (int y = 0; y < hud_h_; ++y) {
-      std::memcpy(hud_pixels_.data() + static_cast<size_t>(y * hud_w_ * 4), img.constScanLine(y),
-                  static_cast<size_t>(hud_w_ * 4));
+    if (hud.atlas && hud.atlas_bytes > 0 && hud.atlas_gen != hud_atlas_gen_) {
+      hud_pixels_.assign(hud.atlas, hud.atlas + hud.atlas_bytes);
+      hud_atlas_w_ = hud.atlas_w;
+      hud_atlas_h_ = hud.atlas_h;
+      hud_atlas_gen_ = hud.atlas_gen;
     }
+    hud_verts_ = hud.verts;
+    hud_mesh_atlas_gen_ = hud.atlas_gen;
     hud_pixels_kind_ = kind;
     hud_pixels_gen_ = ++hud_paint_serial_;
     if (thumb.isNull() || thumb.width() <= 0 || thumb.height() <= 0) {
@@ -2869,6 +2872,7 @@ void HostWindow::xrThreadMain() {
     std::atomic<bool> preview_busy{false};
     std::string preview_path_done;
     std::string preview_wait_path;
+    std::string highlight_row;
     auto preview_wait_since = std::chrono::steady_clock::now();
     auto request_preview = [&](const std::string& path) {
       if (path.empty()) {
@@ -3391,14 +3395,18 @@ void HostWindow::xrThreadMain() {
       if (menu.visible() || menu.controls_visible()) {
         // Decode a thumbnail only after the highlight has stayed put.
         const std::string preview_hi = menu.highlighted_video_path();
-        if (preview_hi != preview_wait_path) {
-          preview_wait_path = preview_hi;
-          preview_wait_since = now;
-          if (preview_path_done != preview_hi) {
-            preview_path_done.clear();
-            menu.clear_preview();
-            requestHudPaint();
+        const std::string row_hi = menu.highlighted_row_id();
+        if (row_hi != highlight_row) {
+          highlight_row = row_hi;
+          if (preview_hi != preview_wait_path) {
+            preview_wait_path = preview_hi;
+            preview_wait_since = now;
+            if (preview_path_done != preview_hi) {
+              preview_path_done.clear();
+              menu.clear_preview();
+            }
           }
+          requestHudPaint();
         }
         if (!preview_hi.empty() && now - preview_wait_since >= std::chrono::milliseconds(450)) {
           request_preview(preview_hi);
@@ -3590,58 +3598,84 @@ void HostWindow::xrThreadMain() {
         force_fsr_refresh = false;
       }
 
-      // HMD menu panel texture
+      // HMD menu: cached atlas on the GPU, quads placed every paint.
       {
-        static uint64_t uploaded_gen = 0;
-        // 0 none, 1 help, 2 file dialog, 3 playback controls.
-        static int shown_kind = 0;
-        static int upload_kind = 0;
+        static uint64_t seen_paint = 0;
+        static uint64_t resident_atlas = 0;
+        static uint64_t inflight_atlas = 0;
+        static uint64_t applied_paint = 0;
+        static int mesh_kind = 0;
+        static bool atlas_resize = false;
+        static std::vector<vrp::HudVertex> pending_verts;
+        static uint64_t pending_atlas = 0;
+        static int pending_kind = 0;
         vrp::VideoFrame hud_frame;
-        int frame_kind = 0;
-        bool have = false;
+        uint64_t upload_gen = 0;
+        bool have_atlas = false;
         {
           std::lock_guard<std::mutex> lock(hud_pixels_mu_);
-          if (hud_pixels_gen_ != uploaded_gen && !hud_pixels_.empty()) {
-            hud_frame.width = hud_w_;
-            hud_frame.height = hud_h_;
+          if (hud_pixels_gen_ != seen_paint) {
+            pending_verts = hud_verts_;
+            pending_atlas = hud_mesh_atlas_gen_;
+            pending_kind = hud_pixels_kind_;
+            seen_paint = hud_pixels_gen_;
+          }
+          if (hud_atlas_gen_ != 0 && hud_atlas_gen_ != resident_atlas && hud_atlas_gen_ != inflight_atlas &&
+              hud_atlas_w_ > 0 && !hud_pixels_.empty()) {
+            hud_frame.width = hud_atlas_w_;
+            hud_frame.height = hud_atlas_h_;
             hud_frame.rgba = hud_pixels_;
-            frame_kind = hud_pixels_kind_;
-            uploaded_gen = hud_pixels_gen_;
-            have = true;
+            upload_gen = hud_atlas_gen_;
+            have_atlas = true;
           }
         }
         const bool help_on = controls_help_.load();
         const int want_kind = help_on ? 1 : menu.visible() ? 2 : menu.controls_visible() ? 3 : 0;
-        // Finish the previous upload before starting another, so the completed image
-        // keeps the kind it was uploaded with.
-        if (hud_tex.poll_present()) shown_kind = upload_kind;
-        if (have && frame_kind == want_kind && want_kind != 0) {
-          (void)scene.wait_previous_submit(5'000'000ull);
-          if (hud_tex.try_upload(hud_frame)) upload_kind = want_kind;
+        if (hud_tex.poll_present() && inflight_atlas != 0) {
+          resident_atlas = inflight_atlas;
+          atlas_resize = false;
         }
-        // The HUD mesh is already 16:9. Aspect 1 keeps texture pixels square;
-        // 1.05 matches the file dialog (slightly taller than the pixel grid).
+        if (have_atlas && want_kind != 0) {
+          if (hud_tex.width() > 0 &&
+              (hud_tex.width() != hud_frame.width || hud_tex.height() != hud_frame.height)) {
+            atlas_resize = true;
+          }
+          (void)scene.wait_previous_submit(5'000'000ull);
+          if (hud_tex.try_upload(hud_frame)) inflight_atlas = upload_gen;
+        }
         constexpr float kHudDistanceM = 1.5f;
         constexpr float kHudAspect = 1.05f;
         auto apply_layout = [&](int kind) {
           if (kind == 1 || kind == 2) {
             scene.set_hud_layout(0.70f, kHudDistanceM, kHudAspect);
           } else if (kind == 3) {
-            // Keep the bar's bottom edge where it was before the aspect correction.
             constexpr float kControlsHalfW = 0.72f;
             constexpr float kOldAspect = 720.f / 1280.f;
             const float y = kControlsHalfW * (kHudAspect - kOldAspect);
             scene.set_hud_layout(kControlsHalfW, kHudDistanceM, kHudAspect, y);
           }
         };
-        // A different panel's image is still the one on the GPU. Hide until the new one presents.
-        if (want_kind != 0 && shown_kind == want_kind) {
+        const bool atlas_ready =
+            resident_atlas != 0 && pending_kind == want_kind && pending_atlas <= resident_atlas &&
+            !pending_verts.empty();
+        if (want_kind == 0 || atlas_resize) {
+          scene.set_hud_mesh(nullptr, 0);
+          scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), false);
+          mesh_kind = 0;
+          applied_paint = 0;
+        } else if (atlas_ready) {
+          if (applied_paint != seen_paint) {
+            scene.set_hud_mesh(pending_verts.data(), static_cast<uint32_t>(pending_verts.size()));
+            applied_paint = seen_paint;
+          }
+          apply_layout(want_kind);
+          scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), true);
+          mesh_kind = want_kind;
+        } else if (mesh_kind == want_kind && resident_atlas != 0) {
           apply_layout(want_kind);
           scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), true);
         } else {
-          if (shown_kind != 0) apply_layout(shown_kind);
           scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), false);
-          if (want_kind == 0) shown_kind = 0;
         }
 
         static uint64_t uploaded_thumb = 0;

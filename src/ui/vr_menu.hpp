@@ -181,6 +181,8 @@ class VrMenu {
   bool controls_visible() const { return controls_visible_; }
   Screen screen() const { return screen_; }
   Snapshot snapshot() const;
+  /** Browser row under the cursor, including directories. Empty outside the file list. */
+  std::string highlighted_row_id() const;
   std::string highlighted_video_path() const;
 
   /** Rows shown in the file list. Page left/right moves by this many. */

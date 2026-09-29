@@ -1167,6 +1167,13 @@ VrMenu::Snapshot VrMenu::snapshot() const {
   return s;
 }
 
+std::string VrMenu::highlighted_row_id() const {
+  if (screen_ != Screen::Browser || entries_.empty()) return {};
+  if (cursor_ < 0 || cursor_ >= static_cast<int>(entries_.size())) return {};
+  const Entry& e = entries_[static_cast<size_t>(cursor_)];
+  return std::to_string(cursor_) + '\n' + e.path.string();
+}
+
 std::string VrMenu::highlighted_video_path() const {
   if (screen_ != Screen::Browser || entries_.empty()) return {};
   if (cursor_ < 0 || cursor_ >= static_cast<int>(entries_.size())) return {};

@@ -162,7 +162,12 @@ void SceneRenderer::shutdown() {
     b = VK_NULL_HANDLE;
     m = VK_NULL_HANDLE;
   };
+  if (hud_mapped_) {
+    vkUnmapMemory(device_, vbo_hud_mem_);
+    hud_mapped_ = nullptr;
+  }
   destroy_buf(vbo_quad_, vbo_quad_mem_);
+  destroy_buf(vbo_hud_, vbo_hud_mem_);
   destroy_buf(vbo_sphere_, vbo_sphere_mem_);
   destroy_buf(ibo_sphere_, ibo_sphere_mem_);
   pipeline_ = VK_NULL_HANDLE;
@@ -290,6 +295,17 @@ void SceneRenderer::set_thumb_pose(float world_half_w, float pixel_h_over_w, flo
   if (distance_m > 0.3f) thumb_distance_ = distance_m;
 }
 
+void SceneRenderer::set_hud_mesh(const HudVertex* vertices, uint32_t count) {
+  if (!vertices || count < 6) {
+    hud_pending_.clear();
+    hud_pending_dirty_ = true;
+    return;
+  }
+  if (count > hud_vert_cap_) count = hud_vert_cap_;
+  hud_pending_.assign(vertices, vertices + count);
+  hud_pending_dirty_ = true;
+}
+
 void SceneRenderer::set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w,
                                    float y_offset_m) {
   if (half_width_m > 0.05f) hud_half_w_ = half_width_m;
@@ -387,6 +403,26 @@ void SceneRenderer::build_meshes() {
   };
 
   upload(quad_tris, sizeof(quad_tris), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_quad_, vbo_quad_mem_);
+
+  // HUD sprites. Host-visible so a marquee or seek bar can move without a new texture.
+  constexpr uint32_t kHudQuads = 2048;
+  hud_vert_cap_ = kHudQuads * 6;
+  {
+    const VkDeviceSize size = static_cast<VkDeviceSize>(hud_vert_cap_) * sizeof(HudVertex);
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+    VRP_CHECK(vkCreateBuffer(device_, &bci, nullptr, &vbo_hud_) == VK_SUCCESS, "hud mesh");
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(device_, vbo_hud_, &req);
+    VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    mai.allocationSize = req.size;
+    mai.memoryTypeIndex =
+        find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VRP_CHECK(vkAllocateMemory(device_, &mai, nullptr, &vbo_hud_mem_) == VK_SUCCESS, "hud mesh mem");
+    vkBindBufferMemory(device_, vbo_hud_, vbo_hud_mem_, 0);
+    VRP_CHECK(vkMapMemory(device_, vbo_hud_mem_, 0, size, 0, &hud_mapped_) == VK_SUCCESS, "hud mesh map");
+  }
 
   // Equirect sphere: Y-up, -Z forward at u=0.5 (video center in front at session start).
   const int stacks = 48, slices = 96;
@@ -596,7 +632,7 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   }
 
   // Head-locked-ish HUD: fixed in app space in front of origin (after recenter = forward).
-  if (hud_visible_ && hud_dset_) {
+  if (hud_visible_ && hud_dset_ && vbo_hud_ && hud_vert_count_ >= 6) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &hud_dset_, 0, nullptr);
     Mat4 hud_model = Mat4::identity();
     const float half_h = hud_half_w_ * hud_aspect_;
@@ -613,8 +649,8 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(hpc), &hpc);
     VkDeviceSize off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_quad_, &off);
-    vkCmdDraw(cmd, 6, 1, 0, 0);
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_hud_, &off);
+    vkCmdDraw(cmd, hud_vert_count_, 1, 0, 0);
   }
 
   if (thumb_visible_ && thumb_dset_) {
@@ -699,6 +735,15 @@ void SceneRenderer::render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo&
       vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, UINT64_MAX);
     }
     vkResetFences(device_, 1, &submit_fence_);
+  }
+
+  if (hud_pending_dirty_ && hud_mapped_) {
+    hud_vert_count_ = static_cast<uint32_t>(hud_pending_.size());
+    if (hud_vert_count_ > hud_vert_cap_) hud_vert_count_ = hud_vert_cap_;
+    if (hud_vert_count_ > 0) {
+      std::memcpy(hud_mapped_, hud_pending_.data(), static_cast<size_t>(hud_vert_count_) * sizeof(HudVertex));
+    }
+    hud_pending_dirty_ = false;
   }
 
   proj_views.resize(frame.view_count);

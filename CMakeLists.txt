@@ -212,6 +212,8 @@ add_executable(vrp_player
   apps/vrp_player/x11_direct_probe.hpp
   apps/vrp_player/hud_paint.cpp
   apps/vrp_player/hud_paint.hpp
+  apps/vrp_player/hud_cache.cpp
+  apps/vrp_player/hud_cache.hpp
   ${DRM_LEASE_HEADER}
   ${DRM_LEASE_CODE}
 )

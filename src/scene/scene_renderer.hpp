@@ -1,6 +1,7 @@
 #pragma once
 
 #include "options.hpp"
+#include "ui/hud_mesh.hpp"
 #include "video/video_decoder.hpp"
 #include "xr/xr_vulkan_app.hpp"
 
@@ -23,8 +24,13 @@ class SceneRenderer {
   /** RGBA video that is still gamma-encoded (e.g. FSR1 output). Linearized like NV12. */
   void set_texture_gamma(VkImageView view, VkSampler sampler);
   void set_nv12_texture(VkImageView y, VkImageView uv, VkSampler sampler, bool full_range = false);
-  /** HUD panel (RGBA). Empty view clears overlay. */
+  /** HUD atlas (RGBA). Empty view clears overlay. */
   void set_hud_texture(VkImageView view, VkSampler sampler, bool visible);
+  /**
+   * Quads that sample the HUD atlas, in the 16:9 panel's local space.
+   * Copied to the GPU after the previous eye submit finishes.
+   */
+  void set_hud_mesh(const HudVertex* vertices, uint32_t count);
   /** World size of the HUD quad. y_offset_m shifts the quad up. */
   void set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w = 0.f,
                       float y_offset_m = 0.f);
@@ -78,6 +84,13 @@ class SceneRenderer {
 
   VkBuffer vbo_quad_ = VK_NULL_HANDLE;
   VkDeviceMemory vbo_quad_mem_ = VK_NULL_HANDLE;
+  VkBuffer vbo_hud_ = VK_NULL_HANDLE;
+  VkDeviceMemory vbo_hud_mem_ = VK_NULL_HANDLE;
+  void* hud_mapped_ = nullptr;
+  uint32_t hud_vert_cap_ = 0;
+  uint32_t hud_vert_count_ = 0;
+  std::vector<HudVertex> hud_pending_;
+  bool hud_pending_dirty_ = false;
   VkBuffer vbo_sphere_ = VK_NULL_HANDLE;
   VkDeviceMemory vbo_sphere_mem_ = VK_NULL_HANDLE;
   VkBuffer ibo_sphere_ = VK_NULL_HANDLE;

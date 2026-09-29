@@ -2,6 +2,7 @@
 
 #include "drm_lease_probe.hpp"
 #include "options.hpp"
+#include "ui/hud_mesh.hpp"
 #include "video/video_decoder.hpp"
 
 #include <QMainWindow>
@@ -192,11 +193,17 @@ class HostWindow : public QMainWindow {
   std::atomic<uint64_t> hud_paint_req_{0};
   std::atomic<uint64_t> hud_paint_done_{0};
   std::mutex hud_pixels_mu_;
+  /** GPU atlas RGBA. Uploaded only when hud_atlas_gen_ changes. */
   std::vector<uint8_t> hud_pixels_;
+  std::vector<vrp::HudVertex> hud_verts_;
   /** 0 none, 1 help, 2 file dialog, 3 playback controls. Guarded by hud_pixels_mu_. */
   int hud_pixels_kind_ = 0;
   int hud_w_ = 1280;
   int hud_h_ = 720;
+  int hud_atlas_w_ = 0;
+  int hud_atlas_h_ = 0;
+  uint64_t hud_atlas_gen_ = 0;
+  uint64_t hud_mesh_atlas_gen_ = 0;
   uint64_t hud_pixels_gen_ = 0;
   uint64_t hud_paint_serial_ = 0;
   std::vector<uint8_t> thumb_pixels_;
