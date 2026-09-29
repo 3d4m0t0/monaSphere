@@ -183,6 +183,9 @@ class VrMenu {
   Snapshot snapshot() const;
   std::string highlighted_video_path() const;
 
+  /** Rows shown in the file list. Page left/right moves by this many. */
+  static constexpr int kVisibleRows = 17;
+
  private:
   enum class Place : uint8_t { Roots = 0, HomeTree = 1, RemovableList = 2, RemovableTree = 3 };
 
@@ -224,6 +227,7 @@ class VrMenu {
   static bool is_video_ext(const std::filesystem::path& p);
   int format_option_count() const;
   void apply_format_index(int index);
+  void page_cursor(int dir);
 
   bool visible_ = true;
   bool controls_visible_ = false;
@@ -236,7 +240,13 @@ class VrMenu {
   std::vector<Entry> entries_;
   int cursor_ = 0;
   int scroll_ = 0;
-  static constexpr int kVisibleRows = 16;
+  struct AxisRepeat {
+    int dir = 0;
+    float held = 0.f;
+    bool repeating = false;
+  };
+  AxisRepeat list_row_repeat_{};
+  AxisRepeat list_page_repeat_{};
 
   ProjectionMode projection_ = ProjectionMode::Flat;
   StereoLayout stereo_ = StereoLayout::Mono;

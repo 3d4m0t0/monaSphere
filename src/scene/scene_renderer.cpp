@@ -257,6 +257,39 @@ void SceneRenderer::set_hud_texture(VkImageView view, VkSampler sampler, bool vi
   vkUpdateDescriptorSets(device_, 2, w, 0, nullptr);
 }
 
+void SceneRenderer::set_thumb_texture(VkImageView view, VkSampler sampler, bool visible) {
+  thumb_visible_ = visible && view && sampler && thumb_dset_;
+  if (!thumb_visible_) return;
+  VkDescriptorImageInfo ii[2]{};
+  for (int i = 0; i < 2; ++i) {
+    ii[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    ii[i].imageView = view;
+    ii[i].sampler = sampler;
+  }
+  VkWriteDescriptorSet w[2]{};
+  for (int i = 0; i < 2; ++i) {
+    w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    w[i].dstSet = thumb_dset_;
+    w[i].dstBinding = static_cast<uint32_t>(i);
+    w[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    w[i].descriptorCount = 1;
+    w[i].pImageInfo = &ii[i];
+  }
+  vkUpdateDescriptorSets(device_, 2, w, 0, nullptr);
+}
+
+void SceneRenderer::set_thumb_pose(float world_half_w, float pixel_h_over_w, float x_m, float y_m,
+                                   float distance_m) {
+  constexpr float kMeshHalfW = 16.f / 9.f;
+  if (world_half_w > 0.02f) {
+    thumb_scale_x_ = world_half_w / kMeshHalfW;
+    thumb_scale_y_ = world_half_w * std::max(0.2f, pixel_h_over_w);
+  }
+  thumb_x_ = x_m;
+  thumb_y_ = y_m;
+  if (distance_m > 0.3f) thumb_distance_ = distance_m;
+}
+
 void SceneRenderer::set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w,
                                    float y_offset_m) {
   if (half_width_m > 0.05f) hud_half_w_ = half_width_m;
@@ -316,6 +349,7 @@ void SceneRenderer::create_descriptors() {
   ai.pSetLayouts = &dsl_;
   VRP_CHECK(vkAllocateDescriptorSets(device_, &ai, &dset_) == VK_SUCCESS, "dset");
   VRP_CHECK(vkAllocateDescriptorSets(device_, &ai, &hud_dset_) == VK_SUCCESS, "hud dset");
+  VRP_CHECK(vkAllocateDescriptorSets(device_, &ai, &thumb_dset_) == VK_SUCCESS, "thumb dset");
 }
 
 void SceneRenderer::build_meshes() {
@@ -578,6 +612,71 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     hpc.nv12 = 0;
     vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(hpc), &hpc);
+    VkDeviceSize off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_quad_, &off);
+    vkCmdDraw(cmd, 6, 1, 0, 0);
+  }
+
+  if (thumb_visible_ && thumb_dset_) {
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &thumb_dset_, 0, nullptr);
+    // Quad normal is +Z. Turn that face toward this eye.
+    const float px = thumb_x_;
+    const float py = thumb_y_;
+    const float pz = -thumb_distance_;
+    float fx = view.pose.position.x - px;
+    float fy = view.pose.position.y - py;
+    float fz = view.pose.position.z - pz;
+    const float flen = std::sqrt(fx * fx + fy * fy + fz * fz);
+    if (flen > 1e-4f) {
+      fx /= flen;
+      fy /= flen;
+      fz /= flen;
+    } else {
+      fx = 0.f;
+      fy = 0.f;
+      fz = 1.f;
+    }
+    float rx = fz;
+    float ry = 0.f;
+    float rz = -fx;
+    float rlen = std::sqrt(rx * rx + rz * rz);
+    if (rlen < 1e-4f) {
+      rx = 1.f;
+      ry = 0.f;
+      rz = 0.f;
+    } else {
+      rx /= rlen;
+      rz /= rlen;
+    }
+    const float ux = fy * rz - fz * ry;
+    const float uy = fz * rx - fx * rz;
+    const float uz = fx * ry - fy * rx;
+    Mat4 scale = Mat4::identity();
+    scale.m[0] = thumb_scale_x_;
+    scale.m[5] = thumb_scale_y_;
+    Mat4 rot = Mat4::identity();
+    rot.m[0] = rx;
+    rot.m[1] = ry;
+    rot.m[2] = rz;
+    rot.m[4] = ux;
+    rot.m[5] = uy;
+    rot.m[6] = uz;
+    rot.m[8] = fx;
+    rot.m[9] = fy;
+    rot.m[10] = fz;
+    Mat4 trans = Mat4::identity();
+    trans.m[12] = px;
+    trans.m[13] = py;
+    trans.m[14] = pz;
+    const Mat4 thumb_model = Mat4::mul(trans, Mat4::mul(rot, scale));
+    PushConstants tpc{};
+    tpc.mvp = Mat4::mul(proj, Mat4::mul(view_mat, thumb_model));
+    tpc.viewIndex = 0;
+    tpc.stereoMode = 0;
+    tpc.is180 = 0;
+    tpc.nv12 = 0;
+    vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(tpc), &tpc);
     VkDeviceSize off = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_quad_, &off);
     vkCmdDraw(cmd, 6, 1, 0, 0);

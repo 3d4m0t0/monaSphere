@@ -199,6 +199,10 @@ class HostWindow : public QMainWindow {
   int hud_h_ = 720;
   uint64_t hud_pixels_gen_ = 0;
   uint64_t hud_paint_serial_ = 0;
+  std::vector<uint8_t> thumb_pixels_;
+  int thumb_w_ = 0;
+  int thumb_h_ = 0;
+  uint64_t thumb_gen_ = 0;
   std::atomic<bool> xr_stop_{false};
   std::atomic<bool> xr_running_{false};
   std::atomic<int> cmd_{0};  // 1 play, 2 seek-, 3 seek+, 4 recenter

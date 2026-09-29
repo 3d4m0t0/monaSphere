@@ -28,6 +28,12 @@ class SceneRenderer {
   /** World size of the HUD quad. y_offset_m shifts the quad up. */
   void set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w = 0.f,
                       float y_offset_m = 0.f);
+  /**
+   * Thumbnail card in front of the file dialog.
+   * world_half_w is meters. pixel_h_over_w is the card's height/width.
+   */
+  void set_thumb_texture(VkImageView view, VkSampler sampler, bool visible);
+  void set_thumb_pose(float world_half_w, float pixel_h_over_w, float x_m, float y_m, float distance_m);
   /** Wait for previous eye submit. Returns false on timeout (do not rewrite descriptors). */
   bool wait_previous_submit(uint64_t timeout_ns = 8'000'000ull);
 
@@ -64,6 +70,7 @@ class SceneRenderer {
   VkDescriptorPool pool_ = VK_NULL_HANDLE;
   VkDescriptorSet dset_ = VK_NULL_HANDLE;
   VkDescriptorSet hud_dset_ = VK_NULL_HANDLE;
+  VkDescriptorSet thumb_dset_ = VK_NULL_HANDLE;
   VkPipelineLayout layout_ = VK_NULL_HANDLE;
   VkPipeline pipeline_ = VK_NULL_HANDLE;
   VkShaderModule vert_ = VK_NULL_HANDLE;
@@ -87,6 +94,12 @@ class SceneRenderer {
   float hud_half_w_ = 0.55f;
   float hud_aspect_ = 1.05f;
   float hud_y_ = 0.f;
+  bool thumb_visible_ = false;
+  float thumb_scale_x_ = 0.16f;
+  float thumb_scale_y_ = 0.16f;
+  float thumb_x_ = 0.f;
+  float thumb_y_ = 0.f;
+  float thumb_distance_ = 1.32f;
   VkFence submit_fence_ = VK_NULL_HANDLE;
 };
 

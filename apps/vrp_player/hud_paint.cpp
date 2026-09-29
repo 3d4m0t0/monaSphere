@@ -817,6 +817,22 @@ void paint_playback_controls(QPainter& p, const VrMenu::Snapshot& snap, int widt
 
 }  // namespace
 
+QImage paint_file_thumb(const VrMenu::Snapshot& snap) {
+  const bool ready = snap.visible && snap.screen == VrMenu::Screen::Browser && snap.preview_w > 0 &&
+                     snap.preview_h > 0 &&
+                     snap.preview_rgba.size() >= static_cast<size_t>(snap.preview_w * snap.preview_h * 4);
+  if (!ready) return {};
+  QImage img(snap.preview_w, snap.preview_h, QImage::Format_RGBA8888);
+  img.fill(Qt::transparent);
+  QPainter p(&img);
+  p.setOpacity(0.78);
+  QImage frame(snap.preview_rgba.data(), snap.preview_w, snap.preview_h, snap.preview_w * 4,
+               QImage::Format_RGBA8888);
+  p.drawImage(QRect(0, 0, snap.preview_w, snap.preview_h), frame);
+  p.end();
+  return img;
+}
+
 QImage paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height, bool sony_face) {
   sony_face_buttons = sony_face;
   QImage img(width, height, QImage::Format_RGBA8888);
@@ -863,17 +879,16 @@ QImage paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height, bool s
 
   if (snap.screen == VrMenu::Screen::Browser) {
     const int list_top = 64;
-    const int preview_w = 220;
-    const bool show_preview =
-        snap.cursor >= 0 && snap.cursor < static_cast<int>(snap.entries.size()) &&
-        snap.entries[static_cast<size_t>(snap.cursor)].is_video && snap.preview_w > 0 &&
-        snap.preview_h > 0 &&
-        snap.preview_rgba.size() >= static_cast<size_t>(snap.preview_w * snap.preview_h * 4);
-
     const int list_x = side + 10;
-    const int list_w = show_preview ? (content_w - preview_w - 32) : (content_w - 24);
     const int row_h = 34;
-    const int max_rows = std::max(8, (height - list_top - 52) / row_h);
+    const int fit_rows = std::max(1, (height - list_top - 52) / row_h);
+    const int max_rows = std::min(fit_rows, VrMenu::kVisibleRows);
+    const int count = static_cast<int>(snap.entries.size());
+    const bool show_scroll = count > max_rows;
+    constexpr int kScrollW = 14;
+    constexpr int kScrollGap = 8;
+    int list_w = content_w - 24;
+    if (show_scroll) list_w -= kScrollW + kScrollGap;
     p.setFont(body_font);
     const int start = snap.scroll;
     const int end = std::min(static_cast<int>(snap.entries.size()), start + max_rows);
@@ -890,14 +905,19 @@ QImage paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height, bool s
       }
     }
 
-    if (show_preview) {
-      const QRect prev(side + content_w - preview_w - 12, list_top, preview_w, 124);
-      p.fillRect(prev, QColor(8, 10, 14));
-      p.setPen(QColor(60, 70, 90));
-      p.drawRect(prev);
-      QImage thumb(snap.preview_rgba.data(), snap.preview_w, snap.preview_h, snap.preview_w * 4,
-                   QImage::Format_RGBA8888);
-      p.drawImage(prev, thumb);
+    if (show_scroll) {
+      const QRect track(list_x + list_w + kScrollGap, list_top + 2, kScrollW, max_rows * row_h - 4);
+      p.setPen(QPen(QColor(190, 206, 230), 2));
+      p.setBrush(QColor(36, 46, 64));
+      p.drawRoundedRect(track, 6, 6);
+      const int span = std::max(1, count - max_rows);
+      const float pos = std::clamp(static_cast<float>(snap.scroll) / static_cast<float>(span), 0.f, 1.f);
+      const int thumb_h = std::min(track.height() - 4, std::max(56, track.height() * max_rows / std::max(count, 1)));
+      const int travel = std::max(0, track.height() - thumb_h);
+      const int thumb_y = track.y() + static_cast<int>(std::lround(travel * pos));
+      p.setPen(Qt::NoPen);
+      p.setBrush(QColor(232, 240, 255));
+      p.drawRoundedRect(QRect(track.x() + 3, thumb_y + 2, track.width() - 6, thumb_h - 4), 4, 4);
     }
   } else if (snap.screen == VrMenu::Screen::Format) {
     p.setFont(body_font);

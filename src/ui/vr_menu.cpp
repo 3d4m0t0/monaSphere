@@ -418,6 +418,18 @@ void VrMenu::move_cursor(int delta) {
   bump();
 }
 
+void VrMenu::page_cursor(int dir) {
+  if (screen_ != Screen::Browser || entries_.empty() || dir == 0) return;
+  const int n = static_cast<int>(entries_.size());
+  const int page = std::max(1, kVisibleRows);
+  const int max_scroll = std::max(0, n - page);
+  cursor_ = std::clamp(cursor_ + dir * page, 0, n - 1);
+  scroll_ = std::clamp(scroll_ + dir * page, 0, max_scroll);
+  if (cursor_ < scroll_) cursor_ = scroll_;
+  if (cursor_ >= scroll_ + page) cursor_ = std::min(n - 1, scroll_ + page - 1);
+  bump();
+}
+
 std::string VrMenu::sibling_video(int delta) const {
   if (media_path_.empty() || delta == 0) return {};
   const fs::path dir = media_path_.parent_path();
@@ -859,10 +871,45 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     }
   };
 
-  if (in.nav_up || in.stick_y > 0.55f) nav(-1, 0);
-  if (in.nav_down || in.stick_y < -0.55f) nav(1, 0);
-  if (in.nav_left || in.stick_x < -0.55f) nav(0, -1);
-  if (in.nav_right || in.stick_x > 0.55f) nav(0, 1);
+  const bool nav_up = in.nav_up || in.stick_y > 0.55f;
+  const bool nav_down = in.nav_down || in.stick_y < -0.55f;
+  const bool nav_left = in.nav_left || in.stick_x < -0.55f;
+  const bool nav_right = in.nav_right || in.stick_x > 0.55f;
+  if (visible_ && !controls_visible_ && screen_ == Screen::Browser) {
+    // File list: one step, a pause, then repeat while held. Left/right turn a page.
+    auto pump_repeat = [&](AxisRepeat& axis, int dir, float initial, float interval, auto&& fire) {
+      if (dir == 0) {
+        axis = {};
+        return;
+      }
+      if (dir != axis.dir) {
+        axis.dir = dir;
+        axis.held = 0.f;
+        axis.repeating = false;
+        fire(dir);
+        return;
+      }
+      axis.held += dt;
+      const float need = axis.repeating ? interval : initial;
+      if (axis.held >= need) {
+        axis.held -= need;
+        if (axis.held > interval) axis.held = 0.f;
+        axis.repeating = true;
+        fire(dir);
+      }
+    };
+    const int row_dir = (nav_up && !nav_down) ? -1 : (nav_down && !nav_up) ? 1 : 0;
+    const int page_dir = (nav_left && !nav_right) ? -1 : (nav_right && !nav_left) ? 1 : 0;
+    pump_repeat(list_row_repeat_, row_dir, 0.40f, 0.055f, [&](int d) { move_cursor(d); });
+    pump_repeat(list_page_repeat_, page_dir, 0.40f, 0.22f, [&](int d) { page_cursor(d); });
+  } else {
+    list_row_repeat_ = {};
+    list_page_repeat_ = {};
+    if (nav_up) nav(-1, 0);
+    if (nav_down) nav(1, 0);
+    if (nav_left) nav(0, -1);
+    if (nav_right) nav(0, 1);
+  }
 
   if (controls_visible_ && (screen_ == Screen::Player || !visible_)) {
     screen_ = Screen::Player;

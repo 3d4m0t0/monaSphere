@@ -710,6 +710,10 @@ void HostWindow::paintHudNow() {
   QImage img = help ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load())
                     : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load());
   if (img.format() != QImage::Format_RGBA8888) img = img.convertToFormat(QImage::Format_RGBA8888);
+  QImage thumb = (!help && snap.visible) ? vrp::paint_file_thumb(snap) : QImage();
+  if (!thumb.isNull() && thumb.format() != QImage::Format_RGBA8888) {
+    thumb = thumb.convertToFormat(QImage::Format_RGBA8888);
+  }
   {
     std::lock_guard<std::mutex> lock(hud_pixels_mu_);
     hud_pixels_.resize(static_cast<size_t>(hud_w_ * hud_h_ * 4));
@@ -719,6 +723,19 @@ void HostWindow::paintHudNow() {
     }
     hud_pixels_kind_ = kind;
     hud_pixels_gen_ = ++hud_paint_serial_;
+    if (thumb.isNull() || thumb.width() <= 0 || thumb.height() <= 0) {
+      thumb_pixels_.clear();
+      thumb_w_ = thumb_h_ = 0;
+    } else {
+      thumb_w_ = thumb.width();
+      thumb_h_ = thumb.height();
+      thumb_pixels_.resize(static_cast<size_t>(thumb_w_ * thumb_h_ * 4));
+      for (int y = 0; y < thumb_h_; ++y) {
+        std::memcpy(thumb_pixels_.data() + static_cast<size_t>(y * thumb_w_ * 4), thumb.constScanLine(y),
+                    static_cast<size_t>(thumb_w_ * 4));
+      }
+    }
+    thumb_gen_ = hud_pixels_gen_;
   }
   hud_paint_done_.store(snap.gen);
 }
@@ -2799,6 +2816,9 @@ void HostWindow::xrThreadMain() {
     vrp::VideoTexture hud_tex;
     hud_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
                  /*nearest_filter=*/false);
+    vrp::VideoTexture thumb_tex;
+    thumb_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
+                   /*nearest_filter=*/false);
     vrp::VrMenu menu;
     {
       std::filesystem::path start;
@@ -2848,6 +2868,8 @@ void HostWindow::xrThreadMain() {
 
     std::atomic<bool> preview_busy{false};
     std::string preview_path_done;
+    std::string preview_wait_path;
+    auto preview_wait_since = std::chrono::steady_clock::now();
     auto request_preview = [&](const std::string& path) {
       if (path.empty()) {
         if (!preview_path_done.empty() || preview_busy.load()) {
@@ -3367,7 +3389,20 @@ void HostWindow::xrThreadMain() {
       // Video end-of-stream loop → keep audio on the same timeline (avoids post-repeat silence).
       if (decoder.consume_looped() && audio.is_open() && decoder.seek_in_flight()) audio.mute_output();
       if (menu.visible() || menu.controls_visible()) {
-        request_preview(menu.highlighted_video_path());
+        // Decode a thumbnail only after the highlight has stayed put.
+        const std::string preview_hi = menu.highlighted_video_path();
+        if (preview_hi != preview_wait_path) {
+          preview_wait_path = preview_hi;
+          preview_wait_since = now;
+          if (preview_path_done != preview_hi) {
+            preview_path_done.clear();
+            menu.clear_preview();
+            requestHudPaint();
+          }
+        }
+        if (!preview_hi.empty() && now - preview_wait_since >= std::chrono::milliseconds(450)) {
+          request_preview(preview_hi);
+        }
         static auto last_hud_paint = std::chrono::steady_clock::time_point{};
         if (now - last_hud_paint > std::chrono::milliseconds(100)) {
           last_hud_paint = now;
@@ -3608,6 +3643,37 @@ void HostWindow::xrThreadMain() {
           scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), false);
           if (want_kind == 0) shown_kind = 0;
         }
+
+        static uint64_t uploaded_thumb = 0;
+        static bool thumb_shown = false;
+        if (thumb_tex.poll_present()) thumb_shown = true;
+        vrp::VideoFrame thumb_frame;
+        bool thumb_upload = false;
+        bool thumb_pixels = false;
+        float thumb_aspect = 9.f / 16.f;
+        {
+          std::lock_guard<std::mutex> lock(hud_pixels_mu_);
+          thumb_pixels = thumb_w_ > 0 && thumb_h_ > 0 && !thumb_pixels_.empty();
+          if (thumb_pixels) thumb_aspect = static_cast<float>(thumb_h_) / static_cast<float>(thumb_w_);
+          if (thumb_pixels && thumb_gen_ != uploaded_thumb) {
+            thumb_frame.width = thumb_w_;
+            thumb_frame.height = thumb_h_;
+            thumb_frame.rgba = thumb_pixels_;
+            uploaded_thumb = thumb_gen_;
+            thumb_upload = true;
+          }
+        }
+        if (thumb_upload && want_kind == 2) {
+          (void)scene.wait_previous_submit(5'000'000ull);
+          (void)thumb_tex.try_upload(thumb_frame);
+        }
+        if (want_kind == 2 && thumb_pixels && thumb_shown && thumb_tex.view()) {
+          scene.set_thumb_pose(0.34f, thumb_aspect, 0.66f, 0.12f, kHudDistanceM - 0.18f);
+          scene.set_thumb_texture(thumb_tex.view(), thumb_tex.sampler(), true);
+        } else {
+          scene.set_thumb_texture(thumb_tex.view(), thumb_tex.sampler(), false);
+          if (!thumb_pixels || want_kind != 2) thumb_shown = false;
+        }
       }
 
       scene.render_frame(xr, fi, proj_views, layer);
@@ -3709,6 +3775,7 @@ void HostWindow::xrThreadMain() {
     }
     scene.set_texture(texture.view(), texture.sampler());
     scene.set_hud_texture(VK_NULL_HANDLE, VK_NULL_HANDLE, false);
+    scene.set_thumb_texture(VK_NULL_HANDLE, VK_NULL_HANDLE, false);
     VRP_LOG("teardown: reset NV12 slots (before decoder.close)");
     cuda_tex.reset_slots(decoder.cuda_context());
     decoder.close();
@@ -3716,6 +3783,7 @@ void HostWindow::xrThreadMain() {
     fsr.shutdown();
     cuda_tex.shutdown();
     vaapi_tex.shutdown();
+    thumb_tex.shutdown();
     hud_tex.shutdown();
     texture.shutdown();
     scene.shutdown();
