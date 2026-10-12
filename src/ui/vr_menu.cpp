@@ -1012,7 +1012,6 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
       controls_visible_ = !controls_visible_;
       if (controls_visible_) {
         screen_ = Screen::Player;
-        transport_cursor_ = kPlayPause;
         close_controls_edit();
       } else {
         close_controls_edit();

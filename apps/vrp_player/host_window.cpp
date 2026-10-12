@@ -719,7 +719,7 @@ void HostWindow::paintHudNow() {
     seconds_left = left_ms <= 0 ? 0 : static_cast<int>((left_ms + 999) / 1000);
   }
   const vrp::HudPaintResult hud =
-      help ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load())
+      help ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load(), menu_option_.load())
            : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load());
   QImage thumb = (!help && snap.visible) ? vrp::paint_file_thumb(snap) : QImage();
   if (!thumb.isNull() && thumb.format() != QImage::Format_RGBA8888) {
@@ -3251,6 +3251,7 @@ void HostWindow::xrThreadMain() {
 
       auto input = xr.poll_actions();
       bool pad_sony = false;
+      bool pad_present = false;
       bool pad_nav_up = false;
       bool pad_nav_down = false;
       bool pad_nav_left = false;
@@ -3277,6 +3278,7 @@ void HostWindow::xrThreadMain() {
             }
             last_gamepad_name = gp.name;
             last_gamepad_connection = gp.connection;
+            pad_present = true;
             pad_sony = gp.sony_face;
             {
               std::lock_guard<std::mutex> lock(gamepad_name_mu_);
@@ -3347,7 +3349,8 @@ void HostWindow::xrThreadMain() {
           hmd_sony = n.find("playstation") != std::string::npos || n.find("psvr") != std::string::npos;
         }
         const bool sony = hmd_sony || pad_sony;
-        if (face_sony_.exchange(sony) != sony) requestHudPaint();
+        const bool option = pad_present ? pad_sony : hmd_sony;
+        if (face_sony_.exchange(sony) != sony || menu_option_.exchange(option) != option) requestHudPaint();
       }
       decoder.set_seek_scrubbing(false);
 

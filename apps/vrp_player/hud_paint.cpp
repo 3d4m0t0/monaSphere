@@ -32,6 +32,7 @@ uint64_t hud_key(std::initializer_list<uint64_t> parts, const QString& extra = {
 }
 
 bool sony_face_buttons = false;
+bool menu_button_option = false;
 
 QFont iconGothicBold(int point_size) {
   const char* families[] = {"DejaVu Sans", "Liberation Sans", "Nimbus Sans", "Noto Sans"};
@@ -203,7 +204,7 @@ void paint_transport_icon(HudCanvas& c, const QRect& r, TransportIcon kind, bool
                  });
 }
 
-enum class DpadDir { Up, Down };
+enum class DpadDir { Up, Down, Left, Right };
 
 void paint_knockout_qp(QPainter& p, const QRect& r, bool round, const QString& letter, QPoint shift,
                        qreal corner) {
@@ -362,28 +363,21 @@ void paint_dpad_qp(QPainter& p, const QRect& box, DpadDir dir) {
   p.drawRoundedRect(vert, rad, rad);
   p.drawRoundedRect(horiz, rad, rad);
 
+  p.translate(c);
+  if (dir == DpadDir::Down) p.rotate(180);
+  else if (dir == DpadDir::Left) p.rotate(-90);
+  else if (dir == DpadDir::Right) p.rotate(90);
   const qreal arm_len = (s - t) / 2;
-  const QRectF arm = dir == DpadDir::Up ? QRectF(c.x() - t / 2, c.y() - s / 2, t, arm_len)
-                                        : QRectF(c.x() - t / 2, c.y() + t / 2, t, arm_len);
+  const QRectF arm(-t / 2, -s / 2, t, arm_len);
   const qreal rr = std::min(rad, std::min(arm.width(), arm.height()) * 0.5);
   QPainterPath tip;
-  if (dir == DpadDir::Up) {
-    tip.moveTo(arm.left() + rr, arm.top());
-    tip.lineTo(arm.right() - rr, arm.top());
-    tip.arcTo(QRectF(arm.right() - 2 * rr, arm.top(), 2 * rr, 2 * rr), 90, -90);
-    tip.lineTo(arm.right(), arm.bottom());
-    tip.lineTo(arm.left(), arm.bottom());
-    tip.lineTo(arm.left(), arm.top() + rr);
-    tip.arcTo(QRectF(arm.left(), arm.top(), 2 * rr, 2 * rr), 180, -90);
-  } else {
-    tip.moveTo(arm.left(), arm.top());
-    tip.lineTo(arm.right(), arm.top());
-    tip.lineTo(arm.right(), arm.bottom() - rr);
-    tip.arcTo(QRectF(arm.right() - 2 * rr, arm.bottom() - 2 * rr, 2 * rr, 2 * rr), 0, -90);
-    tip.lineTo(arm.left() + rr, arm.bottom());
-    tip.arcTo(QRectF(arm.left(), arm.bottom() - 2 * rr, 2 * rr, 2 * rr), 270, -90);
-    tip.lineTo(arm.left(), arm.top());
-  }
+  tip.moveTo(arm.left() + rr, arm.top());
+  tip.lineTo(arm.right() - rr, arm.top());
+  tip.arcTo(QRectF(arm.right() - 2 * rr, arm.top(), 2 * rr, 2 * rr), 90, -90);
+  tip.lineTo(arm.right(), arm.bottom());
+  tip.lineTo(arm.left(), arm.bottom());
+  tip.lineTo(arm.left(), arm.top() + rr);
+  tip.arcTo(QRectF(arm.left(), arm.top(), 2 * rr, 2 * rr), 180, -90);
   tip.closeSubpath();
   p.setBrush(QColor(214, 42, 48));
   p.drawPath(tip);
@@ -404,26 +398,28 @@ constexpr int kIcon = 32;
 constexpr int kStick = kIcon;
 constexpr int kStartPad = 2;
 
-QFont start_label_font() {
-  const int inner_w = kIcon - kStartPad * 2 - 2;
-  const QString text = QStringLiteral("START");
-  for (int pt = 16; pt >= 5; --pt) {
-    if (QFontMetrics(iconGothicBold(pt)).tightBoundingRect(text).width() <= inner_w) return iconGothicBold(pt);
-  }
-  return iconGothicBold(5);
+QString menu_button_text() {
+  return menu_button_option ? QStringLiteral("OPTION") : QStringLiteral("MENU");
+}
+
+constexpr int kMenuPt = 11;
+
+int menu_button_width() {
+  const int tw = QFontMetrics(iconGothicBold(kMenuPt)).horizontalAdvance(menu_button_text());
+  return tw + kStartPad * 2 + 8;
 }
 
 int start_icon_height() {
-  const int text_h = QFontMetrics(start_label_font()).tightBoundingRect(QStringLiteral("START")).height();
-  return text_h + kStartPad * 2 + 2;
+  const int text_h = QFontMetrics(iconGothicBold(kMenuPt)).tightBoundingRect(menu_button_text()).height();
+  return text_h + kStartPad * 2 + 4;
 }
 
 void paint_start_qp(QPainter& p, const QRect& r) {
   p.save();
   p.setRenderHint(QPainter::Antialiasing, true);
   p.setRenderHint(QPainter::TextAntialiasing, true);
-  const QString text = QStringLiteral("START");
-  const QFont font = start_label_font();
+  const QString text = menu_button_text();
+  const QFont font = iconGothicBold(kMenuPt);
   const QRectF ink = QFontMetricsF(font).tightBoundingRect(text);
   p.setBrush(Qt::NoBrush);
   p.setPen(QPen(Qt::white, 1.2));
@@ -466,7 +462,8 @@ void paint_stick_qp(QPainter& p, const QRect& r, const QString& hand) {
 }
 
 void paint_start_button(HudCanvas& c, const QRect& r) {
-  c.paint_cached(hud_key({24, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}), r,
+  const QString text = menu_button_text();
+  c.paint_cached(hud_key({24, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, text), r,
                  r.width(), r.height(), [&](QPainter& p) {
                    paint_start_qp(p, QRect(0, 0, r.width(), r.height()));
                  });
@@ -482,7 +479,7 @@ void paint_stick_icon(HudCanvas& c, const QRect& r, const QString& hand) {
 int help_icon_width(HelpIcon kind) {
   constexpr int kFace = kIcon;
   if (kind == HelpIcon::A || kind == HelpIcon::B) return kFace;
-  if (kind == HelpIcon::Start) return kIcon;
+  if (kind == HelpIcon::Start) return menu_button_width();
   if (kind == HelpIcon::Stick) return 28 * 2 + 4 + 8 + kStick;
   if (kind == HelpIcon::Speed) return 44 * 2 + 8;
   if (kind == HelpIcon::SpeedReset) return 96;
@@ -499,8 +496,9 @@ int paint_help_icons(HudCanvas& c, int x, int y, int h, HelpIcon kind) {
   if (kind == HelpIcon::Start) {
     const int start_h = start_icon_height();
     const int by = y + (h - start_h) / 2;
-    paint_start_button(c, QRect(x, by, kIcon, start_h));
-    return kIcon;
+    const int start_w = menu_button_width();
+    paint_start_button(c, QRect(x, by, start_w, start_h));
+    return start_w;
   }
   if (kind == HelpIcon::Stick) {
     constexpr int kBarW = 28;
@@ -562,32 +560,6 @@ int paint_ab_footer(HudCanvas& c, int right, int y, int h, const QString& a_labe
   return x;
 }
 
-int paint_lr_step(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
-  constexpr int kW = 22;
-  constexpr int kH = 16;
-  constexpr int kGap = 2;
-  const int by = y + (h - kH) / 2;
-  paint_square_button(c, QRect(x, by, kW, kH), QStringLiteral("L"));
-  paint_square_button(c, QRect(x + kW + kGap, by, kW, kH), QStringLiteral("R"));
-  return paint_footer_label(c, x + kW * 2 + kGap + 4, y, h, label, font) + 14;
-}
-
-int paint_seek_cluster(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
-  constexpr int kStickFoot = 26;
-  const int sy = y + (h - kStickFoot) / 2;
-  paint_stick_icon(c, QRect(x, sy, kStickFoot, kStickFoot), QStringLiteral("L"));
-  return paint_footer_label(c, x + kStickFoot + 4, y, h, label, font) + 14;
-}
-
-int paint_trigger_cluster(HudCanvas& c, int x, int y, int h, const QString& which, const QString& label,
-                          const QFont& font) {
-  constexpr int kW = 40;
-  constexpr int kH = 22;
-  const int by = y + (h - kH) / 2;
-  paint_trigger_button(c, QRect(x, by, kW, kH), which);
-  return paint_footer_label(c, x + kW + 4, y, h, label, font) + 14;
-}
-
 int paint_stick_a_cluster(HudCanvas& c, int x, int y, int h, DpadDir dir, const QString& label,
                           const QFont& font) {
   constexpr int kDpad = 26;
@@ -596,6 +568,42 @@ int paint_stick_a_cluster(HudCanvas& c, int x, int y, int h, DpadDir dir, const 
   paint_dpad(c, QRect(x, dy, kDpad, kDpad), dir);
   paint_face_button(c, QRect(x + kDpad + 2, face_y, kFootFace, kFootFace), true);
   return paint_footer_label(c, x + kDpad + 2 + kFootFace + 4, y, h, label, font) + 14;
+}
+
+int paint_dpad_lr_cluster(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
+  constexpr int kDpad = 26;
+  constexpr int kGap = 2;
+  const int dy = y + (h - kDpad) / 2;
+  paint_dpad(c, QRect(x, dy, kDpad, kDpad), DpadDir::Left);
+  paint_dpad(c, QRect(x + kDpad + kGap, dy, kDpad, kDpad), DpadDir::Right);
+  return paint_footer_label(c, x + kDpad * 2 + kGap + 4, y, h, label, font) + 14;
+}
+
+int paint_lr_stick_cluster(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
+  constexpr int kW = 22;
+  constexpr int kH = 16;
+  constexpr int kGap = 2;
+  constexpr int kStick = 26;
+  const int by = y + (h - kH) / 2;
+  paint_square_button(c, QRect(x, by, kW, kH), QStringLiteral("L"));
+  paint_square_button(c, QRect(x + kW + kGap, by, kW, kH), QStringLiteral("R"));
+  const int sx = x + kW * 2 + kGap + 8;
+  const int sy = y + (h - kStick) / 2;
+  paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"));
+  return paint_footer_label(c, sx + kStick + 4, y, h, label, font) + 14;
+}
+
+int paint_dpad_ud_stick_cluster(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
+  constexpr int kDpad = 26;
+  constexpr int kGap = 2;
+  constexpr int kStick = 26;
+  const int dy = y + (h - kDpad) / 2;
+  paint_dpad(c, QRect(x, dy, kDpad, kDpad), DpadDir::Up);
+  paint_dpad(c, QRect(x + kDpad + kGap, dy, kDpad, kDpad), DpadDir::Down);
+  const int sx = x + kDpad * 2 + kGap + 8;
+  const int sy = y + (h - kStick) / 2;
+  paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"));
+  return paint_footer_label(c, sx + kStick + 4, y, h, label, font) + 14;
 }
 
 int paint_stick_cluster(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
@@ -972,18 +980,12 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
   const int limit = actions_left - 12;
   auto fits = [&](int w) { return lx + w <= limit; };
   if (left_kind == 0) {
-    const QString step = QStringLiteral("±30s");
-    const int step_w = 22 + 2 + 22 + 4 + fm.horizontalAdvance(step) + 14;
-    if (fits(step_w)) lx = paint_lr_step(c, lx, foot.y(), foot.height(), step, body_font);
+    const QString select = VRP_TR("Select");
+    const int select_w = 26 + 2 + 26 + 4 + fm.horizontalAdvance(select) + 14;
+    if (fits(select_w)) lx = paint_dpad_lr_cluster(c, lx, foot.y(), foot.height(), select, body_font);
     const QString seek = VRP_TR("Seek");
-    const int seek_w = 26 + 4 + fm.horizontalAdvance(seek) + 14;
-    if (fits(seek_w)) lx = paint_seek_cluster(c, lx, foot.y(), foot.height(), seek, body_font);
-    const QString slower = VRP_TR("Slower");
-    const int slow_w = 40 + 4 + fm.horizontalAdvance(slower) + 14;
-    if (fits(slow_w)) lx = paint_trigger_cluster(c, lx, foot.y(), foot.height(), QStringLiteral("L2"), slower, body_font);
-    const QString faster = VRP_TR("Faster");
-    const int spd_w = 40 + 4 + fm.horizontalAdvance(faster) + 14;
-    if (fits(spd_w)) paint_trigger_cluster(c, lx, foot.y(), foot.height(), QStringLiteral("R2"), faster, body_font);
+    const int seek_w = 22 + 2 + 22 + 8 + 26 + 4 + fm.horizontalAdvance(seek) + 14;
+    if (fits(seek_w)) paint_lr_stick_cluster(c, lx, foot.y(), foot.height(), seek, body_font);
   } else if (left_kind == 1 || left_kind == 2) {
     const QString label = left_kind == 1 ? VRP_TR("Volume") : VRP_TR("Select");
     const int w = 26 + 2 + 26 + 4 + fm.horizontalAdvance(label) + 14;
@@ -1046,6 +1048,9 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
 
   const QRect foot(side + 16, height - 44, content_w - 32, 40);
   paint_ab_footer(canvas, foot.right(), foot.y(), foot.height(), VRP_TR("Decide"), VRP_TR("Back"), body_font);
+  if (snap.screen == VrMenu::Screen::Browser) {
+    paint_dpad_ud_stick_cluster(canvas, foot.x(), foot.y(), foot.height(), VRP_TR("Select"), body_font);
+  }
 
   if (snap.screen == VrMenu::Screen::Browser) {
     const int list_top = 64;
@@ -1120,8 +1125,10 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
   return canvas.take();
 }
 
-HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool sony_face) {
+HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool sony_face,
+                                   bool menu_option) {
   sony_face_buttons = sony_face;
+  menu_button_option = menu_option;
   HudCanvas& canvas = shared_hud_canvas();
   canvas.begin(width, height);
 

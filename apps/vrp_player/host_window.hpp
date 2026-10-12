@@ -258,6 +258,8 @@ class HostWindow : public QMainWindow {
   std::atomic<bool> gamepad_sdl_owned_{false};
   /** Confirm/back glyphs: PlayStation ×/○ while a Sony HMD or pad is connected. */
   std::atomic<bool> face_sony_{false};
+  /** Menu-button caption. Sony pads say OPTION. Xbox and other XInput pads say MENU. */
+  std::atomic<bool> menu_option_{false};
   std::mutex gamepad_name_mu_;
   QString gamepad_seen_name_;
   QActionGroup* controller_group_ = nullptr;
