@@ -124,6 +124,24 @@ add_custom_command(
 )
 list(APPEND VRP_SPV_FILES ${SPV})
 
+set(SPV ${VRP_SPV_DIR}/bc7_mode6.comp.spv)
+add_custom_command(
+  OUTPUT ${SPV}
+  COMMAND ${GLSLANG_VALIDATOR} -V ${CMAKE_SOURCE_DIR}/shaders/bc7_mode6.comp -o ${SPV}
+  DEPENDS ${CMAKE_SOURCE_DIR}/shaders/bc7_mode6.comp
+  COMMENT "Compiling bc7_mode6.comp"
+)
+list(APPEND VRP_SPV_FILES ${SPV})
+
+set(SPV ${VRP_SPV_DIR}/bc1.comp.spv)
+add_custom_command(
+  OUTPUT ${SPV}
+  COMMAND ${GLSLANG_VALIDATOR} -V ${CMAKE_SOURCE_DIR}/shaders/bc1.comp -o ${SPV}
+  DEPENDS ${CMAKE_SOURCE_DIR}/shaders/bc1.comp
+  COMMENT "Compiling bc1.comp"
+)
+list(APPEND VRP_SPV_FILES ${SPV})
+
 add_custom_target(vrp_shaders ALL DEPENDS ${VRP_SPV_FILES})
 
 # STATIC: the SUSE cmake macro sets BUILD_SHARED_LIBS=ON, which would
@@ -133,6 +151,7 @@ add_library(vrp_core STATIC
   src/video/video_decoder.cpp
   src/video/cuda_minimal.cpp
   src/video/cuda_nv12_texture.cpp
+  src/video/bc7_thumbs.cpp
   src/video/vaapi_nv12_texture.cpp
   src/audio/audio_player.cpp
   src/scene/scene_renderer.cpp

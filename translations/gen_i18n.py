@@ -88,7 +88,7 @@ ROWS = [
     ("monaSphere", "A: restart  B: back", {"ja": "A:再起動  B:戻る", "de": "A: Neu  B: zurück", "fr": "A: relance  B: retour", "es": "A: reinicio  B: atrás", "ko": "A: 재시작  B: 뒤로", "zh_CN": "A:重启  B:返回", "zh_TW": "A:重啟  B:返回"}),
     ("monaSphere", "L/R: move  Up+A: faster  Down+A: slower  A: OK  B: close", {"ja": "左右:移動  上+A:速く  下+A:遅く  A:実行  B:閉じる", "de": "L/R: bewegen  Auf+A: schneller  Ab+A: langsamer  A: OK  B: zu", "fr": "G/D: bouger  Haut+A: plus vite  Bas+A: plus lent  A: OK  B: ferme", "es": "I/D: mover  Arr+A: más rápido  Ab+A: más lento  A: OK  B: cerrar", "ko": "좌/우: 이동  상+A: 빠르게  하+A: 느리게  A: 실행  B: 닫기", "zh_CN": "左右:移动  上+A:加快  下+A:减慢  A:执行  B:关闭", "zh_TW": "左右:移動  上+A:加快  下+A:減慢  A:執行  B:關閉"}),
     ("monaSphere", "A: open  B: back", {"ja": "A:開く  B:戻る", "de": "A: öffnen  B: zurück", "fr": "A: ouvrir  B: retour", "es": "A: abrir  B: atrás", "ko": "A: 열기  B: 뒤로", "zh_CN": "A:打开  B:返回", "zh_TW": "A:開啟  B:返回"}),
-    ("monaSphere", "Controls", {"ja": "操作", "de": "Bedienung", "fr": "Commandes", "es": "Controles", "ko": "조작", "zh_CN": "操作", "zh_TW": "操作"}),
+    ("monaSphere", "Controls", {"ja": "操作説明", "de": "Bedienung", "fr": "Commandes", "es": "Controles", "ko": "조작", "zh_CN": "操作", "zh_TW": "操作"}),
     ("monaSphere", "Close", {"ja": "閉じる", "de": "Schließen", "fr": "Fermer", "es": "Cerrar", "ko": "닫기", "zh_CN": "关闭", "zh_TW": "關閉"}),
     ("monaSphere", "Execute", {"ja": "実行", "de": "Ausführen", "fr": "Exécuter", "es": "Ejecutar", "ko": "실행", "zh_CN": "执行", "zh_TW": "執行"}),
     ("monaSphere", "Decide", {"ja": "決定", "de": "OK", "fr": "OK", "es": "OK", "ko": "결정", "zh_CN": "确定", "zh_TW": "確定"}),
@@ -103,9 +103,9 @@ ROWS = [
     ("monaSphere", "Start long-press", {"ja": "スタートボタン長押し", "de": "Start lang", "fr": "Start long", "es": "Start largo", "ko": "스타트 길게", "zh_CN": "开始键长按", "zh_TW": "開始鍵長按"}),
     ("monaSphere", "Recenter", {"ja": "リセンター", "de": "Recenter", "fr": "Recentrer", "es": "Recentrar", "ko": "리센터", "zh_CN": "重置中心", "zh_TW": "重置中心"}),
     ("monaSphere", "Start", {"ja": "スタートボタン", "de": "Start", "fr": "Start", "es": "Start", "ko": "스타트", "zh_CN": "开始键", "zh_TW": "開始鍵"}),
-    ("monaSphere", "File dialog", {"ja": "ファイルダイアログ 表示切替", "de": "Dateidialog", "fr": "Fichiers", "es": "Archivos", "ko": "파일 창", "zh_CN": "文件窗口 显示切换", "zh_TW": "檔案視窗 顯示切換"}),
+    ("monaSphere", "File dialog", {"ja": "ファイルダイアログを開く", "de": "Dateidialog", "fr": "Fichiers", "es": "Archivos", "ko": "파일 창", "zh_CN": "文件窗口 显示切换", "zh_TW": "檔案視窗 顯示切換"}),
     ("monaSphere", "button", {"ja": "ボタン", "de": "Taste", "fr": "bouton", "es": "botón", "ko": "버튼", "zh_CN": "键", "zh_TW": "鍵"}),
-    ("monaSphere", "Playback controls", {"ja": "再生コントロール 表示切替", "de": "Wiedergabe", "fr": "Lecture", "es": "Reproducción", "ko": "재생 조작", "zh_CN": "播放控制 显示切换", "zh_TW": "播放控制 顯示切換"}),
+    ("monaSphere", "Playback controls", {"ja": "再生コントロールを開く", "de": "Wiedergabe", "fr": "Lecture", "es": "Reproducción", "ko": "재생 조작", "zh_CN": "播放控制 显示切换", "zh_TW": "播放控制 顯示切換"}),
     ("monaSphere", "Play or pause", {"ja": "再生・一時停止", "de": "Play/Pause", "fr": "Lecture/pause", "es": "Reproducir/pausa", "ko": "재생/일시정지", "zh_CN": "播放/暂停", "zh_TW": "播放/暫停"}),
     ("monaSphere", "Seek", {"ja": "シーク", "de": "Spulen", "fr": "Seek", "es": "Buscar", "ko": "탐색", "zh_CN": "跳转", "zh_TW": "跳轉"}),
     ("monaSphere", "Playback speed", {"ja": "再生速度調整", "de": "Tempo", "fr": "Vitesse", "es": "Velocidad", "ko": "재생 속도", "zh_CN": "播放速度", "zh_TW": "播放速度"}),
@@ -283,6 +283,8 @@ T = {
     "Vulkan: picking GPU…": {"ja": "Vulkan: GPU 選択…", "de": "Vulkan: GPU…", "fr": "Vulkan : GPU…", "es": "Vulkan: GPU…", "ko": "Vulkan: GPU 선택…", "zh_CN": "Vulkan: 选择 GPU…", "zh_TW": "Vulkan: 選擇 GPU…"},
     "Vulkan: creating device…": {"ja": "Vulkan: デバイス作成…", "de": "Vulkan: Gerät…", "fr": "Vulkan : device…", "es": "Vulkan: dispositivo…", "ko": "Vulkan: 장치 생성…", "zh_CN": "Vulkan: 创建设备…", "zh_TW": "Vulkan: 建立裝置…"},
     "Vulkan: command pool…": {"ja": "Vulkan: コマンドプール…", "de": "Vulkan: Command-Pool…", "fr": "Vulkan : command pool…", "es": "Vulkan: command pool…", "ko": "Vulkan: 커맨드 풀…", "zh_CN": "Vulkan: 命令池…", "zh_TW": "Vulkan: 命令池…"},
+    "Vulkan compute queue: index 1": {"ja": "Vulkan コンピュートキュー: index 1", "de": "Vulkan-Compute-Queue: Index 1", "fr": "File compute Vulkan : index 1", "es": "Cola de cómputo Vulkan: índice 1", "ko": "Vulkan 컴퓨트 큐: index 1", "zh_CN": "Vulkan 计算队列: index 1", "zh_TW": "Vulkan 計算佇列: index 1"},
+    "Vulkan compute queue: sharing the frame queue": {"ja": "Vulkan コンピュートキュー: フレームキューと共用", "de": "Vulkan-Compute-Queue: teilt die Frame-Queue", "fr": "File compute Vulkan : partagée avec les frames", "es": "Cola de cómputo Vulkan: compartida con los frames", "ko": "Vulkan 컴퓨트 큐: 프레임 큐와 공유", "zh_CN": "Vulkan 计算队列: 与帧队列共用", "zh_TW": "Vulkan 計算佇列: 與影格佇列共用"},
 }
 
 def emit(locale: str) -> None:

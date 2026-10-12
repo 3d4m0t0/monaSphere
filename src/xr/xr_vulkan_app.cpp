@@ -138,6 +138,7 @@ void XrVulkanApp::shutdown() {
   actions_ready_ = false;
   play_action_ = seek_back_action_ = seek_fwd_action_ = recenter_action_ = XR_NULL_HANDLE;
   navigate_action_ = confirm_action_ = back_action_ = menu_toggle_action_ = XR_NULL_HANDLE;
+  l2_action_ = r2_action_ = XR_NULL_HANDLE;
 
   if (session_) {
     xrDestroySession(session_);
@@ -336,12 +337,15 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   }
   VRP_CHECK(queue_family_index_ != UINT32_MAX, "No graphics queue");
 
-  float priority = 1.f;
+  const uint32_t family_queues = qprops[queue_family_index_].queueCount;
+  const bool split_compute = family_queues >= 2 &&
+                             (qprops[queue_family_index_].queueFlags & VK_QUEUE_COMPUTE_BIT);
+  float priorities[2] = {1.f, 0.5f};
   VkDeviceQueueCreateInfo qci{};
   qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
   qci.queueFamilyIndex = queue_family_index_;
-  qci.queueCount = 1;
-  qci.pQueuePriorities = &priority;
+  qci.queueCount = split_compute ? 2u : 1u;
+  qci.pQueuePriorities = priorities;
 
   // Optional extensions for CUDA↔Vulkan zero-copy (opaque FD).
   uint32_t ext_count = 0;
@@ -370,12 +374,18 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     dma_buf_import_ = true;
   }
 
+  VkPhysicalDeviceFeatures gpu_features{};
+  vkGetPhysicalDeviceFeatures(physical_device_, &gpu_features);
+  VkPhysicalDeviceFeatures enabled_features{};
+  if (gpu_features.textureCompressionBC) enabled_features.textureCompressionBC = VK_TRUE;
+
   VkDeviceCreateInfo dci{};
   dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dci.queueCreateInfoCount = 1;
   dci.pQueueCreateInfos = &qci;
   dci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
   dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
+  dci.pEnabledFeatures = &enabled_features;
 
   XrVulkanDeviceCreateInfoKHR xvdci{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
   xvdci.systemId = system_;
@@ -391,6 +401,12 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   VRP_CHECK(vk_r == VK_SUCCESS, "Vulkan device create failed");
 
   vkGetDeviceQueue(device_, queue_family_index_, 0, &queue_);
+  if (split_compute) {
+    vkGetDeviceQueue(device_, queue_family_index_, 1, &compute_queue_);
+    note("Vulkan compute queue: index 1");
+  } else {
+    note("Vulkan compute queue: sharing the frame queue");
+  }
   if (external_memory_fd_) {
     VRP_LOG("Vulkan external memory FD: yes (NVIDIA CUDA zero-copy)");
   } else {
@@ -574,6 +590,9 @@ void XrVulkanApp::set_controller_prefs(ControllerProfile profile, ControllerHand
 }
 
 void XrVulkanApp::create_actions() {
+  // TODO: VR controllers should drive the playback controls by aiming with the
+  // controller pose (position and orientation). Bindings here are buttons and
+  // the stick only.
   XrActionSetCreateInfo asci{XR_TYPE_ACTION_SET_CREATE_INFO};
   std::strncpy(asci.actionSetName, "vrp", XR_MAX_ACTION_SET_NAME_SIZE - 1);
   std::strncpy(asci.localizedActionSetName, "VRP", XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE - 1);
@@ -604,6 +623,8 @@ void XrVulkanApp::create_actions() {
   make_bool("confirm", "Confirm", &confirm_action_);
   make_bool("back", "Back", &back_action_);
   make_bool("menu_toggle", "Menu Toggle", &menu_toggle_action_);
+  make_bool("rate_slower", "Slower", &l2_action_);
+  make_bool("rate_faster", "Faster", &r2_action_);
 
   auto suggest = [&](const char* profile_path, const std::vector<XrActionSuggestedBinding>& binds) {
     XrPath profile = XR_NULL_PATH;
@@ -661,7 +682,9 @@ void XrVulkanApp::create_actions() {
              {play_action_, hand_path(primary, "squeeze/click")},
              {seek_back_action_, hand_path(secondary, left ? "a/click" : "x/click")},
              {seek_fwd_action_, hand_path(primary, "thumbstick/click")},
-             {recenter_action_, hand_path(secondary, "menu/click")}});
+             {recenter_action_, hand_path(secondary, "menu/click")},
+             {l2_action_, hand_path("left", "trigger/click")},
+             {r2_action_, hand_path("right", "trigger/click")}});
   }
 
   // Microsoft motion
@@ -672,6 +695,8 @@ void XrVulkanApp::create_actions() {
              {back_action_, hand_path(primary, "trackpad/click")},
              {menu_toggle_action_, hand_path(secondary, "menu/click")},
              {play_action_, hand_path(primary, "trackpad/click")},
+             {l2_action_, hand_path("left", "trigger/click")},
+             {r2_action_, hand_path("right", "trigger/click")},
              {recenter_action_, hand_path(secondary, "thumbstick/click")}});
   }
 
@@ -683,6 +708,8 @@ void XrVulkanApp::create_actions() {
              {back_action_, hand_path(primary, "menu/click")},
              {menu_toggle_action_, hand_path(secondary, "menu/click")},
              {play_action_, hand_path(primary, "squeeze/click")},
+             {l2_action_, hand_path("left", "trigger/click")},
+             {r2_action_, hand_path("right", "trigger/click")},
              {recenter_action_, hand_path(secondary, "trackpad/click")}});
   }
 
@@ -694,6 +721,8 @@ void XrVulkanApp::create_actions() {
              {back_action_, hand_path(primary, "b/click")},
              {menu_toggle_action_, hand_path(secondary, "b/click")},
              {play_action_, hand_path(primary, "trigger/click")},
+             {l2_action_, hand_path("left", "trigger/click")},
+             {r2_action_, hand_path("right", "trigger/click")},
              {seek_back_action_, hand_path(secondary, "a/click")},
              {seek_fwd_action_, hand_path(primary, "thumbstick/click")},
              {recenter_action_, hand_path(secondary, "thumbstick/click")}});
@@ -1042,10 +1071,14 @@ XrVulkanApp::InputState XrVulkanApp::poll_actions() {
 
   st.play_toggle = edge(play_action_);
   const auto now = std::chrono::steady_clock::now();
-  st.seek_back =
-      key_repeat(action_down(seek_back_action_), seek_back_held_, seek_back_repeating_, seek_back_next_, now);
-  st.seek_forward =
-      key_repeat(action_down(seek_fwd_action_), seek_fwd_held_, seek_fwd_repeating_, seek_fwd_next_, now);
+  const bool seek_back_down = action_down(seek_back_action_);
+  const bool seek_fwd_down = action_down(seek_fwd_action_);
+  st.seek_back_held = seek_back_down;
+  st.seek_forward_held = seek_fwd_down;
+  st.l2_held = action_down(l2_action_);
+  st.r2_held = action_down(r2_action_);
+  st.seek_back = key_repeat(seek_back_down, seek_back_held_, seek_back_repeating_, seek_back_next_, now);
+  st.seek_forward = key_repeat(seek_fwd_down, seek_fwd_held_, seek_fwd_repeating_, seek_fwd_next_, now);
   st.seek_scrubbing = seek_back_repeating_ || seek_fwd_repeating_;
   st.recenter = edge(recenter_action_);
   st.confirm = edge(confirm_action_);

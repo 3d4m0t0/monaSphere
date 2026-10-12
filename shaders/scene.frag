@@ -71,7 +71,7 @@ void main() {
     if (c.a < 0.02) discard;
     outColor = vec4(srgb_to_linear(c.rgb), c.a);
   } else {
-    // HUD RGBA (already authored for the sRGB swapchain).
+    // Seek thumbs are RGBA or BC1. Sampler is bilinear.
     vec4 c = texture(videoTex, uv);
     if (c.a < 0.02) discard;
     outColor = c;

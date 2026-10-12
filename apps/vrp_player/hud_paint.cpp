@@ -305,24 +305,66 @@ void paint_square_button(HudCanvas& c, const QRect& r, const QString& letter) {
                  });
 }
 
+void paint_trigger_qp(QPainter& p, const QRect& r, const QString& label) {
+  constexpr int kScale = 2;
+  QImage plate(std::max(1, r.width()) * kScale, std::max(1, r.height()) * kScale,
+               QImage::Format_ARGB32_Premultiplied);
+  plate.fill(Qt::transparent);
+  QPainter ip(&plate);
+  ip.setRenderHint(QPainter::Antialiasing, true);
+  ip.setRenderHint(QPainter::TextAntialiasing, true);
+  ip.scale(kScale, kScale);
+  ip.setPen(Qt::NoPen);
+  ip.setBrush(Qt::white);
+  const QRectF b(0.5, 0.5, std::max(1, r.width()) - 1.0, std::max(1, r.height()) - 1.0);
+  const qreal rad = std::min(b.width(), b.height()) * 0.42;
+  ip.drawRoundedRect(b, rad, rad);
+  QFont font = iconGothicBold(6);
+  for (int pt = 14; pt >= 6; --pt) {
+    const QFont try_font = iconGothicBold(pt);
+    if (QFontMetricsF(try_font).tightBoundingRect(label).width() <= b.width() - 4) {
+      font = try_font;
+      break;
+    }
+  }
+  const QRectF ink = QFontMetricsF(font).tightBoundingRect(label);
+  const QPointF c = b.center();
+  const QPointF at(c.x() - (ink.x() + ink.width() / 2.0), c.y() - (ink.y() + ink.height() / 2.0));
+  ip.setCompositionMode(QPainter::CompositionMode_DestinationOut);
+  ip.setFont(font);
+  ip.setPen(Qt::white);
+  ip.drawText(at, label);
+  ip.end();
+  p.save();
+  p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+  p.drawImage(r, plate);
+  p.restore();
+}
+
+void paint_trigger_button(HudCanvas& c, const QRect& r, const QString& label) {
+  c.paint_cached(hud_key({26, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, label), r,
+                 r.width(), r.height(), [&](QPainter& p) {
+                   paint_trigger_qp(p, QRect(0, 0, r.width(), r.height()), label);
+                 });
+}
+
 void paint_dpad_qp(QPainter& p, const QRect& box, DpadDir dir) {
   p.save();
   p.setRenderHint(QPainter::Antialiasing, true);
   p.setPen(Qt::NoPen);
-  const int s = std::min(box.width(), box.height());
-  const QRect r(box.center().x() - s / 2, box.center().y() - s / 2, s, s);
-  const int t = std::max(8, s / 3);
-  const int mid_x = r.center().x() - t / 2;
-  const int mid_y = r.center().y() - t / 2;
-  const QColor idle(78, 86, 102);
-  const QColor hot(214, 42, 48);
-  const qreal rad = t * 0.25;
-  p.setBrush(idle);
-  p.drawRoundedRect(QRectF(mid_x, r.y(), t, s), rad, rad);
-  p.drawRoundedRect(QRectF(r.x(), mid_y, s, t), rad, rad);
-  const QRectF arm = dir == DpadDir::Up
-                         ? QRectF(mid_x, r.y(), t, mid_y - r.y())
-                         : QRectF(mid_x, mid_y + t, t, r.bottom() - (mid_y + t) + 1);
+  const QPointF c(box.x() + box.width() / 2.0, box.y() + box.height() / 2.0);
+  const qreal s = std::min(box.width(), box.height());
+  const qreal t = s / 3.0;
+  const qreal rad = t * 0.28;
+  const QRectF vert(c.x() - t / 2, c.y() - s / 2, t, s);
+  const QRectF horiz(c.x() - s / 2, c.y() - t / 2, s, t);
+  p.setBrush(QColor(78, 86, 102));
+  p.drawRoundedRect(vert, rad, rad);
+  p.drawRoundedRect(horiz, rad, rad);
+
+  const qreal arm_len = (s - t) / 2;
+  const QRectF arm = dir == DpadDir::Up ? QRectF(c.x() - t / 2, c.y() - s / 2, t, arm_len)
+                                        : QRectF(c.x() - t / 2, c.y() + t / 2, t, arm_len);
   const qreal rr = std::min(rad, std::min(arm.width(), arm.height()) * 0.5);
   QPainterPath tip;
   if (dir == DpadDir::Up) {
@@ -343,65 +385,149 @@ void paint_dpad_qp(QPainter& p, const QRect& box, DpadDir dir) {
     tip.lineTo(arm.left(), arm.top());
   }
   tip.closeSubpath();
-  p.setBrush(hot);
+  p.setBrush(QColor(214, 42, 48));
   p.drawPath(tip);
   p.restore();
 }
 
 void paint_dpad(HudCanvas& c, const QRect& box, DpadDir dir) {
-  c.paint_cached(hud_key({6, static_cast<uint64_t>(box.width()), static_cast<uint64_t>(box.height()),
+  c.paint_cached(hud_key({20, static_cast<uint64_t>(box.width()), static_cast<uint64_t>(box.height()),
                          static_cast<uint64_t>(dir)}),
                  box, box.width(), box.height(), [&](QPainter& p) {
                    paint_dpad_qp(p, QRect(0, 0, box.width(), box.height()), dir);
                  });
 }
 
-enum class HelpIcon { None, A, B, LR, Speed };
+enum class HelpIcon { None, A, B, Stick, Speed, SpeedReset, Start };
+
+constexpr int kIcon = 32;
+constexpr int kStick = kIcon;
+constexpr int kStartPad = 2;
+
+QFont start_label_font() {
+  const int inner_w = kIcon - kStartPad * 2 - 2;
+  const QString text = QStringLiteral("START");
+  for (int pt = 16; pt >= 5; --pt) {
+    if (QFontMetrics(iconGothicBold(pt)).tightBoundingRect(text).width() <= inner_w) return iconGothicBold(pt);
+  }
+  return iconGothicBold(5);
+}
+
+int start_icon_height() {
+  const int text_h = QFontMetrics(start_label_font()).tightBoundingRect(QStringLiteral("START")).height();
+  return text_h + kStartPad * 2 + 2;
+}
+
+void paint_start_qp(QPainter& p, const QRect& r) {
+  p.save();
+  p.setRenderHint(QPainter::Antialiasing, true);
+  p.setRenderHint(QPainter::TextAntialiasing, true);
+  const QString text = QStringLiteral("START");
+  const QFont font = start_label_font();
+  const QRectF ink = QFontMetricsF(font).tightBoundingRect(text);
+  p.setBrush(Qt::NoBrush);
+  p.setPen(QPen(Qt::white, 1.2));
+  p.drawRoundedRect(QRectF(r).adjusted(0.6, 0.6, -0.6, -0.6), 3, 3);
+  const QPointF c(r.x() + r.width() / 2.0, r.y() + r.height() / 2.0);
+  const QPointF at(c.x() - (ink.x() + ink.width() / 2.0), c.y() - (ink.y() + ink.height() / 2.0));
+  p.setFont(font);
+  p.setPen(Qt::white);
+  p.drawText(at, text);
+  p.restore();
+}
+
+void paint_stick_qp(QPainter& p, const QRect& r, const QString& hand) {
+  p.save();
+  p.setRenderHint(QPainter::Antialiasing, true);
+  p.setRenderHint(QPainter::TextAntialiasing, true);
+  const QRectF b = QRectF(r).adjusted(0.5, 0.5, -0.5, -0.5);
+  const qreal side = std::min(b.width(), b.height());
+  const QRectF circle(b.center().x() - side / 2.0, b.center().y() - side / 2.0, side, side);
+  p.setPen(Qt::NoPen);
+  p.setBrush(QColor(140, 146, 156));
+  p.drawEllipse(circle);
+  const qreal inner = side * 0.62;
+  QFont font = iconGothicBold(8);
+  for (int pt = 18; pt >= 6; --pt) {
+    const QFont try_font = iconGothicBold(pt);
+    const QRectF ink = QFontMetricsF(try_font).tightBoundingRect(hand);
+    if (ink.width() <= inner && ink.height() <= inner) {
+      font = try_font;
+      break;
+    }
+  }
+  const QRectF ink = QFontMetricsF(font).tightBoundingRect(hand);
+  const QPointF c = circle.center();
+  const QPointF at(c.x() - (ink.x() + ink.width() / 2.0), c.y() - (ink.y() + ink.height() / 2.0));
+  p.setFont(font);
+  p.setPen(Qt::white);
+  p.drawText(at, hand);
+  p.restore();
+}
+
+void paint_start_button(HudCanvas& c, const QRect& r) {
+  c.paint_cached(hud_key({24, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}), r,
+                 r.width(), r.height(), [&](QPainter& p) {
+                   paint_start_qp(p, QRect(0, 0, r.width(), r.height()));
+                 });
+}
+
+void paint_stick_icon(HudCanvas& c, const QRect& r, const QString& hand) {
+  c.paint_cached(hud_key({18, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, hand), r,
+                 r.width(), r.height(), [&](QPainter& p) {
+                   paint_stick_qp(p, QRect(0, 0, r.width(), r.height()), hand);
+                 });
+}
 
 int help_icon_width(HelpIcon kind) {
-  constexpr int kFace = 32;
-  constexpr int kBarW = 54;
-  constexpr int kBarGap = 6;
-  constexpr int kDpad = 36;
-  constexpr int kTight = 2;
+  constexpr int kFace = kIcon;
   if (kind == HelpIcon::A || kind == HelpIcon::B) return kFace;
-  if (kind == HelpIcon::LR) return kBarW * 2 + kBarGap;
-  if (kind == HelpIcon::Speed) return (kDpad + kTight + kFace) * 2 + 16;
+  if (kind == HelpIcon::Start) return kIcon;
+  if (kind == HelpIcon::Stick) return 28 * 2 + 4 + 8 + kStick;
+  if (kind == HelpIcon::Speed) return 44 * 2 + 8;
+  if (kind == HelpIcon::SpeedReset) return 96;
   return 0;
 }
 
-int paint_help_icons(HudCanvas& c, int x, int y, int h, HelpIcon kind, const QFont& font) {
-  constexpr int kFace = 32;
+int paint_help_icons(HudCanvas& c, int x, int y, int h, HelpIcon kind) {
+  constexpr int kFace = kIcon;
   const int face_y = y + (h - kFace) / 2;
   if (kind == HelpIcon::A || kind == HelpIcon::B) {
     paint_face_button(c, QRect(x, face_y, kFace, kFace), kind == HelpIcon::A);
     return kFace;
   }
-  if (kind == HelpIcon::LR) {
-    constexpr int kBarW = 54;
-    constexpr int kBarH = 26;
-    constexpr int kBarGap = 6;
+  if (kind == HelpIcon::Start) {
+    const int start_h = start_icon_height();
+    const int by = y + (h - start_h) / 2;
+    paint_start_button(c, QRect(x, by, kIcon, start_h));
+    return kIcon;
+  }
+  if (kind == HelpIcon::Stick) {
+    constexpr int kBarW = 28;
+    constexpr int kBarH = 22;
+    constexpr int kBarGap = 4;
     const int bar_y = y + (h - kBarH) / 2;
     paint_square_button(c, QRect(x, bar_y, kBarW, kBarH), QStringLiteral("L"));
     paint_square_button(c, QRect(x + kBarW + kBarGap, bar_y, kBarW, kBarH), QStringLiteral("R"));
-    return kBarW * 2 + kBarGap;
+    const int sx = x + kBarW * 2 + kBarGap + 8;
+    const int sy = y + (h - kStick) / 2;
+    paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"));
+    return help_icon_width(kind);
   }
   if (kind == HelpIcon::Speed) {
-    constexpr int kDpad = 36;
-    constexpr int kTight = 2;
-    const int dy = y + (h - kDpad) / 2;
-    int cx = x;
-    paint_dpad(c, QRect(cx, dy, kDpad, kDpad), DpadDir::Up);
-    cx += kDpad + kTight;
-    paint_face_button(c, QRect(cx, face_y, kFace, kFace), true);
-    cx += kFace;
-    QFont dot = font;
-    dot.setPointSize(16);
-    c.text(QRect(cx, y, 16, h), QStringLiteral("·"), dot, QColor(180, 190, 205), Qt::AlignCenter);
-    cx += 16;
-    paint_dpad(c, QRect(cx, dy, kDpad, kDpad), DpadDir::Down);
-    cx += kDpad + kTight;
-    paint_face_button(c, QRect(cx, face_y, kFace, kFace), true);
+    constexpr int kTrigW = 44;
+    constexpr int kTrigH = 30;
+    constexpr int kTrigGap = 8;
+    const int by = y + (h - kTrigH) / 2;
+    paint_trigger_button(c, QRect(x, by, kTrigW, kTrigH), QStringLiteral("L2"));
+    paint_trigger_button(c, QRect(x + kTrigW + kTrigGap, by, kTrigW, kTrigH), QStringLiteral("R2"));
+    return help_icon_width(kind);
+  }
+  if (kind == HelpIcon::SpeedReset) {
+    constexpr int kW = 96;
+    constexpr int kH = 30;
+    const int by = y + (h - kH) / 2;
+    paint_trigger_button(c, QRect(x, by, kW, kH), QStringLiteral("L2+R2"));
     return help_icon_width(kind);
   }
   return 0;
@@ -436,14 +562,30 @@ int paint_ab_footer(HudCanvas& c, int right, int y, int h, const QString& a_labe
   return x;
 }
 
-int paint_lr_cluster(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
-  constexpr int kBarW = 40;
-  constexpr int kBarH = 22;
-  constexpr int kGap = 4;
-  const int bar_y = y + (h - kBarH) / 2;
-  paint_square_button(c, QRect(x, bar_y, kBarW, kBarH), QStringLiteral("L"));
-  paint_square_button(c, QRect(x + kBarW + kGap, bar_y, kBarW, kBarH), QStringLiteral("R"));
-  return paint_footer_label(c, x + kBarW * 2 + kGap + 4, y, h, label, font) + 14;
+int paint_lr_step(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
+  constexpr int kW = 22;
+  constexpr int kH = 16;
+  constexpr int kGap = 2;
+  const int by = y + (h - kH) / 2;
+  paint_square_button(c, QRect(x, by, kW, kH), QStringLiteral("L"));
+  paint_square_button(c, QRect(x + kW + kGap, by, kW, kH), QStringLiteral("R"));
+  return paint_footer_label(c, x + kW * 2 + kGap + 4, y, h, label, font) + 14;
+}
+
+int paint_seek_cluster(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
+  constexpr int kStickFoot = 26;
+  const int sy = y + (h - kStickFoot) / 2;
+  paint_stick_icon(c, QRect(x, sy, kStickFoot, kStickFoot), QStringLiteral("L"));
+  return paint_footer_label(c, x + kStickFoot + 4, y, h, label, font) + 14;
+}
+
+int paint_trigger_cluster(HudCanvas& c, int x, int y, int h, const QString& which, const QString& label,
+                          const QFont& font) {
+  constexpr int kW = 40;
+  constexpr int kH = 22;
+  const int by = y + (h - kH) / 2;
+  paint_trigger_button(c, QRect(x, by, kW, kH), which);
+  return paint_footer_label(c, x + kW + 4, y, h, label, font) + 14;
 }
 
 int paint_stick_a_cluster(HudCanvas& c, int x, int y, int h, DpadDir dir, const QString& label,
@@ -578,6 +720,9 @@ struct PlaybackPanel {
   int panel_h = 0;
   int pad = 12;
   int scrub_y = 0;
+  int title_y = 0;
+  int buttons_y = 0;
+  int info_y = 0;
   QRect bar;
   QRect time;
   bool has_info = false;
@@ -606,7 +751,10 @@ PlaybackPanel playback_panel(const VrMenu::Snapshot& snap, int width, int height
                     kGap + kHzW;
   p.panel_w = row_w + p.pad * 2;
   p.panel_x = std::max(0, (width - p.panel_w) / 2);
-  p.scrub_y = p.panel_y + kButtonsOff + kBtn + 14;
+  p.title_y = p.panel_y + 4;
+  p.buttons_y = p.panel_y + kButtonsOff;
+  p.scrub_y = p.panel_y + scrub_off;
+  p.info_y = p.scrub_y + 18;
   constexpr int kTimeW = 110;
   p.bar = QRect(p.panel_x + p.pad, p.scrub_y, p.panel_w - p.pad * 2 - kTimeW - 8, 10);
   p.time = QRect(p.panel_x + p.panel_w - p.pad - kTimeW, p.scrub_y - 6, kTimeW, 22);
@@ -615,14 +763,21 @@ PlaybackPanel playback_panel(const VrMenu::Snapshot& snap, int width, int height
 
 void paint_scrub_bar(HudCanvas& c, const VrMenu::Snapshot& snap, const QRect& bar, const QRect& time,
                      const QFont& hint_font) {
-  c.rounded(bar, QColor(30, 36, 48, 200), 3);
+  const double duration = snap.duration_sec > 0 ? snap.duration_sec : 0;
+  double ready = duration > 0 ? snap.thumb_cover_sec / duration : 1.0;
+  ready = std::clamp(ready, 0.0, 1.0);
+  const int ready_w = static_cast<int>(std::lround(bar.width() * ready));
+  c.rounded(bar, QColor(92, 48, 36, 220), 3);
+  if (ready_w > 0) {
+    c.rounded(QRect(bar.x(), bar.y(), std::min(bar.width(), ready_w), bar.height()), QColor(30, 36, 48, 220), 3);
+  }
   double t = 0;
-  if (snap.duration_sec > 0) t = snap.position_sec / snap.duration_sec;
+  if (duration > 0) t = snap.position_sec / duration;
   t = std::clamp(t, 0.0, 1.0);
   const int fill_w = std::max(0, static_cast<int>(bar.width() * t));
   if (fill_w > 0) c.rounded(QRect(bar.x(), bar.y(), fill_w, bar.height()), QColor(50, 160, 255, 230), 3);
-  c.text(time, fmt_time(snap.position_sec) + QStringLiteral(" / ") + fmt_time(snap.duration_sec), hint_font,
-         QColor(200, 210, 220), Qt::AlignRight | Qt::AlignVCenter);
+  const QString label = fmt_time(snap.position_sec) + QStringLiteral(" / ") + fmt_time(snap.duration_sec);
+  c.clock(time, label, hint_font, QColor(200, 210, 220), Qt::AlignRight | Qt::AlignVCenter);
 }
 
 void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int width, int height,
@@ -650,16 +805,16 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
 
   const QString fname = snap.media_name.empty() ? VRP_TR(snap.title.c_str())
                                                 : QString::fromStdString(snap.media_name);
-  c.scrolling_text(QRect(panel_x + pad, top + 4, panel_w - pad * 2 - 80, 24), fname, body_font,
+  c.scrolling_text(QRect(panel_x + pad, panel.title_y, panel_w - pad * 2 - 80, 24), fname, body_font,
                    QColor(230, 240, 255));
   {
     const QString speed = QStringLiteral("×%1").arg(snap.rate, 0, 'g', 3);
-    c.text(QRect(panel_x + panel_w - pad - 72, top + 4, 72, 24), speed, hint_font, QColor(120, 200, 255),
+    c.text(QRect(panel_x + panel_w - pad - 72, panel.title_y, 72, 24), speed, hint_font, QColor(120, 200, 255),
            Qt::AlignVCenter | Qt::AlignRight);
   }
 
   int x = panel_x + pad;
-  const int y = top + 32;
+  const int y = panel.buttons_y;
 
   const int sel = std::clamp(snap.transport_cursor, 0, 9);
   const bool editing = snap.controls_edit != VrMenu::ControlsEdit::None;
@@ -702,12 +857,11 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
             snap.controls_edit == VrMenu::ControlsEdit::HzPick ||
                 snap.controls_edit == VrMenu::ControlsEdit::HzConfirm);
 
-  // Seek bar + time within panel. The standalone bar uses this same rect.
-  const int scrub_y = panel.scrub_y;
+  // Seek bar sits under the buttons. The standalone bar uses this same rect.
   paint_scrub_bar(c, snap, panel.bar, panel.time, hint_font);
 
   if (has_info) {
-    const int info_top = scrub_y + 18;
+    const int info_top = panel.info_y;
     const QRect info_box(panel_x + pad, info_top, panel_w - pad * 2, info_h - 8);
     c.rounded(info_box, QColor(255, 255, 255, 210), 4);
     QFont info_font = hint_font;
@@ -818,15 +972,18 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
   const int limit = actions_left - 12;
   auto fits = [&](int w) { return lx + w <= limit; };
   if (left_kind == 0) {
+    const QString step = QStringLiteral("±30s");
+    const int step_w = 22 + 2 + 22 + 4 + fm.horizontalAdvance(step) + 14;
+    if (fits(step_w)) lx = paint_lr_step(c, lx, foot.y(), foot.height(), step, body_font);
     const QString seek = VRP_TR("Seek");
-    const int seek_w = 40 + 4 + 40 + 4 + fm.horizontalAdvance(seek) + 14;
-    if (fits(seek_w)) lx = paint_lr_cluster(c, lx, foot.y(), foot.height(), seek, body_font);
-    const QString faster = VRP_TR("Faster");
-    const int spd_w = 26 + 2 + kFootFace + 4 + fm.horizontalAdvance(faster) + 14;
-    if (fits(spd_w)) lx = paint_stick_a_cluster(c, lx, foot.y(), foot.height(), DpadDir::Up, faster, body_font);
+    const int seek_w = 26 + 4 + fm.horizontalAdvance(seek) + 14;
+    if (fits(seek_w)) lx = paint_seek_cluster(c, lx, foot.y(), foot.height(), seek, body_font);
     const QString slower = VRP_TR("Slower");
-    const int slow_w = 26 + 2 + kFootFace + 4 + fm.horizontalAdvance(slower) + 14;
-    if (fits(slow_w)) paint_stick_a_cluster(c, lx, foot.y(), foot.height(), DpadDir::Down, slower, body_font);
+    const int slow_w = 40 + 4 + fm.horizontalAdvance(slower) + 14;
+    if (fits(slow_w)) lx = paint_trigger_cluster(c, lx, foot.y(), foot.height(), QStringLiteral("L2"), slower, body_font);
+    const QString faster = VRP_TR("Faster");
+    const int spd_w = 40 + 4 + fm.horizontalAdvance(faster) + 14;
+    if (fits(spd_w)) paint_trigger_cluster(c, lx, foot.y(), foot.height(), QStringLiteral("R2"), faster, body_font);
   } else if (left_kind == 1 || left_kind == 2) {
     const QString label = left_kind == 1 ? VRP_TR("Volume") : VRP_TR("Select");
     const int w = 26 + 2 + 26 + 4 + fm.horizontalAdvance(label) + 14;
@@ -855,7 +1012,10 @@ QImage paint_file_thumb(const VrMenu::Snapshot& snap) {
 void paint_seek_bar_only(HudCanvas& c, const VrMenu::Snapshot& snap, int width, int height,
                           const QFont& hint_font) {
   const PlaybackPanel panel = playback_panel(snap, width, height);
-  c.rounded(QRect(panel.panel_x, panel.scrub_y - 10, panel.panel_w, 36), QColor(16, 20, 30, 220), 8);
+  constexpr int kStripH = 36;
+  const int strip_y = panel.bar.y() - (kStripH - panel.bar.height()) / 2;
+  const QRect strip(panel.panel_x, strip_y, panel.panel_w, kStripH);
+  c.rounded(strip, QColor(16, 20, 30, 220), 8);
   paint_scrub_bar(c, snap, panel.bar, panel.time, hint_font);
 }
 
@@ -971,13 +1131,13 @@ HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool
     const char* action;
   };
   const Row rows[] = {
-      {HelpIcon::None, "Start long-press", "Recenter"},
-      {HelpIcon::None, "Start", "File dialog"},
+      {HelpIcon::Start, "long-press", "Recenter"},
+      {HelpIcon::Start, nullptr, "File dialog"},
       {HelpIcon::B, nullptr, "Playback controls"},
       {HelpIcon::A, nullptr, "Play or pause"},
-      {HelpIcon::LR, nullptr, "Seek"},
+      {HelpIcon::Stick, nullptr, "Seek"},
       {HelpIcon::Speed, nullptr, "Playback speed"},
-      {HelpIcon::B, "long-press", "Speed ×1"},
+      {HelpIcon::SpeedReset, nullptr, "Speed ×1"},
   };
 
   const QFont title_font = deUiFont(22, QFont::DemiBold);
@@ -1017,7 +1177,7 @@ HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool
     const int y = panel_y + title_h + i * row_h;
     const QRect row(panel_x + 8, y, panel_w - 16, row_h);
     if (i % 2 == 0) canvas.rounded(row, QColor(255, 255, 255, 10), 6);
-    const int icon_w = paint_help_icons(canvas, panel_x + pad, y, row_h, rows[i].icon, body_font);
+    const int icon_w = paint_help_icons(canvas, panel_x + pad, y, row_h, rows[i].icon);
     int text_x = panel_x + pad + icon_w;
     if (icon_w > 0 && rows[i].name) text_x += 4;
     if (rows[i].name) {

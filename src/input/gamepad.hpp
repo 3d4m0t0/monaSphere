@@ -28,8 +28,13 @@ class GamepadInput {
     bool back_held = false;  // B level (for long-press)
     bool menu_toggle = false;  // Start/Guide short press
     bool recenter = false;     // Start/Guide long press
-    bool seek_back = false;    // LB
-    bool seek_forward = false; // RB
+    bool seek_back = false;    // LB edge (repeat)
+    bool seek_forward = false; // RB edge (repeat)
+    bool seek_back_held = false;
+    bool seek_forward_held = false;
+    /** Left / right trigger (L2 / R2). */
+    bool l2_held = false;
+    bool r2_held = false;
     /** True while LB/RB key-repeat is active (after initial delay, until release). */
     bool seek_scrubbing = false;
     /** PlayStation face buttons: confirm is ×, back is ○. */

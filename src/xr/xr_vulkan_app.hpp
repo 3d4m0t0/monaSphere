@@ -83,6 +83,8 @@ class XrVulkanApp {
   VkDevice device() const { return device_; }
   VkPhysicalDevice physical_device() const { return physical_device_; }
   VkQueue queue() const { return queue_; }
+  /** Second queue of the graphics family when the device has one. BC7 must not use `queue()`. */
+  VkQueue compute_queue() const { return compute_queue_ ? compute_queue_ : queue_; }
   uint32_t queue_family() const { return queue_family_index_; }
   VkCommandPool command_pool() const { return command_pool_; }
   VkRenderPass color_pass() const { return color_pass_; }
@@ -139,6 +141,8 @@ class XrVulkanApp {
     bool play_toggle = false;
     bool seek_back = false;
     bool seek_forward = false;
+    bool seek_back_held = false;
+    bool seek_forward_held = false;
     /** True while seek key-repeat is active (after initial delay, until release). */
     bool seek_scrubbing = false;
     bool recenter = false;
@@ -150,6 +154,9 @@ class XrVulkanApp {
     bool back = false;
     bool back_held = false;  // B / back button level
     bool menu_toggle = false;
+    /** Left / right trigger held (L2 / R2). */
+    bool l2_held = false;
+    bool r2_held = false;
   };
   InputState poll_actions();
 
@@ -184,6 +191,7 @@ class XrVulkanApp {
   VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
   VkDevice device_ = VK_NULL_HANDLE;
   VkQueue queue_ = VK_NULL_HANDLE;
+  VkQueue compute_queue_ = VK_NULL_HANDLE;
   uint32_t queue_family_index_ = 0;
   VkCommandPool command_pool_ = VK_NULL_HANDLE;
   VkRenderPass color_pass_ = VK_NULL_HANDLE;
@@ -216,6 +224,8 @@ class XrVulkanApp {
   XrAction confirm_action_ = XR_NULL_HANDLE;
   XrAction back_action_ = XR_NULL_HANDLE;
   XrAction menu_toggle_action_ = XR_NULL_HANDLE;
+  XrAction l2_action_ = XR_NULL_HANDLE;
+  XrAction r2_action_ = XR_NULL_HANDLE;
   bool actions_ready_ = false;
   ControllerProfile controller_profile_ = ControllerProfile::Gamepad;
   ControllerHand controller_hand_ = ControllerHand::Right;

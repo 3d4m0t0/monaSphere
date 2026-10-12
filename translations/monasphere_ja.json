@@ -353,7 +353,7 @@
     {
       "context": "monaSphere",
       "source": "Controls",
-      "translation": "操作"
+      "translation": "操作説明"
     },
     {
       "context": "monaSphere",
@@ -428,7 +428,7 @@
     {
       "context": "monaSphere",
       "source": "File dialog",
-      "translation": "ファイルダイアログ 表示切替"
+      "translation": "ファイルダイアログを開く"
     },
     {
       "context": "monaSphere",
@@ -438,7 +438,7 @@
     {
       "context": "monaSphere",
       "source": "Playback controls",
-      "translation": "再生コントロール 表示切替"
+      "translation": "再生コントロールを開く"
     },
     {
       "context": "monaSphere",
@@ -1299,6 +1299,16 @@
       "context": "HostWindow",
       "source": "Vulkan: command pool…",
       "translation": "Vulkan: コマンドプール…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan compute queue: index 1",
+      "translation": "Vulkan コンピュートキュー: index 1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan compute queue: sharing the frame queue",
+      "translation": "Vulkan コンピュートキュー: フレームキューと共用"
     }
   ]
 }

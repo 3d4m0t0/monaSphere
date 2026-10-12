@@ -1,0 +1,124 @@
+#version 450
+// One BC7 mode-6 block per thread. Endpoints share one index (photographic stills).
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) readonly buffer Src { uint pixels[]; };
+layout(set = 0, binding = 1) writeonly buffer Dst { uint blocks[]; };
+
+layout(push_constant) uniform Push {
+  uint src_w;
+  uint src_h;
+  uint blocks_x;
+  uint blocks_y;
+  uint block_base;
+} pc;
+
+const uint kW[16] = uint[](0u, 4u, 9u, 13u, 17u, 21u, 26u, 30u, 34u, 38u, 43u, 47u, 51u, 55u, 60u, 64u);
+
+uint src_at(int x, int y) {
+  x = clamp(x, 0, int(pc.src_w) - 1);
+  y = clamp(y, 0, int(pc.src_h) - 1);
+  return pixels[uint(y) * pc.src_w + uint(x)];
+}
+
+void put_bits(inout uint bit, inout uvec4 w, uint value, uint n) {
+  for (uint i = 0u; i < 7u; ++i) {
+    if (i >= n) break;
+    uint b = (value >> i) & 1u;
+    uint word = bit >> 5u;
+    uint shift = bit & 31u;
+    w[word] |= b << shift;
+    bit += 1u;
+  }
+}
+
+void main() {
+  uint id = gl_GlobalInvocationID.x + pc.block_base;
+  uint nblocks = pc.blocks_x * pc.blocks_y;
+  if (id >= nblocks) return;
+  uint bx = id % pc.blocks_x;
+  uint by = id / pc.blocks_x;
+
+  vec3 pix[16];
+  vec3 mean = vec3(0.0);
+  for (int i = 0; i < 16; ++i) {
+    int x = int(bx) * 4 + (i & 3);
+    int y = int(by) * 4 + (i >> 2);
+    uint p = src_at(x, y);
+    pix[i] = vec3(float(p & 255u), float((p >> 8u) & 255u), float((p >> 16u) & 255u));
+    mean += pix[i];
+  }
+  mean *= (1.0 / 16.0);
+
+  vec3 axis = vec3(0.0);
+  for (int i = 0; i < 16; ++i) axis += abs(pix[i] - mean);
+  if (dot(axis, axis) < 1.0) axis = vec3(1.0, 1.0, 1.0);
+  axis = normalize(axis);
+  for (int it = 0; it < 4; ++it) {
+    vec3 next = vec3(0.0);
+    for (int i = 0; i < 16; ++i) {
+      vec3 d = pix[i] - mean;
+      next += d * dot(d, axis);
+    }
+    float len2 = dot(next, next);
+    if (len2 < 1e-4) break;
+    axis = next * inversesqrt(len2);
+  }
+
+  int imin = 0;
+  int imax = 0;
+  float tmin = 1e9;
+  float tmax = -1e9;
+  for (int i = 0; i < 16; ++i) {
+    float t = dot(pix[i] - mean, axis);
+    if (t < tmin) { tmin = t; imin = i; }
+    if (t > tmax) { tmax = t; imax = i; }
+  }
+  ivec3 e0 = ivec3(pix[imin]);
+  ivec3 e1 = ivec3(pix[imax]);
+  e0 &= ~ivec3(1);
+  e1 &= ~ivec3(1);
+
+  uint idx[16];
+  for (int i = 0; i < 16; ++i) {
+    uint best = 0u;
+    int best_err = 1 << 30;
+    ivec3 c = ivec3(pix[i]);
+    for (uint k = 0u; k < 16u; ++k) {
+      uint wgt = kW[k];
+      ivec3 q = ((ivec3(64u - wgt) * e0 + ivec3(wgt) * e1 + ivec3(32)) >> ivec3(6));
+      ivec3 d = q - c;
+      int err = d.x * d.x + d.y * d.y + d.z * d.z;
+      if (err < best_err) { best_err = err; best = k; }
+    }
+    idx[i] = best;
+  }
+  if (idx[0] >= 8u) {
+    ivec3 tmp = e0;
+    e0 = e1;
+    e1 = tmp;
+    for (int i = 0; i < 16; ++i) idx[i] = 15u - idx[i];
+  }
+
+  uvec4 words = uvec4(0);
+  uint bit = 0u;
+  // Mode 6 is a 1 in bit 6. P-bits stay 0 because endpoints were forced even.
+  put_bits(bit, words, 1u << 6u, 7u);
+  put_bits(bit, words, uint(e0.x) >> 1u, 7u);
+  put_bits(bit, words, uint(e1.x) >> 1u, 7u);
+  put_bits(bit, words, uint(e0.y) >> 1u, 7u);
+  put_bits(bit, words, uint(e1.y) >> 1u, 7u);
+  put_bits(bit, words, uint(e0.z) >> 1u, 7u);
+  put_bits(bit, words, uint(e1.z) >> 1u, 7u);
+  put_bits(bit, words, 254u >> 1u, 7u);
+  put_bits(bit, words, 254u >> 1u, 7u);
+  put_bits(bit, words, 0u, 1u);
+  put_bits(bit, words, 0u, 1u);
+  put_bits(bit, words, idx[0], 3u);
+  for (int i = 1; i < 16; ++i) put_bits(bit, words, idx[i], 4u);
+
+  blocks[id * 4u + 0u] = words.x;
+  blocks[id * 4u + 1u] = words.y;
+  blocks[id * 4u + 2u] = words.z;
+  blocks[id * 4u + 3u] = words.w;
+}

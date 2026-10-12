@@ -1,5 +1,6 @@
 #include "video/video_decoder.hpp"
 
+#include "options.hpp"
 #include "video/cuda_nv12_texture.hpp"
 #include "video/vaapi_nv12_texture.hpp"
 
@@ -22,11 +23,17 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/rational.h>
 #include <libswscale/swscale.h>
 }
 #endif
 
 namespace vrp {
+
+std::mutex& cuda_decode_mu() {
+  static std::mutex mu;
+  return mu;
+}
 
 namespace {
 
@@ -41,6 +48,51 @@ struct HwOpaque {
   AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
 };
 
+int snap_block(double v) {
+  int n = static_cast<int>(std::lround(v));
+  if (n < 4) return 4;
+  const int down = n & ~3;
+  if (n - down <= 2) return std::max(4, down);
+  return down + 4;
+}
+
+// Pixel count matches a long-edge fit of the coded frame. Width and height then
+// follow the picture: sample aspect, and the unsqueeze of half SBS / half OU.
+void fit_seek_thumb(int src_w, int src_h, double par, int edge_cap, const std::string& path, int& thumb_w,
+                    int& thumb_h) {
+  double bw = src_w;
+  double bh = src_h;
+  const double longest = std::max(bw, bh);
+  if (longest > edge_cap) {
+    const double scale = static_cast<double>(edge_cap) / longest;
+    bw *= scale;
+    bh *= scale;
+  }
+  const double pixels = std::max(16.0, bw * bh);
+  double frame_aspect = (static_cast<double>(src_w) * par) / static_cast<double>(src_h);
+  if (!(frame_aspect > 0.05) || frame_aspect > 50.0) frame_aspect = bw / bh;
+
+  ProjectionMode projection = ProjectionMode::Flat;
+  StereoLayout stereo = StereoLayout::Mono;
+  bool stereo_full = true;
+  detect_format_from_filename(path, projection, stereo, stereo_full);
+  (void)projection;
+  double stored = frame_aspect;
+  if (!stereo_full && stereo == StereoLayout::Sbs) stored = frame_aspect * 2.0;
+  else if (!stereo_full && stereo == StereoLayout::OverUnder) stored = frame_aspect * 0.5;
+  if (stored < 0.05) stored = 0.05;
+  if (stored > 50.0) stored = 50.0;
+
+  thumb_w = snap_block(std::sqrt(pixels * stored));
+  thumb_h = snap_block(std::sqrt(pixels / stored));
+  constexpr int kSideMax = 8192;
+  if (thumb_w > kSideMax || thumb_h > kSideMax) {
+    const double scale = static_cast<double>(kSideMax) / static_cast<double>(std::max(thumb_w, thumb_h));
+    thumb_w = snap_block(thumb_w * scale);
+    thumb_h = snap_block(thumb_h * scale);
+  }
+}
+
 enum AVPixelFormat get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* pix_fmts) {
   auto* hw = static_cast<HwOpaque*>(ctx->opaque);
   if (!hw) return AV_PIX_FMT_NONE;
@@ -48,6 +100,147 @@ enum AVPixelFormat get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* 
     if (*p == hw->hw_pix_fmt) return *p;
   }
   return AV_PIX_FMT_NONE;
+}
+
+struct JpegStill {
+  AVCodecContext* ctx = nullptr;
+  AVFrame* yuv = nullptr;
+  AVPacket* pkt = nullptr;
+  SwsContext* sws = nullptr;
+  int w = 0;
+  int h = 0;
+  int64_t pts = 0;
+
+  ~JpegStill() { reset(); }
+
+  void reset() {
+    if (sws) sws_freeContext(sws);
+    sws = nullptr;
+    if (pkt) av_packet_free(&pkt);
+    if (yuv) av_frame_free(&yuv);
+    if (ctx) avcodec_free_context(&ctx);
+    w = h = 0;
+  }
+
+  bool open(int width, int height) {
+    reset();
+    if (width < 2 || height < 2) return false;
+    const AVCodec* enc = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+    if (!enc) return false;
+    ctx = avcodec_alloc_context3(enc);
+    if (!ctx) return false;
+    ctx->width = width;
+    ctx->height = height;
+    ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+    ctx->time_base = AVRational{1, 25};
+    ctx->color_range = AVCOL_RANGE_JPEG;
+    ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
+    ctx->flags |= AV_CODEC_FLAG_QSCALE;
+    ctx->global_quality = FF_QP2LAMBDA * kSeekThumbJpegQscale;
+    if (avcodec_open2(ctx, enc, nullptr) < 0) {
+      reset();
+      return false;
+    }
+    yuv = av_frame_alloc();
+    pkt = av_packet_alloc();
+    if (!yuv || !pkt) {
+      reset();
+      return false;
+    }
+    yuv->format = AV_PIX_FMT_YUVJ420P;
+    yuv->width = width;
+    yuv->height = height;
+    if (av_frame_get_buffer(yuv, 32) < 0) {
+      reset();
+      return false;
+    }
+    sws = sws_getContext(width, height, AV_PIX_FMT_RGBA, width, height, AV_PIX_FMT_YUVJ420P, SWS_FAST_BILINEAR,
+                         nullptr, nullptr, nullptr);
+    if (!sws) {
+      reset();
+      return false;
+    }
+    w = width;
+    h = height;
+    return true;
+  }
+
+  bool encode(const uint8_t* rgba, int stride, std::vector<uint8_t>& out) {
+    out.clear();
+    if (!rgba) return false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      if (!ctx || !yuv || !sws) return false;
+      if (av_frame_make_writable(yuv) < 0) return false;
+      uint8_t* src_slices[4] = {const_cast<uint8_t*>(rgba), nullptr, nullptr, nullptr};
+      int src_stride[4] = {stride, 0, 0, 0};
+      sws_scale(sws, src_slices, src_stride, 0, h, yuv->data, yuv->linesize);
+      // The encoder rejects a repeated pts and then refuses every later frame.
+      yuv->pts = pts++;
+      yuv->quality = ctx->global_quality;
+      out.clear();
+      if (avcodec_send_frame(ctx, yuv) < 0) {
+        const int rw = w;
+        const int rh = h;
+        if (attempt == 0 && open(rw, rh)) continue;
+        return false;
+      }
+      while (avcodec_receive_packet(ctx, pkt) == 0) {
+        out.insert(out.end(), pkt->data, pkt->data + pkt->size);
+        av_packet_unref(pkt);
+      }
+      if (!out.empty()) return true;
+    }
+    return false;
+  }
+};
+
+bool decode_seek_jpeg(const uint8_t* data, size_t n, std::vector<uint8_t>& rgba, int& w, int& h) {
+  rgba.clear();
+  w = h = 0;
+  if (!data || n == 0) return false;
+  const AVCodec* dec = avcodec_find_decoder(AV_CODEC_ID_MJPEG);
+  if (!dec) return false;
+  AVCodecContext* ctx = avcodec_alloc_context3(dec);
+  AVPacket* pkt = av_packet_alloc();
+  AVFrame* frame = av_frame_alloc();
+  SwsContext* sws = nullptr;
+  bool ok = false;
+  if (ctx && pkt && frame && avcodec_open2(ctx, dec, nullptr) == 0 && av_new_packet(pkt, static_cast<int>(n)) == 0) {
+    std::memcpy(pkt->data, data, n);
+    pkt->flags |= AV_PKT_FLAG_KEY;
+    if (avcodec_send_packet(ctx, pkt) == 0 && avcodec_receive_frame(ctx, frame) == 0 && frame->width > 0 &&
+        frame->height > 0) {
+      sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), frame->width,
+                           frame->height, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+      if (sws) {
+        w = frame->width;
+        h = frame->height;
+        // SIMD stores spill past a tightly packed row and corrupt the next heap chunk.
+        const int row = w * 4;
+        const int stride = (row + 63) & ~63;
+        std::vector<uint8_t> padded(static_cast<size_t>(stride) * static_cast<size_t>(h) + 64);
+        uint8_t* dst_slices[4] = {padded.data(), nullptr, nullptr, nullptr};
+        int dst_stride[4] = {stride, 0, 0, 0};
+        sws_scale(sws, frame->data, frame->linesize, 0, h, dst_slices, dst_stride);
+        rgba.resize(static_cast<size_t>(row) * static_cast<size_t>(h));
+        for (int y = 0; y < h; ++y) {
+          std::memcpy(rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row),
+                      padded.data() + static_cast<size_t>(y) * static_cast<size_t>(stride),
+                      static_cast<size_t>(row));
+        }
+        ok = true;
+      }
+    }
+  }
+  if (sws) sws_freeContext(sws);
+  av_frame_free(&frame);
+  av_packet_free(&pkt);
+  avcodec_free_context(&ctx);
+  if (!ok) {
+    rgba.clear();
+    w = h = 0;
+  }
+  return ok;
 }
 
 const char* hw_type_label(AVHWDeviceType t) {
@@ -95,18 +288,20 @@ std::string format_bitrate(int64_t bps) {
 }  // namespace
 
 bool ThumbnailStrip::sample_at(double sec, std::vector<uint8_t>& out_rgba, int& w, int& h) const {
-  if (!ready || count <= 0 || rgba.empty()) return false;
+  out_rgba.clear();
+  w = h = 0;
+#if !defined(VRP_HAS_FFMPEG)
+  (void)sec;
+  return false;
+#else
+  if (!ready || count <= 0 || jpeg.empty()) return false;
   int idx = 0;
-  if (interval_sec > 0) {
-    idx = static_cast<int>(sec / interval_sec + 0.5);
-  }
+  if (interval_sec > 0) idx = static_cast<int>(sec / interval_sec + 0.5);
   idx = std::clamp(idx, 0, count - 1);
-  w = thumb_w;
-  h = thumb_h;
-  const size_t bytes = static_cast<size_t>(thumb_w) * static_cast<size_t>(thumb_h) * 4;
-  out_rgba.resize(bytes);
-  std::memcpy(out_rgba.data(), rgba.data() + static_cast<size_t>(idx) * bytes, bytes);
-  return true;
+  if (idx >= static_cast<int>(jpeg.size()) || jpeg[static_cast<size_t>(idx)].empty()) return false;
+  const std::vector<uint8_t>& blob = jpeg[static_cast<size_t>(idx)];
+  return decode_seek_jpeg(blob.data(), blob.size(), out_rgba, w, h);
+#endif
 }
 
 std::string VideoInfo::summary_line() const {
@@ -134,7 +329,9 @@ std::string VideoInfo::summary_line() const {
   return oss.str();
 }
 
-ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, int thumb_w, int thumb_h) {
+ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, int thumb_w, int thumb_h,
+                                     SeekThumbStep on_thumb, SeekThumbRawStep on_raw, int max_edge,
+                                     bool allow_hwaccel) {
   ThumbnailStrip strip;
   strip.thumb_w = thumb_w;
   strip.thumb_h = thumb_h;
@@ -142,6 +339,8 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
 #if !defined(VRP_HAS_FFMPEG)
   (void)path;
   (void)max_thumbs;
+  (void)max_edge;
+  (void)allow_hwaccel;
   strip.status = "FFmpeg なし";
   return strip;
 #else
@@ -171,7 +370,24 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
   if (duration <= 0) duration = 60.0;
   strip.duration_sec = duration;
 
-  max_thumbs = std::max(4, std::min(max_thumbs, 64));
+  // 0 means "fit the video". Pixel count stays on the long-edge budget; the
+  // sides follow the picture aspect, including half SBS / half OU unsqueeze.
+  if (thumb_w <= 0 || thumb_h <= 0) {
+    const int src_w = st->codecpar->width > 0 ? st->codecpar->width : 1280;
+    const int src_h = st->codecpar->height > 0 ? st->codecpar->height : 720;
+    int edge_cap = max_edge > 0 ? max_edge : kSeekThumbMaxEdge;
+    if (edge_cap < kSeekThumbEdgeMin) edge_cap = kSeekThumbEdgeMin;
+    if (edge_cap > kSeekThumbEdgeMax) edge_cap = kSeekThumbEdgeMax;
+    double par = 1.0;
+    const AVRational sar = st->sample_aspect_ratio.num > 0 ? st->sample_aspect_ratio
+                                                           : st->codecpar->sample_aspect_ratio;
+    if (sar.num > 0 && sar.den > 0) par = av_q2d(sar);
+    fit_seek_thumb(src_w, src_h, par, edge_cap, path, thumb_w, thumb_h);
+  }
+  strip.thumb_w = thumb_w;
+  strip.thumb_h = thumb_h;
+
+  max_thumbs = std::max(kSeekThumbCountMin, std::min(max_thumbs, kSeekThumbCountMax));
   strip.interval_sec = duration / static_cast<double>(max_thumbs);
   if (strip.interval_sec < 1.0) strip.interval_sec = 1.0;
   const int count = std::min(max_thumbs, std::max(1, static_cast<int>(duration / strip.interval_sec) + 1));
@@ -185,30 +401,102 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
   AVCodecContext* codec = avcodec_alloc_context3(dec);
   avcodec_parameters_to_context(codec, st->codecpar);
   codec->thread_count = 1;
-  if (avcodec_open2(codec, dec, nullptr) < 0) {
+
+  // Same NVDEC device type as playback. The frame is downloaded only after decode,
+  // so the 8K HEVC parse stays on the GPU. Software remains the fallback.
+  HwOpaque hw_opaque{};
+  AVBufferRef* hw_device = nullptr;
+  bool nvdec = false;
+  AVPixelFormat hw_pix = AV_PIX_FMT_NONE;
+  if (allow_hwaccel) {
+    for (int i = 0;; ++i) {
+      const AVCodecHWConfig* cfg = avcodec_get_hw_config(dec, i);
+      if (!cfg) break;
+      if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+          cfg->device_type == AV_HWDEVICE_TYPE_CUDA) {
+        hw_pix = cfg->pix_fmt;
+        break;
+      }
+    }
+  }
+  if (hw_pix != AV_PIX_FMT_NONE) {
+    std::lock_guard<std::mutex> lock(cuda_decode_mu());
+    if (av_hwdevice_ctx_create(&hw_device, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) >= 0) {
+      hw_opaque.hw_pix_fmt = hw_pix;
+      codec->opaque = &hw_opaque;
+      codec->get_format = get_hw_format;
+      codec->hw_device_ctx = av_buffer_ref(hw_device);
+      if (avcodec_open2(codec, dec, nullptr) >= 0) {
+        nvdec = true;
+        VRP_LOG("Thumbnail hwaccel: cuda (NVDEC)");
+      } else {
+        av_buffer_unref(&codec->hw_device_ctx);
+        av_buffer_unref(&hw_device);
+        codec->hw_device_ctx = nullptr;
+        codec->opaque = nullptr;
+        codec->get_format = avcodec_default_get_format;
+      }
+    }
+  }
+  if (!nvdec) codec->get_format = avcodec_default_get_format;
+  if (!nvdec && avcodec_open2(codec, dec, nullptr) < 0) {
+    av_buffer_unref(&hw_device);
     avcodec_free_context(&codec);
     avformat_close_input(&fmt);
     strip.status = "デコーダ open 失敗";
     return strip;
   }
+  if (!nvdec) VRP_LOG("Thumbnail hwaccel: software");
 
   AVFrame* frame = av_frame_alloc();
+  AVFrame* sw_frame = av_frame_alloc();
   AVFrame* rgba = av_frame_alloc();
   AVPacket* packet = av_packet_alloc();
   SwsContext* sws = nullptr;
+  JpegStill enc;
   const size_t thumb_bytes = static_cast<size_t>(thumb_w) * static_cast<size_t>(thumb_h) * 4;
-  strip.rgba.resize(thumb_bytes * static_cast<size_t>(count));
+  std::vector<uint8_t> packed(thumb_bytes);
+  strip.jpeg.reserve(static_cast<size_t>(count));
   strip.times_sec.reserve(static_cast<size_t>(count));
 
   auto* rgba_buf = static_cast<uint8_t*>(av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, thumb_w, thumb_h, 1)));
   av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, thumb_w, thumb_h, 1);
-
+  const bool enc_ok = static_cast<bool>(on_raw) || enc.open(thumb_w, thumb_h);
   int made = 0;
-  for (int i = 0; i < count; ++i) {
+  bool stop = !enc_ok;
+
+  auto store = [&](double t) -> bool {
+    if (on_raw) {
+      if (!on_raw(made, t, count, strip.interval_sec, thumb_w, thumb_h, packed.data(), packed.size())) {
+        stop = true;
+        return false;
+      }
+      strip.times_sec.push_back(t);
+      return true;
+    }
+    std::vector<uint8_t> jpeg;
+    if (!enc.encode(packed.data(), thumb_w * 4, jpeg) || jpeg.empty()) return false;
+    strip.jpeg.push_back(std::move(jpeg));
+    strip.times_sec.push_back(t);
+    const std::vector<uint8_t>& blob = strip.jpeg.back();
+    if (on_thumb &&
+        !on_thumb(static_cast<int>(strip.jpeg.size()) - 1, t, count, strip.interval_sec, thumb_w, thumb_h,
+                  blob.data(), blob.size())) {
+      stop = true;
+    }
+    return true;
+  };
+
+  for (int i = 0; i < count && !stop; ++i) {
     const double t = std::min(duration, i * strip.interval_sec);
     const int64_t ts = static_cast<int64_t>(t / av_q2d(st->time_base));
     av_seek_frame(fmt, vstream, ts, AVSEEK_FLAG_BACKWARD);
-    avcodec_flush_buffers(codec);
+    if (nvdec) {
+      std::lock_guard<std::mutex> lock(cuda_decode_mu());
+      avcodec_flush_buffers(codec);
+    } else {
+      avcodec_flush_buffers(codec);
+    }
 
     bool got = false;
     while (av_read_frame(fmt, packet) >= 0) {
@@ -216,51 +504,73 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
         av_packet_unref(packet);
         continue;
       }
+      std::unique_lock<std::mutex> cuda_lock(cuda_decode_mu(), std::defer_lock);
+      if (nvdec) cuda_lock.lock();
       if (avcodec_send_packet(codec, packet) < 0) {
         av_packet_unref(packet);
         continue;
       }
       av_packet_unref(packet);
       while (avcodec_receive_frame(codec, frame) == 0) {
+        AVFrame* src = frame;
+        if (nvdec && frame->format == hw_pix) {
+          av_frame_unref(sw_frame);
+          if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) {
+            VRP_LOG("Thumbnail NVDEC download failed");
+            continue;
+          }
+          src = sw_frame;
+        }
+        if (cuda_lock.owns_lock()) cuda_lock.unlock();
         if (!sws) {
-          sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), thumb_w,
-                               thumb_h, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+          sws = sws_getContext(src->width, src->height, static_cast<AVPixelFormat>(src->format), thumb_w, thumb_h,
+                               AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
           if (!sws) break;
         }
-        sws_scale(sws, frame->data, frame->linesize, 0, frame->height, rgba->data, rgba->linesize);
-        uint8_t* dst = strip.rgba.data() + static_cast<size_t>(made) * thumb_bytes;
+        sws_scale(sws, src->data, src->linesize, 0, src->height, rgba->data, rgba->linesize);
         for (int y = 0; y < thumb_h; ++y) {
-          std::memcpy(dst + static_cast<size_t>(y * thumb_w * 4), rgba->data[0] + y * rgba->linesize[0],
+          std::memcpy(packed.data() + static_cast<size_t>(y * thumb_w * 4), rgba->data[0] + y * rgba->linesize[0],
                       static_cast<size_t>(thumb_w * 4));
         }
-        strip.times_sec.push_back(t);
-        ++made;
+        if (store(t)) ++made;
         got = true;
         break;
       }
-      if (got) break;
+      if (got || stop) break;
     }
-    if (!got) {
-      // Leave black thumb on failure.
-      std::memset(strip.rgba.data() + static_cast<size_t>(made) * thumb_bytes, 0, thumb_bytes);
-      strip.times_sec.push_back(t);
-      ++made;
+    if (!got && !stop) {
+      std::memset(packed.data(), 0, thumb_bytes);
+      if (store(t)) ++made;
     }
   }
 
   strip.count = made;
-  strip.rgba.resize(thumb_bytes * static_cast<size_t>(made));
   strip.ready = made > 0;
-  char buf[96];
-  std::snprintf(buf, sizeof(buf), "%d 枚 / %.1fs 間隔 (%dx%d)", made, strip.interval_sec, thumb_w, thumb_h);
-  strip.status = buf;
+  if (on_raw) {
+    const int blocks_x = (thumb_w + 3) / 4;
+    const int blocks_y = (thumb_h + 3) / 4;
+    const double mb = static_cast<double>(made) * blocks_x * blocks_y * 8.0 / (1024.0 * 1024.0);
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%d 枚 / %.1fs 間隔 (%dx%d, BC1 %.0fMB%s)", made, strip.interval_sec, thumb_w,
+                  thumb_h, mb, nvdec ? ", NVDEC" : "");
+    strip.status = buf;
+  } else if (enc_ok) {
+    size_t jpeg_bytes = 0;
+    for (const std::vector<uint8_t>& blob : strip.jpeg) jpeg_bytes += blob.size();
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%d 枚 / %.1fs 間隔 (%dx%d, %.1fMB%s)", made, strip.interval_sec, thumb_w,
+                  thumb_h, static_cast<double>(jpeg_bytes) / (1024.0 * 1024.0), nvdec ? ", NVDEC" : "");
+    strip.status = buf;
+  }
 
   if (sws) sws_freeContext(sws);
   av_free(rgba_buf);
   av_frame_free(&rgba);
+  av_frame_free(&sw_frame);
   av_frame_free(&frame);
   av_packet_free(&packet);
   avcodec_free_context(&codec);
+  av_buffer_unref(&hw_device);
   avformat_close_input(&fmt);
   VRP_LOG("Thumbnail strip: %s — %s", path.c_str(), strip.status.c_str());
   return strip;
@@ -306,6 +616,7 @@ bool extract_video_preview(const std::string& path, int thumb_w, int thumb_h,
   AVCodecContext* codec = avcodec_alloc_context3(dec);
   avcodec_parameters_to_context(codec, st->codecpar);
   codec->thread_count = 1;
+  codec->get_format = avcodec_default_get_format;
   if (avcodec_open2(codec, dec, nullptr) < 0) {
     avcodec_free_context(&codec);
     avformat_close_input(&fmt);
@@ -656,6 +967,7 @@ void VideoDecoder::decode_loop() {
   auto next_deadline = clock::now();
   bool was_playing = false;
   VideoFrame scratch;
+  int seek_skips = 0;
   while (!decode_stop_.load()) {
     if (!open_.load()) {
       next_deadline = clock::now();
@@ -671,6 +983,7 @@ void VideoDecoder::decode_loop() {
     }
 
     if (seek_req_.exchange(false)) {
+      seek_skips = 0;
       const double t = seek_target_.load();
       demux_pause_.store(true);
       seek_serial_.fetch_add(1);
@@ -714,7 +1027,8 @@ void VideoDecoder::decode_loop() {
       next_deadline = now;
     }
     // If far behind, drain without RGBA convert (drop frames).
-    // After seek, do not drop — we need the first real frame for A/V resync.
+    // After a seek this pacing drain stays off. Frames before the requested time
+    // are discarded in decode_next so playback starts at the bar.
     int drops = 0;
     while (!awaiting_frame_after_seek_ &&
            now > next_deadline + std::chrono::duration<double>(step * 1.5) && drops < 45) {
@@ -730,9 +1044,17 @@ void VideoDecoder::decode_loop() {
 
     bool got = false;
     if (open_.load() && (playing_.load() || awaiting_frame_after_seek_)) {
-      got = decode_next(scratch, true);
+      // After a seek, discard frames until the requested time. The keyframe is earlier.
+      const double present_after =
+          (awaiting_frame_after_seek_ && seek_skips < 300) ? seek_target_.load() : -1.0;
+      got = decode_next(scratch, true, present_after);
+    }
+    if (got && awaiting_frame_after_seek_ && scratch.width == 0) {
+      ++seek_skips;
+      continue;
     }
     if (got) {
+      seek_skips = 0;
       {
         std::lock_guard<std::mutex> fl(frame_mu_);
         latest_ = std::move(scratch);
@@ -778,10 +1100,14 @@ void VideoDecoder::stop_thumbnail_build() {
   if (thumbs_thread_.joinable()) thumbs_thread_.detach();
 }
 
-void VideoDecoder::start_thumbnail_build(std::function<void(ThumbnailStrip)> on_done) {
+void VideoDecoder::start_thumbnail_build(std::function<void(ThumbnailStrip)> on_done, int max_thumbs,
+                                           int thumb_w, int thumb_h, SeekThumbRawStep on_raw, int max_edge,
+                                           bool allow_hwaccel) {
   stop_thumbnail_build();
   thumbs_cancel_.store(false);
   thumbs_ready_.store(false);
+  thumb_cover_sec_.store(0);
+  const uint64_t epoch = thumbs_epoch_.fetch_add(1) + 1;
   {
     std::lock_guard<std::mutex> lock(thumbs_mu_);
     thumbs_ = {};
@@ -790,21 +1116,110 @@ void VideoDecoder::start_thumbnail_build(std::function<void(ThumbnailStrip)> on_
   info_.thumb_status = "生成中…";
   info_.thumb_count = 0;
   const std::string path = info_.path;
-  if (path.empty()) return;
+  if (path.empty()) {
+    thumbs_done_epoch_.store(epoch);
+    return;
+  }
 
   const uint64_t gen = thumbs_gen_.load();
-  thumbs_thread_ = std::thread([this, path, gen, on_done = std::move(on_done)]() mutable {
-    ThumbnailStrip strip = build_thumbnail_strip(path);
+  thumbs_thread_ = std::thread([this, path, gen, epoch, max_thumbs, thumb_w, thumb_h, max_edge, allow_hwaccel,
+                                 on_done = std::move(on_done), on_raw = std::move(on_raw)]() mutable {
+    auto step = [this, gen](int index, double time_sec, int planned, double interval, int w, int h,
+                            const uint8_t* jpeg, size_t jpeg_bytes) {
+      if (thumbs_cancel_.load() || thumbs_gen_.load() != gen || !jpeg || jpeg_bytes == 0 || w <= 0 || h <= 0) {
+        return false;
+      }
+      std::vector<uint8_t> blob(jpeg, jpeg + jpeg_bytes);
+      {
+        std::lock_guard<std::mutex> lock(thumbs_mu_);
+        if (thumbs_.jpeg.size() < static_cast<size_t>(std::max(planned, index + 1))) {
+          thumbs_.jpeg.resize(static_cast<size_t>(std::max(planned, index + 1)));
+        }
+        thumbs_.jpeg[static_cast<size_t>(index)] = std::move(blob);
+        if (static_cast<int>(thumbs_.times_sec.size()) == index) thumbs_.times_sec.push_back(time_sec);
+        thumbs_.count = index + 1;
+        thumbs_.thumb_w = w;
+        thumbs_.thumb_h = h;
+        thumbs_.interval_sec = interval;
+      }
+      thumb_cover_sec_.store(time_sec);
+      return true;
+    };
+    auto raw_step = [this, gen, on_raw](int index, double time_sec, int planned, double interval, int w, int h,
+                                        const uint8_t* rgba, size_t rgba_bytes) {
+      if (thumbs_cancel_.load() || thumbs_gen_.load() != gen || !rgba || rgba_bytes == 0 || w <= 0 || h <= 0) {
+        return false;
+      }
+      {
+        std::lock_guard<std::mutex> lock(thumbs_mu_);
+        if (static_cast<int>(thumbs_.times_sec.size()) == index) thumbs_.times_sec.push_back(time_sec);
+        thumbs_.count = index + 1;
+        thumbs_.thumb_w = w;
+        thumbs_.thumb_h = h;
+        thumbs_.interval_sec = interval;
+      }
+      thumb_cover_sec_.store(time_sec);
+      (void)planned;
+      return on_raw && on_raw(index, time_sec, planned, interval, w, h, rgba, rgba_bytes);
+    };
+    ThumbnailStrip strip =
+        on_raw ? build_thumbnail_strip(path, max_thumbs, thumb_w, thumb_h, {}, raw_step, max_edge, allow_hwaccel)
+               : build_thumbnail_strip(path, max_thumbs, thumb_w, thumb_h, step, {}, max_edge, allow_hwaccel);
     if (thumbs_cancel_.load() || thumbs_gen_.load() != gen) return;
+    const bool ready = strip.ready;
+    const int count = strip.count;
+    const double duration = strip.duration_sec;
+    const std::string status = strip.status;
     {
       std::lock_guard<std::mutex> lock(thumbs_mu_);
-      thumbs_ = strip;
-      info_.thumb_count = strip.count;
-      info_.thumb_status = strip.status;
+      thumbs_ = std::move(strip);
+      info_.thumb_count = count;
+      info_.thumb_status = status;
     }
-    thumbs_ready_.store(strip.ready);
-    if (on_done) on_done(std::move(strip));
+    thumbs_ready_.store(ready);
+    // A finished strip covers the whole file. A failed build must not leave seek stuck.
+    thumb_cover_sec_.store(ready && duration > 0 ? duration : std::max(duration, 1.0e9));
+    uint64_t seen = thumbs_done_epoch_.load();
+    while (seen < epoch && !thumbs_done_epoch_.compare_exchange_weak(seen, epoch)) {
+    }
+    if (on_done) {
+      ThumbnailStrip brief;
+      brief.ready = ready;
+      brief.count = count;
+      brief.status = status;
+      on_done(std::move(brief));
+    }
   });
+}
+
+bool VideoDecoder::copy_thumb(double sec, int& index, VideoFrame& out) const {
+  std::vector<uint8_t> jpeg;
+  int idx = 0;
+  {
+    std::lock_guard<std::mutex> lock(thumbs_mu_);
+    if (thumbs_.count <= 0 || thumbs_.jpeg.empty() || thumbs_.thumb_w <= 0 || thumbs_.thumb_h <= 0) return false;
+    if (thumbs_.interval_sec > 0) idx = static_cast<int>(sec / thumbs_.interval_sec);
+    idx = std::clamp(idx, 0, thumbs_.count - 1);
+    if (idx == index) return false;
+    if (idx >= static_cast<int>(thumbs_.jpeg.size()) || thumbs_.jpeg[static_cast<size_t>(idx)].empty()) return false;
+    jpeg = thumbs_.jpeg[static_cast<size_t>(idx)];
+  }
+  std::vector<uint8_t> rgba;
+  int w = 0;
+  int h = 0;
+#if defined(VRP_HAS_FFMPEG)
+  const bool ok = decode_seek_jpeg(jpeg.data(), jpeg.size(), rgba, w, h);
+#else
+  const bool ok = false;
+  (void)jpeg;
+#endif
+  index = idx;
+  if (!ok) return false;
+  out.rgba = std::move(rgba);
+  out.width = w;
+  out.height = h;
+  out.pts_sec = sec;
+  return true;
 }
 
 ThumbnailStrip VideoDecoder::thumbnails_copy() const {
@@ -812,13 +1227,14 @@ ThumbnailStrip VideoDecoder::thumbnails_copy() const {
   return thumbs_;
 }
 
-bool VideoDecoder::open(const std::string& path) {
+bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
   close();
   info_ = {};
   info_.path = path;
   info_.hwaccel = "software";
   info_.thumb_status = "未生成";
 #if !defined(VRP_HAS_FFMPEG)
+  (void)allow_hwaccel;
   fail_open(path, "このビルドに FFmpeg が含まれていません（devel パッケージを入れて再ビルド）");
   return false;
 #else
@@ -874,7 +1290,7 @@ bool VideoDecoder::open(const std::string& path) {
   bool hw_ok = false;
   const AVHWDeviceType try_types[] = {AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_VDPAU,
                                       AV_HWDEVICE_TYPE_NONE};
-  for (int ti = 0; try_types[ti] != AV_HWDEVICE_TYPE_NONE; ++ti) {
+  for (int ti = 0; allow_hwaccel && try_types[ti] != AV_HWDEVICE_TYPE_NONE; ++ti) {
     const AVHWDeviceType type = try_types[ti];
     AVPixelFormat hw_pix = AV_PIX_FMT_NONE;
     for (int i = 0;; ++i) {
@@ -891,6 +1307,8 @@ bool VideoDecoder::open(const std::string& path) {
     }
 
     AVBufferRef* ctx = nullptr;
+    std::unique_lock<std::mutex> cuda_lock(cuda_decode_mu(), std::defer_lock);
+    if (type == AV_HWDEVICE_TYPE_CUDA) cuda_lock.lock();
     if (av_hwdevice_ctx_create(&ctx, type, nullptr, nullptr, 0) < 0) {
       VRP_DBG("hwaccel skip %s: av_hwdevice_ctx_create failed", av_hwdevice_get_type_name(type));
       continue;
@@ -926,10 +1344,12 @@ bool VideoDecoder::open(const std::string& path) {
   }
 
   if (!hw_ok) {
+    // HEVC still offers CUDA/VAAPI formats. A null get_format is called and SIGSEGV.
+    // Frame threads decode several pictures at once. Slice-only stays on one core.
     ff_->codec->thread_count = 0;
     ff_->codec->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     ff_->codec->opaque = nullptr;
-    ff_->codec->get_format = nullptr;
+    ff_->codec->get_format = avcodec_default_get_format;
     err = avcodec_open2(ff_->codec, dec, nullptr);
     if (err < 0) {
       fail_open(path, std::string("デコーダを開けません (") + dec->name + "): " + av_err(err));
@@ -1144,6 +1564,7 @@ void VideoDecoder::close() {
   duration_sec_ = 0;
   position_sec_.store(0);
   thumbs_ready_.store(false);
+  thumb_cover_sec_.store(0);
   {
     std::lock_guard<std::mutex> lock(thumbs_mu_);
     thumbs_ = {};
@@ -1211,9 +1632,10 @@ bool VideoDecoder::consume_playback_started() { return playback_started_.exchang
 
 bool VideoDecoder::consume_looped() { return looped_.exchange(false); }
 
-bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba) {
+bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double present_after_sec) {
 #if !defined(VRP_HAS_FFMPEG)
   (void)convert_rgba;
+  (void)present_after_sec;
   out = {};
   out.width = display_w_ > 0 ? display_w_ : 64;
   out.height = display_h_ > 0 ? display_h_ : 64;
@@ -1241,6 +1663,11 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba) {
     }
     std::lock_guard<std::mutex> lock(ff_mu_);
     if (!ff_->codec) return false;
+    std::unique_lock<std::mutex> cuda_lock(cuda_decode_mu(), std::defer_lock);
+    if (ff_->hw_device_ctx) {
+      auto* hw = reinterpret_cast<AVHWDeviceContext*>(ff_->hw_device_ctx->data);
+      if (hw && hw->type == AV_HWDEVICE_TYPE_CUDA) cuda_lock.lock();
+    }
     if (avcodec_send_packet(ff_->codec, ff_->packet) < 0) {
       av_packet_unref(ff_->packet);
       continue;
@@ -1255,6 +1682,11 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba) {
       }
       out = {};
       out.pts_sec = position_sec_.load();
+      if (present_after_sec >= 0.0 && out.pts_sec + 0.04 < present_after_sec) {
+        out.width = 0;
+        out.height = 0;
+        return true;
+      }
       if (!convert_rgba) {
         out.width = width_;
         out.height = height_;
@@ -1368,6 +1800,16 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba) {
 
 bool VideoDecoder::update(double /*delta_sec*/, VideoFrame& out_frame) {
   if (!open_.load() || !playing_.load()) return false;
+  return take_latest(out_frame);
+}
+
+uint64_t VideoDecoder::frame_seq() {
+  std::lock_guard<std::mutex> lock(frame_mu_);
+  return latest_seq_;
+}
+
+bool VideoDecoder::take_latest(VideoFrame& out_frame) {
+  if (!open_.load()) return false;
   std::lock_guard<std::mutex> lock(frame_mu_);
   if (latest_seq_ == consumed_seq_) return false;
   out_frame = std::move(latest_);

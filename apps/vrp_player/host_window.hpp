@@ -208,6 +208,8 @@ class HostWindow : public QMainWindow {
   uint64_t hud_mesh_atlas_gen_ = 0;
   uint64_t hud_pixels_gen_ = 0;
   uint64_t hud_paint_serial_ = 0;
+  /** Bar time in the seek-bar paint that produced hud_pixels_gen_. */
+  double hud_painted_seek_sec_ = 0;
   std::vector<uint8_t> thumb_pixels_;
   int thumb_w_ = 0;
   int thumb_h_ = 0;
@@ -270,6 +272,12 @@ class HostWindow : public QMainWindow {
   QStringList audio_device_labels_;
 
   int preferred_hz_ = 0;               // 0 = auto, else 90 / 120
+  int seek_thumb_count_ = vrp::kSeekThumbCount;
+  int seek_thumb_edge_ = vrp::kSeekThumbMaxEdge;
+  /** monasphere.conf `hwaccel`. 0 forces software decode for playback and seek thumbs. */
+  bool hwaccel_ = true;
+  /** monasphere.conf `thumb_jpeg`. 1 stores seek thumbs as JPEG in main memory. */
+  bool thumb_jpeg_ = true;
   vrp::FsrMode preferred_fsr_ = vrp::FsrMode::Quality;
   std::atomic<int> fsr_req_{-1};       // -1 none; else FsrMode
   int monado_desired_mode_ = -1;       // cached XRT_COMPOSITOR_DESIRED_MODE

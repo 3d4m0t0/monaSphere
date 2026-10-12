@@ -1,6 +1,7 @@
 #include "video/cuda_nv12_texture.hpp"
 
 #include "video/cuda_minimal.hpp"
+#include "video/video_decoder.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -168,9 +169,24 @@ void CudaNv12Texture::pop_cuda_ctx(CtxScope& scope) {
   scope.primary_retained = false;
 }
 
+VkImageView CudaNv12Texture::y_view() const {
+  std::lock_guard<std::mutex> lock(slots_mu_);
+  if (!layouts_ready_ || !valid_.load(std::memory_order_acquire)) return VK_NULL_HANDLE;
+  return slots_[display_slot_.load(std::memory_order_acquire)].y.view;
+}
+
+VkImageView CudaNv12Texture::uv_view() const {
+  std::lock_guard<std::mutex> lock(slots_mu_);
+  if (!layouts_ready_ || !valid_.load(std::memory_order_acquire)) return VK_NULL_HANDLE;
+  return slots_[display_slot_.load(std::memory_order_acquire)].uv.view;
+}
+
 void CudaNv12Texture::reset_slots(void* cu_context) {
   drain_copies();
+  std::lock_guard<std::mutex> cuda_lock(cuda_decode_mu());
   std::lock_guard<std::mutex> lock(slots_mu_);
+  valid_.store(false);
+  layouts_ready_ = false;
   CtxScope scope;
   const bool ctx = push_cuda_ctx(scope, cu_context);
   if (ctx && cuda::api().cuCtxSynchronize) {
@@ -179,11 +195,9 @@ void CudaNv12Texture::reset_slots(void* cu_context) {
   destroy_slots();
   if (ctx) pop_cuda_ctx(scope);
   create_failed_ = false;
-  layouts_ready_ = false;
   present_gen_.store(0);
   bound_gen_ = 0;
   display_slot_.store(0);
-  valid_.store(false);
   width_ = 0;
   height_ = 0;
 }
@@ -501,6 +515,7 @@ bool CudaNv12Texture::ensure_size(int width, int height) {
   if (create_failed_) return false;
 
   VRP_LOG("CudaNv12Texture: ensure_size %dx%d → %dx%d", width_, height_, width, height);
+  valid_.store(false);
   if (!wait_fence_timeout(kFenceTimeoutNs)) {
     set_error("fence timeout on resize");
     return false;
@@ -541,8 +556,9 @@ bool CudaNv12Texture::wait_fence_timeout(uint64_t ns) {
 }
 
 bool CudaNv12Texture::poll_present() {
+  if (!valid_.load(std::memory_order_acquire)) return false;
   const uint64_t g = present_gen_.load(std::memory_order_acquire);
-  if (g == bound_gen_) return false;
+  if (g == 0 || g == bound_gen_) return false;
   bound_gen_ = g;
   present_flips_.fetch_add(1);
   return true;

@@ -9,6 +9,7 @@
 #include "scene/fsr1_upscaler.hpp"
 #include "scene/scene_renderer.hpp"
 #include "ui/vr_menu.hpp"
+#include "video/bc7_thumbs.hpp"
 #include "video/cuda_nv12_texture.hpp"
 #include "video/vaapi_nv12_texture.hpp"
 #include "video/video_decoder.hpp"
@@ -88,7 +89,6 @@ HostWindow::HostWindow(vrp::PlayerOptions opt, QString shader_dir, QWidget* pare
     vrp::VideoDecoder probe;
     if (probe.open(opt_.video_path)) {
       reportVideoOpen(probe.info());
-      beginThumbnailBuild(opt_.video_path);
     } else {
       reportVideoOpen(probe.info());
     }
@@ -737,6 +737,7 @@ void HostWindow::paintHudNow() {
     hud_mesh_atlas_gen_ = hud.atlas_gen;
     hud_pixels_kind_ = kind;
     hud_pixels_gen_ = ++hud_paint_serial_;
+    if (kind == 4) hud_painted_seek_sec_ = snap.position_sec;
     if (thumb.isNull() || thumb.width() <= 0 || thumb.height() <= 0) {
       thumb_pixels_.clear();
       thumb_w_ = thumb_h_ = 0;
@@ -1060,6 +1061,10 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("pad"), QStringLiteral("auto")},
       {QStringLiteral("hand"), QStringLiteral("right")},
       {QStringLiteral("gamepad"), QStringLiteral("1")},
+      {QStringLiteral("thumb_count"), QString::number(vrp::kSeekThumbCount)},
+      {QStringLiteral("thumb_edge"), QString::number(vrp::kSeekThumbMaxEdge)},
+      {QStringLiteral("hwaccel"), QStringLiteral("1")},
+      {QStringLiteral("thumb_jpeg"), QStringLiteral("1")},
   };
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   ensureMonasphereConfKeys(defaults);
@@ -1110,6 +1115,25 @@ void HostWindow::loadAppConf() {
     } else if (line.startsWith(QStringLiteral("hand="))) {
       opt_.controller_hand = line.mid(5) == QLatin1String("left") ? vrp::ControllerHand::Left
                                                                   : vrp::ControllerHand::Right;
+    } else if (line.startsWith(QStringLiteral("thumb_count="))) {
+      bool ok = false;
+      const int v = line.mid(12).toInt(&ok);
+      if (ok && v >= vrp::kSeekThumbCountMin && v <= vrp::kSeekThumbCountMax) seek_thumb_count_ = v;
+    } else if (line.startsWith(QStringLiteral("thumb_edge="))) {
+      bool ok = false;
+      int v = line.mid(11).toInt(&ok);
+      if (ok && v >= vrp::kSeekThumbEdgeMin && v <= vrp::kSeekThumbEdgeMax) {
+        v &= ~1;
+        if (v >= vrp::kSeekThumbEdgeMin) seek_thumb_edge_ = v;
+      }
+    } else if (line.startsWith(QStringLiteral("hwaccel="))) {
+      bool ok = false;
+      const int v = line.mid(8).toInt(&ok);
+      if (ok && (v == 0 || v == 1)) hwaccel_ = v != 0;
+    } else if (line.startsWith(QStringLiteral("thumb_jpeg="))) {
+      bool ok = false;
+      const int v = line.mid(11).toInt(&ok);
+      if (ok && (v == 0 || v == 1)) thumb_jpeg_ = v != 0;
     }
   }
   user.close();
@@ -1757,15 +1781,19 @@ void HostWindow::reportThumbnails(const vrp::ThumbnailStrip& strip) {
   }
 }
 
+// Same strip the XR playback path starts. Count and long edge come from monasphere.conf.
 void HostWindow::beginThumbnailBuild(const std::string& path) {
   if (path.empty()) return;
   thumb_cancel_.store(true);
   if (thumb_thread_.joinable()) thumb_thread_.detach();
   thumb_cancel_.store(false);
 
-
-  thumb_thread_ = std::thread([this, path] {
-    vrp::ThumbnailStrip strip = vrp::build_thumbnail_strip(path);
+  const int thumb_count = seek_thumb_count_;
+  const int thumb_edge = seek_thumb_edge_;
+  const bool allow_hw = hwaccel_;
+  thumb_thread_ = std::thread([this, path, thumb_count, thumb_edge, allow_hw] {
+    vrp::ThumbnailStrip strip =
+        vrp::build_thumbnail_strip(path, thumb_count, 0, 0, {}, {}, thumb_edge, allow_hw);
     if (thumb_cancel_.load() || shutting_down_.load()) return;
     QMetaObject::invokeMethod(
         this,
@@ -2809,6 +2837,16 @@ void HostWindow::xrThreadMain() {
     vrp::VaapiNv12Texture vaapi_tex;
     vrp::VideoFrame pending_upload;
     texture.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
+    vrp::VideoTexture seek_tex;
+    seek_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
+    vrp::Bc7ThumbCache bc7;
+    bc7.init(xr.physical_device(), xr.device(), xr.compute_queue(), xr.queue(), xr.queue_family(),
+             &xr.queue_mutex(), shader_dir_.toStdString());
+    VkPhysicalDeviceProperties gpu_props{};
+    vkGetPhysicalDeviceProperties(xr.physical_device(), &gpu_props);
+    const bool nvidia_bc7 = !thumb_jpeg_ && gpu_props.vendorID == 0x10DEu && bc7.ok();
+    VRP_LOG("Seek thumbs: %s (GPU vendor 0x%x, %s)", nvidia_bc7 ? "BC1" : "JPEG", gpu_props.vendorID,
+            gpu_props.deviceName);
     const bool gpu_nv12 =
         cuda_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
                       xr.external_memory_fd());
@@ -2912,8 +2950,31 @@ void HostWindow::xrThreadMain() {
     };
 
     bool vaapi_hud_pending = true;
+    bool thumb_latched = false;
+    bool seek_settle = false;
+    std::chrono::steady_clock::time_point seek_settle_from{};
+    bool wait_stop_frame = false;
+    bool stop_frame_shown = false;
+    bool stop_seek_sent = false;
+    bool stop_upload_sent = false;
+    uint64_t stop_seq = 0;
+    double stop_pts = -1.0;
+    bool have_pending_thumb = false;
+    int thumb_idx = -1;
+    vrp::VideoFrame pending_thumb;
     auto open_media = [&](const std::string& path) {
       vaapi_hud_pending = true;
+      thumb_latched = false;
+      seek_settle = false;
+      wait_stop_frame = false;
+      stop_frame_shown = false;
+      stop_seek_sent = false;
+      stop_upload_sent = false;
+      stop_seq = 0;
+      stop_pts = -1.0;
+      have_pending_thumb = false;
+      thumb_idx = -1;
+      pending_thumb = {};
       // Keep miniaudio alive and muted so silence keeps flushing HMD/Pulse during the switch.
       // Closing the device mid-switch is what left the previous file's audio in the sink.
       if (audio.is_open()) audio.mute_output();
@@ -2926,15 +2987,43 @@ void HostWindow::xrThreadMain() {
       pending_upload = {};
       cuda_tex.drain_copies();
 
-      // Bound GPU wait — full vkQueueWaitIdle stalls the HMD on high-bitrate switches.
-      (void)scene.wait_previous_submit(50'000'000ull);  // 50ms
-      // Unbind NV12 descriptors first, then free Vulkan/CUDA memory under the import context.
+      // Stop further BC7 submits, but keep the images until the eye frame that may
+      // still sample them has finished. Destroying them on a 50ms timeout faulted the
+      // GPU on the next file and the HMD stopped receiving frames.
+      const uint64_t bc7_build = bc7.begin_build();
+      if (!scene.wait_previous_submit(0)) {
+        VRP_LOG("BC1 thumbs: waiting for the frame that still samples the old images");
+        while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
+        }
+      }
+      const bool gpu_idle = scene.wait_previous_submit(0);
+      if (!gpu_idle) return false;
       scene.set_texture(texture.view(), texture.sampler());
       cuda_tex.reset_slots(decoder.cuda_context());
       vaapi_tex.reset();
+      bc7.release_images();
       decoder.close();
 
-      const bool ok = decoder.open(path);
+      const bool ok = decoder.open(path, hwaccel_);
+      if (ok) {
+        vrp::SeekThumbRawStep raw;
+        if (nvidia_bc7) {
+          raw = [&bc7, bc7_build](int index, double /*time_sec*/, int /*planned*/, double interval, int w, int h,
+                                  const uint8_t* rgba, size_t /*rgba_bytes*/) {
+            return bc7.compress(index, rgba, w, h, interval, bc7_build);
+          };
+        }
+        decoder.start_thumbnail_build(
+            [this](vrp::ThumbnailStrip strip) {
+              QMetaObject::invokeMethod(
+                  this,
+                  [this, strip = std::move(strip)] {
+                    if (!shutting_down_.load()) reportThumbnails(strip);
+                  },
+                  Qt::QueuedConnection);
+            },
+            seek_thumb_count_, 0, 0, raw, seek_thumb_edge_, hwaccel_);
+      }
       const vrp::VideoInfo info = decoder.info();
       QMetaObject::invokeMethod(
           this, [this, info] { reportVideoOpen(info); }, Qt::QueuedConnection);
@@ -3010,9 +3099,6 @@ void HostWindow::xrThreadMain() {
             },
             Qt::QueuedConnection);
         requestHudPaint();
-        // Host-side strip only — do not block XR on high-bitrate thumbnail decode.
-        QMetaObject::invokeMethod(
-            this, [this, path] { beginThumbnailBuild(path); }, Qt::QueuedConnection);
         if (!opt_.mute) {
           std::string adev;
           {
@@ -3058,6 +3144,13 @@ void HostWindow::xrThreadMain() {
     }
 
     auto last = std::chrono::steady_clock::now();
+    double ui_accum = 0;
+    bool seek_paint_wait = false;
+    uint64_t seek_paint_gen = 0;
+    uint64_t seek_paint_pixels = 0;
+    uint64_t hud_mesh_applied = 0;
+    bool stop_seek_pending = false;
+    double stop_seek_sec = 0;
     std::vector<XrCompositionLayerProjectionView> proj_views;
     XrCompositionLayerProjection layer{};
     auto last_status = std::chrono::steady_clock::now();
@@ -3069,6 +3162,24 @@ void HostWindow::xrThreadMain() {
       double dt = std::chrono::duration<double>(now - last).count();
       last = now;
       if (dt > 0.1) dt = 0.1;
+      // UI state and HUD paints run at 60fps. The XR loop stays at the display rate.
+      constexpr double kUiStep = 1.0 / 60.0;
+      float ui_dt = 0.f;
+      float seek_dt = 0.f;
+      ui_accum += dt;
+      if (ui_accum >= kUiStep) {
+        ui_dt = static_cast<float>(kUiStep);
+        // The seek clock keeps the host time this tick actually covered.
+        seek_dt = static_cast<float>(ui_accum > 0.1 ? 0.1 : ui_accum);
+        ui_accum = 0;
+      }
+
+      if (seek_paint_wait && seek_paint_pixels == 0 &&
+          hud_paint_done_.load(std::memory_order_acquire) >= seek_paint_gen) {
+        std::lock_guard<std::mutex> lock(hud_pixels_mu_);
+        seek_paint_pixels = hud_pixels_gen_;
+      }
+      menu.set_seek_frame_dt(seek_dt);
 
       const int cmd = cmd_.exchange(0);
       if (cmd == 1) {
@@ -3083,13 +3194,13 @@ void HostWindow::xrThreadMain() {
           audio.pause();
         }
       }
-      if (cmd == 2) {
-        decoder.seek_relative(-10.0);
-        audio.pause();
-      }
-      if (cmd == 3) {
-        decoder.seek_relative(10.0);
-        audio.pause();
+      if (cmd == 2 || cmd == 3) {
+        double target = 0;
+        if (menu.arm_seek_delta(cmd == 2 ? -10.0 : 10.0, target)) {
+          decoder.seek_to(target);
+          audio.pause();
+          requestHudPaint();
+        }
       }
       if (cmd == 4 && xr.recenter()) {
         showControlsHelp();
@@ -3188,6 +3299,10 @@ void HostWindow::xrThreadMain() {
             input.menu_toggle = input.menu_toggle || gp.menu_toggle;
             input.seek_back = input.seek_back || gp.seek_back;
             input.seek_forward = input.seek_forward || gp.seek_forward;
+            input.seek_back_held = input.seek_back_held || gp.seek_back_held;
+            input.seek_forward_held = input.seek_forward_held || gp.seek_forward_held;
+            input.l2_held = input.l2_held || gp.l2_held;
+            input.r2_held = input.r2_held || gp.r2_held;
             input.seek_scrubbing = input.seek_scrubbing || gp.seek_scrubbing;
             input.recenter = input.recenter || gp.recenter;
           } else {
@@ -3234,7 +3349,7 @@ void HostWindow::xrThreadMain() {
         const bool sony = hmd_sony || pad_sony;
         if (face_sony_.exchange(sony) != sony) requestHudPaint();
       }
-      decoder.set_seek_scrubbing(input.seek_scrubbing && !menu.visible());
+      decoder.set_seek_scrubbing(false);
 
       vrp::VrMenu::PadInput pad;
       if (help_swallow_back_ && !input.back_held && !input.back) help_swallow_back_ = false;
@@ -3254,10 +3369,19 @@ void HostWindow::xrThreadMain() {
           pad.back_held = input.back_held;
         }
       }
+      pad.l2_held = input.l2_held;
+      pad.r2_held = input.r2_held;
+      pad.seek_back_held = input.seek_back_held;
+      pad.seek_forward_held = input.seek_forward_held;
       const bool menu_was = menu.visible();
       const bool controls_was = menu.controls_visible();
-      const auto menu_out = menu.update(pad, static_cast<float>(dt));
-      if (menu_out.seek_scrubbing && !menu.visible()) decoder.set_seek_scrubbing(true);
+      if (decoder.is_open()) {
+        menu.set_thumb_cover(decoder.thumb_cover_sec());
+        menu.set_thumb_bar_force(!decoder.thumbnails_finished());
+      } else {
+        menu.set_thumb_bar_force(false);
+      }
+      const auto menu_out = menu.update(pad, ui_dt);
       if (menu.visible() != menu_was || menu.controls_visible() != controls_was) requestHudPaint();
       if (menu_out.open_video) {
         if (!open_media(menu_out.video_path)) {
@@ -3315,7 +3439,7 @@ void HostWindow::xrThreadMain() {
       if (menu_out.stop) {
         play_wanted = false;
         decoder.pause();
-        decoder.seek_to(0.0);
+        decoder.seek_to(menu.place_seek_bar(0.0));
         // Must seek audio demuxer to 0 as well — pause alone leaves decode at the stop point,
         // so the next play() can briefly emit that PCM (and Pulse may still hold it).
         if (audio.is_open()) audio.stop();
@@ -3370,38 +3494,73 @@ void HostWindow::xrThreadMain() {
         menu.set_volume(audio.volume());
         requestHudPaint();
       }
-      // A seek is a pause. Playback, when it should continue, goes through play()
-      // and the single start below — the same path as the play button.
+      // The bar moves on its own. Playback pauses and a prebuilt thumb fills the screen.
+      // On release, one seek and the still stays up. Playback starts 0.5s after the
+      // stick or shoulder is released, from the frame at that time.
       const bool file_ui = menu.visible();
-      const bool scrubbing = !file_ui && (input.seek_scrubbing || menu_out.seek_scrubbing);
-      const bool seek_now = !file_ui && (input.seek_back || menu_out.seek_back || input.seek_forward ||
-                                         menu_out.seek_forward || menu_out.seek_start || menu_out.stick_seek);
-      if (!file_ui && (input.seek_back || menu_out.seek_back)) decoder.seek_relative(-10.0);
-      if (!file_ui && (input.seek_forward || menu_out.seek_forward)) decoder.seek_relative(10.0);
-      if (!file_ui && menu_out.stick_seek) decoder.seek_to(menu_out.stick_seek_sec);
-      if (!file_ui && menu_out.seek_start) decoder.seek_to(0.0);
-      if (seek_now) audio.pause();
-      bool resume_posted = false;
-      // Key-repeat stays paused. Releasing the key is the end of the seek.
-      if (was_scrubbing && !scrubbing && !seek_now && play_wanted && !decoder.seek_in_flight() &&
-          !decoder.is_playing() && !decoder.is_priming()) {
-        decoder.play();
-        resume_posted = true;
+      const bool scrubbing = !file_ui && menu_out.seek_scrubbing;
+      const bool seek_release = !file_ui && menu_out.seek;
+      const bool seek_now = seek_release || (!file_ui && menu_out.seek_start);
+      auto arm_stop_seek = [&](double sec) {
+        audio.pause();
+        decoder.pause();
+        decoder.seek_to(sec);
+        stop_seek_sent = true;
+        wait_stop_frame = true;
+        stop_frame_shown = false;
+        stop_seq = decoder.frame_seq();
+        stop_pts = -1.0;
+        stop_upload_sent = false;
+        seek_settle = true;
+        seek_settle_from = now;
+        requestHudPaint();
+      };
+      if (scrubbing) {
+        if (!was_scrubbing) menu.clear_seek_bar_drawn();
+        decoder.pause();
+        audio.pause();
+        decoder.set_seek_scrubbing(true);
+        thumb_latched = true;
+        seek_settle = false;
+        wait_stop_frame = false;
+        stop_frame_shown = false;
+        stop_seek_sent = false;
+        stop_pts = -1.0;
+        stop_upload_sent = false;
+        stop_seek_pending = false;
+      } else if (seek_release) {
+        stop_seek_pending = true;
+        stop_seek_sec = menu_out.seek_sec;
+      } else if (was_scrubbing && !wait_stop_frame && !seek_settle && !stop_seek_pending) {
+        thumb_latched = false;
+      }
+      if (stop_seek_pending && !seek_paint_wait) {
+        arm_stop_seek(stop_seek_sec);
+        stop_seek_pending = false;
+      }
+      if (!file_ui && menu_out.seek_start) {
+        arm_stop_seek(menu.place_seek_bar(0.0));
       }
       was_scrubbing = scrubbing;
+      const bool seek_settling =
+          seek_settle && std::chrono::duration<double>(now - seek_settle_from).count() < 0.5;
+      const bool hold_play = scrubbing || seek_settling || wait_stop_frame || stop_seek_pending;
+      if (hold_play) audio.pause();
 
       if (decoder.consume_av_resync()) {
-        const bool resume = play_wanted && !scrubbing && !resume_posted;
+        const bool resume = play_wanted && !hold_play;
         if (resume) decoder.play();
-        else if (!play_wanted || scrubbing) audio.park_at(decoder.position());
+        else if (!play_wanted || hold_play) audio.park_at(decoder.position());
       }
 
       // Sole start: audible audio, then the first new frame. Seek-in-flight waits
       // so we arm at the landed PTS rather than the requested time.
-      if (decoder.consume_playback_started() && play_wanted && !scrubbing && !decoder.is_playing() &&
+      if (decoder.consume_playback_started() && play_wanted && !hold_play && !decoder.is_playing() &&
           !decoder.seek_in_flight()) {
-        if (audio.is_open()) audio.arm_at(decoder.position());
+        const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
+        if (audio.is_open()) audio.arm_at(arm);
         decoder.start_presentation();
+        stop_pts = -1.0;
       }
 
       if (input.recenter && xr.recenter()) {
@@ -3419,7 +3578,7 @@ void HostWindow::xrThreadMain() {
       // Video end-of-stream loop → keep audio on the same timeline (avoids post-repeat silence).
       if (decoder.consume_looped() && audio.is_open() && decoder.seek_in_flight()) audio.mute_output();
       menu.note_seek_bar(!menu.visible() && !menu.controls_visible() &&
-                         (scrubbing || seek_now || menu.seek_gliding()));
+                         (scrubbing || seek_now || stop_seek_pending || menu.seek_gliding() || seek_paint_wait));
       static bool seek_overlay_was = false;
       const bool seek_overlay = menu.seek_bar_only();
       if (seek_overlay != seek_overlay_was) {
@@ -3442,7 +3601,18 @@ void HostWindow::xrThreadMain() {
           }
           requestHudPaint();
         }
-        if (menu.list_gliding() || menu.seek_gliding()) requestHudPaint();
+        // One seek-bar paint per UI update. The clock does not wait on that paint.
+        if (ui_dt > 0.f && (menu.list_gliding() || menu.seek_gliding())) {
+          if (menu.seek_gliding()) {
+            const uint64_t g = menu.publish_seek_bar();
+            if (g != 0) {
+              seek_paint_wait = true;
+              seek_paint_gen = g;
+              seek_paint_pixels = 0;
+            }
+          }
+          requestHudPaint();
+        }
         if (!preview_hi.empty() && now - preview_wait_since >= std::chrono::milliseconds(450)) {
           request_preview(preview_hi);
         }
@@ -3556,8 +3726,26 @@ void HostWindow::xrThreadMain() {
         }
       }
 
+      // While the bar is moving, show the prebuilt thumb at or behind the bar. After release, keep it
+      // until the decoded frame at the stop time is bound, then start from that frame.
+      if (wait_stop_frame && !scrubbing && stop_pts < 0.0 && decoder.frame_seq() != stop_seq) {
+        vrp::VideoFrame landed;
+        if (decoder.take_latest(landed)) {
+          stop_pts = landed.pts_sec;
+          if (landed.gpu || landed.rgba.empty()) {
+            stop_upload_sent = true;
+          } else {
+            pending_upload = std::move(landed);
+            stop_upload_sent = false;
+          }
+        }
+      }
+      const bool reveal_stop = wait_stop_frame && !scrubbing && stop_pts >= 0.0;
+      const bool show_thumb =
+          thumb_latched && (scrubbing || stop_seek_pending || (wait_stop_frame && !reveal_stop));
+      const bool seek_visual = show_thumb && !reveal_stop;
       // Only wait when rebinding — avoid stalling every XR frame.
-      if (!opt_.clear_only && decoder.is_open()) {
+      if (!seek_visual && !opt_.clear_only && decoder.is_open()) {
         bool video_updated = false;
         int nv12_mode = 0;
         VkImageView src_y = VK_NULL_HANDLE;
@@ -3609,8 +3797,9 @@ void HostWindow::xrThreadMain() {
           }
           if (!pending_upload.rgba.empty() && texture.try_upload(pending_upload)) {
             pending_upload = {};
+            if (reveal_stop) stop_upload_sent = true;
           }
-          if (texture.poll_present()) {
+          if (texture.poll_present() && (!reveal_stop || stop_upload_sent)) {
             video_updated = true;
           }
           src_y = texture.view();
@@ -3631,6 +3820,25 @@ void HostWindow::xrThreadMain() {
           }
         }
         force_fsr_refresh = false;
+        if (reveal_stop && video_updated) stop_frame_shown = true;
+      }
+
+      // The still stays up through the 0.5s settle. Play starts after that, at the landed PTS.
+      if (stop_frame_shown && !seek_settling && !scrubbing && !decoder.seek_in_flight() &&
+          !decoder.is_playing() && !decoder.is_priming()) {
+        wait_stop_frame = false;
+        thumb_latched = false;
+        seek_settle = false;
+        if (play_wanted) {
+          decoder.play();
+          if (decoder.consume_playback_started()) {
+            const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
+            if (audio.is_open()) audio.arm_at(arm);
+            decoder.start_presentation();
+            stop_pts = -1.0;
+          }
+        }
+        stop_frame_shown = false;
       }
 
       // HMD menu: cached atlas on the GPU, quads placed every paint.
@@ -3644,6 +3852,7 @@ void HostWindow::xrThreadMain() {
         static std::vector<vrp::HudVertex> pending_verts;
         static uint64_t pending_atlas = 0;
         static int pending_kind = 0;
+        static double pending_seek_sec = 0;
         vrp::VideoFrame hud_frame;
         uint64_t upload_gen = 0;
         bool have_atlas = false;
@@ -3653,6 +3862,7 @@ void HostWindow::xrThreadMain() {
             pending_verts = hud_verts_;
             pending_atlas = hud_mesh_atlas_gen_;
             pending_kind = hud_pixels_kind_;
+            pending_seek_sec = hud_painted_seek_sec_;
             seen_paint = hud_pixels_gen_;
           }
           if (hud_atlas_gen_ != 0 && hud_atlas_gen_ != resident_atlas && hud_atlas_gen_ != inflight_atlas &&
@@ -3665,7 +3875,11 @@ void HostWindow::xrThreadMain() {
           }
         }
         const bool help_on = controls_help_.load();
-        const int want_kind = help_on ? 1 : menu.visible() ? 2 : menu.controls_visible() ? 3 : menu.seek_bar_only() ? 4 : 0;
+        const int want_kind = help_on ? 1
+                                      : menu.visible() ? 2
+                                      : menu.controls_visible() ? 3
+                                      : menu.seek_bar_only() ? 4
+                                                             : 0;
         if (hud_tex.poll_present() && inflight_atlas != 0) {
           resident_atlas = inflight_atlas;
           atlas_resize = false;
@@ -3693,7 +3907,8 @@ void HostWindow::xrThreadMain() {
         const bool atlas_ready =
             resident_atlas != 0 && pending_kind == want_kind && pending_atlas <= resident_atlas &&
             !pending_verts.empty();
-        if (want_kind == 0 || atlas_resize) {
+        const bool keep_seek_bar = mesh_kind == 4 && (scrubbing || stop_seek_pending || menu.seek_bar_only());
+        if ((want_kind == 0 || atlas_resize) && !keep_seek_bar) {
           scene.set_hud_mesh(nullptr, 0);
           scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), false);
           mesh_kind = 0;
@@ -3706,11 +3921,51 @@ void HostWindow::xrThreadMain() {
           apply_layout(want_kind);
           scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), true);
           mesh_kind = want_kind;
-        } else if (mesh_kind == want_kind && resident_atlas != 0) {
+          hud_mesh_applied = applied_paint;
+          // Kind 3 is the playback panel, which already draws the bar. Kind 4 is the
+          // bar alone. Either one finishing is enough to release the stop-seek.
+          const bool seek_hud = want_kind == 3 || want_kind == 4;
+          if (seek_hud && seek_paint_wait && seek_paint_pixels == 0 &&
+              hud_paint_done_.load(std::memory_order_acquire) >= seek_paint_gen) {
+            std::lock_guard<std::mutex> lock(hud_pixels_mu_);
+            seek_paint_pixels = hud_pixels_gen_;
+          }
+          if (want_kind == 4 && pending_kind == 4) menu.note_seek_bar_drawn(pending_seek_sec);
+          if (seek_hud &&
+              (!seek_paint_wait || (seek_paint_pixels != 0 && hud_mesh_applied >= seek_paint_pixels))) {
+            seek_paint_wait = false;
+          }
+        } else if ((mesh_kind == want_kind || (want_kind == 4 && mesh_kind == 4)) && resident_atlas != 0) {
           apply_layout(want_kind);
           scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), true);
         } else {
           scene.set_hud_texture(hud_tex.view(), hud_tex.sampler(), false);
+        }
+
+        // Same sample as the bar that was just shown.
+        if (show_thumb) {
+          if (nvidia_bc7) {
+            const int idx = bc7.index_for(menu.seek_bar_drawn() ? menu.seek_drawn_sec() : menu.seek_bar_sec());
+            VkImageView thumb_view = bc7.view(idx);
+            if (idx >= 0 && idx != thumb_idx && thumb_view) {
+              scene.set_texture(thumb_view, bc7.sampler());
+              thumb_idx = idx;
+            }
+          } else {
+            vrp::VideoFrame thumb;
+            if (decoder.copy_thumb(menu.seek_bar_drawn() ? menu.seek_drawn_sec() : menu.seek_bar_sec(), thumb_idx,
+                                   thumb)) {
+              pending_thumb = std::move(thumb);
+              have_pending_thumb = true;
+            }
+            if (have_pending_thumb && seek_tex.try_upload(pending_thumb)) {
+              have_pending_thumb = false;
+              pending_thumb = {};
+            }
+            if (seek_tex.poll_present() && seek_tex.view()) {
+              scene.set_texture(seek_tex.view(), seek_tex.sampler());
+            }
+          }
         }
 
         static uint64_t uploaded_thumb = 0;
@@ -3848,12 +4103,14 @@ void HostWindow::xrThreadMain() {
     VRP_LOG("teardown: reset NV12 slots (before decoder.close)");
     cuda_tex.reset_slots(decoder.cuda_context());
     decoder.close();
+    bc7.shutdown();
     VRP_LOG("teardown: decoder closed");
     fsr.shutdown();
     cuda_tex.shutdown();
     vaapi_tex.shutdown();
     thumb_tex.shutdown();
     hud_tex.shutdown();
+    seek_tex.shutdown();
     texture.shutdown();
     scene.shutdown();
     xr.shutdown();

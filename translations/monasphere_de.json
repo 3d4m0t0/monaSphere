@@ -1299,6 +1299,16 @@
       "context": "HostWindow",
       "source": "Vulkan: command pool…",
       "translation": "Vulkan: Command-Pool…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan compute queue: index 1",
+      "translation": "Vulkan-Compute-Queue: Index 1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Vulkan compute queue: sharing the frame queue",
+      "translation": "Vulkan-Compute-Queue: teilt die Frame-Queue"
     }
   ]
 }

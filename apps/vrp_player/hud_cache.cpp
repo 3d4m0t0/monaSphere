@@ -22,6 +22,39 @@ uint64_t domain_key(uint64_t domain, uint64_t key) {
   return key ^ (domain * 0x9E3779B97F4A7C15ull);
 }
 
+uint64_t font_key(const QFont& font) {
+  uint64_t h = 14695981039346656037ull;
+  h = mix_key(h, static_cast<uint64_t>(font.pointSize()));
+  h = mix_key(h, static_cast<uint64_t>(font.pixelSize()));
+  h = mix_key(h, static_cast<uint64_t>(font.weight()));
+  h = mix_key(h, font.bold() ? 1u : 0u);
+  h = mix_key(h, static_cast<uint64_t>(qHash(font.family())));
+  return h;
+}
+
+struct ClockMetrics {
+  int digit = 1;
+  int space = 1;
+  int height = 1;
+};
+
+ClockMetrics clock_metrics(const QFont& font) {
+  const QFontMetrics fm(font);
+  ClockMetrics m;
+  m.height = std::max(1, fm.height());
+  m.space = std::max(1, fm.horizontalAdvance(QChar(' ')));
+  for (int i = 0; i < 10; ++i) {
+    m.digit = std::max(m.digit, fm.horizontalAdvance(QChar('0' + i)));
+  }
+  return m;
+}
+
+int clock_advance(const ClockMetrics& m, const QFontMetrics& fm, QChar ch) {
+  if (ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) return m.digit;
+  if (ch == QLatin1Char(' ')) return m.space;
+  return std::max(1, fm.horizontalAdvance(ch));
+}
+
 uint64_t text_key(const QString& s, const QFont& font, const QColor& color) {
   uint64_t h = 14695981039346656037ull;
   h = mix_key(h, static_cast<uint64_t>(font.pointSize()));
@@ -58,6 +91,7 @@ void HudCanvas::begin(int panel_w, int panel_h) {
   pixels_.assign(static_cast<size_t>(atlas_w_) * static_cast<size_t>(atlas_h_) * 4, 0);
   sprites_.clear();
   texts_.clear();
+  clocks_.clear();
   pen_x_ = 1;
   pen_y_ = 1;
   row_h_ = 0;
@@ -329,6 +363,53 @@ void HudCanvas::text(const QRect& r, const QString& s, const QFont& font, const 
   if (flags & Qt::AlignBottom) y = r.y() + r.height() - raster.height;
   else if (!(flags & Qt::AlignTop)) y = r.y() + (r.height() - raster.height) / 2;
   blit_text(x, y, raster, r);
+}
+
+int HudCanvas::clock_width(const QString& s, const QFont& font) const {
+  if (s.isEmpty()) return 0;
+  const ClockMetrics m = clock_metrics(font);
+  const QFontMetrics fm(font);
+  int w = 0;
+  for (const QChar ch : s) w += clock_advance(m, fm, ch);
+  return w;
+}
+
+void HudCanvas::clock(const QRect& r, const QString& s, const QFont& font, const QColor& color, int flags) {
+  if (s.isEmpty() || r.width() <= 0 || r.height() <= 0 || color.alpha() == 0) return;
+  const uint64_t key = mix_key(font_key(font), color.rgba());
+  ClockFace& face = clocks_[key];
+  const ClockMetrics metrics = clock_metrics(font);
+  if (!face.ready) {
+    face.digit_advance = metrics.digit;
+    face.space_advance = metrics.space;
+    face.height = metrics.height;
+    for (const QChar ch : QStringLiteral("0123456789:/")) {
+      TextSprite raster = make_text(QString(ch), font, color);
+      if (raster.slices.empty()) continue;
+      face.glyphs.emplace(ch.unicode(), std::move(raster));
+    }
+    face.ready = true;
+  }
+  const QFontMetrics fm(font);
+  const ClockMetrics laid{face.digit_advance, face.space_advance, face.height};
+  int total = 0;
+  for (const QChar ch : s) total += clock_advance(laid, fm, ch);
+  int x = r.x();
+  if (flags & Qt::AlignHCenter) x = r.x() + (r.width() - total) / 2;
+  else if (flags & Qt::AlignRight) x = r.x() + r.width() - total;
+  int y = r.y();
+  if (flags & Qt::AlignBottom) y = r.y() + r.height() - face.height;
+  else if (!(flags & Qt::AlignTop)) y = r.y() + (r.height() - face.height) / 2;
+  for (const QChar ch : s) {
+    const int cell = clock_advance(laid, fm, ch);
+    const auto found = face.glyphs.find(ch.unicode());
+    if (found != face.glyphs.end()) {
+      const int glyph_w = found->second.width;
+      const int gx = (ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) ? x + (cell - glyph_w) / 2 : x;
+      blit_text(gx, y, found->second, r);
+    }
+    x += cell;
+  }
 }
 
 void HudCanvas::scrolling_text(const QRect& r, const QString& s, const QFont& font, const QColor& color) {

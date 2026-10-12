@@ -209,6 +209,10 @@ GamepadInput::State GamepadInput::poll() {
   st.back = edge(b, prev_b_);
   st.back_held = b;
   const auto now = std::chrono::steady_clock::now();
+  st.seek_back_held = lb;
+  st.seek_forward_held = rb;
+  st.l2_held = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERLEFT) > 8000;
+  st.r2_held = SDL_GameControllerGetAxis(gc, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) > 8000;
   st.seek_back = key_repeat(lb, lb_held_, lb_repeating_, lb_next_, now);
   st.seek_forward = key_repeat(rb, rb_held_, rb_repeating_, rb_next_, now);
   st.seek_scrubbing = lb_repeating_ || rb_repeating_;

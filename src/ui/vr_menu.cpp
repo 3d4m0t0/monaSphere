@@ -105,6 +105,8 @@ void VrMenu::set_media(const std::string& path, double duration_sec) {
   seek_glide_paint_ = false;
   seek_bar_hold_ = false;
   stick_seek_repeat_ = {};
+  thumb_cover_sec_ = 0;
+  thumb_bar_force_ = false;
   bump();
 }
 
@@ -126,6 +128,7 @@ void VrMenu::set_media_info(const std::string& video_codec, const std::string& r
 }
 
 void VrMenu::note_seek_bar(bool active) {
+  std::lock_guard lock(mu_);
   if (visible_ || controls_visible_) {
     seek_bar_only_ = false;
     seek_bar_until_ = {};
@@ -133,7 +136,51 @@ void VrMenu::note_seek_bar(bool active) {
   }
   const auto now = std::chrono::steady_clock::now();
   if (active) seek_bar_until_ = now + std::chrono::seconds(2);
-  seek_bar_only_ = now < seek_bar_until_;
+  seek_bar_only_ = thumb_bar_force_ || now < seek_bar_until_;
+}
+
+void VrMenu::set_thumb_bar_force(bool on) {
+  if (thumb_bar_force_ == on) return;
+  thumb_bar_force_ = on;
+  bump();
+}
+
+void VrMenu::set_thumb_cover(double sec) {
+  if (sec < 0) sec = 0;
+  if (std::fabs(sec - thumb_cover_sec_) < 0.01) return;
+  thumb_cover_sec_ = sec;
+  bump();
+}
+
+double VrMenu::place_seek_bar(double sec) {
+  double limit = duration_sec_ > 0 ? duration_sec_ : 0;
+  if (thumb_cover_sec_ + 0.05 < limit) limit = thumb_cover_sec_;
+  if (limit > 0) sec = std::clamp(sec, 0.0, limit);
+  else if (sec < 0) sec = 0;
+  seek_bar_sec_ = sec;
+  seek_target_sec_ = sec;
+  seek_gliding_ = false;
+  seek_bar_hold_ = true;
+  bump();
+  return sec;
+}
+
+bool VrMenu::arm_seek_delta(double delta_sec, double& target_sec) {
+  if (media_path_.empty() || std::fabs(delta_sec) < 0.001) return false;
+  if (stick_seek_repeat_.dir == 0 && !seek_gliding_ && !seek_bar_hold_) seek_bar_sec_ = position_sec_;
+  if (stick_seek_repeat_.dir == 0 && !seek_gliding_) seek_target_sec_ = seek_bar_sec_;
+  double limit = duration_sec_ > 0 ? duration_sec_ : 1.0e9;
+  if (thumb_cover_sec_ + 0.05 < limit) limit = std::max(0.0, thumb_cover_sec_);
+  const double next = std::clamp(seek_target_sec_ + delta_sec, 0.0, limit);
+  if (std::fabs(next - seek_target_sec_) < 0.001) return false;
+  seek_bar_sec_ = next;
+  seek_target_sec_ = next;
+  seek_step_sec_ = std::fabs(delta_sec);
+  seek_gliding_ = false;
+  seek_bar_hold_ = true;
+  target_sec = next;
+  bump();
+  return true;
 }
 
 void VrMenu::set_output_note(const std::string& output_note) {
@@ -149,7 +196,6 @@ void VrMenu::set_playback(bool playing, double position_sec) {
   const bool stick_busy = seek_gliding_ || stick_seek_repeat_.dir != 0;
   if (stick_busy) {
     seek_bar_hold_ = true;
-    bump();
     return;
   }
   const bool looped = duration_sec_ > 1.0 && prev > duration_sec_ * 0.5 && position_sec < 1.0;
@@ -414,6 +460,39 @@ void VrMenu::advance_list_glide(float dt) {
   }
   clamp_list_window();
   bump();
+}
+
+void VrMenu::advance_seek_glide(float /*dt*/) {
+  const int dir = stick_seek_repeat_.dir;
+  const double elapsed = seek_frame_dt_;
+  seek_frame_dt_ = 0;
+  // Rate is video seconds per host second. A late paint must not drop this interval.
+  if (!(elapsed > 0.0) || !seek_gliding_ || dir == 0) return;
+  double limit = duration_sec_ > 0 ? duration_sec_ : 1.0e9;
+  if (thumb_cover_sec_ + 0.05 < limit) limit = std::max(0.0, thumb_cover_sec_);
+  const double next =
+      std::clamp(seek_bar_sec_ + seek_step_sec_ * elapsed * static_cast<double>(dir), 0.0, limit);
+  if (std::fabs(next - seek_bar_sec_) < 1.0e-6) return;
+  seek_bar_sec_ = next;
+  seek_target_sec_ = next;
+  seek_bar_hold_ = true;
+  bump();
+}
+
+void VrMenu::set_seek_frame_dt(float dt) { seek_frame_dt_ = dt > 0.f ? static_cast<double>(dt) : 0.0; }
+
+void VrMenu::note_seek_bar_drawn(double sec) {
+  seek_drawn_sec_ = sec;
+  seek_bar_drawn_ = true;
+}
+
+void VrMenu::clear_seek_bar_drawn() { seek_bar_drawn_ = false; }
+
+uint64_t VrMenu::publish_seek_bar() {
+  if (std::fabs(seek_bar_sec_ - seek_published_sec_) < 0.0005) return 0;
+  seek_published_sec_ = seek_bar_sec_;
+  bump();
+  return gen_;
 }
 
 void VrMenu::clamp_list_window() {
@@ -805,6 +884,52 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   prev_confirm_ = in.confirm;
   prev_menu_toggle_ = in.menu_toggle;
 
+  // L2 slows, R2 speeds up. Both together reset to ×1, then both must be released.
+  {
+    const bool l2 = in.l2_held;
+    const bool r2 = in.r2_held;
+    if (l2 && r2) {
+      if (!rate_trigger_lock_ && !visible_) {
+        rate_ = 1.f;
+        out.rate_changed = true;
+        out.rate = 1.f;
+        bump();
+      }
+      rate_trigger_lock_ = true;
+      rate_trigger_repeat_ = {};
+    } else if (!l2 && !r2) {
+      rate_trigger_lock_ = false;
+      rate_trigger_repeat_ = {};
+    } else if (rate_trigger_lock_ || visible_) {
+      rate_trigger_repeat_ = {};
+    } else {
+      const int dir = r2 ? 1 : -1;
+      constexpr float kInitial = 0.40f;
+      constexpr float kRepeat = 0.12f;
+      auto fire = [&](int d) {
+        rate_ = step_playback_rate(rate_, d);
+        out.rate_changed = true;
+        out.rate = rate_;
+        bump();
+      };
+      if (dir != rate_trigger_repeat_.dir) {
+        rate_trigger_repeat_.dir = dir;
+        rate_trigger_repeat_.held = 0.f;
+        rate_trigger_repeat_.repeating = false;
+        fire(dir);
+      } else {
+        rate_trigger_repeat_.held += dt;
+        const float need = rate_trigger_repeat_.repeating ? kRepeat : kInitial;
+        if (rate_trigger_repeat_.held >= need) {
+          rate_trigger_repeat_.held -= need;
+          if (rate_trigger_repeat_.held > kRepeat) rate_trigger_repeat_.held = 0.f;
+          rate_trigger_repeat_.repeating = true;
+          fire(dir);
+        }
+      }
+    }
+  }
+
   // B held (level): short-release = back/toggle; long-hold on controls = rate ×1
   bool back_short = false;
   bool back_long_reset = false;
@@ -897,8 +1022,8 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     return out;
   }
 
-  // Stick left/right seeks. LB/RB stay ±10s. The bar glides across each step.
-  auto stick_seek = [&]() {
+  // Left stick and LB/RB share this path. The stick picks the step; LB/RB are 30s per host second.
+  auto seek_gesture = [&]() {
     const bool was_gliding = seek_gliding_;
     if (media_path_.empty()) {
       stick_seek_repeat_ = {};
@@ -909,87 +1034,57 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
       seek_glide_paint_ = was_gliding;
       return;
     }
-    constexpr float kInitial = 0.40f;
-    constexpr float kRepeat = 0.12f;
     constexpr float kDead = 0.20f;
-    constexpr double kSteps[] = {5, 10, 15, 30, 60, 120};
+    // Video seconds per host second. At 60 UI fps, 60 is +1s per update, 480 is +8s.
+    constexpr double kRates[] = {15, 30, 60, 120, 240, 480};
+    constexpr double kButtonRate = 30;
     int dir = 0;
     const float mag = std::fabs(in.stick_x);
     if (mag > kDead) {
       const float t = std::clamp((mag - kDead) / (1.f - kDead), 0.f, 1.f);
       const int band = std::min(5, static_cast<int>(t * 6.f));
-      seek_step_sec_ = kSteps[band];
+      seek_step_sec_ = kRates[band];
       dir = in.stick_x > 0.f ? 1 : -1;
-    }
-    auto pump = [&](int step_dir) {
-      if (step_dir == 0) {
-        stick_seek_repeat_ = {};
-        return;
-      }
-      auto fire = [&](int d) {
-        const double limit = duration_sec_ > 0 ? duration_sec_ : 1.0e9;
-        const double next =
-            std::clamp(seek_target_sec_ + static_cast<double>(d) * seek_step_sec_, 0.0, limit);
-        if (std::fabs(next - seek_target_sec_) < 0.001) return;
-        seek_target_sec_ = next;
-        seek_gliding_ = true;
-        seek_bar_hold_ = true;
-        out.stick_seek = true;
-        out.stick_seek_sec = next;
-      };
-      if (step_dir != stick_seek_repeat_.dir) {
-        if (stick_seek_repeat_.dir == 0) {
-          if (!seek_gliding_ && !seek_bar_hold_) seek_bar_sec_ = position_sec_;
-          seek_target_sec_ = seek_bar_sec_;
-          seek_bar_hold_ = true;
+    } else {
+      bool back = in.seek_back_held;
+      bool fwd = in.seek_forward_held;
+      if (controls_visible_ && controls_edit_ == ControlsEdit::None) {
+        const bool stick_up = in.nav_up || in.stick_y > 0.55f;
+        const bool stick_down = in.nav_down || in.stick_y < -0.55f;
+        if (stick_up == stick_down && in.confirm_held) {
+          if (transport_cursor_ == kSeekBack) back = true;
+          if (transport_cursor_ == kSeekForward) fwd = true;
         }
-        stick_seek_repeat_.dir = step_dir;
-        stick_seek_repeat_.held = 0.f;
-        stick_seek_repeat_.repeating = false;
-        fire(step_dir);
-        return;
       }
-      stick_seek_repeat_.held += dt;
-      const float need = stick_seek_repeat_.repeating ? kRepeat : kInitial;
-      if (stick_seek_repeat_.held >= need) {
-        stick_seek_repeat_.held -= need;
-        if (stick_seek_repeat_.held > kRepeat) stick_seek_repeat_.held = 0.f;
-        stick_seek_repeat_.repeating = true;
-        fire(step_dir);
+      if (fwd != back) {
+        seek_step_sec_ = kButtonRate;
+        dir = fwd ? 1 : -1;
       }
-    };
+    }
     const bool was_held = stick_seek_repeat_.dir != 0;
-    pump(dir);
     if (dir == 0) {
-      // Centered stick: stop on the bar's current time. Do not finish the step.
-      if (was_gliding || (was_held && std::fabs(seek_bar_sec_ - seek_target_sec_) > 0.05)) {
+      stick_seek_repeat_.dir = 0;
+      if (was_held) {
         seek_gliding_ = false;
         seek_target_sec_ = seek_bar_sec_;
         seek_bar_hold_ = true;
-        out.stick_seek = true;
-        out.stick_seek_sec = seek_bar_sec_;
         bump();
+        out.seek = true;
+        out.seek_sec = seek_bar_sec_;
       }
     } else {
+      if (!was_held && !seek_bar_hold_) seek_bar_sec_ = position_sec_;
+      stick_seek_repeat_.dir = dir;
+      seek_gliding_ = true;
+      seek_bar_hold_ = true;
       out.seek_scrubbing = true;
-      if (seek_gliding_) {
-        const double move =
-            (seek_step_sec_ / static_cast<double>(kRepeat)) * static_cast<double>(std::min(dt, 0.05f));
-        const double delta = seek_target_sec_ - seek_bar_sec_;
-        if (std::fabs(delta) <= move) {
-          seek_bar_sec_ = seek_target_sec_;
-          seek_gliding_ = false;
-        } else {
-          seek_bar_sec_ += std::copysign(move, delta);
-        }
-        bump();
-      }
+      advance_seek_glide(dt);
     }
     seek_glide_paint_ = was_gliding || seek_gliding_;
   };
 
   if (!visible_ && !controls_visible_) {
-    stick_seek();
+    seek_gesture();
     const bool stick_up = in.nav_up || in.stick_y > 0.55f;
     const bool stick_down = in.nav_down || in.stick_y < -0.55f;
     if (confirm && (stick_up != stick_down)) {
@@ -1138,7 +1233,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     } else {
       if (in.nav_left) nav(0, -1);
       if (in.nav_right) nav(0, 1);
-      stick_seek();
+      seek_gesture();
     }
   }
 
@@ -1149,38 +1244,6 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     const bool stick_up = in.nav_up || in.stick_y > 0.55f;
     const bool stick_down = in.nav_down || in.stick_y < -0.55f;
     const bool rate_chord = stick_up != stick_down;
-
-    // [<] / [>] with A held: same key-repeat seek as LB / RB (disabled while rate chord).
-    if (!rate_chord && controls_edit_ == ControlsEdit::None &&
-        (transport_cursor_ == kSeekBack || transport_cursor_ == kSeekForward)) {
-      constexpr auto kInitial = std::chrono::milliseconds(400);
-      constexpr auto kInterval = std::chrono::milliseconds(120);
-      const auto now = std::chrono::steady_clock::now();
-      bool fire = false;
-      if (!in.confirm_held) {
-        confirm_seek_held_ = false;
-        confirm_seek_repeating_ = false;
-      } else if (!confirm_seek_held_) {
-        confirm_seek_held_ = true;
-        confirm_seek_repeating_ = false;
-        confirm_seek_next_ = now + kInitial;
-        fire = true;
-      } else if (now >= confirm_seek_next_) {
-        confirm_seek_next_ = now + kInterval;
-        confirm_seek_repeating_ = true;
-        fire = true;
-      }
-      if (fire) {
-        if (transport_cursor_ == kSeekBack) out.seek_back = true;
-        else out.seek_forward = true;
-        out.seek_scrubbing = confirm_seek_repeating_;
-        bump();
-      }
-      out.seek_scrubbing = confirm_seek_repeating_;
-    } else {
-      confirm_seek_held_ = false;
-      confirm_seek_repeating_ = false;
-    }
 
     if (confirm) {
       if (controls_edit_ == ControlsEdit::Volume) {
@@ -1250,7 +1313,6 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         }
         case kSeekBack:
         case kSeekForward:
-          // Handled by confirm_held key-repeat above (same as L/R).
           break;
         case kPlayPause:
           out.play_toggle = true;
@@ -1328,6 +1390,7 @@ VrMenu::Snapshot VrMenu::snapshot() const {
   s.visible = visible_;
   s.controls_visible = controls_visible_;
   s.seek_bar_only = seek_bar_only_;
+  s.thumb_cover_sec = thumb_cover_sec_;
   s.controls_edit = controls_edit_;
   s.screen = screen_;
   if (controls_visible_) {

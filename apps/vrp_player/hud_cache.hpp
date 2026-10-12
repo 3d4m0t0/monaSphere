@@ -44,6 +44,16 @@ class HudCanvas {
   /** Horizontal 3-slice so a changing width does not rasterize again. */
   void rounded(const QRect& r, const QColor& color, int radius);
   void text(const QRect& r, const QString& s, const QFont& font, const QColor& color, int flags);
+  /**
+   * Width of a time label laid out from digit cells. Digits share one advance so the
+   * bar end stays put as the seconds change.
+   */
+  int clock_width(const QString& s, const QFont& font) const;
+  /**
+   * Time label sampled from digit glyphs already in the atlas.
+   * A new time only moves quads; the atlas is not uploaded again.
+   */
+  void clock(const QRect& r, const QString& s, const QFont& font, const QColor& color, int flags);
   void scrolling_text(const QRect& r, const QString& s, const QFont& font, const QColor& color);
   void paint_cached(uint64_t key, const QRect& dest, int raster_w, int raster_h,
                     const std::function<void(QPainter&)>& draw);
@@ -58,6 +68,13 @@ class HudCanvas {
     int height = 0;
     int pad = 1;
     std::vector<Sprite> slices;
+  };
+  struct ClockFace {
+    bool ready = false;
+    int digit_advance = 1;
+    int space_advance = 1;
+    int height = 1;
+    std::unordered_map<uint32_t, TextSprite> glyphs;
   };
 
   Sprite pack_image(const QImage& src);
@@ -81,6 +98,7 @@ class HudCanvas {
   std::vector<uint8_t> pixels_;
   std::unordered_map<uint64_t, Sprite> sprites_;
   std::unordered_map<uint64_t, TextSprite> texts_;
+  std::unordered_map<uint64_t, ClockFace> clocks_;
   std::vector<HudVertex> verts_;
 };
 

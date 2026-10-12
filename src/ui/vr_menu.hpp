@@ -71,6 +71,8 @@ class VrMenu {
     bool controls_visible = false;
     /** Seek bar alone, while playback controls are hidden. */
     bool seek_bar_only = false;
+    /** How far from 0 the thumbnail strip already covers. The rest of the bar cannot be seeked. */
+    double thumb_cover_sec = 0;
     Screen screen = Screen::Browser;
     ControlsEdit controls_edit = ControlsEdit::None;
     std::string title;
@@ -123,13 +125,11 @@ class VrMenu {
     bool pause = false;
     bool stop = false;
     bool play_toggle = false;
-    bool seek_back = false;
-    bool seek_forward = false;
     bool seek_start = false;  // [|<] cue to 0
-    bool seek_scrubbing = false;  // A hold-repeat on [<]/[>]
-    /** Stick seek target in seconds. Valid when stick_seek is set. LB/RB stay ±10s. */
-    bool stick_seek = false;
-    double stick_seek_sec = 0;
+    bool seek_scrubbing = false;  // left stick held in a seek
+    /** Absolute bar time, once, when the stick or LB/RB is released. */
+    bool seek = false;
+    double seek_sec = 0;
     float volume_delta = 0.f;
     bool rate_changed = false;
     float rate = 1.f;
@@ -144,7 +144,7 @@ class VrMenu {
     float stick_x = 0;
     float stick_y = 0;
     bool confirm = false;
-    bool confirm_held = false;  // A / confirm level (seek hold-repeat)
+    bool confirm_held = false;  // A / confirm level
     bool back = false;
     /** Continuous B/back for long-press (not edge). */
     bool back_held = false;
@@ -153,6 +153,12 @@ class VrMenu {
     bool nav_down = false;
     bool nav_left = false;
     bool nav_right = false;
+    /** LB/RB held. Same seek path as the stick, fixed 30s per host second. */
+    bool seek_back_held = false;
+    bool seek_forward_held = false;
+    /** Left / right trigger held. L2 slows, R2 speeds up, both reset to ×1. */
+    bool l2_held = false;
+    bool r2_held = false;
   };
 
   void init(const std::filesystem::path& start_dir);
@@ -188,14 +194,33 @@ class VrMenu {
   bool visible() const { return visible_; }
   bool controls_visible() const { return controls_visible_; }
   bool seek_bar_only() const { return seek_bar_only_; }
+  /** While thumbs are still building, keep a seek bar up (unless playback controls are open). */
+  void set_thumb_bar_force(bool on);
+  void set_thumb_cover(double sec);
   /** Seeking keeps the bar up. It hides about two seconds after seeking stops. */
   void note_seek_bar(bool active);
+  /** One seek step on the bar. On success, `target_sec` is the absolute bar target. */
+  bool arm_seek_delta(double delta_sec, double& target_sec);
+  /**
+   * Publish the bar time for this HUD tick. Returns the menu generation of that
+   * paint, or 0 when the shown time did not change.
+   */
+  uint64_t publish_seek_bar();
+  /** Host seconds since the previous UI tick. The seek clock uses this, not the paint. */
+  void set_seek_frame_dt(float dt);
+  double seek_bar_sec() const { return seek_bar_sec_; }
+  /** Cinema thumb time. Updates only after the matching bar mesh is shown. */
+  double seek_drawn_sec() const { return seek_drawn_sec_; }
+  bool seek_bar_drawn() const { return seek_bar_drawn_; }
+  void note_seek_bar_drawn(double sec);
+  void clear_seek_bar_drawn();
+  double place_seek_bar(double sec);
   Screen screen() const { return screen_; }
   Snapshot snapshot() const;
   /** Browser row under the cursor, including directories. Empty outside the file list. */
   std::string highlighted_row_id() const;
   std::string highlighted_video_path() const;
-  /** The file-list highlight is sliding between rows. The HUD should repaint every frame. */
+  /** The file-list highlight is sliding between rows. */
   bool list_gliding() const { return list_glide_paint_; }
   /** The seek bar is sliding between stick-seek targets. */
   bool seek_gliding() const { return seek_glide_paint_; }
@@ -209,10 +234,10 @@ class VrMenu {
   /** [|<][<][>/||][□][>][>|] [Vol] [Fmt] [FSR] [Hz] */
   enum Transport : int {
     kCuePrev = 0,     // [|<] seek start / prev video if near start
-    kSeekBack = 1,    // [<] same as LB
+    kSeekBack = 1,    // [<]
     kPlayPause = 2,
     kStop = 3,
-    kSeekForward = 4, // [>] same as RB
+    kSeekForward = 4, // [>]
     kNextVideo = 5,   // [>|]
     kVolume = 6,
     kFormat = 7,
@@ -228,6 +253,7 @@ class VrMenu {
   void step_list_row(int dir);
   void advance_list_glide(float dt);
   void sync_list_pose();
+  void advance_seek_glide(float dt);
   void clamp_list_window();
   void activate();
   void go_back();
@@ -254,6 +280,8 @@ class VrMenu {
   bool controls_visible_ = false;
   bool seek_bar_only_ = false;
   std::chrono::steady_clock::time_point seek_bar_until_{};
+  bool thumb_bar_force_ = false;
+  double thumb_cover_sec_ = 0;
   ControlsEdit controls_edit_ = ControlsEdit::None;
   Screen screen_ = Screen::Browser;
   Place place_ = Place::Roots;
@@ -296,12 +324,22 @@ class VrMenu {
   /** Shown seek-bar time while a stick seek glides. Decoder time stays in position_sec_. */
   double seek_bar_sec_ = 0;
   double seek_target_sec_ = 0;
+  /** Video seconds advanced per host second while the stick or shoulder is held. */
   double seek_step_sec_ = 5;
+  /** Last bar time handed to a HUD paint. */
+  double seek_published_sec_ = 0;
+  /** Host seconds to apply on the next seek step. Consumed by advance_seek_glide. */
+  double seek_frame_dt_ = 0;
   bool seek_gliding_ = false;
+  double seek_drawn_sec_ = 0;
+  bool seek_bar_drawn_ = false;
   bool seek_glide_paint_ = false;
   /** Keep the bar on the commanded time. A decoded keyframe is earlier and must not pull it back. */
   bool seek_bar_hold_ = false;
   AxisRepeat stick_seek_repeat_{};
+  /** After L2+R2, ignore both triggers until each has been released. */
+  bool rate_trigger_lock_ = false;
+  AxisRepeat rate_trigger_repeat_{};
   float volume_ = 0.2f;
   float rate_ = 1.f;
   FsrMode fsr_ = FsrMode::Quality;
@@ -337,11 +375,6 @@ class VrMenu {
   float back_held_sec_ = 0.f;
   static constexpr float kBackLongPressSec = 0.45f;
   static constexpr double kNearStartSec = 3.0;
-
-  // A held on [<]/[>] — same key-repeat timing as LB/RB
-  bool confirm_seek_held_ = false;
-  bool confirm_seek_repeating_ = false;
-  std::chrono::steady_clock::time_point confirm_seek_next_{};
 };
 
 }  // namespace vrp

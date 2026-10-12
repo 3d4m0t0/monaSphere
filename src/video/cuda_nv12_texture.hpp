@@ -30,12 +30,8 @@ class CudaNv12Texture {
                           bool full_range_hint = false);
   bool poll_present();
 
-  VkImageView y_view() const {
-    return slots_[display_slot_.load(std::memory_order_acquire)].y.view;
-  }
-  VkImageView uv_view() const {
-    return slots_[display_slot_.load(std::memory_order_acquire)].uv.view;
-  }
+  VkImageView y_view() const;
+  VkImageView uv_view() const;
   VkSampler sampler() const { return sampler_; }
   int width() const { return width_; }
   int height() const { return height_; }
@@ -106,7 +102,7 @@ class CudaNv12Texture {
   mutable std::mutex err_mu_;
   std::string last_error_;
   /** Serialize CUDA copy vs slot destroy/recreate. */
-  std::mutex slots_mu_;
+  mutable std::mutex slots_mu_;
 
   uint8_t vk_uuid_[16]{};
   int cuda_dev_ = -1;

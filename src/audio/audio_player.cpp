@@ -961,7 +961,10 @@ void AudioPlayer::start_thread() {
       // Let the device callback observe output_live==false before resetting the SPSC ring.
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
       if (st_->rb_ok) st_->clear_ring_exclusive();
-      if (was_out) st_->output_live.store(true, std::memory_order_release);
+      // A seek/pause during the mute window must not turn the speaker back on.
+      if (was_out && st_->playing.load(std::memory_order_acquire)) {
+        st_->output_live.store(true, std::memory_order_release);
+      }
       return true;
     };
 

@@ -19,6 +19,9 @@
 namespace vrp {
 
 class CudaNv12Texture;
+
+/** Playback NVDEC and thumbnail NVDEC must not enter CUDA at the same time. */
+std::mutex& cuda_decode_mu();
 class VaapiNv12Texture;
 
 struct VideoFrame {
@@ -30,19 +33,19 @@ struct VideoFrame {
   bool full_range = false;  // AVCOL_RANGE_JPEG / PC levels
 };
 
-/** Precomputed seek-preview strip (atlas of small RGBA thumbs). */
+/** Precomputed seek-preview strip. Each still is a JPEG, expanded to RGBA when shown. */
 struct ThumbnailStrip {
   int thumb_w = 160;
   int thumb_h = 90;
   int count = 0;
   double interval_sec = 0.0;
   double duration_sec = 0.0;
-  std::vector<uint8_t> rgba;  // count * thumb_w * thumb_h * 4
+  std::vector<std::vector<uint8_t>> jpeg;
   std::vector<double> times_sec;
   bool ready = false;
   std::string status;  // UI text
 
-  /** Copy the nearest thumb for seek position into out (RGBA). */
+  /** Decode the nearest thumb for seek position into out (RGBA). */
   bool sample_at(double sec, std::vector<uint8_t>& out_rgba, int& w, int& h) const;
 };
 
@@ -75,9 +78,35 @@ struct VideoInfo {
   std::string summary_line() const;
 };
 
+/** Default seek-strip length. `thumb_count` in monasphere.conf overrides this. */
+inline constexpr int kSeekThumbCount = 128;
+inline constexpr int kSeekThumbCountMin = 4;
+inline constexpr int kSeekThumbCountMax = 512;
+/** Long side that sets the seek-thumb pixel budget. `thumb_edge` in monasphere.conf overrides this. */
+inline constexpr int kSeekThumbMaxEdge = 4096;
+inline constexpr int kSeekThumbEdgeMin = 64;
+inline constexpr int kSeekThumbEdgeMax = 4096;
+/** MJPEG qscale for stored thumbs. Lower is cleaner; 3 stays sharp on the cinema quad. */
+inline constexpr int kSeekThumbJpegQscale = 3;
+
+/**
+ * Called after each stored thumb, in order from the start of the file.
+ * Return false to stop. `jpeg` is only valid for the call.
+ */
+using SeekThumbStep = std::function<bool(int index, double time_sec, int planned, double interval_sec, int thumb_w,
+                                         int thumb_h, const uint8_t* jpeg, size_t jpeg_bytes)>;
+
+/**
+ * NVIDIA path. Called with one tightly packed RGBA frame instead of a JPEG.
+ * Return false to stop. `rgba` is only valid for the call.
+ */
+using SeekThumbRawStep = std::function<bool(int index, double time_sec, int planned, double interval_sec, int thumb_w,
+                                            int thumb_h, const uint8_t* rgba, size_t rgba_bytes)>;
+
 /** Build a strip offline (own demuxer). Safe to call from a worker thread. */
-ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs = 48, int thumb_w = 160,
-                                     int thumb_h = 90);
+ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs = kSeekThumbCount, int thumb_w = 160,
+                                     int thumb_h = 90, SeekThumbStep on_thumb = {}, SeekThumbRawStep on_raw = {},
+                                     int max_edge = kSeekThumbMaxEdge, bool allow_hwaccel = true);
 
 /** Single mid-clip preview frame. Safe from a worker thread. */
 bool extract_video_preview(const std::string& path, int thumb_w, int thumb_h,
@@ -89,7 +118,8 @@ class VideoDecoder {
   ~VideoDecoder();
 
   bool available() const;
-  bool open(const std::string& path);
+  /** `allow_hwaccel` false skips NVDEC, VA-API, and VDPAU. Software decode is used. */
+  bool open(const std::string& path, bool allow_hwaccel = true);
   void close();
   /** Pause and join decode thread; keep demuxer/hwaccel alive (for CUDA interop teardown). */
   void halt_decode();
@@ -110,9 +140,24 @@ class VideoDecoder {
   const std::string& last_error() const { return info_.error; }
 
   /** Non-blocking; spawns worker. on_done may run on that worker thread. */
-  void start_thumbnail_build(std::function<void(ThumbnailStrip)> on_done = {});
+  void start_thumbnail_build(std::function<void(ThumbnailStrip)> on_done = {},
+                             int max_thumbs = kSeekThumbCount, int thumb_w = 0, int thumb_h = 0,
+                             SeekThumbRawStep on_raw = {}, int max_edge = kSeekThumbMaxEdge,
+                             bool allow_hwaccel = true);
   bool thumbnails_ready() const { return thumbs_ready_.load(); }
+  /** The worker for the current build has finished, success or failure. */
+  bool thumbnails_finished() const {
+    const uint64_t epoch = thumbs_epoch_.load();
+    return epoch != 0 && thumbs_done_epoch_.load() == epoch;
+  }
+  /** Seconds from 0 that already have a thumb. Equals the duration once the build finishes. */
+  double thumb_cover_sec() const { return thumb_cover_sec_.load(); }
   ThumbnailStrip thumbnails_copy() const;
+  /**
+   * Nearest ready seek thumb. Returns false when the strip is not ready or `index`
+   * is already that thumb. On success, `index` becomes the thumb that was copied.
+   */
+  bool copy_thumb(double sec, int& index, VideoFrame& out) const;
 
   /** Attach CUDA↔Vulkan target before open(). nullptr = CPU RGBA path. */
   void set_cuda_texture(CudaNv12Texture* tex) { cuda_tex_ = tex; }
@@ -147,8 +192,12 @@ class VideoDecoder {
   void set_rate(float rate);
   float rate() const { return rate_.load(); }
 
-  /** Pull latest decoded frame (CPU RGBA and/or GPU flag). */
+  /** Pull latest decoded frame (CPU RGBA and/or GPU flag). Playing only. */
   bool update(double delta_sec, VideoFrame& out_frame);
+  /** Frames published since open. Advances when a frame is stored, including while paused. */
+  uint64_t frame_seq();
+  /** Like update(), but also while paused. Used to show the frame a seek landed on. */
+  bool take_latest(VideoFrame& out_frame);
 
  private:
   std::atomic<bool> open_{false};
@@ -206,9 +255,13 @@ class VideoDecoder {
   std::atomic<bool> thumbs_ready_{false};
   std::atomic<bool> thumbs_cancel_{false};
   std::atomic<uint64_t> thumbs_gen_{0};
+  std::atomic<uint64_t> thumbs_epoch_{0};
+  std::atomic<uint64_t> thumbs_done_epoch_{0};
+  std::atomic<double> thumb_cover_sec_{0};
   std::thread thumbs_thread_;
 
-  bool decode_next(VideoFrame& out, bool convert_rgba);
+  /** present_after_sec >= 0 drops a frame that is still before that time (no pixels). */
+  bool decode_next(VideoFrame& out, bool convert_rgba, double present_after_sec = -1.0);
   void fail_open(const std::string& path, const std::string& reason);
   void start_decode_thread();
   void stop_decode_thread();
