@@ -33,6 +33,31 @@ vec3 yuv_to_rgb_full(float y, float u, float v) {
   return clamp(vec3(r, g, b), 0.0, 1.0);
 }
 
+// 4:2:0 chroma is half the luma resolution. Catmull-Rom from four bilinear taps.
+vec2 sample_chroma(sampler2D tex, vec2 uv) {
+  vec2 texSize = vec2(textureSize(tex, 0));
+  vec2 pc = uv * texSize - 0.5;
+  vec2 base = floor(pc);
+  vec2 f = pc - base;
+  vec2 f2 = f * f;
+  vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+  vec2 w1 = 1.0 + f2 * (-2.5 + 1.5 * f);
+  vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+  vec2 w3 = f2 * (-0.5 + 0.5 * f);
+  vec2 g0 = w0 + w1;
+  vec2 g1 = w2 + w3;
+  vec2 h0 = w1 / max(g0, vec2(1e-5));
+  vec2 h1 = w3 / max(g1, vec2(1e-5));
+  vec2 invSize = 1.0 / texSize;
+  vec2 p0 = (base - 0.5 + h0) * invSize;
+  vec2 p1 = (base + 1.5 + h1) * invSize;
+  vec2 s = texture(tex, vec2(p0.x, p0.y)).rg * (g0.x * g0.y);
+  s += texture(tex, vec2(p1.x, p0.y)).rg * (g1.x * g0.y);
+  s += texture(tex, vec2(p0.x, p1.y)).rg * (g0.x * g1.y);
+  s += texture(tex, vec2(p1.x, p1.y)).rg * (g1.x * g1.y);
+  return clamp(s, 0.0, 1.0);
+}
+
 // Display-referred sRGB → linear (swapchain is VK_FORMAT_*_SRGB).
 vec3 srgb_to_linear(vec3 c) {
   bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
@@ -60,7 +85,7 @@ void main() {
 
   if (pc.nv12 == 1 || pc.nv12 == 2) {
     float y = texture(videoTex, uv).r;
-    vec2 chroma = texture(videoTexUV, uv).rg;
+    vec2 chroma = sample_chroma(videoTexUV, uv);
     vec3 rgb = (pc.nv12 == 2) ? yuv_to_rgb_full(y, chroma.r, chroma.g)
                               : yuv_to_rgb_limited(y, chroma.r, chroma.g);
     // YUV→RGB is gamma-encoded; sRGB FB expects linear.
