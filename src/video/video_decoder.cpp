@@ -577,17 +577,16 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
 #endif
 }
 
-bool extract_video_preview(const std::string& path, int thumb_w, int thumb_h,
-                           std::vector<uint8_t>& out_rgba) {
+bool extract_video_preview(const std::string& path, int max_edge, std::vector<uint8_t>& out_rgba, int& out_w,
+                           int& out_h) {
   out_rgba.clear();
+  out_w = out_h = 0;
 #if !defined(VRP_HAS_FFMPEG)
   (void)path;
-  (void)thumb_w;
-  (void)thumb_h;
+  (void)max_edge;
   return false;
 #else
-  thumb_w = std::max(32, std::min(thumb_w, 640));
-  thumb_h = std::max(18, std::min(thumb_h, 360));
+  max_edge = std::max(64, std::min(max_edge, 4096));
   AVFormatContext* fmt = nullptr;
   if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
   if (avformat_find_stream_info(fmt, nullptr) < 0) {
@@ -632,9 +631,9 @@ bool extract_video_preview(const std::string& path, int thumb_w, int thumb_h,
   AVFrame* rgba = av_frame_alloc();
   AVPacket* packet = av_packet_alloc();
   SwsContext* sws = nullptr;
-  auto* rgba_buf =
-      static_cast<uint8_t*>(av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, thumb_w, thumb_h, 1)));
-  av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, thumb_w, thumb_h, 1);
+  uint8_t* rgba_buf = nullptr;
+  int dst_w = 0;
+  int dst_h = 0;
 
   bool ok = false;
   while (av_read_frame(fmt, packet) >= 0) {
@@ -649,17 +648,32 @@ bool extract_video_preview(const std::string& path, int thumb_w, int thumb_h,
     av_packet_unref(packet);
     while (avcodec_receive_frame(codec, frame) == 0) {
       if (!sws) {
-        sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), thumb_w,
-                             thumb_h, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+        dst_w = std::max(2, frame->width);
+        dst_h = std::max(2, frame->height);
+        const int long_edge = std::max(dst_w, dst_h);
+        if (long_edge > max_edge) {
+          const double s = static_cast<double>(max_edge) / static_cast<double>(long_edge);
+          dst_w = std::max(2, static_cast<int>(std::lround(dst_w * s)));
+          dst_h = std::max(2, static_cast<int>(std::lround(dst_h * s)));
+        }
+        dst_w &= ~1;
+        dst_h &= ~1;
+        rgba_buf = static_cast<uint8_t*>(av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, dst_w, dst_h, 1)));
+        if (!rgba_buf) break;
+        av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, dst_w, dst_h, 1);
+        sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), dst_w,
+                             dst_h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!sws) break;
       }
       sws_scale(sws, frame->data, frame->linesize, 0, frame->height, rgba->data, rgba->linesize);
-      const size_t need = static_cast<size_t>(thumb_w) * static_cast<size_t>(thumb_h) * 4;
+      const size_t need = static_cast<size_t>(dst_w) * static_cast<size_t>(dst_h) * 4;
       out_rgba.resize(need);
-      for (int y = 0; y < thumb_h; ++y) {
-        std::memcpy(out_rgba.data() + static_cast<size_t>(y * thumb_w * 4),
-                    rgba->data[0] + y * rgba->linesize[0], static_cast<size_t>(thumb_w * 4));
+      for (int y = 0; y < dst_h; ++y) {
+        std::memcpy(out_rgba.data() + static_cast<size_t>(y * dst_w * 4),
+                    rgba->data[0] + y * rgba->linesize[0], static_cast<size_t>(dst_w * 4));
       }
+      out_w = dst_w;
+      out_h = dst_h;
       ok = true;
       break;
     }

@@ -103,6 +103,7 @@ struct PushConstants {
   int32_t stereoMode;
   int32_t is180;
   int32_t nv12;
+  int32_t project;  // 1 = thumbnail samples a 90° forward window
 };
 
 Mat4 rot_x(float a) {
@@ -405,6 +406,11 @@ void SceneRenderer::set_thumb_texture(VkImageView view, VkSampler sampler, bool 
     w[i].pImageInfo = &ii[i];
   }
   vkUpdateDescriptorSets(device_, 2, w, 0, nullptr);
+}
+
+void SceneRenderer::set_thumb_format(ProjectionMode mode, StereoLayout stereo) {
+  thumb_mode_ = mode;
+  thumb_stereo_ = stereo;
 }
 
 void SceneRenderer::set_thumb_pose(float world_half_w, float pixel_h_over_w, float x_m, float y_m,
@@ -943,10 +949,13 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     const Mat4 thumb_model = Mat4::mul(trans, Mat4::mul(rot, scale));
     PushConstants tpc{};
     tpc.mvp = Mat4::mul(proj, Mat4::mul(view_mat, thumb_model));
-    tpc.viewIndex = 0;
-    tpc.stereoMode = 0;
-    tpc.is180 = 0;
+    const bool thumb_stereo = thumb_stereo_ != StereoLayout::Mono;
+    const bool thumb_project = thumb_mode_ != ProjectionMode::Flat;
+    tpc.viewIndex = thumb_stereo ? static_cast<int32_t>(view_index) : 0;
+    tpc.stereoMode = thumb_stereo ? static_cast<int32_t>(thumb_stereo_) : 0;
+    tpc.is180 = (thumb_mode_ == ProjectionMode::Deg180) ? 1 : 0;
     tpc.nv12 = 0;
+    tpc.project = thumb_project ? 1 : 0;
     vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                        sizeof(tpc), &tpc);
     VkDeviceSize off = 0;

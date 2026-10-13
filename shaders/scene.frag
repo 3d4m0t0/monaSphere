@@ -12,6 +12,8 @@ layout(push_constant) uniform Push {
   int is180;
   // 0 = RGBA, 1 = NV12 limited (TV) BT.709, 2 = NV12 full (PC) BT.709
   int nv12;
+  // 1 = file-dialog 180/360 card. Card UV is a 90° window looking forward.
+  int project;
 } pc;
 
 vec3 yuv_to_rgb_limited(float y, float u, float v) {
@@ -68,6 +70,15 @@ vec3 srgb_to_linear(vec3 c) {
 
 void main() {
   vec2 uv = vUV;
+  if (pc.project != 0) {
+    // Match the video sphere: +X right, +Y up, u=0.5 looks down -Z.
+    float nx = uv.x * 2.0 - 1.0;
+    float ny = 1.0 - uv.y * 2.0;
+    vec3 dir = normalize(vec3(nx, ny, -1.0));
+    float theta = atan(dir.x, -dir.z);
+    float phi = acos(clamp(dir.y, -1.0, 1.0));
+    uv = vec2(theta / (2.0 * 3.14159265) + 0.5, phi / 3.14159265);
+  }
   if (pc.is180 != 0) {
     if (uv.x < 0.25 || uv.x > 0.75) {
       discard;

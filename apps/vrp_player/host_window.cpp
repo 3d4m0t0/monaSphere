@@ -2936,11 +2936,13 @@ void HostWindow::xrThreadMain() {
       preview_busy.store(true);
       std::thread([&, path] {
         std::vector<uint8_t> rgba;
-        const bool ok = vrp::extract_video_preview(path, 288, 162, rgba);
-        if (ok && !xr_stop_.load() && !shutting_down_.load()) {
+        int pw = 0;
+        int ph = 0;
+        const bool ok = vrp::extract_video_preview(path, 2048, rgba, pw, ph);
+        if (ok && pw > 0 && ph > 0 && !xr_stop_.load() && !shutting_down_.load()) {
           // Drop if selection moved away while decoding the thumb.
           if (menu.highlighted_video_path() == path) {
-            menu.set_preview(std::move(rgba), 288, 162);
+            menu.set_preview(std::move(rgba), pw, ph);
             preview_path_done = path;
             requestHudPaint();
           }
@@ -3988,10 +3990,26 @@ void HostWindow::xrThreadMain() {
         bool thumb_upload = false;
         bool thumb_pixels = false;
         float thumb_aspect = 9.f / 16.f;
+        vrp::ProjectionMode thumb_proj = vrp::ProjectionMode::Flat;
+        vrp::StereoLayout thumb_stereo = vrp::StereoLayout::Mono;
+        bool thumb_full = true;
+        if (want_kind == 2) {
+          const std::string hi = menu.highlighted_video_path();
+          if (!hi.empty()) vrp::detect_format_from_filename(hi, thumb_proj, thumb_stereo, thumb_full);
+        }
         {
           std::lock_guard<std::mutex> lock(hud_pixels_mu_);
           thumb_pixels = thumb_w_ > 0 && thumb_h_ > 0 && !thumb_pixels_.empty();
-          if (thumb_pixels) thumb_aspect = static_cast<float>(thumb_h_) / static_cast<float>(thumb_w_);
+          if (thumb_pixels) {
+            if (thumb_proj != vrp::ProjectionMode::Flat) {
+              thumb_aspect = 1.f;
+            } else {
+              const float disp = vrp::frame_display_aspect(static_cast<float>(thumb_w_),
+                                                           static_cast<float>(thumb_h_), thumb_stereo,
+                                                           thumb_full);
+              thumb_aspect = 1.f / disp;
+            }
+          }
           if (thumb_pixels && thumb_gen_ != uploaded_thumb) {
             thumb_frame.width = thumb_w_;
             thumb_frame.height = thumb_h_;
@@ -4005,7 +4023,8 @@ void HostWindow::xrThreadMain() {
           (void)thumb_tex.try_upload(thumb_frame);
         }
         if (want_kind == 2 && thumb_pixels && thumb_shown && thumb_tex.view()) {
-          scene.set_thumb_pose(0.34f, thumb_aspect, 0.66f, 0.12f, kHudDistanceM - 0.18f);
+          scene.set_thumb_format(thumb_proj, thumb_stereo);
+          scene.set_thumb_pose(0.46f, thumb_aspect, 0.66f, 0.12f, kHudDistanceM - 0.18f);
           scene.set_thumb_texture(thumb_tex.view(), thumb_tex.sampler(), true);
         } else {
           scene.set_thumb_texture(thumb_tex.view(), thumb_tex.sampler(), false);

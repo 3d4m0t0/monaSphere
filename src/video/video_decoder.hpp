@@ -108,9 +108,13 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs = k
                                      int thumb_h = 90, SeekThumbStep on_thumb = {}, SeekThumbRawStep on_raw = {},
                                      int max_edge = kSeekThumbMaxEdge, bool allow_hwaccel = true);
 
-/** Single mid-clip preview frame. Safe from a worker thread. */
-bool extract_video_preview(const std::string& path, int thumb_w, int thumb_h,
-                           std::vector<uint8_t>& out_rgba);
+/**
+ * Single mid-clip preview frame. Safe from a worker thread.
+ * Scales uniformly so the long edge is at most max_edge. Does not enlarge a smaller frame.
+ * Writes the stored size to out_w and out_h.
+ */
+bool extract_video_preview(const std::string& path, int max_edge, std::vector<uint8_t>& out_rgba, int& out_w,
+                           int& out_h);
 
 class VideoDecoder {
  public:

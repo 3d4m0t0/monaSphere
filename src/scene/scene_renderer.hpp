@@ -44,6 +44,8 @@ class SceneRenderer {
    */
   void set_thumb_texture(VkImageView view, VkSampler sampler, bool visible);
   void set_thumb_pose(float world_half_w, float pixel_h_over_w, float x_m, float y_m, float distance_m);
+  /** File-dialog preview. Flat stays a frame card. 180/360 projects a square window. */
+  void set_thumb_format(ProjectionMode mode, StereoLayout stereo);
   /** Wait for previous eye submit. Returns false on timeout (do not rewrite descriptors). */
   bool wait_previous_submit(uint64_t timeout_ns = 8'000'000ull);
 
@@ -123,6 +125,8 @@ class SceneRenderer {
   float hud_aspect_ = 1.05f;
   float hud_y_ = 0.f;
   bool thumb_visible_ = false;
+  ProjectionMode thumb_mode_ = ProjectionMode::Flat;
+  StereoLayout thumb_stereo_ = StereoLayout::Mono;
   float thumb_scale_x_ = 0.16f;
   float thumb_scale_y_ = 0.16f;
   float thumb_x_ = 0.f;

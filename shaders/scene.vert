@@ -9,6 +9,7 @@ layout(push_constant) uniform Push {
   int stereoMode; // 0 mono 1 sbs 2 ou
   int is180;
   int _pad;
+  int project;
 } pc;
 
 void main() {
