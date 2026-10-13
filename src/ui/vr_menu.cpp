@@ -930,7 +930,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     }
   }
 
-  // B held (level): short-release = back/toggle; long-hold on controls = rate ×1
+  // B held: short release backs out. A long hold resets the stick look offset.
   bool back_short = false;
   bool back_long_reset = false;
   if (in.back_held) {
@@ -940,9 +940,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
       back_held_sec_ = 0.f;
     } else {
       back_held_sec_ += dt;
-      // Rate reset stays available with the controls hidden. The file dialog uses B to go back.
-      if (!back_long_fired_ && !visible_ && controls_edit_ == ControlsEdit::None &&
-          back_held_sec_ >= kBackLongPressSec) {
+      if (!back_long_fired_ && back_held_sec_ >= kBackLongPressSec) {
         back_long_fired_ = true;
         back_long_reset = true;
       }
@@ -956,10 +954,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   prev_back_ = in.back_held;
 
   if (back_long_reset) {
-    rate_ = 1.f;
-    out.rate_changed = true;
-    out.rate = 1.f;
-    bump();
+    out.view_reset = true;
     return out;
   }
 

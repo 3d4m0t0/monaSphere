@@ -3155,6 +3155,8 @@ void HostWindow::xrThreadMain() {
     XrCompositionLayerProjection layer{};
     auto last_status = std::chrono::steady_clock::now();
     bool force_fsr_refresh = true;
+    float look_yaw = 0.f;
+    float look_pitch = 0.f;
 
     while (!xr_stop_.load() && xr.pump_events()) {
       bool help_shown = false;
@@ -3203,6 +3205,8 @@ void HostWindow::xrThreadMain() {
         }
       }
       if (cmd == 4 && xr.recenter()) {
+        look_yaw = 0.f;
+        look_pitch = 0.f;
         showControlsHelp();
         help_shown = true;
       }
@@ -3293,6 +3297,10 @@ void HostWindow::xrThreadMain() {
             if (std::fabs(gp.stick_x) > 0.15f || std::fabs(gp.stick_y) > 0.15f) {
               input.stick_x = gp.stick_x;
               input.stick_y = gp.stick_y;
+            }
+            if (std::fabs(gp.stick_rx) > 0.15f || std::fabs(gp.stick_ry) > 0.15f) {
+              input.stick_rx = gp.stick_rx;
+              input.stick_ry = gp.stick_ry;
             }
             input.confirm = input.confirm || gp.confirm;
             input.confirm_held = input.confirm_held || gp.confirm_held;
@@ -3567,6 +3575,8 @@ void HostWindow::xrThreadMain() {
       }
 
       if (input.recenter && xr.recenter()) {
+        look_yaw = 0.f;
+        look_pitch = 0.f;
         showControlsHelp();
         help_shown = true;
       }
@@ -4002,6 +4012,31 @@ void HostWindow::xrThreadMain() {
           if (!thumb_pixels || want_kind != 2) thumb_shown = false;
         }
       }
+
+      if (menu_out.view_reset) {
+        look_yaw = 0.f;
+        look_pitch = 0.f;
+      }
+      auto look_axis = [](float v) {
+        constexpr float kDead = 0.20f;
+        const float mag = std::fabs(v);
+        if (mag <= kDead) return 0.f;
+        const float t = std::clamp((mag - kDead) / (1.f - kDead), 0.f, 1.f);
+        return std::copysign(t, v);
+      };
+      const float look_x = look_axis(input.stick_rx);
+      const float look_y = look_axis(input.stick_ry);
+      constexpr float kLookRad = 120.f * 3.14159265f / 180.f;
+      const float look_dt = static_cast<float>(dt);
+      look_yaw -= look_x * kLookRad * look_dt;
+      look_pitch += look_y * kLookRad * look_dt;
+      constexpr float kPitchLimit = 80.f * 3.14159265f / 180.f;
+      look_pitch = std::clamp(look_pitch, -kPitchLimit, kPitchLimit);
+      constexpr float kPi = 3.14159265f;
+      if (look_yaw > kPi) look_yaw -= 2.f * kPi;
+      else if (look_yaw < -kPi) look_yaw += 2.f * kPi;
+      scene.set_view_offset(look_yaw, look_pitch);
+      scene.set_comfort_grid(look_x != 0.f || look_y != 0.f);
 
       scene.render_frame(xr, fi, proj_views, layer);
       std::vector<XrCompositionLayerBaseHeader*> layers = {

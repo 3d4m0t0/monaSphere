@@ -138,6 +138,7 @@ void XrVulkanApp::shutdown() {
   actions_ready_ = false;
   play_action_ = seek_back_action_ = seek_fwd_action_ = recenter_action_ = XR_NULL_HANDLE;
   navigate_action_ = confirm_action_ = back_action_ = menu_toggle_action_ = XR_NULL_HANDLE;
+  look_action_ = XR_NULL_HANDLE;
   l2_action_ = r2_action_ = XR_NULL_HANDLE;
 
   if (session_) {
@@ -620,6 +621,7 @@ void XrVulkanApp::create_actions() {
   make_bool("seek_forward", "Seek Forward", &seek_fwd_action_);
   make_bool("recenter", "Recenter", &recenter_action_);
   make_vec2("navigate", "Navigate", &navigate_action_);
+  make_vec2("look", "Look", &look_action_);
   make_bool("confirm", "Confirm", &confirm_action_);
   make_bool("back", "Back", &back_action_);
   make_bool("menu_toggle", "Menu Toggle", &menu_toggle_action_);
@@ -649,10 +651,16 @@ void XrVulkanApp::create_actions() {
   const bool left = controller_hand_ == ControllerHand::Left;
   const char* primary = left ? "left" : "right";
   const char* secondary = left ? "right" : "left";
+  // Right-stick look. When the right stick is already navigate, the gamepad stick still turns the view.
+  const bool look_on_right = left;
   auto hand_path = [&](const char* hand, const char* suffix) {
     char buf[128];
     std::snprintf(buf, sizeof(buf), "/user/hand/%s/input/%s", hand, suffix);
     return path(buf);
+  };
+  auto add_look = [&](std::vector<XrActionSuggestedBinding> binds, const char* component) {
+    if (look_on_right) binds.push_back({look_action_, hand_path("right", component)});
+    return binds;
   };
 
   const auto want = [&](ControllerProfile p) {
@@ -675,57 +683,61 @@ void XrVulkanApp::create_actions() {
   // Oculus Touch / PSVR2 Sense (typical under Monado)
   if (want(ControllerProfile::OculusTouch)) {
     suggest("/interaction_profiles/oculus/touch_controller",
-            {{navigate_action_, hand_path(primary, "thumbstick")},
-             {confirm_action_, hand_path(primary, left ? "x/click" : "a/click")},
-             {back_action_, hand_path(primary, left ? "y/click" : "b/click")},
-             {menu_toggle_action_, hand_path(secondary, left ? "b/click" : "y/click")},
-             {play_action_, hand_path(primary, "squeeze/click")},
-             {seek_back_action_, hand_path(secondary, left ? "a/click" : "x/click")},
-             {seek_fwd_action_, hand_path(primary, "thumbstick/click")},
-             {recenter_action_, hand_path(secondary, "menu/click")},
-             {l2_action_, hand_path("left", "trigger/click")},
-             {r2_action_, hand_path("right", "trigger/click")}});
+            add_look({{navigate_action_, hand_path(primary, "thumbstick")},
+                      {confirm_action_, hand_path(primary, left ? "x/click" : "a/click")},
+                      {back_action_, hand_path(primary, left ? "y/click" : "b/click")},
+                      {menu_toggle_action_, hand_path(secondary, left ? "b/click" : "y/click")},
+                      {play_action_, hand_path(primary, "squeeze/click")},
+                      {seek_back_action_, hand_path(secondary, left ? "a/click" : "x/click")},
+                      {seek_fwd_action_, hand_path(primary, "thumbstick/click")},
+                      {recenter_action_, hand_path(secondary, "menu/click")},
+                      {l2_action_, hand_path("left", "trigger/click")},
+                      {r2_action_, hand_path("right", "trigger/click")}},
+                     "thumbstick"));
   }
 
   // Microsoft motion
   if (want(ControllerProfile::MicrosoftMotion)) {
     suggest("/interaction_profiles/microsoft/motion_controller",
-            {{navigate_action_, hand_path(primary, "thumbstick")},
-             {confirm_action_, hand_path(primary, "squeeze/click")},
-             {back_action_, hand_path(primary, "trackpad/click")},
-             {menu_toggle_action_, hand_path(secondary, "menu/click")},
-             {play_action_, hand_path(primary, "trackpad/click")},
-             {l2_action_, hand_path("left", "trigger/click")},
-             {r2_action_, hand_path("right", "trigger/click")},
-             {recenter_action_, hand_path(secondary, "thumbstick/click")}});
+            add_look({{navigate_action_, hand_path(primary, "thumbstick")},
+                      {confirm_action_, hand_path(primary, "squeeze/click")},
+                      {back_action_, hand_path(primary, "trackpad/click")},
+                      {menu_toggle_action_, hand_path(secondary, "menu/click")},
+                      {play_action_, hand_path(primary, "trackpad/click")},
+                      {l2_action_, hand_path("left", "trigger/click")},
+                      {r2_action_, hand_path("right", "trigger/click")},
+                      {recenter_action_, hand_path(secondary, "thumbstick/click")}},
+                     "thumbstick"));
   }
 
   // Vive controller
   if (want(ControllerProfile::ViveController)) {
     suggest("/interaction_profiles/htc/vive_controller",
-            {{navigate_action_, hand_path(primary, "trackpad")},
-             {confirm_action_, hand_path(primary, "trigger/click")},
-             {back_action_, hand_path(primary, "menu/click")},
-             {menu_toggle_action_, hand_path(secondary, "menu/click")},
-             {play_action_, hand_path(primary, "squeeze/click")},
-             {l2_action_, hand_path("left", "trigger/click")},
-             {r2_action_, hand_path("right", "trigger/click")},
-             {recenter_action_, hand_path(secondary, "trackpad/click")}});
+            add_look({{navigate_action_, hand_path(primary, "trackpad")},
+                      {confirm_action_, hand_path(primary, "trigger/click")},
+                      {back_action_, hand_path(primary, "menu/click")},
+                      {menu_toggle_action_, hand_path(secondary, "menu/click")},
+                      {play_action_, hand_path(primary, "squeeze/click")},
+                      {l2_action_, hand_path("left", "trigger/click")},
+                      {r2_action_, hand_path("right", "trigger/click")},
+                      {recenter_action_, hand_path(secondary, "trackpad/click")}},
+                     "trackpad"));
   }
 
   // Valve Index
   if (want(ControllerProfile::ValveIndex)) {
     suggest("/interaction_profiles/valve/index_controller",
-            {{navigate_action_, hand_path(primary, "thumbstick")},
-             {confirm_action_, hand_path(primary, "a/click")},
-             {back_action_, hand_path(primary, "b/click")},
-             {menu_toggle_action_, hand_path(secondary, "b/click")},
-             {play_action_, hand_path(primary, "trigger/click")},
-             {l2_action_, hand_path("left", "trigger/click")},
-             {r2_action_, hand_path("right", "trigger/click")},
-             {seek_back_action_, hand_path(secondary, "a/click")},
-             {seek_fwd_action_, hand_path(primary, "thumbstick/click")},
-             {recenter_action_, hand_path(secondary, "thumbstick/click")}});
+            add_look({{navigate_action_, hand_path(primary, "thumbstick")},
+                      {confirm_action_, hand_path(primary, "a/click")},
+                      {back_action_, hand_path(primary, "b/click")},
+                      {menu_toggle_action_, hand_path(secondary, "b/click")},
+                      {play_action_, hand_path(primary, "trigger/click")},
+                      {l2_action_, hand_path("left", "trigger/click")},
+                      {r2_action_, hand_path("right", "trigger/click")},
+                      {seek_back_action_, hand_path(secondary, "a/click")},
+                      {seek_fwd_action_, hand_path(primary, "thumbstick/click")},
+                      {recenter_action_, hand_path(secondary, "thumbstick/click")}},
+                     "thumbstick"));
   }
 
   // Always: PSVR2 HMD function button → recenter
@@ -1094,6 +1106,15 @@ XrVulkanApp::InputState XrVulkanApp::poll_actions() {
     if (XR_SUCCEEDED(xrGetActionStateVector2f(session_, &gi, &v)) && v.isActive) {
       st.stick_x = v.currentState.x;
       st.stick_y = v.currentState.y;
+    }
+  }
+  if (look_action_) {
+    XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};
+    gi.action = look_action_;
+    XrActionStateVector2f v{XR_TYPE_ACTION_STATE_VECTOR2F};
+    if (XR_SUCCEEDED(xrGetActionStateVector2f(session_, &gi, &v)) && v.isActive) {
+      st.stick_rx = v.currentState.x;
+      st.stick_ry = v.currentState.y;
     }
   }
   return st;

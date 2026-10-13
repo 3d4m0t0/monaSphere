@@ -20,6 +20,10 @@ class SceneRenderer {
   void set_projection(ProjectionMode mode, StereoLayout stereo, float flat_fov_deg, float distance);
   /** Content width/height for Flat screen sizing (default 16:9). */
   void set_content_aspect(float width_over_height);
+  /** Extra yaw/pitch (radians) around the head. HUD stays locked to the real pose. */
+  void set_view_offset(float yaw_rad, float pitch_rad);
+  /** Latitude/longitude cage locked to the picture, drawn while the stick is turning the view. */
+  void set_comfort_grid(bool on);
   void set_texture(VkImageView view, VkSampler sampler);
   /** RGBA video that is still gamma-encoded (e.g. FSR1 output). Linearized like NV12. */
   void set_texture_gamma(VkImageView view, VkSampler sampler);
@@ -71,6 +75,17 @@ class SceneRenderer {
   float flat_fov_deg_ = 70.f;
   float distance_ = 4.f;
   float content_aspect_ = 16.f / 9.f;
+  float look_yaw_ = 0.f;
+  float look_pitch_ = 0.f;
+  bool comfort_grid_ = false;
+
+  VkPipeline grid_pipeline_ = VK_NULL_HANDLE;
+  VkPipelineLayout grid_layout_ = VK_NULL_HANDLE;
+  VkShaderModule grid_vert_ = VK_NULL_HANDLE;
+  VkShaderModule grid_frag_ = VK_NULL_HANDLE;
+  VkBuffer vbo_grid_ = VK_NULL_HANDLE;
+  VkDeviceMemory vbo_grid_mem_ = VK_NULL_HANDLE;
+  uint32_t grid_vert_count_ = 0;
 
   VkDescriptorSetLayout dsl_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_ = VK_NULL_HANDLE;

@@ -61,8 +61,19 @@ QString fmt_time(double sec) {
   const int h = s / 3600;
   const int m = (s % 3600) / 60;
   const int r = s % 60;
-  if (h > 0) return QString("%1:%2:%3").arg(h).arg(m, 2, 10, QChar('0')).arg(r, 2, 10, QChar('0'));
-  return QString("%1:%2").arg(m).arg(r, 2, 10, QChar('0'));
+  return QString("%1:%2:%3").arg(h).arg(m, 2, 10, QChar('0')).arg(r, 2, 10, QChar('0'));
+}
+
+int clock_label_width(const QString& s, const QFont& font) {
+  const QFontMetrics fm(font);
+  int digit = 1;
+  for (int i = 0; i < 10; ++i) digit = std::max(digit, fm.horizontalAdvance(QChar('0' + i)));
+  int w = 0;
+  for (const QChar ch : s) {
+    if (ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) w += digit;
+    else w += std::max(1, fm.horizontalAdvance(ch));
+  }
+  return w;
 }
 
 void draw_row(HudCanvas& c, const QRect& r, const QString& text, const QFont& font, bool dim = false) {
@@ -392,7 +403,7 @@ void paint_dpad(HudCanvas& c, const QRect& box, DpadDir dir) {
                  });
 }
 
-enum class HelpIcon { None, A, B, Stick, Speed, SpeedReset, Start };
+enum class HelpIcon { None, A, B, Stick, StickR, Speed, SpeedReset, Start };
 
 constexpr int kIcon = 32;
 constexpr int kStick = kIcon;
@@ -481,6 +492,7 @@ int help_icon_width(HelpIcon kind) {
   if (kind == HelpIcon::A || kind == HelpIcon::B) return kFace;
   if (kind == HelpIcon::Start) return menu_button_width();
   if (kind == HelpIcon::Stick) return 28 * 2 + 4 + 8 + kStick;
+  if (kind == HelpIcon::StickR) return kStick;
   if (kind == HelpIcon::Speed) return 44 * 2 + 8;
   if (kind == HelpIcon::SpeedReset) return 96;
   return 0;
@@ -511,6 +523,11 @@ int paint_help_icons(HudCanvas& c, int x, int y, int h, HelpIcon kind) {
     const int sy = y + (h - kStick) / 2;
     paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"));
     return help_icon_width(kind);
+  }
+  if (kind == HelpIcon::StickR) {
+    const int sy = y + (h - kStick) / 2;
+    paint_stick_icon(c, QRect(x, sy, kStick, kStick), QStringLiteral("R"));
+    return kStick;
   }
   if (kind == HelpIcon::Speed) {
     constexpr int kTrigW = 44;
@@ -737,7 +754,7 @@ struct PlaybackPanel {
   int info_h = 0;
 };
 
-PlaybackPanel playback_panel(const VrMenu::Snapshot& snap, int width, int height) {
+PlaybackPanel playback_panel(const VrMenu::Snapshot& snap, int width, int height, const QFont& time_font) {
   PlaybackPanel p;
   p.has_info = !snap.info_video_codec.empty() || !snap.info_res.empty() || !snap.info_audio_codec.empty();
   p.info_h = p.has_info ? 72 : 0;
@@ -763,9 +780,15 @@ PlaybackPanel playback_panel(const VrMenu::Snapshot& snap, int width, int height
   p.buttons_y = p.panel_y + kButtonsOff;
   p.scrub_y = p.panel_y + scrub_off;
   p.info_y = p.scrub_y + 18;
-  constexpr int kTimeW = 110;
-  p.bar = QRect(p.panel_x + p.pad, p.scrub_y, p.panel_w - p.pad * 2 - kTimeW - 8, 10);
-  p.time = QRect(p.panel_x + p.panel_w - p.pad - kTimeW, p.scrub_y - 6, kTimeW, 22);
+  const QString shown = fmt_time(snap.position_sec) + QStringLiteral(" / ") + fmt_time(snap.duration_sec);
+  const QString wide = QStringLiteral("00:00:00 / 00:00:00");
+  const int time_w = std::max(clock_label_width(shown, time_font), clock_label_width(wide, time_font)) + 6;
+  const int time_h = std::max(22, QFontMetrics(time_font).height() + 4);
+  constexpr int kBarH = 10;
+  constexpr int kTimeGap = 10;
+  const int bar_w = std::max(40, p.panel_w - p.pad * 2 - time_w - kTimeGap);
+  p.bar = QRect(p.panel_x + p.pad, p.scrub_y, bar_w, kBarH);
+  p.time = QRect(p.panel_x + p.pad + bar_w + kTimeGap, p.scrub_y + (kBarH - time_h) / 2, time_w, time_h);
   return p;
 }
 
@@ -790,7 +813,7 @@ void paint_scrub_bar(HudCanvas& c, const VrMenu::Snapshot& snap, const QRect& ba
 
 void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int width, int height,
                              const QFont& body_font, const QFont& hint_font) {
-  const PlaybackPanel panel = playback_panel(snap, width, height);
+  const PlaybackPanel panel = playback_panel(snap, width, height, hint_font);
   const bool has_info = panel.has_info;
   const int info_h = panel.info_h;
   const int top = panel.panel_y;
@@ -1013,7 +1036,7 @@ QImage paint_file_thumb(const VrMenu::Snapshot& snap) {
 
 void paint_seek_bar_only(HudCanvas& c, const VrMenu::Snapshot& snap, int width, int height,
                           const QFont& hint_font) {
-  const PlaybackPanel panel = playback_panel(snap, width, height);
+  const PlaybackPanel panel = playback_panel(snap, width, height, hint_font);
   constexpr int kStripH = 36;
   const int strip_y = panel.bar.y() - (kStripH - panel.bar.height()) / 2;
   const QRect strip(panel.panel_x, strip_y, panel.panel_w, kStripH);
@@ -1143,6 +1166,8 @@ HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool
       {HelpIcon::B, nullptr, "Playback controls"},
       {HelpIcon::A, nullptr, "Play or pause"},
       {HelpIcon::Stick, nullptr, "Seek"},
+      {HelpIcon::StickR, nullptr, "Look"},
+      {HelpIcon::B, "long-press", "Reset view"},
       {HelpIcon::Speed, nullptr, "Playback speed"},
       {HelpIcon::SpeedReset, nullptr, "Speed ×1"},
   };
@@ -1151,7 +1176,7 @@ HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool
   const QFont body_font = deUiFont(16, QFont::Normal);
   const QFont desc_font = body_font;
 
-  constexpr int kRows = 7;
+  constexpr int kRows = static_cast<int>(sizeof(rows) / sizeof(rows[0]));
   const int row_h = 48;
   const int title_h = 44;
   const int pad = 16;

@@ -452,6 +452,16 @@
     },
     {
       "context": "monaSphere",
+      "source": "Look",
+      "translation": "Look"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Reset view",
+      "translation": "Reset view"
+    },
+    {
+      "context": "monaSphere",
       "source": "Playback speed",
       "translation": "Playback speed"
     },

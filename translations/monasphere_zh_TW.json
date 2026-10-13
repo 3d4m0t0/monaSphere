@@ -452,6 +452,16 @@
     },
     {
       "context": "monaSphere",
+      "source": "Look",
+      "translation": "視角變更"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Reset view",
+      "translation": "重置視角"
+    },
+    {
+      "context": "monaSphere",
       "source": "Playback speed",
       "translation": "播放速度"
     },

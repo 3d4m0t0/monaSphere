@@ -108,6 +108,8 @@ ROWS = [
     ("monaSphere", "Playback controls", {"ja": "再生コントロールを開く", "de": "Wiedergabe", "fr": "Lecture", "es": "Reproducción", "ko": "재생 조작", "zh_CN": "播放控制 显示切换", "zh_TW": "播放控制 顯示切換"}),
     ("monaSphere", "Play or pause", {"ja": "再生・一時停止", "de": "Play/Pause", "fr": "Lecture/pause", "es": "Reproducir/pausa", "ko": "재생/일시정지", "zh_CN": "播放/暂停", "zh_TW": "播放/暫停"}),
     ("monaSphere", "Seek", {"ja": "シーク", "de": "Spulen", "fr": "Seek", "es": "Buscar", "ko": "탐색", "zh_CN": "跳转", "zh_TW": "跳轉"}),
+    ("monaSphere", "Look", {"ja": "視点変更", "de": "Blick ändern", "fr": "Changer la vue", "es": "Cambiar vista", "ko": "시점 변경", "zh_CN": "视角变更", "zh_TW": "視角變更"}),
+    ("monaSphere", "Reset view", {"ja": "視点を戻す", "de": "Blick zurück", "fr": "Vue d'origine", "es": "Vista inicial", "ko": "시점 되돌리기", "zh_CN": "重置视角", "zh_TW": "重置視角"}),
     ("monaSphere", "Playback speed", {"ja": "再生速度調整", "de": "Tempo", "fr": "Vitesse", "es": "Velocidad", "ko": "재생 속도", "zh_CN": "播放速度", "zh_TW": "播放速度"}),
     ("monaSphere", "long-press", {"ja": "長押し", "de": "lang", "fr": "long", "es": "largo", "ko": "길게", "zh_CN": "长按", "zh_TW": "長按"}),
     ("monaSphere", "Speed ×1", {"ja": "再生速度1倍", "de": "Tempo ×1", "fr": "Vitesse ×1", "es": "Velocidad ×1", "ko": "속도 1배", "zh_CN": "播放速度1倍", "zh_TW": "播放速度1倍"}),

@@ -452,6 +452,16 @@
     },
     {
       "context": "monaSphere",
+      "source": "Look",
+      "translation": "Changer la vue"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Reset view",
+      "translation": "Vue d'origine"
+    },
+    {
+      "context": "monaSphere",
       "source": "Playback speed",
       "translation": "Vitesse"
     },

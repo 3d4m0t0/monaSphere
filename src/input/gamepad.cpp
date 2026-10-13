@@ -160,6 +160,8 @@ GamepadInput::State GamepadInput::poll() {
 
   st.stick_x = axis(SDL_CONTROLLER_AXIS_LEFTX);
   st.stick_y = -axis(SDL_CONTROLLER_AXIS_LEFTY);
+  st.stick_rx = axis(SDL_CONTROLLER_AXIS_RIGHTX);
+  st.stick_ry = -axis(SDL_CONTROLLER_AXIS_RIGHTY);
   st.nav_left = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_LEFT) != 0;
   st.nav_right = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_RIGHT) != 0;
   st.nav_up = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_DPAD_UP) != 0;

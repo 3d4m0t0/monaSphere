@@ -105,6 +105,28 @@ struct PushConstants {
   int32_t nv12;
 };
 
+Mat4 rot_x(float a) {
+  Mat4 r = Mat4::identity();
+  const float c = std::cos(a);
+  const float s = std::sin(a);
+  r.m[5] = c;
+  r.m[6] = s;
+  r.m[9] = -s;
+  r.m[10] = c;
+  return r;
+}
+
+Mat4 rot_y(float a) {
+  Mat4 r = Mat4::identity();
+  const float c = std::cos(a);
+  const float s = std::sin(a);
+  r.m[0] = c;
+  r.m[2] = -s;
+  r.m[8] = s;
+  r.m[10] = c;
+  return r;
+}
+
 std::vector<uint32_t> read_spv(const std::string& path) {
   std::ifstream f(path, std::ios::binary | std::ios::ate);
   if (!f) vrp_fatal("Cannot open shader: " + path);
@@ -113,6 +135,94 @@ std::vector<uint32_t> read_spv(const std::string& path) {
   std::vector<uint32_t> data(static_cast<size_t>(size) / 4);
   f.read(reinterpret_cast<char*>(data.data()), size);
   return data;
+}
+
+struct GridVert {
+  float x, y, z;
+  float r, g, b;
+};
+
+struct GridCol {
+  float r, g, b;
+};
+
+void add_grid_seg(std::vector<GridVert>& out, float ax, float ay, float az, float bx, float by, float bz,
+                  GridCol col, float half_w) {
+  const float dx = bx - ax;
+  const float dy = by - ay;
+  const float dz = bz - az;
+  const float len = std::sqrt(dx * dx + dy * dy + dz * dz);
+  if (len < 1e-5f) return;
+  const float inv = 1.f / len;
+  const float dirx = dx * inv;
+  const float diry = dy * inv;
+  const float dirz = dz * inv;
+  float mx = ax + bx;
+  float my = ay + by;
+  float mz = az + bz;
+  const float ml = std::sqrt(mx * mx + my * my + mz * mz);
+  if (ml < 1e-5f) return;
+  mx /= ml;
+  my /= ml;
+  mz /= ml;
+  float sx = diry * mz - dirz * my;
+  float sy = dirz * mx - dirx * mz;
+  float sz = dirx * my - diry * mx;
+  const float sl = std::sqrt(sx * sx + sy * sy + sz * sz);
+  if (sl < 1e-5f) return;
+  const float s = half_w / sl;
+  sx *= s;
+  sy *= s;
+  sz *= s;
+  const GridVert q[4] = {
+      {ax - sx, ay - sy, az - sz, col.r, col.g, col.b},
+      {ax + sx, ay + sy, az + sz, col.r, col.g, col.b},
+      {bx + sx, by + sy, bz + sz, col.r, col.g, col.b},
+      {bx - sx, by - sy, bz - sz, col.r, col.g, col.b},
+  };
+  const int idx[6] = {0, 1, 2, 0, 2, 3};
+  for (int i : idx) out.push_back(q[i]);
+}
+
+void sphere_point(float lat_deg, float lon_deg, float radius, float& x, float& y, float& z) {
+  const float lat = lat_deg * static_cast<float>(M_PI) / 180.f;
+  const float lon = lon_deg * static_cast<float>(M_PI) / 180.f;
+  const float cl = std::cos(lat);
+  x = std::sin(lon) * cl * radius;
+  y = std::sin(lat) * radius;
+  z = -std::cos(lon) * cl * radius;
+}
+
+std::vector<GridVert> build_comfort_grid() {
+  // Y up. Longitude 0 looks down -Z, matching the video sphere.
+  // ±90° are the poles: every meridian ends there, so those latitudes are the meeting points.
+  constexpr float kRadius = 80.f;
+  constexpr float kStep = 3.f;
+  const float half_w = kRadius * std::tan(0.18f * static_cast<float>(M_PI) / 180.f);
+  const float equator_w = half_w * 4.f;
+  const GridCol line{0.78f, 0.84f, 0.90f};
+  const GridCol equator{1.f, 1.f, 1.f};
+  std::vector<GridVert> verts;
+  const float lats[] = {90.f, 60.f, 30.f, 0.f, -30.f, -60.f, -90.f};
+  for (float lat : lats) {
+    if (std::fabs(lat) >= 89.f) continue;
+    const GridCol col = lat == 0.f ? equator : line;
+    for (float lon = 0.f; lon < 360.f; lon += kStep) {
+      float ax, ay, az, bx, by, bz;
+      sphere_point(lat, lon, kRadius, ax, ay, az);
+      sphere_point(lat, lon + kStep, kRadius, bx, by, bz);
+      add_grid_seg(verts, ax, ay, az, bx, by, bz, col, lat == 0.f ? equator_w : half_w);
+    }
+  }
+  for (float lon = 0.f; lon < 360.f; lon += 45.f) {
+    for (float lat = -90.f; lat < 90.f; lat += kStep) {
+      float ax, ay, az, bx, by, bz;
+      sphere_point(lat, lon, kRadius, ax, ay, az);
+      sphere_point(lat + kStep, lon, kRadius, bx, by, bz);
+      add_grid_seg(verts, ax, ay, az, bx, by, bz, line, half_w);
+    }
+  }
+  return verts;
 }
 
 }  // namespace
@@ -148,9 +258,13 @@ void SceneRenderer::shutdown() {
     submit_fence_ = VK_NULL_HANDLE;
   }
   if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
+  if (grid_pipeline_) vkDestroyPipeline(device_, grid_pipeline_, nullptr);
   if (layout_) vkDestroyPipelineLayout(device_, layout_, nullptr);
+  if (grid_layout_) vkDestroyPipelineLayout(device_, grid_layout_, nullptr);
   if (vert_) vkDestroyShaderModule(device_, vert_, nullptr);
   if (frag_) vkDestroyShaderModule(device_, frag_, nullptr);
+  if (grid_vert_) vkDestroyShaderModule(device_, grid_vert_, nullptr);
+  if (grid_frag_) vkDestroyShaderModule(device_, grid_frag_, nullptr);
   if (dset_) {
     // freed with pool
   }
@@ -170,8 +284,11 @@ void SceneRenderer::shutdown() {
   destroy_buf(vbo_hud_, vbo_hud_mem_);
   destroy_buf(vbo_sphere_, vbo_sphere_mem_);
   destroy_buf(ibo_sphere_, ibo_sphere_mem_);
+  destroy_buf(vbo_grid_, vbo_grid_mem_);
   pipeline_ = VK_NULL_HANDLE;
+  grid_pipeline_ = VK_NULL_HANDLE;
   layout_ = VK_NULL_HANDLE;
+  grid_layout_ = VK_NULL_HANDLE;
 }
 
 void SceneRenderer::set_projection(ProjectionMode mode, StereoLayout stereo, float flat_fov_deg,
@@ -187,6 +304,13 @@ void SceneRenderer::set_content_aspect(float width_over_height) {
     content_aspect_ = width_over_height;
   }
 }
+
+void SceneRenderer::set_view_offset(float yaw_rad, float pitch_rad) {
+  look_yaw_ = yaw_rad;
+  look_pitch_ = pitch_rad;
+}
+
+void SceneRenderer::set_comfort_grid(bool on) { comfort_grid_ = on; }
 
 void SceneRenderer::set_texture(VkImageView view, VkSampler sampler) {
   if (!view || !sampler || !dset_) return;
@@ -460,6 +584,12 @@ void SceneRenderer::build_meshes() {
          vbo_sphere_mem_);
   upload(sphere_i.data(), sphere_i.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, ibo_sphere_,
          ibo_sphere_mem_);
+
+  const std::vector<GridVert> grid = build_comfort_grid();
+  grid_vert_count_ = static_cast<uint32_t>(grid.size());
+  if (!grid.empty()) {
+    upload(grid.data(), grid.size() * sizeof(GridVert), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_grid_, vbo_grid_mem_);
+  }
 }
 
 void SceneRenderer::create_pipelines(VkFormat /*format*/) {
@@ -557,6 +687,85 @@ void SceneRenderer::create_pipelines(VkFormat /*format*/) {
   gp.subpass = 0;
   VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gp, nullptr, &pipeline_) == VK_SUCCESS,
             "pipeline");
+
+  grid_vert_ = load_shader(shader_dir_ + "/grid.vert.spv");
+  grid_frag_ = load_shader(shader_dir_ + "/grid.frag.spv");
+  VkPushConstantRange grid_pcr{};
+  grid_pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+  grid_pcr.size = sizeof(Mat4);
+  VkPipelineLayoutCreateInfo grid_pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  grid_pl.pushConstantRangeCount = 1;
+  grid_pl.pPushConstantRanges = &grid_pcr;
+  VRP_CHECK(vkCreatePipelineLayout(device_, &grid_pl, nullptr, &grid_layout_) == VK_SUCCESS, "grid layout");
+
+  VkPipelineShaderStageCreateInfo grid_stages[2]{};
+  grid_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  grid_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  grid_stages[0].module = grid_vert_;
+  grid_stages[0].pName = "main";
+  grid_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  grid_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  grid_stages[1].module = grid_frag_;
+  grid_stages[1].pName = "main";
+
+  VkVertexInputBindingDescription grid_bind{};
+  grid_bind.binding = 0;
+  grid_bind.stride = sizeof(GridVert);
+  grid_bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+  VkVertexInputAttributeDescription grid_attrs[2]{};
+  grid_attrs[0].location = 0;
+  grid_attrs[0].binding = 0;
+  grid_attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+  grid_attrs[0].offset = offsetof(GridVert, x);
+  grid_attrs[1].location = 1;
+  grid_attrs[1].binding = 0;
+  grid_attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+  grid_attrs[1].offset = offsetof(GridVert, r);
+
+  VkPipelineVertexInputStateCreateInfo grid_vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  grid_vi.vertexBindingDescriptionCount = 1;
+  grid_vi.pVertexBindingDescriptions = &grid_bind;
+  grid_vi.vertexAttributeDescriptionCount = 2;
+  grid_vi.pVertexAttributeDescriptions = grid_attrs;
+
+  VkPipelineInputAssemblyStateCreateInfo grid_ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+  grid_ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+  VkPipelineRasterizationStateCreateInfo grid_rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+  grid_rs.polygonMode = VK_POLYGON_MODE_FILL;
+  grid_rs.cullMode = VK_CULL_MODE_NONE;
+  grid_rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+  grid_rs.lineWidth = 1.f;
+
+  VkPipelineColorBlendAttachmentState grid_blend{};
+  grid_blend.blendEnable = VK_TRUE;
+  grid_blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  grid_blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  grid_blend.colorBlendOp = VK_BLEND_OP_ADD;
+  grid_blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  grid_blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  grid_blend.alphaBlendOp = VK_BLEND_OP_ADD;
+  grid_blend.colorWriteMask =
+      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo grid_cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  grid_cb.attachmentCount = 1;
+  grid_cb.pAttachments = &grid_blend;
+
+  VkGraphicsPipelineCreateInfo grid_gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  grid_gp.stageCount = 2;
+  grid_gp.pStages = grid_stages;
+  grid_gp.pVertexInputState = &grid_vi;
+  grid_gp.pInputAssemblyState = &grid_ia;
+  grid_gp.pViewportState = &vp;
+  grid_gp.pRasterizationState = &grid_rs;
+  grid_gp.pMultisampleState = &ms;
+  grid_gp.pColorBlendState = &grid_cb;
+  grid_gp.pDynamicState = &dyn;
+  grid_gp.layout = grid_layout_;
+  grid_gp.renderPass = app_->color_pass();
+  grid_gp.subpass = 0;
+  VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &grid_gp, nullptr, &grid_pipeline_) == VK_SUCCESS,
+            "grid pipeline");
 }
 
 void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapchain& sc,
@@ -589,7 +798,17 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &dset_, 0, nullptr);
 
-  Mat4 view_mat = invert_rigid(pose_to_matrix(view.pose));
+  const Mat4 head = pose_to_matrix(view.pose);
+  Mat4 view_mat = invert_rigid(head);
+  // Stick look turns the picture around the head. The HUD stays on the real pose.
+  Mat4 content_view = view_mat;
+  if (look_yaw_ != 0.f || look_pitch_ != 0.f) {
+    Mat4 turned = Mat4::mul(Mat4::mul(rot_y(look_yaw_), rot_x(look_pitch_)), head);
+    turned.m[12] = head.m[12];
+    turned.m[13] = head.m[13];
+    turned.m[14] = head.m[14];
+    content_view = invert_rigid(turned);
+  }
   Mat4 proj = projection_fov(view.fov, 0.05f, 100.f);
   Mat4 model = Mat4::identity();
 
@@ -608,7 +827,7 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   }
 
   PushConstants pc{};
-  pc.mvp = Mat4::mul(proj, Mat4::mul(view_mat, model));
+  pc.mvp = Mat4::mul(proj, Mat4::mul(content_view, model));
   pc.viewIndex = static_cast<int32_t>(view_index);
   pc.stereoMode = static_cast<int32_t>(stereo_);
   pc.is180 = (mode_ == ProjectionMode::Deg180) ? 1 : 0;
@@ -629,6 +848,23 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_sphere_, &off);
     vkCmdBindIndexBuffer(cmd, ibo_sphere_, 0, VK_INDEX_TYPE_UINT32);
     vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, 0);
+  }
+
+  // The cage turns with the picture. The eye stays at the center.
+  if (comfort_grid_ && grid_pipeline_ && vbo_grid_ && grid_vert_count_ >= 6) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, grid_pipeline_);
+    Mat4 grid_model = Mat4::identity();
+    grid_model.m[12] = head.m[12];
+    grid_model.m[13] = head.m[13];
+    grid_model.m[14] = head.m[14];
+    const Mat4 grid_mvp = Mat4::mul(proj, Mat4::mul(content_view, grid_model));
+    vkCmdPushConstants(cmd, grid_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(grid_mvp), &grid_mvp);
+    VkDeviceSize grid_off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_grid_, &grid_off);
+    vkCmdDraw(cmd, grid_vert_count_, 1, 0, 0);
+    // HUD vertices are a different layout. Leave the picture pipeline bound for them.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
   }
 
   // Head-locked-ish HUD: fixed in app space in front of origin (after recenter = forward).

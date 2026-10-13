@@ -17,6 +17,9 @@ class GamepadInput {
     std::string connection;
     float stick_x = 0.f;
     float stick_y = 0.f;  // +up
+    /** Right stick. +x right, +y up. Turns the view; not saved. */
+    float stick_rx = 0.f;
+    float stick_ry = 0.f;
     /** Cross key buttons. Kept off the stick axis so a full tilt stays the fast analog glide. */
     bool nav_up = false;
     bool nav_down = false;

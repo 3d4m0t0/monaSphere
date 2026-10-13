@@ -149,6 +149,9 @@ class XrVulkanApp {
     // HMD UI / pad
     float stick_x = 0.f;
     float stick_y = 0.f;
+    /** Right stick. +x right, +y up. */
+    float stick_rx = 0.f;
+    float stick_ry = 0.f;
     bool confirm = false;
     bool confirm_held = false;  // A / confirm level
     bool back = false;
@@ -221,6 +224,7 @@ class XrVulkanApp {
   XrAction seek_fwd_action_ = XR_NULL_HANDLE;
   XrAction recenter_action_ = XR_NULL_HANDLE;
   XrAction navigate_action_ = XR_NULL_HANDLE;  // VECTOR2
+  XrAction look_action_ = XR_NULL_HANDLE;      // VECTOR2, right stick when it is not navigate
   XrAction confirm_action_ = XR_NULL_HANDLE;
   XrAction back_action_ = XR_NULL_HANDLE;
   XrAction menu_toggle_action_ = XR_NULL_HANDLE;

@@ -79,6 +79,8 @@ message(STATUS "miniaudio playback enabled (third_party/miniaudio)")
 set(VRP_SHADERS
   ${CMAKE_SOURCE_DIR}/shaders/scene.vert
   ${CMAKE_SOURCE_DIR}/shaders/scene.frag
+  ${CMAKE_SOURCE_DIR}/shaders/grid.vert
+  ${CMAKE_SOURCE_DIR}/shaders/grid.frag
 )
 set(VRP_SPV_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${VRP_SPV_DIR})
