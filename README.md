@@ -9,7 +9,7 @@ HMD 映像内にファイルダイアログと再生コントロールの UI を
 
 1.0.0-dev.20260928 からの更新:
 
-今回から AppImage 版を用意した（`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`）。中には本体、Qt 6、LGPL の FFmpeg、OpenXR ローダが入っている。動かすには、ホスト側に次のものが要る。
+今回から AppImage 版を用意した（[`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`](https://github.com/3d4m0t0/monaSphere/releases/tag/1.0.0-dev.20261014)）。中には本体、Qt 6、LGPL の FFmpeg、OpenXR ローダが入っている。動かすには、ホスト側に次のものが要る。
 
 - glibc が Ubuntu 24.04 以降（openSUSE Tumbleweed を含む）。それより古いディストリビューションでは動かない
 - Vulkan に対応した GPU と、そのドライバ
@@ -21,15 +21,15 @@ HMD 映像内にファイルダイアログと再生コントロールの UI を
 - PSVR2 向け Monado 起動時の問題を修正
 - ファイル名による投影・モードの自動選択の対応を増やした。空白、`_`、`-`、`.` は区切りとして同じ語になる
 
-| 選択 | タグ |
-|------|------|
-| 360 | `360`（`360fps` はフレームレートとして無視） |
-| 180 | `180`（`180fps` はフレームレートとして無視） |
-| 平面 | `fisheye`、`180f`、`MKX200`、`VRCA220`、`RF52`、`EAC`、`360EAC` |
-| フル SBS | `fullsbs`、`fsbs`、`3dfsbs`、`3dhf`、`3dphf`、`lrf`、`full side by side` |
-| ハーフ SBS | `halfsbs`、`hsbs`、`3dhsbs`、`3dsbs`、`3dh`、`3dph`、`lrh`、`sbs3d`、`side by side`、`left right`、`sbs`、`lr`、`3d` |
-| フル OU | `fullou`、`fulltb`、`ftab`、`ftb`、`3dftab`、`3dvf`、`3dpvf`、`tbf`、`full over under`、`full top bottom` |
-| ハーフ OU | `halfou`、`hou`、`htab`、`htb`、`3dhtab`、`3dtab`、`3dv`、`3dpv`、`tbh`、`ou3d`、`tb3d`、`over under`、`top bottom`、`ou`、`tb` |
+| 選択 / Selection | タグ / Tags |
+|-----------------|------------|
+| 360 | `360`（`360fps` はフレームレートとして無視 / `360fps` is a frame rate and is ignored） |
+| 180 | `180`（`180fps` はフレームレートとして無視 / `180fps` is a frame rate and is ignored） |
+| 平面 / Flat | `fisheye`、`180f`、`MKX200`、`VRCA220`、`RF52`、`EAC`、`360EAC` |
+| フル SBS / Full SBS | `fullsbs`、`fsbs`、`3dfsbs`、`3dhf`、`3dphf`、`lrf`、`full side by side` |
+| ハーフ SBS / Half SBS | `halfsbs`、`hsbs`、`3dhsbs`、`3dsbs`、`3dh`、`3dph`、`lrh`、`sbs3d`、`side by side`、`left right`、`sbs`、`lr`、`3d` |
+| フル OU / Full OU | `fullou`、`fulltb`、`ftab`、`ftb`、`3dftab`、`3dvf`、`3dpvf`、`tbf`、`full over under`、`full top bottom` |
+| ハーフ OU / Half OU | `halfou`、`hou`、`htab`、`htb`、`3dhtab`、`3dtab`、`3dv`、`3dpv`、`tbh`、`ou3d`、`tb3d`、`over under`、`top bottom`、`ou`、`tb` |
 
 - ファイル一覧でのレスポンスを向上。L スティックの選択に対応
 - シークを改善。L スティックによるシーク。シーク用サムネイルの作成
@@ -50,7 +50,7 @@ The in-HMD UI provides a file dialog, playback controls, and related operations.
 
 Changes since 1.0.0-dev.20260928:
 
-An AppImage is now provided (`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`). It contains the program, Qt 6, an LGPL FFmpeg, and the OpenXR loader. The host still needs:
+An AppImage is now provided ([`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`](https://github.com/3d4m0t0/monaSphere/releases/tag/1.0.0-dev.20261014)). It contains the program, Qt 6, an LGPL FFmpeg, and the OpenXR loader. The host still needs:
 
 - glibc from Ubuntu 24.04 or newer (including openSUSE Tumbleweed). Older distributions will not run it
 - A Vulkan-capable GPU and its driver
@@ -60,17 +60,7 @@ An AppImage is now provided (`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`). I
 Note: only gamepads that SDL can recognize are usable.
 
 - Fixed Monado startup for PSVR2
-- Filename detection of projection and stereo covers more tags. Spaces, `_`, `-`, and `.` are word breaks
-
-| Selection | Tags |
-|-----------|------|
-| 360 | `360` (`360fps` is a frame rate and is ignored) |
-| 180 | `180` (`180fps` is a frame rate and is ignored) |
-| Flat | `fisheye`, `180f`, `MKX200`, `VRCA220`, `RF52`, `EAC`, `360EAC` |
-| Full SBS | `fullsbs`, `fsbs`, `3dfsbs`, `3dhf`, `3dphf`, `lrf`, `full side by side` |
-| Half SBS | `halfsbs`, `hsbs`, `3dhsbs`, `3dsbs`, `3dh`, `3dph`, `lrh`, `sbs3d`, `side by side`, `left right`, `sbs`, `lr`, `3d` |
-| Full OU | `fullou`, `fulltb`, `ftab`, `ftb`, `3dftab`, `3dvf`, `3dpvf`, `tbf`, `full over under`, `full top bottom` |
-| Half OU | `halfou`, `hou`, `htab`, `htb`, `3dhtab`, `3dtab`, `3dv`, `3dpv`, `tbh`, `ou3d`, `tb3d`, `over under`, `top bottom`, `ou`, `tb` |
+- Filename detection of projection and stereo covers more tags. Spaces, `_`, `-`, and `.` are word breaks. The tags are in the table above
 
 - The file list responds faster. The left stick moves the selection
 - Seek improved: left-stick seek, and seek thumbnails are generated
