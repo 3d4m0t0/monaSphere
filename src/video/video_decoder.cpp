@@ -636,7 +636,8 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
   int dst_h = 0;
 
   bool ok = false;
-  while (av_read_frame(fmt, packet) >= 0) {
+  bool scale_failed = false;
+  while (av_read_frame(fmt, packet) >= 0 && !scale_failed) {
     if (packet->stream_index != vstream) {
       av_packet_unref(packet);
       continue;
@@ -663,7 +664,12 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
         av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, dst_w, dst_h, 1);
         sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), dst_w,
                              dst_h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
-        if (!sws) break;
+        if (!sws) {
+          av_free(rgba_buf);
+          rgba_buf = nullptr;
+          scale_failed = true;
+          break;
+        }
       }
       sws_scale(sws, frame->data, frame->linesize, 0, frame->height, rgba->data, rgba->linesize);
       const size_t need = static_cast<size_t>(dst_w) * static_cast<size_t>(dst_h) * 4;
