@@ -7,7 +7,7 @@
 
 Name:           monasphere
 Version:        1.0.0
-Release:        dev.20260928
+Release:        dev.20261014
 Summary:        Native Linux VR video player (OpenXR / Vulkan)
 License:        MIT
 Group:          Productivity/Multimedia/Video/Players
@@ -20,6 +20,7 @@ BuildRequires:  gcc-c++
 BuildRequires:  pkgconfig
 BuildRequires:  pkgconfig(Qt6Widgets)
 BuildRequires:  pkgconfig(Qt6Network)
+BuildRequires:  pkgconfig(Qt6DBus)
 BuildRequires:  cmake(Qt6GuiPrivate)
 BuildRequires:  pkgconfig(openxr)
 BuildRequires:  pkgconfig(vulkan)
@@ -72,6 +73,14 @@ same SONAME on the user's system. This package does not promise a codec set.
 %{_datadir}/applications/monasphere.desktop
 
 %changelog
+* Wed Oct 14 2026 flex - 1.0.0-dev.20261014
+- AppImage added. Host still provides the GPU driver and OpenXR runtime. Gamepads must be recognized by SDL.
+- Fixed Monado startup for PSVR2.
+- Filename detection covers more projection and half/full stereo tags.
+- Faster file list with left-stick selection. Left-stick seek and seek thumbnails.
+- Right-stick view turn, with a motion-sickness countermeasure.
+- Catmull-Rom 4:2:0 chroma. Higher-resolution stereo file preview.
+- AppImage host UI follows the desktop font and color scheme. Builds with OpenXR 1.0 headers.
 * Mon Sep 28 2026 flex - 1.0.0-dev.20260928
 - Fixed settings-file handling. Settings stay in monasphere.conf.
 - Seek behavior improved. The saved refresh rate is applied at startup.

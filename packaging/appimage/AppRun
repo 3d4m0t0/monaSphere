@@ -1,0 +1,11 @@
+#!/bin/sh
+# AppImage runtime leaves $ORIGIN at the .AppImage file, so the bundled
+# LGPL FFmpeg is not visible unless this directory is on LD_LIBRARY_PATH.
+set -eu
+if [ -n "${APPDIR:-}" ]; then
+  here=$APPDIR
+else
+  here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+fi
+export LD_LIBRARY_PATH="$here/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$here/usr/bin/monasphere" "$@"

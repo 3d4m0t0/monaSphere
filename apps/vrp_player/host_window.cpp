@@ -1,4 +1,5 @@
 #include "host_window.hpp"
+#include "desktop_ui.hpp"
 #include "hud_paint.hpp"
 #include "i18n.hpp"
 #include "x11_direct_probe.hpp"
@@ -353,6 +354,32 @@ QString leaseListText(const DrmLeaseProbeResult& probe) {
                       QString::fromStdString(connector.description));
   }
   return parts.join(QStringLiteral(", "));
+}
+
+// AppRun prepends $APPDIR/usr/lib so the bundled LGPL FFmpeg loads. Host tools
+// (monado-service, wivrn-server, vulkaninfo) must keep the system library
+// search path; Ubuntu libs there break Tumbleweed's OpenSSL and SDL.
+QProcessEnvironment hostToolEnvironment() {
+  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  const QByteArray appdir = qgetenv("APPDIR");
+  if (appdir.isEmpty()) return env;
+  const QString bundled = QString::fromLocal8Bit(appdir) + QStringLiteral("/usr/lib");
+  const QString key = QStringLiteral("LD_LIBRARY_PATH");
+  if (!env.contains(key)) return env;
+  const QStringList parts = env.value(key).split(QLatin1Char(':'), Qt::SkipEmptyParts);
+  QStringList kept;
+  kept.reserve(parts.size());
+  for (const QString& part : parts) {
+    const QString trimmed = part.endsWith(QLatin1Char('/')) ? part.chopped(1) : part;
+    if (trimmed == bundled) continue;
+    kept.push_back(part);
+  }
+  if (kept.isEmpty()) {
+    env.remove(key);
+  } else {
+    env.insert(key, kept.join(QLatin1Char(':')));
+  }
+  return env;
 }
 
 }  // namespace
@@ -779,6 +806,7 @@ void HostWindow::stopMonadoProcess() {
 void HostWindow::stopSystemdMonadoForOwnedStart() {
   // Socket activation will respawn monado-service without our DESIRED_MODE unless stopped.
   QProcess ctl;
+  ctl.setProcessEnvironment(hostToolEnvironment());
   ctl.start(QStringLiteral("systemctl"),
             {QStringLiteral("--user"), QStringLiteral("stop"), QStringLiteral("monado.socket"),
              QStringLiteral("monado.service")});
@@ -789,6 +817,7 @@ void HostWindow::stopSystemdMonadoForOwnedStart() {
   }
   // Best-effort: any leftover monado-service (not our QProcess child).
   QProcess killall;
+  killall.setProcessEnvironment(hostToolEnvironment());
   killall.start(QStringLiteral("pkill"), {QStringLiteral("-x"), QStringLiteral("monado-service")});
   if (killall.waitForStarted(500)) killall.waitForFinished(2000);
   for (int i = 0; i < 50 && isMonadoIpcLive(); ++i) {
@@ -816,31 +845,35 @@ void HostWindow::restartOwnedMonadoForHz() {
 
 namespace {
 
-/** DE terminal/fixed family + smallest-readable size (never fall back to proportional). */
+/** Desktop fixed face and size. Without a desktop fixed font, keep a monospace face at the UI size. */
 QFont makeLogTerminalFont() {
-  QFont term = QFontDatabase::systemFont(QFontDatabase::FixedFont);
-  term.setStyleHint(QFont::TypeWriter);
-  term.setFixedPitch(true);
-
-  // When kdeglobals `fixed=` is unset, FixedFont can resolve to the proportional General font.
-  if (!QFontInfo(term).fixedPitch()) {
-    const char* fallbacks[] = {"Hack", "DejaVu Sans Mono", "Noto Sans Mono", "Source Code Pro",
-                               "monospace", nullptr};
-    for (int i = 0; fallbacks[i]; ++i) {
-      QFont trial(QString::fromUtf8(fallbacks[i]));
-      trial.setStyleHint(QFont::TypeWriter);
-      trial.setFixedPitch(true);
-      if (QFontInfo(trial).fixedPitch()) {
-        term = trial;
-        break;
+  QFont term = desktopFixedFont();
+  if (term.family().isEmpty() || !QFontInfo(term).fixedPitch()) {
+    term = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    term.setStyleHint(QFont::TypeWriter);
+    term.setFixedPitch(true);
+    if (!QFontInfo(term).fixedPitch()) {
+      const char* fallbacks[] = {"Hack", "DejaVu Sans Mono", "Noto Sans Mono", "Source Code Pro",
+                                 "monospace", nullptr};
+      for (int i = 0; fallbacks[i]; ++i) {
+        QFont trial(QString::fromUtf8(fallbacks[i]));
+        trial.setStyleHint(QFont::TypeWriter);
+        trial.setFixedPitch(true);
+        if (QFontInfo(trial).fixedPitch()) {
+          term = trial;
+          break;
+        }
       }
     }
+    const QFont ui = desktopUiFont();
+    if (ui.pointSizeF() > 0.0) term.setPointSizeF(ui.pointSizeF());
+    else if (ui.pixelSize() > 0) term.setPixelSize(ui.pixelSize());
+    else {
+      const QFont small = QFontDatabase::systemFont(QFontDatabase::SmallestReadableFont);
+      if (small.pointSizeF() > 0.0) term.setPointSizeF(small.pointSizeF());
+      else if (small.pixelSize() > 0) term.setPixelSize(small.pixelSize());
+    }
   }
-
-  const QFont small = QFontDatabase::systemFont(QFontDatabase::SmallestReadableFont);
-  if (small.pointSizeF() > 0.0) term.setPointSizeF(small.pointSizeF());
-  else if (small.pixelSize() > 0) term.setPixelSize(small.pixelSize());
-  // Re-assert after size change (some platforms re-resolve family).
   term.setStyleHint(QFont::TypeWriter);
   term.setFixedPitch(true);
   return term;
@@ -1290,7 +1323,7 @@ void HostWindow::showAboutDialog() {
       "<p>Source license: MIT</p>"
       "<p>FFmpeg / Qt and others are linked dynamically. "
       "See THIRD_PARTY.md when distributing a binary.</p>")
-                           .arg(QStringLiteral("1.0.0-dev.20260928"));
+                           .arg(QStringLiteral("1.0.0-dev.20261014"));
   QString html = text;
   html.replace(QStringLiteral("<h3>"), QStringLiteral("<h3 style=\"margin:0;\">"));
   html.replace(QStringLiteral("<p>"), QStringLiteral("<p style=\"margin:0;\">"));
@@ -1987,6 +2020,7 @@ bool HostWindow::adoptExternalMonado() {
 bool HostWindow::isWivrnServerLive() const {
   if (monado_ && monado_->state() != QProcess::NotRunning) return true;
   QProcess probe;
+  probe.setProcessEnvironment(hostToolEnvironment());
   probe.start(QStringLiteral("pgrep"), {QStringLiteral("-x"), QStringLiteral("wivrn-server")});
   if (!probe.waitForFinished(800)) return false;
   return probe.exitCode() == 0;
@@ -2021,7 +2055,7 @@ void HostWindow::startOwnedWivrn(bool allow_external_adopt) {
   if (runtime_json_.isEmpty()) {
     appendLog(tr("openxr_wivrn.json not found"));
   }
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  QProcessEnvironment env = hostToolEnvironment();
   env.remove(QStringLiteral("XRT_COMPOSITOR_DESIRED_MODE"));
   qunsetenv("XRT_COMPOSITOR_DESIRED_MODE");
   if (!runtime_json_.isEmpty()) {
@@ -2128,6 +2162,7 @@ bool HostWindow::ensureMonadoModeTable() {
 
   // Probe HMD VkDisplay modes before Monado start (PRINT_MODES only appears after compositor init).
   QProcess probe;
+  probe.setProcessEnvironment(hostToolEnvironment());
   probe.start(QStringLiteral("vulkaninfo"), {});
   if (!probe.waitForStarted(2000)) {
     appendLog(tr("vulkaninfo failed — wait for Monado modes"));
@@ -2464,7 +2499,7 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
   if (runtime_json_.isEmpty()) {
     runtime_json_ = findRuntimeJson();
   }
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  QProcessEnvironment env = hostToolEnvironment();
   if (!runtime_json_.isEmpty()) {
     env.insert("XR_RUNTIME_JSON", runtime_json_);
     qputenv("XR_RUNTIME_JSON", runtime_json_.toUtf8());

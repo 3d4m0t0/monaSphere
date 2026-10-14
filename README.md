@@ -5,16 +5,39 @@ Linux 向けのネイティブ VR 動画プレーヤーです。コマンド名�
 OpenXR（Monado）と Vulkan で HMD に映像を出します。
 HMD 映像内にファイルダイアログと再生コントロールの UI を持ち、各種操作が行えます。
 
-**版 1.0.0-dev.20260928**
+**版 1.0.0-dev.20261014**
 
-1.0.0-dev.20260927 からの更新:
+1.0.0-dev.20260928 からの更新:
 
-- Qt の GuiPrivate が使えない環境でもビルドできるようにした。使える環境では Wayland の前面表示を維持
-- 設定ファイルの扱いが誤っていたのを修正。設定は `monasphere.conf` にまとめた
-- シーク動作を改善
-- 保存したリフレッシュレートを、起動時に反映できていなかったのを修正
-- HMD のコントローラーとは別に、SDL でゲームパッドを接続できる
-- リセンターの際に操作説明を表示。UI はデスクトップ環境で使っているフォントで描画するように変更。他に、細かな UI の調整
+今回から AppImage 版を用意した（`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`）。中には本体、Qt 6、LGPL の FFmpeg、OpenXR ローダが入っている。動かすには、ホスト側に次のものが要る。
+
+- glibc が Ubuntu 24.04 以降（openSUSE Tumbleweed を含む）。それより古いディストリビューションでは動かない
+- Vulkan に対応した GPU と、そのドライバ
+- OpenXR ランタイム。Monado（`monado-service`）または WiVRn が PATH から起動できること
+- NVIDIA でゼロコピー再生する場合は `libcuda.so.1`。VA-API / VDPAU を使う場合は、そのドライバ
+
+注意: ゲームパッドは、現在 SDL が認識できるものだけ使える。
+
+- PSVR2 向け Monado 起動時の問題を修正
+- ファイル名による投影・モードの自動選択の対応を増やした。空白、`_`、`-`、`.` は区切りとして同じ語になる
+
+| 選択 | タグ |
+|------|------|
+| 360 | `360`（`360fps` はフレームレートとして無視） |
+| 180 | `180`（`180fps` はフレームレートとして無視） |
+| 平面 | `fisheye`、`180f`、`MKX200`、`VRCA220`、`RF52`、`EAC`、`360EAC` |
+| フル SBS | `fullsbs`、`fsbs`、`3dfsbs`、`3dhf`、`3dphf`、`lrf`、`full side by side` |
+| ハーフ SBS | `halfsbs`、`hsbs`、`3dhsbs`、`3dsbs`、`3dh`、`3dph`、`lrh`、`sbs3d`、`side by side`、`left right`、`sbs`、`lr`、`3d` |
+| フル OU | `fullou`、`fulltb`、`ftab`、`ftb`、`3dftab`、`3dvf`、`3dpvf`、`tbf`、`full over under`、`full top bottom` |
+| ハーフ OU | `halfou`、`hou`、`htab`、`htb`、`3dhtab`、`3dtab`、`3dv`、`3dpv`、`tbh`、`ou3d`、`tb3d`、`over under`、`top bottom`、`ou`、`tb` |
+
+- ファイル一覧でのレスポンスを向上。L スティックの選択に対応
+- シークを改善。L スティックによるシーク。シーク用サムネイルの作成
+- R スティックでの視点変更。VR 酔い対策込み
+- 4:2:0 の色差を Catmull-Rom で拡大し、色の縁を単一のバイリニアよりシャープにした
+- ファイルダイアログのプレビューを高解像にした。立体視に対応
+- AppImage でも、ホスト UI のフォントと明暗を実行中のデスクトップ設定に合うように変更
+- Ubuntu 24.04 の OpenXR 1.0 ヘッダでもビルドできるようにした
 
 ### English
 
@@ -23,16 +46,39 @@ A native VR video player for Linux. The command name is `monasphere`.
 Video is presented to the HMD with OpenXR (Monado) and Vulkan.
 The in-HMD UI provides a file dialog, playback controls, and related operations.
 
-**Version 1.0.0-dev.20260928**
+**Version 1.0.0-dev.20261014**
 
-Changes since 1.0.0-dev.20260927:
+Changes since 1.0.0-dev.20260928:
 
-- The build succeeds when Qt GuiPrivate is unavailable. Wayland focus is kept where that API is usable
-- Fixed incorrect settings-file handling. Settings are kept in `monasphere.conf`
-- Seek behavior improved
-- Fixed the saved refresh rate not being applied at startup
-- An SDL gamepad can be connected in addition to the HMD controllers
-- Recenter shows a control guide. The UI is drawn with the desktop environment font, with other small UI adjustments
+An AppImage is now provided (`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`). It contains the program, Qt 6, an LGPL FFmpeg, and the OpenXR loader. The host still needs:
+
+- glibc from Ubuntu 24.04 or newer (including openSUSE Tumbleweed). Older distributions will not run it
+- A Vulkan-capable GPU and its driver
+- An OpenXR runtime: Monado (`monado-service`) or WiVRn, available on `PATH`
+- `libcuda.so.1` for NVIDIA zero-copy playback. VA-API / VDPAU need their drivers on the host
+
+Note: only gamepads that SDL can recognize are usable.
+
+- Fixed Monado startup for PSVR2
+- Filename detection of projection and stereo covers more tags. Spaces, `_`, `-`, and `.` are word breaks
+
+| Selection | Tags |
+|-----------|------|
+| 360 | `360` (`360fps` is a frame rate and is ignored) |
+| 180 | `180` (`180fps` is a frame rate and is ignored) |
+| Flat | `fisheye`, `180f`, `MKX200`, `VRCA220`, `RF52`, `EAC`, `360EAC` |
+| Full SBS | `fullsbs`, `fsbs`, `3dfsbs`, `3dhf`, `3dphf`, `lrf`, `full side by side` |
+| Half SBS | `halfsbs`, `hsbs`, `3dhsbs`, `3dsbs`, `3dh`, `3dph`, `lrh`, `sbs3d`, `side by side`, `left right`, `sbs`, `lr`, `3d` |
+| Full OU | `fullou`, `fulltb`, `ftab`, `ftb`, `3dftab`, `3dvf`, `3dpvf`, `tbf`, `full over under`, `full top bottom` |
+| Half OU | `halfou`, `hou`, `htab`, `htb`, `3dhtab`, `3dtab`, `3dv`, `3dpv`, `tbh`, `ou3d`, `tb3d`, `over under`, `top bottom`, `ou`, `tb` |
+
+- The file list responds faster. The left stick moves the selection
+- Seek improved: left-stick seek, and seek thumbnails are generated
+- The right stick turns the view, with a motion-sickness countermeasure
+- 4:2:0 chroma is upsampled with Catmull-Rom, so color edges stay sharper than a single bilinear sample
+- The file-dialog preview is higher resolution and shows stereo
+- In the AppImage, the host UI font and light or dark appearance follow the running desktop
+- The build succeeds with Ubuntu 24.04's OpenXR 1.0 headers
 
 ## AI の利用について
 

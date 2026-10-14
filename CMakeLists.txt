@@ -9,7 +9,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
 find_package(PkgConfig REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+find_package(Qt6 REQUIRED COMPONENTS Widgets Network DBus)
 # Wayland single-instance focus uses a Qt private type. Skip it when the
 # private component or that type is missing, so older distro Qt still builds.
 set(VRP_HAS_QT_GUI_PRIVATE OFF)
@@ -222,6 +222,8 @@ add_custom_command(
 )
 add_executable(vrp_player
   apps/vrp_player/main.cpp
+  apps/vrp_player/desktop_ui.cpp
+  apps/vrp_player/desktop_ui.hpp
   apps/vrp_player/i18n.cpp
   apps/vrp_player/i18n.hpp
   apps/vrp_player/i18n.qrc
@@ -239,7 +241,7 @@ add_executable(vrp_player
   ${DRM_LEASE_CODE}
 )
 set_target_properties(vrp_player PROPERTIES OUTPUT_NAME monasphere)
-target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets Qt6::Network
+target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets Qt6::Network Qt6::DBus
                       ${WAYLAND_CLIENT_LIBRARIES} ${XCB_RANDR_LIBRARIES} ${CMAKE_DL_LIBS})
 target_include_directories(vrp_player PRIVATE ${CMAKE_BINARY_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS}
                            ${XCB_RANDR_INCLUDE_DIRS})

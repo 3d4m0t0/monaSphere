@@ -4,8 +4,8 @@ monaSphere ソース自体は [MIT](LICENSE) です。コマンド名は `monasp
 
 ## 配布バイナリの方針
 
-- **ビルド:** openSUSE `ffmpeg-*-mini`（LGPL）。パッケージの License は MIT のままにできる  
-- **実行:** 同じ SONAME の FFmpeg。再生できるコーデックはそのビルド内容に従う。雛形は [`packaging/opensuse/monasphere.spec`](packaging/opensuse/monasphere.spec)
+- **RPM:** openSUSE `ffmpeg-*-mini`（LGPL）でビルドし、libav* は同梱しない。パッケージの License は MIT のままにできる。実行時は同じ SONAME の FFmpeg。雛形は [`packaging/opensuse/monasphere.spec`](packaging/opensuse/monasphere.spec)
+- **AppImage:** Qt 6（LGPL）と LGPL の FFmpeg を同梱する。GPU ドライバと OpenXR ランタイムは同梱しない。手順は [`packaging/appimage/build-appimage.sh`](packaging/appimage/build-appimage.sh)
 
 ## 動的リンクする主なライブラリ
 

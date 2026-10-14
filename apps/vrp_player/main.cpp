@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "desktop_ui.hpp"
 #include "host_window.hpp"
 #include "i18n.hpp"
 #include "options.hpp"
@@ -7,6 +8,7 @@
 #include <QDir>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QStringList>
 #include <QIcon>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -68,7 +70,14 @@ vrp::PlayerOptions parse_args(int argc, char** argv, bool& show_ui) {
 }
 
 QString find_shader_dir() {
-  const char* candidates[] = {
+  QStringList candidates;
+  const QString app_dir = QCoreApplication::applicationDirPath();
+  if (!app_dir.isEmpty()) {
+    // AppImage / install layout: usr/bin/monasphere -> usr/share/monasphere/shaders
+    candidates << QDir(app_dir).filePath(QStringLiteral("../share/monasphere/shaders"));
+    candidates << QDir(app_dir).filePath(QStringLiteral("shaders"));
+  }
+  const char* relative[] = {
       "shaders",
       "../shaders",
       "build/shaders",
@@ -76,11 +85,12 @@ QString find_shader_dir() {
       "/usr/local/share/monasphere/shaders",
       nullptr,
   };
-  for (int i = 0; candidates[i]; ++i) {
-    QString p = QString(candidates[i]) + "/scene.vert.spv";
-    if (QFileInfo::exists(p)) return candidates[i];
+  for (int i = 0; relative[i]; ++i) candidates << QString(relative[i]);
+  for (const QString& dir : candidates) {
+    const QString cleaned = QDir::cleanPath(dir);
+    if (QFileInfo::exists(cleaned + QStringLiteral("/scene.vert.spv"))) return cleaned;
   }
-  return "shaders";
+  return QStringLiteral("shaders");
 }
 
 QString instanceSocketName() {
@@ -149,6 +159,7 @@ int main(int argc, char** argv) {
   const QByteArray activation_token = startupActivationToken();
 
   QApplication app(argc, argv);
+  applyDesktopAppearance();
   QLocalServer* instance = nullptr;
   if (!claimInstance(app, &instance, activation_token)) return 0;
   MonasphereInstallTranslations(app);

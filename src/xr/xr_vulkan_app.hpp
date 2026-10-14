@@ -11,6 +11,12 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 
+// OpenXR 1.0 headers (Ubuntu 24.04) have only XR_CURRENT_API_VERSION.
+// 1.1 headers name the same value XR_API_VERSION_1_0.
+#ifndef XR_API_VERSION_1_0
+#define XR_API_VERSION_1_0 XR_MAKE_VERSION(1, 0, XR_VERSION_PATCH(XR_CURRENT_API_VERSION))
+#endif
+
 #include <array>
 #include <atomic>
 #include <chrono>
