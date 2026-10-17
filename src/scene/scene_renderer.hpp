@@ -89,6 +89,13 @@ class SceneRenderer {
   VkDeviceMemory vbo_grid_mem_ = VK_NULL_HANDLE;
   uint32_t grid_vert_count_ = 0;
 
+  VkPipeline star_pipeline_ = VK_NULL_HANDLE;
+  VkShaderModule star_vert_ = VK_NULL_HANDLE;
+  VkShaderModule star_frag_ = VK_NULL_HANDLE;
+  VkBuffer vbo_stars_ = VK_NULL_HANDLE;
+  VkDeviceMemory vbo_stars_mem_ = VK_NULL_HANDLE;
+  uint32_t star_vert_count_ = 0;
+
   VkDescriptorSetLayout dsl_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_ = VK_NULL_HANDLE;
   VkDescriptorSet dset_ = VK_NULL_HANDLE;

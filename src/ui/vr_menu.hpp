@@ -133,8 +133,6 @@ class VrMenu {
     float volume_delta = 0.f;
     bool rate_changed = false;
     float rate = 1.f;
-    /** ○ / B held long enough. Clears the stick look offset. Not written to conf. */
-    bool view_reset = false;
     bool fsr_changed = false;
     FsrMode fsr = FsrMode::Off;
     /** User confirmed HMD refresh-rate change (may restart Monado / XR). */
@@ -373,9 +371,6 @@ class VrMenu {
   bool prev_back_ = false;
   bool prev_menu_toggle_ = false;
   bool back_held_ = false;
-  bool back_long_fired_ = false;
-  float back_held_sec_ = 0.f;
-  static constexpr float kBackLongPressSec = 0.70f;
   static constexpr double kNearStartSec = 3.0;
 };
 

@@ -702,6 +702,22 @@ void HostWindow::hideControlsHelp() {
   requestHudPaint();
 }
 
+void HostWindow::showHudToast(const QString& text, int duration_ms) {
+  {
+    std::lock_guard<std::mutex> lock(hud_toast_mu_);
+    hud_toast_ = text;
+    hud_toast_until_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(duration_ms);
+  }
+  hud_toast_active_.store(true);
+  requestHudPaint();
+}
+
+bool HostWindow::hudToastActive() const {
+  if (!hud_toast_active_.load()) return false;
+  std::lock_guard<std::mutex> lock(hud_toast_mu_);
+  return std::chrono::steady_clock::now() < hud_toast_until_ && !hud_toast_.isEmpty();
+}
+
 void HostWindow::requestHudPaint() {
   hud_paint_req_.fetch_add(1, std::memory_order_relaxed);
   bool expected = false;
@@ -727,8 +743,26 @@ void HostWindow::paintHudNow() {
   }
   if (!menu) return;
   const auto snap = menu->snapshot();
+  QString toast;
+  bool toast_on = false;
+  {
+    std::lock_guard<std::mutex> lock(hud_toast_mu_);
+    if (hud_toast_active_.load() && std::chrono::steady_clock::now() < hud_toast_until_ &&
+        !hud_toast_.isEmpty()) {
+      toast = hud_toast_;
+      toast_on = true;
+    } else if (hud_toast_active_.load()) {
+      hud_toast_.clear();
+      hud_toast_active_.store(false);
+    }
+  }
   const bool help = controls_help_.load();
-  const int kind = help ? 1 : snap.visible ? 2 : snap.controls_visible ? 3 : snap.seek_bar_only ? 4 : 0;
+  const int kind = help             ? 1
+                   : snap.visible   ? 2
+                   : snap.controls_visible ? 3
+                   : snap.seek_bar_only    ? 4
+                   : toast_on              ? 5
+                                           : 0;
   if (kind == 0) {
     std::lock_guard<std::mutex> lock(hud_pixels_mu_);
     hud_verts_.clear();
@@ -746,8 +780,10 @@ void HostWindow::paintHudNow() {
     seconds_left = left_ms <= 0 ? 0 : static_cast<int>((left_ms + 999) / 1000);
   }
   const vrp::HudPaintResult hud =
-      help ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load(), menu_option_.load())
-           : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load());
+      help     ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load(),
+                                          menu_option_.load())
+      : kind == 5 ? vrp::paint_hud_toast(toast, hud_w_, hud_h_)
+                  : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load(), menu_option_.load());
   QImage thumb = (!help && snap.visible) ? vrp::paint_file_thumb(snap) : QImage();
   if (!thumb.isNull() && thumb.format() != QImage::Format_RGBA8888) {
     thumb = thumb.convertToFormat(QImage::Format_RGBA8888);
@@ -3194,6 +3230,7 @@ void HostWindow::xrThreadMain() {
     bool force_fsr_refresh = true;
     float look_yaw = 0.f;
     float look_pitch = 0.f;
+    int flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
 
     while (!xr_stop_.load() && xr.pump_events()) {
       bool help_shown = false;
@@ -3297,6 +3334,7 @@ void HostWindow::xrThreadMain() {
       bool pad_nav_down = false;
       bool pad_nav_left = false;
       bool pad_nav_right = false;
+      bool pad_face_y = false;
       const bool want_gamepad = gamepad_enabled_.load();
       if (want_gamepad) {
         gamepad_sdl_owned_.store(true);
@@ -3352,6 +3390,8 @@ void HostWindow::xrThreadMain() {
             input.r2_held = input.r2_held || gp.r2_held;
             input.seek_scrubbing = input.seek_scrubbing || gp.seek_scrubbing;
             input.recenter = input.recenter || gp.recenter;
+            input.view_reset = input.view_reset || gp.view_reset;
+            pad_face_y = gp.face_y;
           } else {
             last_gamepad_name.clear();
             last_gamepad_connection.clear();
@@ -3391,13 +3431,46 @@ void HostWindow::xrThreadMain() {
           for (char& c : n) {
             if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
           }
-          hmd_sony = n.find("playstation") != std::string::npos || n.find("psvr") != std::string::npos;
+          hmd_sony = n.find("playstation") != std::string::npos || n.find("psvr") != std::string::npos ||
+                     n.find("sony") != std::string::npos;
         }
+        // Face icons follow HMD or pad. Options label follows the same Sony source.
         const bool sony = hmd_sony || pad_sony;
-        const bool option = pad_present ? pad_sony : hmd_sony;
+        const bool option = sony;
         if (face_sony_.exchange(sony) != sony || menu_option_.exchange(option) != option) requestHudPaint();
       }
       decoder.set_seek_scrubbing(false);
+
+      // Flat scale: Y/△ cycles Near→Cinema→Far (fixed cinema screen width; FOV follows
+      // distance). XR triangle is flat_scale; Options/menu stays menu_toggle.
+      const bool menus_closed =
+          !menu.visible() && !menu.controls_visible() && !controls_help_.load();
+      const bool can_flat_scale =
+          opt_.projection == vrp::ProjectionMode::Flat && menus_closed && decoder.is_open();
+      const bool scale_press = pad_face_y || input.flat_scale;
+      if (can_flat_scale && scale_press) {
+        flat_scale_index = vrp::next_flat_scale_preset(flat_scale_index);
+        const auto& preset = vrp::kFlatScalePresets[flat_scale_index];
+        opt_.flat_fov_deg = preset.fov_deg;
+        opt_.screen_distance = preset.distance_m;
+        scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
+        const QString toast =
+            QStringLiteral("%1  %2° / %3 m")
+                .arg(QString::fromUtf8(preset.name))
+                .arg(static_cast<double>(preset.fov_deg), 0, 'f', 1)
+                .arg(static_cast<double>(preset.distance_m), 0, 'f', 0);
+        showHudToast(toast);
+        QMetaObject::invokeMethod(
+            this, [this, toast] { appendLog(tr("Flat scale: %1").arg(toast)); }, Qt::QueuedConnection);
+      }
+      if (hud_toast_active_.load() && !hudToastActive()) {
+        {
+          std::lock_guard<std::mutex> lock(hud_toast_mu_);
+          hud_toast_.clear();
+        }
+        hud_toast_active_.store(false);
+        requestHudPaint();
+      }
 
       vrp::VrMenu::PadInput pad;
       if (help_swallow_back_ && !input.back_held && !input.back) help_swallow_back_ = false;
@@ -3456,6 +3529,7 @@ void HostWindow::xrThreadMain() {
         opt_.projection = menu_out.projection;
         opt_.stereo = menu_out.stereo;
         opt_.stereo_full = menu_out.stereo_full;
+        flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
         scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
         menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
         if (decoder.is_open()) {
@@ -3925,11 +3999,13 @@ void HostWindow::xrThreadMain() {
           }
         }
         const bool help_on = controls_help_.load();
+        const bool toast_on = hudToastActive();
         const int want_kind = help_on ? 1
                                       : menu.visible() ? 2
                                       : menu.controls_visible() ? 3
                                       : menu.seek_bar_only() ? 4
-                                                             : 0;
+                                      : toast_on                 ? 5
+                                                                 : 0;
         if (hud_tex.poll_present() && inflight_atlas != 0) {
           resident_atlas = inflight_atlas;
           atlas_resize = false;
@@ -3952,6 +4028,8 @@ void HostWindow::xrThreadMain() {
             constexpr float kOldAspect = 720.f / 1280.f;
             const float y = kControlsHalfW * (kHudAspect - kOldAspect);
             scene.set_hud_layout(kControlsHalfW, kHudDistanceM, kHudAspect, y);
+          } else if (kind == 5) {
+            scene.set_hud_layout(0.55f, kHudDistanceM, kHudAspect);
           }
         };
         const bool atlas_ready =
@@ -4067,7 +4145,7 @@ void HostWindow::xrThreadMain() {
         }
       }
 
-      if (menu_out.view_reset) {
+      if (input.view_reset) {
         look_yaw = 0.f;
         look_pitch = 0.f;
       }

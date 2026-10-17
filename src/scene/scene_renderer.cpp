@@ -1,13 +1,13 @@
 #include "scene/scene_renderer.hpp"
+#include "starfield/starfield.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <mutex>
 #include <string>
-#include <vector>
-#include <fstream>
 #include <vector>
 
 #ifndef M_PI
@@ -194,6 +194,8 @@ void sphere_point(float lat_deg, float lon_deg, float radius, float& x, float& y
   z = -std::cos(lon) * cl * radius;
 }
 
+using StarVert = starfield::Vertex;
+
 std::vector<GridVert> build_comfort_grid() {
   // Y up. Longitude 0 looks down -Z, matching the video sphere.
   // ±90° are the poles: every meridian ends there, so those latitudes are the meeting points.
@@ -260,12 +262,15 @@ void SceneRenderer::shutdown() {
   }
   if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
   if (grid_pipeline_) vkDestroyPipeline(device_, grid_pipeline_, nullptr);
+  if (star_pipeline_) vkDestroyPipeline(device_, star_pipeline_, nullptr);
   if (layout_) vkDestroyPipelineLayout(device_, layout_, nullptr);
   if (grid_layout_) vkDestroyPipelineLayout(device_, grid_layout_, nullptr);
   if (vert_) vkDestroyShaderModule(device_, vert_, nullptr);
   if (frag_) vkDestroyShaderModule(device_, frag_, nullptr);
   if (grid_vert_) vkDestroyShaderModule(device_, grid_vert_, nullptr);
   if (grid_frag_) vkDestroyShaderModule(device_, grid_frag_, nullptr);
+  if (star_vert_) vkDestroyShaderModule(device_, star_vert_, nullptr);
+  if (star_frag_) vkDestroyShaderModule(device_, star_frag_, nullptr);
   if (dset_) {
     // freed with pool
   }
@@ -286,8 +291,10 @@ void SceneRenderer::shutdown() {
   destroy_buf(vbo_sphere_, vbo_sphere_mem_);
   destroy_buf(ibo_sphere_, ibo_sphere_mem_);
   destroy_buf(vbo_grid_, vbo_grid_mem_);
+  destroy_buf(vbo_stars_, vbo_stars_mem_);
   pipeline_ = VK_NULL_HANDLE;
   grid_pipeline_ = VK_NULL_HANDLE;
+  star_pipeline_ = VK_NULL_HANDLE;
   layout_ = VK_NULL_HANDLE;
   grid_layout_ = VK_NULL_HANDLE;
 }
@@ -596,6 +603,17 @@ void SceneRenderer::build_meshes() {
   if (!grid.empty()) {
     upload(grid.data(), grid.size() * sizeof(GridVert), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_grid_, vbo_grid_mem_);
   }
+
+  // Slightly outside the comfort grid (radius 80) so stars stay behind the cage.
+  starfield::MeshOptions star_opt;
+  star_opt.radius = 95.f;
+  const auto catalog = starfield::load_catalog(shader_dir_ + "/stars_wikidata.bin");
+  const std::vector<StarVert> stars = starfield::build_mesh(catalog, star_opt);
+  star_vert_count_ = static_cast<uint32_t>(stars.size());
+  if (!stars.empty()) {
+    upload(stars.data(), stars.size() * sizeof(StarVert), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_stars_,
+           vbo_stars_mem_);
+  }
 }
 
 void SceneRenderer::create_pipelines(VkFormat /*format*/) {
@@ -772,6 +790,72 @@ void SceneRenderer::create_pipelines(VkFormat /*format*/) {
   grid_gp.subpass = 0;
   VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &grid_gp, nullptr, &grid_pipeline_) == VK_SUCCESS,
             "grid pipeline");
+
+  // Starfield: soft discs with catalog RGB, additive blend, black sky behind video.
+  star_vert_ = load_shader(shader_dir_ + "/star.vert.spv");
+  star_frag_ = load_shader(shader_dir_ + "/star.frag.spv");
+  VkPipelineShaderStageCreateInfo star_stages[2]{};
+  star_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  star_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  star_stages[0].module = star_vert_;
+  star_stages[0].pName = "main";
+  star_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  star_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  star_stages[1].module = star_frag_;
+  star_stages[1].pName = "main";
+
+  VkVertexInputBindingDescription star_bind{};
+  star_bind.binding = 0;
+  star_bind.stride = sizeof(StarVert);
+  star_bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+  VkVertexInputAttributeDescription star_attrs[3]{};
+  star_attrs[0].location = 0;
+  star_attrs[0].binding = 0;
+  star_attrs[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+  star_attrs[0].offset = offsetof(StarVert, x);
+  star_attrs[1].location = 1;
+  star_attrs[1].binding = 0;
+  star_attrs[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+  star_attrs[1].offset = offsetof(StarVert, r);
+  star_attrs[2].location = 2;
+  star_attrs[2].binding = 0;
+  star_attrs[2].format = VK_FORMAT_R32G32_SFLOAT;
+  star_attrs[2].offset = offsetof(StarVert, u);
+  VkPipelineVertexInputStateCreateInfo star_vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  star_vi.vertexBindingDescriptionCount = 1;
+  star_vi.pVertexBindingDescriptions = &star_bind;
+  star_vi.vertexAttributeDescriptionCount = 3;
+  star_vi.pVertexAttributeDescriptions = star_attrs;
+
+  VkPipelineColorBlendAttachmentState star_blend{};
+  star_blend.blendEnable = VK_TRUE;
+  star_blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+  star_blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+  star_blend.colorBlendOp = VK_BLEND_OP_ADD;
+  star_blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  star_blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  star_blend.alphaBlendOp = VK_BLEND_OP_ADD;
+  star_blend.colorWriteMask =
+      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo star_cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  star_cb.attachmentCount = 1;
+  star_cb.pAttachments = &star_blend;
+
+  VkGraphicsPipelineCreateInfo star_gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  star_gp.stageCount = 2;
+  star_gp.pStages = star_stages;
+  star_gp.pVertexInputState = &star_vi;
+  star_gp.pInputAssemblyState = &grid_ia;
+  star_gp.pViewportState = &vp;
+  star_gp.pRasterizationState = &grid_rs;
+  star_gp.pMultisampleState = &ms;
+  star_gp.pColorBlendState = &star_cb;
+  star_gp.pDynamicState = &dyn;
+  star_gp.layout = grid_layout_;
+  star_gp.renderPass = app_->color_pass();
+  star_gp.subpass = 0;
+  VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &star_gp, nullptr, &star_pipeline_) == VK_SUCCESS,
+            "star pipeline");
 }
 
 void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapchain& sc,
@@ -783,7 +867,7 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   vkBeginCommandBuffer(cmd, &bi);
 
   VkClearValue clear{};
-  clear.color = {{0.02f, 0.02f, 0.05f, 1.f}};
+  clear.color = {{0.f, 0.f, 0.f, 1.f}};
   VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
   rp.renderPass = app_->color_pass();
   rp.framebuffer = img.framebuffer;
@@ -801,9 +885,6 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   vkCmdSetViewport(cmd, 0, 1, &viewport);
   vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &dset_, 0, nullptr);
-
   const Mat4 head = pose_to_matrix(view.pose);
   Mat4 view_mat = invert_rigid(head);
   // Stick look turns the picture around the head. The HUD stays on the real pose.
@@ -816,6 +897,25 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     content_view = invert_rigid(turned);
   }
   Mat4 proj = projection_fov(view.fov, 0.05f, 100.f);
+
+  // Celestial background (Wikidata stars). Drawn before video; turns with content look.
+  if (star_pipeline_ && vbo_stars_ && star_vert_count_ >= 6) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, star_pipeline_);
+    Mat4 star_model = Mat4::identity();
+    star_model.m[12] = head.m[12];
+    star_model.m[13] = head.m[13];
+    star_model.m[14] = head.m[14];
+    const Mat4 star_mvp = Mat4::mul(proj, Mat4::mul(content_view, star_model));
+    vkCmdPushConstants(cmd, grid_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(star_mvp), &star_mvp);
+    VkDeviceSize star_off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_stars_, &star_off);
+    vkCmdDraw(cmd, star_vert_count_, 1, 0, 0);
+  }
+
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &dset_, 0, nullptr);
+
   Mat4 model = Mat4::identity();
 
   if (mode_ == ProjectionMode::Flat) {

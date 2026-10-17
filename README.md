@@ -210,6 +210,14 @@ cmake --build build
 
 成果物 / Output: `build/monasphere`（隣接の `build/shaders/*.spv` / SPIR-V under `build/shaders/*.spv`）
 
+ゲームパッド／HUD 操作アイコンは静的ライブラリ `vrp_gamepad_icons`（`src/ui/gamepad_icons.hpp`）に分離してある。依存は Qt6::Gui のみ。他プロジェクトからは CMake で `vrp_gamepad_icons` をリンクし、`vrp::icons::paint_*` / `render_*` を呼べばよい。
+
+Gamepad/HUD control icons live in the static library `vrp_gamepad_icons` (`src/ui/gamepad_icons.hpp`), depending only on Qt6::Gui. Other projects can link that target and call `vrp::icons::paint_*` / `render_*`.
+
+全天の星カタログとメッシュ生成は静的ライブラリ `vrp_starfield`（`src/starfield/starfield.hpp`）。依存は C++ 標準ライブラリのみ（Qt / Vulkan 不要）。`load_catalog` / `build_mesh` と `shaders/star.*`、`data/stars_wikidata.bin`（Wikidata / CC0）を利用する。詳細は [`src/starfield/README.md`](src/starfield/README.md)。
+
+All-sky stars are in `vrp_starfield` (`src/starfield/starfield.hpp`): stdlib only. Use `load_catalog` / `build_mesh` with `shaders/star.*` and `data/stars_wikidata.bin` (Wikidata / CC0). See [`src/starfield/README.md`](src/starfield/README.md).
+
 実行例 / Run:
 
 ```bash
@@ -228,7 +236,9 @@ Distributed binaries are expected to be built against `ffmpeg-*-mini-devel`. The
 ## ライセンス
 
 - **本ソフトウェアのソース:** [MIT](LICENSE)
-- **第三者成分:** [`THIRD_PARTY.md`](THIRD_PARTY.md)（Qt、FFmpeg、OpenXR、Vulkan、Wayland、XCB、vendored ライブラリ等）
+- **同梱星カタログ**（`data/stars_wikidata.bin`）: [CC0 1.0](data/LICENSE)（Wikidata 由来）。詳細は [`data/README_stars.md`](data/README_stars.md)
+- **パッケージ SPDX（ソース＋同梱データ）:** `MIT AND CC0-1.0`
+- **第三者成分:** [`THIRD_PARTY.md`](THIRD_PARTY.md)（Qt、FFmpeg、OpenXR、Vulkan、Wayland、XCB、vendored ライブラリ、星データ等）
 - **直接表示の確認:** Wayland client と XCB / XCB RandR は MIT で動的リンクする。リース一覧の定義 [`third_party/wayland/drm-lease-v1.xml`](third_party/wayland/drm-lease-v1.xml) は MIT で同梱し、著作権表示はそのファイルに残す
 
 FFmpeg は動的リンクです。バイナリ配布時はリンク先 FFmpeg のライセンス（LGPL / GPL、ディストリのビルド内容）に従ってください。
@@ -236,7 +246,9 @@ FFmpeg は動的リンクです。バイナリ配布時はリンク先 FFmpeg �
 ### English
 
 - **Source of this software:** [MIT](LICENSE)
-- **Third-party components:** [`THIRD_PARTY.md`](THIRD_PARTY.md) (Qt, FFmpeg, OpenXR, Vulkan, Wayland, XCB, vendored libraries, and similar)
+- **Bundled star catalog** (`data/stars_wikidata.bin`): [CC0 1.0](data/LICENSE) (from Wikidata). See [`data/README_stars.md`](data/README_stars.md)
+- **Package SPDX (source + bundled data):** `MIT AND CC0-1.0`
+- **Third-party components:** [`THIRD_PARTY.md`](THIRD_PARTY.md) (Qt, FFmpeg, OpenXR, Vulkan, Wayland, XCB, vendored libraries, star data, and similar)
 - **Direct-mode checks:** Wayland client and XCB / XCB RandR are MIT and linked dynamically. The lease-list definition [`third_party/wayland/drm-lease-v1.xml`](third_party/wayland/drm-lease-v1.xml) is bundled under MIT, and its copyright notice stays in that file
 
 FFmpeg is linked dynamically. When distributing a binary, follow the license of the FFmpeg you link (LGPL / GPL, and the distro's build flags).

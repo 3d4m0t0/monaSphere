@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 #include <string>
@@ -65,6 +66,43 @@ struct PlayerOptions {
   ControllerProfile controller_profile = ControllerProfile::Gamepad;
   ControllerHand controller_hand = ControllerHand::Right;
 };
+
+/**
+ * Flat-only seat presets. Physical screen width is fixed to the Cinema seat
+ * (70° at 12 m → about 16.8 m wide). Distance changes; FOV follows so the
+ * same screen fills more or less of the view (front / center / rear).
+ */
+struct FlatScalePreset {
+  const char* name;
+  float fov_deg;
+  float distance_m;
+};
+
+// W = 2 * tan(35°) * 12 ≈ 16.805 m. FOV(d) = 2 * atan(W / (2d)).
+inline constexpr FlatScalePreset kFlatScalePresets[] = {
+    {"Near", 92.81f, 8.f},     // front
+    {"Cinema", 70.f, 12.f},    // center (reference size)
+    {"Far", 45.58f, 20.f},     // rear
+};
+inline constexpr int kFlatScalePresetCount =
+    static_cast<int>(sizeof(kFlatScalePresets) / sizeof(kFlatScalePresets[0]));
+
+/** Matching preset index, or -1 when fov/distance are custom. */
+inline int find_flat_scale_preset(float fov_deg, float distance_m) {
+  for (int i = 0; i < kFlatScalePresetCount; ++i) {
+    if (std::fabs(fov_deg - kFlatScalePresets[i].fov_deg) < 0.1f &&
+        std::fabs(distance_m - kFlatScalePresets[i].distance_m) < 0.05f) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+/** Next index after a cycle press. Custom values start the cycle at Near. */
+inline int next_flat_scale_preset(int current_or_minus_one) {
+  if (current_or_minus_one < 0) return 0;
+  return (current_or_minus_one + 1) % kFlatScalePresetCount;
+}
 
 inline const char* projection_name(ProjectionMode m) {
   switch (m) {

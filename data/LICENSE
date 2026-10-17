@@ -1,0 +1,10 @@
+SPDX-License-Identifier: CC0-1.0
+
+The bright-star catalog in this directory (`stars_wikidata.bin`) is derived from
+Wikidata structured data, which is dedicated to the public domain under the
+Creative Commons CC0 1.0 Universal Public Domain Dedication:
+
+  https://creativecommons.org/publicdomain/zero/1.0/
+
+See README_stars.md for catalog contents and how to regenerate the file.
+Attribution to Wikidata is appreciated but not required by CC0.

@@ -1,15 +1,15 @@
 #
 # spec file for package monasphere
 #
-# 方針: ffmpeg-N-mini-devel でビルドして配布（License: MIT）。
-# Policy: build and distribute against ffmpeg-N-mini-devel (License: MIT).
+# 方針: ffmpeg-N-mini-devel でビルド（ソース MIT）。同梱星カタログは CC0。
+# Policy: build against ffmpeg-N-mini-devel (source MIT). Bundled star catalog is CC0.
 #
 
 Name:           monasphere
 Version:        1.0.0
 Release:        dev.20261014
 Summary:        Native Linux VR video player (OpenXR / Vulkan)
-License:        MIT
+License:        MIT AND CC0-1.0
 Group:          Productivity/Multimedia/Video/Players
 URL:            https://github.com/3d4m0t0/monaSphere
 Source:         %{name}-%{version}.tar.xz
@@ -46,9 +46,10 @@ Requires:       libswresample.so.6()(64bit)
 monaSphere (command: monasphere) is a Linux-native VR video player using
 Vulkan and OpenXR (Monado). Flat / 180 / 360 projection, FSR1, host UI.
 
-Built against openSUSE ffmpeg-*-mini (LGPL) so this package stays MIT for
-Factory/OSS. Codecs at runtime follow the FFmpeg libraries that provide the
-same SONAME on the user's system. This package does not promise a codec set.
+Built against openSUSE ffmpeg-*-mini (LGPL). Source is MIT; the bundled
+Wikidata-derived star catalog is CC0-1.0 (License: MIT AND CC0-1.0).
+Codecs at runtime follow the FFmpeg libraries that provide the same SONAME
+on the user's system. This package does not promise a codec set.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -63,8 +64,8 @@ same SONAME on the user's system. This package does not promise a codec set.
 %cmake_install
 
 %files
-%license LICENSE
-%doc README.md
+%license LICENSE data/LICENSE
+%doc README.md THIRD_PARTY.md data/README_stars.md
 # CMake installs these under /usr/share/doc, not %%{_docdir} (/usr/share/doc/packages).
 %{_datadir}/doc/monasphere/
 %{_bindir}/monasphere

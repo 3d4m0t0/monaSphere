@@ -81,6 +81,8 @@ set(VRP_SHADERS
   ${CMAKE_SOURCE_DIR}/shaders/scene.frag
   ${CMAKE_SOURCE_DIR}/shaders/grid.vert
   ${CMAKE_SOURCE_DIR}/shaders/grid.frag
+  ${CMAKE_SOURCE_DIR}/shaders/star.vert
+  ${CMAKE_SOURCE_DIR}/shaders/star.frag
 )
 set(VRP_SPV_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${VRP_SPV_DIR})
@@ -146,6 +148,20 @@ list(APPEND VRP_SPV_FILES ${SPV})
 
 add_custom_target(vrp_shaders ALL DEPENDS ${VRP_SPV_FILES})
 
+# Gamepad / HUD control icons — Qt Gui only, reusable outside the player.
+add_library(vrp_gamepad_icons STATIC
+  src/ui/gamepad_icons.cpp
+)
+target_include_directories(vrp_gamepad_icons PUBLIC ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(vrp_gamepad_icons PUBLIC Qt6::Gui)
+
+# All-sky star catalog + mesh — stdlib only, reusable outside the player.
+add_library(vrp_starfield STATIC
+  src/starfield/starfield.cpp
+)
+set_target_properties(vrp_starfield PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
+target_include_directories(vrp_starfield PUBLIC ${CMAKE_SOURCE_DIR}/src)
+
 # STATIC: the SUSE cmake macro sets BUILD_SHARED_LIBS=ON, which would
 # otherwise emit an unpackaged libvrp_core.so that the player requires.
 add_library(vrp_core STATIC
@@ -171,6 +187,7 @@ target_include_directories(vrp_core PUBLIC
   ${VULKAN_INCLUDE_DIRS}
 )
 target_link_libraries(vrp_core PUBLIC
+  vrp_starfield
   ${OPENXR_LIBRARIES}
   ${VULKAN_LIBRARIES}
   ${CMAKE_DL_LIBS}
@@ -241,7 +258,7 @@ add_executable(vrp_player
   ${DRM_LEASE_CODE}
 )
 set_target_properties(vrp_player PROPERTIES OUTPUT_NAME monasphere)
-target_link_libraries(vrp_player PRIVATE vrp_core Qt6::Widgets Qt6::Network Qt6::DBus
+target_link_libraries(vrp_player PRIVATE vrp_core vrp_gamepad_icons Qt6::Widgets Qt6::Network Qt6::DBus
                       ${WAYLAND_CLIENT_LIBRARIES} ${XCB_RANDR_LIBRARIES} ${CMAKE_DL_LIBS})
 target_include_directories(vrp_player PRIVATE ${CMAKE_BINARY_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS}
                            ${XCB_RANDR_INCLUDE_DIRS})
@@ -257,16 +274,34 @@ add_dependencies(vrp_player vrp_shaders)
 add_custom_command(TARGET vrp_player POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:vrp_player>/shaders
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${VRP_SPV_DIR} $<TARGET_FILE_DIR:vrp_player>/shaders
+  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/data/stars_wikidata.bin
+          $<TARGET_FILE_DIR:vrp_player>/shaders/stars_wikidata.bin
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:vrp_player>/translations
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/translations $<TARGET_FILE_DIR:vrp_player>/translations
 )
 
 install(TARGETS vrp_player RUNTIME DESTINATION bin)
+install(TARGETS vrp_gamepad_icons vrp_starfield ARCHIVE DESTINATION lib)
+install(FILES ${CMAKE_SOURCE_DIR}/src/ui/gamepad_icons.hpp DESTINATION include/vrp/ui)
+install(FILES ${CMAKE_SOURCE_DIR}/src/starfield/starfield.hpp DESTINATION include/vrp/starfield)
+install(FILES
+  ${CMAKE_SOURCE_DIR}/shaders/star.vert
+  ${CMAKE_SOURCE_DIR}/shaders/star.frag
+  ${CMAKE_SOURCE_DIR}/data/LICENSE
+  ${CMAKE_SOURCE_DIR}/data/README_stars.md
+  DESTINATION share/vrp/starfield)
+install(FILES ${CMAKE_SOURCE_DIR}/src/starfield/README.md DESTINATION share/doc/vrp_starfield)
 install(FILES ${CMAKE_SOURCE_DIR}/icons/hicolor/256x256/apps/monasphere.png
   DESTINATION share/icons/hicolor/256x256/apps)
 install(FILES ${CMAKE_SOURCE_DIR}/data/monasphere.desktop
   DESTINATION share/applications)
 install(DIRECTORY ${VRP_SPV_DIR}/ DESTINATION share/monasphere/shaders)
+install(FILES ${CMAKE_SOURCE_DIR}/data/stars_wikidata.bin
+  DESTINATION share/monasphere/shaders)
+install(FILES
+  ${CMAKE_SOURCE_DIR}/data/LICENSE
+  ${CMAKE_SOURCE_DIR}/data/README_stars.md
+  DESTINATION share/monasphere/shaders)
 install(FILES ${CMAKE_SOURCE_DIR}/THIRD_PARTY.md
   DESTINATION share/doc/monasphere
 )

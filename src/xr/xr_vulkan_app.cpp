@@ -138,8 +138,11 @@ void XrVulkanApp::shutdown() {
   actions_ready_ = false;
   play_action_ = seek_back_action_ = seek_fwd_action_ = recenter_action_ = XR_NULL_HANDLE;
   navigate_action_ = confirm_action_ = back_action_ = menu_toggle_action_ = XR_NULL_HANDLE;
+  flat_scale_action_ = view_reset_action_ = XR_NULL_HANDLE;
   look_action_ = XR_NULL_HANDLE;
   l2_action_ = r2_action_ = XR_NULL_HANDLE;
+  menu_btn_down_ = false;
+  menu_long_fired_ = false;
 
   if (session_) {
     xrDestroySession(session_);
@@ -625,6 +628,8 @@ void XrVulkanApp::create_actions() {
   make_bool("confirm", "Confirm", &confirm_action_);
   make_bool("back", "Back", &back_action_);
   make_bool("menu_toggle", "Menu Toggle", &menu_toggle_action_);
+  make_bool("flat_scale", "Flat Scale", &flat_scale_action_);
+  make_bool("view_reset", "Reset View", &view_reset_action_);
   make_bool("rate_slower", "Slower", &l2_action_);
   make_bool("rate_faster", "Faster", &r2_action_);
 
@@ -681,16 +686,19 @@ void XrVulkanApp::create_actions() {
   }
 
   // Oculus Touch / PSVR2 Sense (typical under Monado)
+  // Options short = file dialog, Options long = recenter (see poll_actions).
+  // △ = Flat seats. R3 = reset look. ○ = back. Recenter also on HMD function.
   if (want(ControllerProfile::OculusTouch)) {
     suggest("/interaction_profiles/oculus/touch_controller",
             add_look({{navigate_action_, hand_path(primary, "thumbstick")},
                       {confirm_action_, hand_path(primary, left ? "x/click" : "a/click")},
-                      {back_action_, hand_path(primary, left ? "y/click" : "b/click")},
-                      {menu_toggle_action_, hand_path(secondary, left ? "b/click" : "y/click")},
+                      {back_action_, hand_path("right", "b/click")},
+                      {menu_toggle_action_, hand_path("left", "menu/click")},
+                      {flat_scale_action_, hand_path("left", "y/click")},
+                      {view_reset_action_, hand_path("right", "thumbstick/click")},
                       {play_action_, hand_path(primary, "squeeze/click")},
                       {seek_back_action_, hand_path(secondary, left ? "a/click" : "x/click")},
-                      {seek_fwd_action_, hand_path(primary, "thumbstick/click")},
-                      {recenter_action_, hand_path(secondary, "menu/click")},
+                      {seek_fwd_action_, hand_path("left", "thumbstick/click")},
                       {l2_action_, hand_path("left", "trigger/click")},
                       {r2_action_, hand_path("right", "trigger/click")}},
                      "thumbstick"));
@@ -1097,7 +1105,28 @@ XrVulkanApp::InputState XrVulkanApp::poll_actions() {
   st.confirm_held = action_down(confirm_action_);
   st.back = edge(back_action_);
   st.back_held = action_down(back_action_);
-  st.menu_toggle = edge(menu_toggle_action_);
+  st.flat_scale = edge(flat_scale_action_);
+  st.view_reset = edge(view_reset_action_);
+
+  // Options / menu button: short release toggles the file dialog; long press recenters.
+  {
+    constexpr auto kMenuLongPress = std::chrono::milliseconds(700);
+    const bool menu_down = action_down(menu_toggle_action_);
+    if (menu_down) {
+      if (!menu_btn_down_) {
+        menu_btn_down_ = true;
+        menu_long_fired_ = false;
+        menu_down_at_ = now;
+      } else if (!menu_long_fired_ && now - menu_down_at_ >= kMenuLongPress) {
+        st.recenter = true;
+        menu_long_fired_ = true;
+      }
+    } else if (menu_btn_down_) {
+      if (!menu_long_fired_) st.menu_toggle = true;
+      menu_btn_down_ = false;
+      menu_long_fired_ = false;
+    }
+  }
 
   if (navigate_action_) {
     XrActionStateGetInfo gi{XR_TYPE_ACTION_STATE_GET_INFO};

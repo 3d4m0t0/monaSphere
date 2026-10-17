@@ -11,6 +11,7 @@
 #include <QString>
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -144,6 +145,9 @@ class HostWindow : public QMainWindow {
   void paintHudNow();
   void showControlsHelp();
   void hideControlsHelp();
+  /** Short HMD toast (Flat scale preset). Safe from the XR thread. */
+  void showHudToast(const QString& text, int duration_ms = 2200);
+  bool hudToastActive() const;
   QString findMonadoBinary() const;
   QString findWivrnBinary() const;
   QString findRuntimeJson() const;
@@ -188,6 +192,10 @@ class HostWindow : public QMainWindow {
   vrp::VrMenu* vr_menu_ = nullptr;
   std::atomic<bool> controls_help_{false};
   std::atomic<int64_t> controls_help_until_ms_{0};
+  mutable std::mutex hud_toast_mu_;
+  QString hud_toast_;
+  std::chrono::steady_clock::time_point hud_toast_until_{};
+  std::atomic<bool> hud_toast_active_{false};
   /** B that closed the help card is still down. Do not treat its release as a controls toggle. */
   bool help_swallow_back_ = false;
   std::atomic<uint64_t> hud_paint_req_{0};
@@ -198,7 +206,7 @@ class HostWindow : public QMainWindow {
   /** GPU atlas RGBA. Uploaded only when hud_atlas_gen_ changes. */
   std::vector<uint8_t> hud_pixels_;
   std::vector<vrp::HudVertex> hud_verts_;
-  /** 0 none, 1 help, 2 file dialog, 3 playback controls. Guarded by hud_pixels_mu_. */
+  /** 0 none, 1 help, 2 file dialog, 3 playback controls, 4 seek bar, 5 toast. */
   int hud_pixels_kind_ = 0;
   int hud_w_ = 1280;
   int hud_h_ = 720;

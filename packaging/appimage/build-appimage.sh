@@ -106,6 +106,8 @@ cmake --install "$work/build" --prefix "$appdir/usr"
 doc=$appdir/usr/share/doc/monasphere
 mkdir -p "$doc"
 cp "$root/LICENSE" "$root/THIRD_PARTY.md" "$doc/"
+cp "$root/data/LICENSE" "$doc/stars-CC0-LICENSE"
+cp "$root/data/README_stars.md" "$doc/"
 cp "$deps/ffmpeg-$ffmpeg_version/COPYING.LGPLv2.1" "$doc/ffmpeg-COPYING.LGPLv2.1"
 if [ -f /usr/share/doc/qt6-base-dev/copyright ]; then
   cp /usr/share/doc/qt6-base-dev/copyright "$doc/Qt-copyright"
@@ -114,11 +116,14 @@ cat > "$doc/AppImage.txt" <<EOF
 monaSphere AppImage
 
 Source license: MIT (LICENSE).
+Bundled star catalog (stars_wikidata.bin): CC0 1.0 (stars-CC0-LICENSE,
+README_stars.md) from Wikidata.
 This image also contains Qt 6 (LGPL, see Qt-copyright) and FFmpeg $ffmpeg_version
 built with --disable-gpl --disable-nonfree --extra-version=monasphere-lgpl
 (see ffmpeg-COPYING.LGPLv2.1). nv-codec-headers $nv_headers_version supply the
 NVDEC API; libcuda.so.1 is not included.
 Vulkan ICDs, VA-API/VDPAU drivers, and the OpenXR runtime come from the host.
+See THIRD_PARTY.md for the full list.
 EOF
 
 if ! pkg-config --exists libavcodec; then
@@ -244,6 +249,10 @@ if [ -z "$codec" ] || ! strings "$codec" | grep -q monasphere-lgpl; then
 fi
 if [ ! -f "$appdir/usr/share/monasphere/shaders/scene.vert.spv" ]; then
   echo "AppDir is missing shaders" >&2
+  exit 1
+fi
+if [ ! -f "$appdir/usr/share/monasphere/shaders/stars_wikidata.bin" ]; then
+  echo "AppDir is missing star catalog" >&2
   exit 1
 fi
 if [ ! -f "$appdir/usr/plugins/platforms/libqxcb.so" ] \

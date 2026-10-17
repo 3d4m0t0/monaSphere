@@ -930,33 +930,15 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     }
   }
 
-  // B held: short release backs out. A long hold resets the stick look offset.
+  // B / ○: release backs out (level tracking so a held B does not repeat).
   bool back_short = false;
-  bool back_long_reset = false;
   if (in.back_held) {
-    if (!back_held_) {
-      back_held_ = true;
-      back_long_fired_ = false;
-      back_held_sec_ = 0.f;
-    } else {
-      back_held_sec_ += dt;
-      if (!back_long_fired_ && back_held_sec_ >= kBackLongPressSec) {
-        back_long_fired_ = true;
-        back_long_reset = true;
-      }
-    }
+    if (!back_held_) back_held_ = true;
   } else if (back_held_) {
-    if (!back_long_fired_) back_short = true;
+    back_short = true;
     back_held_ = false;
-    back_long_fired_ = false;
-    back_held_sec_ = 0.f;
   }
   prev_back_ = in.back_held;
-
-  if (back_long_reset) {
-    out.view_reset = true;
-    return out;
-  }
 
   if (menu_toggle) {
     if (visible_) {

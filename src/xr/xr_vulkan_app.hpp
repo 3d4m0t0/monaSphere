@@ -163,6 +163,10 @@ class XrVulkanApp {
     bool back = false;
     bool back_held = false;  // B / back button level
     bool menu_toggle = false;
+    /** Y / △. Flat seat preset cycle when applicable. */
+    bool flat_scale = false;
+    /** Right stick click (R3). Clears stick look offset. */
+    bool view_reset = false;
     /** Left / right trigger held (L2 / R2). */
     bool l2_held = false;
     bool r2_held = false;
@@ -234,6 +238,8 @@ class XrVulkanApp {
   XrAction confirm_action_ = XR_NULL_HANDLE;
   XrAction back_action_ = XR_NULL_HANDLE;
   XrAction menu_toggle_action_ = XR_NULL_HANDLE;
+  XrAction flat_scale_action_ = XR_NULL_HANDLE;
+  XrAction view_reset_action_ = XR_NULL_HANDLE;
   XrAction l2_action_ = XR_NULL_HANDLE;
   XrAction r2_action_ = XR_NULL_HANDLE;
   bool actions_ready_ = false;
@@ -247,6 +253,11 @@ class XrVulkanApp {
   bool seek_fwd_repeating_ = false;
   std::chrono::steady_clock::time_point seek_back_next_{};
   std::chrono::steady_clock::time_point seek_fwd_next_{};
+
+  // Options / menu: short = file dialog, long = recenter (same timing as gamepad Start).
+  bool menu_btn_down_ = false;
+  bool menu_long_fired_ = false;
+  std::chrono::steady_clock::time_point menu_down_at_{};
 };
 
 }  // namespace vrp

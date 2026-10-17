@@ -2,16 +2,16 @@
 #include "i18n.hpp"
 #include "options.hpp"
 
+#include "ui/gamepad_icons.hpp"
+
 #include <QGuiApplication>
 #include <QPainter>
 #include <QFont>
-#include <QFontInfo>
 #include <QFontMetrics>
 #include <QPainterPath>
 #include <QImage>
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 
@@ -34,16 +34,8 @@ uint64_t hud_key(std::initializer_list<uint64_t> parts, const QString& extra = {
 bool sony_face_buttons = false;
 bool menu_button_option = false;
 
-QFont iconGothicBold(int point_size) {
-  const char* families[] = {"DejaVu Sans", "Liberation Sans", "Nimbus Sans", "Noto Sans"};
-  for (const char* name : families) {
-    QFont f(QString::fromUtf8(name), point_size, QFont::Bold);
-    f.setStyleName(QStringLiteral("Bold"));
-    if (QFontInfo(f).family().compare(QLatin1String(name), Qt::CaseInsensitive) == 0) return f;
-  }
-  QFont f(QStringLiteral("Sans Serif"), point_size, QFont::Bold);
-  f.setBold(true);
-  return f;
+icons::FaceLayout face_layout() {
+  return sony_face_buttons ? icons::FaceLayout::Sony : icons::FaceLayout::Xbox;
 }
 
 QFont deUiFont(int point_size, QFont::Weight weight) {
@@ -215,285 +207,88 @@ void paint_transport_icon(HudCanvas& c, const QRect& r, TransportIcon kind, bool
                  });
 }
 
-enum class DpadDir { Up, Down, Left, Right };
+using DpadDir = icons::DpadDir;
+using StickMotion = icons::StickMotion;
 
-void paint_knockout_qp(QPainter& p, const QRect& r, bool round, const QString& letter, QPoint shift,
-                       qreal corner) {
-  constexpr int kScale = 2;
-  QImage plate(r.width() * kScale, r.height() * kScale, QImage::Format_ARGB32_Premultiplied);
-  plate.fill(Qt::transparent);
-  QPainter ip(&plate);
-  ip.setRenderHint(QPainter::Antialiasing, true);
-  ip.setRenderHint(QPainter::TextAntialiasing, true);
-  ip.scale(kScale, kScale);
-  ip.setPen(Qt::NoPen);
-  ip.setBrush(Qt::white);
-  const QRectF box(0, 0, r.width(), r.height());
-  if (round) ip.drawEllipse(box.adjusted(0.5, 0.5, -0.5, -0.5));
-  else ip.drawRoundedRect(box.adjusted(0.5, 0.5, -0.5, -0.5), corner, corner);
-  ip.setCompositionMode(QPainter::CompositionMode_DestinationOut);
-  ip.setFont(iconGothicBold(15));
-  ip.setPen(Qt::white);
-  ip.drawText(box.translated(shift).toAlignedRect(), Qt::AlignCenter, letter);
-  ip.end();
-  p.save();
-  p.setRenderHint(QPainter::SmoothPixmapTransform, true);
-  p.drawImage(r, plate);
-  p.restore();
-}
+enum class HelpIcon { None, A, B, X, Y, Stick, StickR, StickR3, Speed, SpeedReset, Start };
 
-void paint_round_qp(QPainter& p, const QRect& r, const QString& letter) {
-  paint_knockout_qp(p, r, true, letter, QPoint(0, 0), 0);
-}
-
-void paint_sony_qp(QPainter& p, const QRect& r, bool cross) {
-  constexpr int kScale = 2;
-  QImage plate(r.width() * kScale, r.height() * kScale, QImage::Format_ARGB32_Premultiplied);
-  plate.fill(Qt::transparent);
-  QPainter ip(&plate);
-  ip.setRenderHint(QPainter::Antialiasing, true);
-  ip.scale(kScale, kScale);
-  ip.setPen(Qt::NoPen);
-  ip.setBrush(Qt::white);
-  const QRectF box(0, 0, r.width(), r.height());
-  ip.drawEllipse(box.adjusted(0.5, 0.5, -0.5, -0.5));
-
-  const qreal d = std::min(box.width(), box.height());
-  const QPointF c = box.center();
-  const qreal thick = d * 0.14;
-  ip.setCompositionMode(QPainter::CompositionMode_DestinationOut);
-  ip.setBrush(Qt::white);
-  if (cross) {
-    const qreal arm = d * 0.36;
-    ip.save();
-    ip.translate(c);
-    ip.rotate(45);
-    ip.drawRoundedRect(QRectF(-arm, -thick / 2, arm * 2, thick), thick / 2, thick / 2);
-    ip.rotate(90);
-    ip.drawRoundedRect(QRectF(-arm, -thick / 2, arm * 2, thick), thick / 2, thick / 2);
-    ip.restore();
-  } else {
-    const qreal outer = d * 0.40;
-    QPainterPath ring;
-    ring.setFillRule(Qt::OddEvenFill);
-    ring.addEllipse(c, outer, outer);
-    ring.addEllipse(c, outer - thick, outer - thick);
-    ip.drawPath(ring);
-  }
-  ip.end();
-  p.save();
-  p.setRenderHint(QPainter::SmoothPixmapTransform, true);
-  p.drawImage(r, plate);
-  p.restore();
-}
-
-void paint_face_qp(QPainter& p, const QRect& r, bool confirm) {
-  if (!sony_face_buttons) {
-    paint_round_qp(p, r, confirm ? QStringLiteral("A") : QStringLiteral("B"));
-    return;
-  }
-  paint_sony_qp(p, r, confirm);
-}
-
-void paint_square_qp(QPainter& p, const QRect& r, const QString& letter) {
-  const qreal corner = std::min(r.width(), r.height()) * 0.35;
-  paint_knockout_qp(p, r, false, letter, QPoint(0, 0), corner);
-}
-
-void paint_face_button(HudCanvas& c, const QRect& r, bool confirm) {
-  const QString mark = confirm ? (sony_face_buttons ? QStringLiteral("cross") : QStringLiteral("A"))
-                               : (sony_face_buttons ? QStringLiteral("circle") : QStringLiteral("B"));
-  c.paint_cached(hud_key({4, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height()),
-                          sony_face_buttons ? 1ull : 0ull, confirm ? 1ull : 0ull},
-                         mark),
-                 r, r.width(), r.height(),
-                 [&](QPainter& p) { paint_face_qp(p, QRect(0, 0, r.width(), r.height()), confirm); });
-}
-
-void paint_square_button(HudCanvas& c, const QRect& r, const QString& letter) {
-  c.paint_cached(hud_key({5, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, letter), r,
-                 r.width(), r.height(), [&](QPainter& p) {
-                   paint_square_qp(p, QRect(0, 0, r.width(), r.height()), letter);
-                 });
-}
-
-void paint_trigger_qp(QPainter& p, const QRect& r, const QString& label) {
-  constexpr int kScale = 2;
-  QImage plate(std::max(1, r.width()) * kScale, std::max(1, r.height()) * kScale,
-               QImage::Format_ARGB32_Premultiplied);
-  plate.fill(Qt::transparent);
-  QPainter ip(&plate);
-  ip.setRenderHint(QPainter::Antialiasing, true);
-  ip.setRenderHint(QPainter::TextAntialiasing, true);
-  ip.scale(kScale, kScale);
-  ip.setPen(Qt::NoPen);
-  ip.setBrush(Qt::white);
-  const QRectF b(0.5, 0.5, std::max(1, r.width()) - 1.0, std::max(1, r.height()) - 1.0);
-  const qreal rad = std::min(b.width(), b.height()) * 0.42;
-  ip.drawRoundedRect(b, rad, rad);
-  QFont font = iconGothicBold(6);
-  for (int pt = 14; pt >= 6; --pt) {
-    const QFont try_font = iconGothicBold(pt);
-    if (QFontMetricsF(try_font).tightBoundingRect(label).width() <= b.width() - 4) {
-      font = try_font;
-      break;
-    }
-  }
-  const QRectF ink = QFontMetricsF(font).tightBoundingRect(label);
-  const QPointF c = b.center();
-  const QPointF at(c.x() - (ink.x() + ink.width() / 2.0), c.y() - (ink.y() + ink.height() / 2.0));
-  ip.setCompositionMode(QPainter::CompositionMode_DestinationOut);
-  ip.setFont(font);
-  ip.setPen(Qt::white);
-  ip.drawText(at, label);
-  ip.end();
-  p.save();
-  p.setRenderHint(QPainter::SmoothPixmapTransform, true);
-  p.drawImage(r, plate);
-  p.restore();
-}
-
-void paint_trigger_button(HudCanvas& c, const QRect& r, const QString& label) {
-  c.paint_cached(hud_key({26, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, label), r,
-                 r.width(), r.height(), [&](QPainter& p) {
-                   paint_trigger_qp(p, QRect(0, 0, r.width(), r.height()), label);
-                 });
-}
-
-void paint_dpad_qp(QPainter& p, const QRect& box, DpadDir dir) {
-  p.save();
-  p.setRenderHint(QPainter::Antialiasing, true);
-  p.setPen(Qt::NoPen);
-  const QPointF c(box.x() + box.width() / 2.0, box.y() + box.height() / 2.0);
-  const qreal s = std::min(box.width(), box.height());
-  const qreal t = s / 3.0;
-  const qreal rad = t * 0.28;
-  const QRectF vert(c.x() - t / 2, c.y() - s / 2, t, s);
-  const QRectF horiz(c.x() - s / 2, c.y() - t / 2, s, t);
-  p.setBrush(QColor(78, 86, 102));
-  p.drawRoundedRect(vert, rad, rad);
-  p.drawRoundedRect(horiz, rad, rad);
-
-  p.translate(c);
-  if (dir == DpadDir::Down) p.rotate(180);
-  else if (dir == DpadDir::Left) p.rotate(-90);
-  else if (dir == DpadDir::Right) p.rotate(90);
-  const qreal arm_len = (s - t) / 2;
-  const QRectF arm(-t / 2, -s / 2, t, arm_len);
-  const qreal rr = std::min(rad, std::min(arm.width(), arm.height()) * 0.5);
-  QPainterPath tip;
-  tip.moveTo(arm.left() + rr, arm.top());
-  tip.lineTo(arm.right() - rr, arm.top());
-  tip.arcTo(QRectF(arm.right() - 2 * rr, arm.top(), 2 * rr, 2 * rr), 90, -90);
-  tip.lineTo(arm.right(), arm.bottom());
-  tip.lineTo(arm.left(), arm.bottom());
-  tip.lineTo(arm.left(), arm.top() + rr);
-  tip.arcTo(QRectF(arm.left(), arm.top(), 2 * rr, 2 * rr), 180, -90);
-  tip.closeSubpath();
-  p.setBrush(QColor(214, 42, 48));
-  p.drawPath(tip);
-  p.restore();
-}
-
-void paint_dpad(HudCanvas& c, const QRect& box, DpadDir dir) {
-  c.paint_cached(hud_key({20, static_cast<uint64_t>(box.width()), static_cast<uint64_t>(box.height()),
-                         static_cast<uint64_t>(dir)}),
-                 box, box.width(), box.height(), [&](QPainter& p) {
-                   paint_dpad_qp(p, QRect(0, 0, box.width(), box.height()), dir);
-                 });
-}
-
-enum class HelpIcon { None, A, B, Stick, StickR, Speed, SpeedReset, Start };
-
-constexpr int kIcon = 32;
+constexpr int kIcon = icons::kDefaultFaceSize;
 constexpr int kStick = kIcon;
-constexpr int kStartPad = 2;
 
 QString menu_button_text() {
   return menu_button_option ? QStringLiteral("OPTION") : QStringLiteral("MENU");
 }
 
-constexpr int kMenuPt = 11;
+int menu_button_width() { return icons::menu_chip_width(menu_button_text()); }
 
-int menu_button_width() {
-  const int tw = QFontMetrics(iconGothicBold(kMenuPt)).horizontalAdvance(menu_button_text());
-  return tw + kStartPad * 2 + 8;
+int start_icon_height() { return icons::menu_chip_height(menu_button_text()); }
+
+void paint_face_button(HudCanvas& c, const QRect& r, bool confirm) {
+  const auto btn = confirm ? icons::FaceButton::A : icons::FaceButton::B;
+  const QString mark = confirm ? (sony_face_buttons ? QStringLiteral("cross") : QStringLiteral("A"))
+                               : (sony_face_buttons ? QStringLiteral("circle") : QStringLiteral("B"));
+  c.paint_cached(hud_key({4, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height()),
+                          sony_face_buttons ? 1ull : 0ull, confirm ? 1ull : 0ull},
+                         mark),
+                 r, r.width(), r.height(), [&](QPainter& p) {
+                   icons::paint_face(p, QRect(0, 0, r.width(), r.height()), btn, face_layout());
+                 });
 }
 
-int start_icon_height() {
-  const int text_h = QFontMetrics(iconGothicBold(kMenuPt)).tightBoundingRect(menu_button_text()).height();
-  return text_h + kStartPad * 2 + 4;
+void paint_xy_face_button(HudCanvas& c, const QRect& r, bool north) {
+  const auto btn = north ? icons::FaceButton::Y : icons::FaceButton::X;
+  const QString mark = north ? (sony_face_buttons ? QStringLiteral("tri") : QStringLiteral("Y"))
+                             : (sony_face_buttons ? QStringLiteral("sqr") : QStringLiteral("X"));
+  c.paint_cached(hud_key({29, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height()),
+                          sony_face_buttons ? 1ull : 0ull, north ? 1ull : 0ull},
+                         mark),
+                 r, r.width(), r.height(), [&](QPainter& p) {
+                   icons::paint_face(p, QRect(0, 0, r.width(), r.height()), btn, face_layout());
+                 });
 }
 
-void paint_start_qp(QPainter& p, const QRect& r) {
-  p.save();
-  p.setRenderHint(QPainter::Antialiasing, true);
-  p.setRenderHint(QPainter::TextAntialiasing, true);
-  const QString text = menu_button_text();
-  const QFont font = iconGothicBold(kMenuPt);
-  const QRectF ink = QFontMetricsF(font).tightBoundingRect(text);
-  p.setBrush(Qt::NoBrush);
-  p.setPen(QPen(Qt::white, 1.2));
-  p.drawRoundedRect(QRectF(r).adjusted(0.6, 0.6, -0.6, -0.6), 3, 3);
-  const QPointF c(r.x() + r.width() / 2.0, r.y() + r.height() / 2.0);
-  const QPointF at(c.x() - (ink.x() + ink.width() / 2.0), c.y() - (ink.y() + ink.height() / 2.0));
-  p.setFont(font);
-  p.setPen(Qt::white);
-  p.drawText(at, text);
-  p.restore();
+void paint_trigger_button(HudCanvas& c, const QRect& r, const QString& label) {
+  c.paint_cached(hud_key({26, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, label), r,
+                 r.width(), r.height(), [&](QPainter& p) {
+                   icons::paint_trigger(p, QRect(0, 0, r.width(), r.height()), label);
+                 });
 }
 
-void paint_stick_qp(QPainter& p, const QRect& r, const QString& hand) {
-  p.save();
-  p.setRenderHint(QPainter::Antialiasing, true);
-  p.setRenderHint(QPainter::TextAntialiasing, true);
-  const QRectF b = QRectF(r).adjusted(0.5, 0.5, -0.5, -0.5);
-  const qreal side = std::min(b.width(), b.height());
-  const QRectF circle(b.center().x() - side / 2.0, b.center().y() - side / 2.0, side, side);
-  p.setPen(Qt::NoPen);
-  p.setBrush(QColor(140, 146, 156));
-  p.drawEllipse(circle);
-  const qreal inner = side * 0.62;
-  QFont font = iconGothicBold(8);
-  for (int pt = 18; pt >= 6; --pt) {
-    const QFont try_font = iconGothicBold(pt);
-    const QRectF ink = QFontMetricsF(try_font).tightBoundingRect(hand);
-    if (ink.width() <= inner && ink.height() <= inner) {
-      font = try_font;
-      break;
-    }
-  }
-  const QRectF ink = QFontMetricsF(font).tightBoundingRect(hand);
-  const QPointF c = circle.center();
-  const QPointF at(c.x() - (ink.x() + ink.width() / 2.0), c.y() - (ink.y() + ink.height() / 2.0));
-  p.setFont(font);
-  p.setPen(Qt::white);
-  p.drawText(at, hand);
-  p.restore();
+void paint_dpad(HudCanvas& c, const QRect& box, DpadDir dir) {
+  c.paint_cached(hud_key({20, static_cast<uint64_t>(box.width()), static_cast<uint64_t>(box.height()),
+                          static_cast<uint64_t>(dir)}),
+                 box, box.width(), box.height(), [&](QPainter& p) {
+                   icons::paint_dpad(p, QRect(0, 0, box.width(), box.height()), dir);
+                 });
 }
 
 void paint_start_button(HudCanvas& c, const QRect& r) {
   const QString text = menu_button_text();
   c.paint_cached(hud_key({24, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, text), r,
                  r.width(), r.height(), [&](QPainter& p) {
-                   paint_start_qp(p, QRect(0, 0, r.width(), r.height()));
+                   icons::paint_menu_chip(p, QRect(0, 0, r.width(), r.height()), text);
                  });
 }
 
-void paint_stick_icon(HudCanvas& c, const QRect& r, const QString& hand) {
-  c.paint_cached(hud_key({18, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, hand), r,
-                 r.width(), r.height(), [&](QPainter& p) {
-                   paint_stick_qp(p, QRect(0, 0, r.width(), r.height()), hand);
+void paint_stick_icon(HudCanvas& c, const QRect& r, const QString& hand, StickMotion motion) {
+  c.paint_cached(hud_key({20, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height()),
+                          static_cast<uint64_t>(motion)},
+                         hand),
+                 r, r.width(), r.height(), [&](QPainter& p) {
+                   icons::paint_stick(p, QRect(0, 0, r.width(), r.height()), hand, motion);
                  });
 }
 
 int help_icon_width(HelpIcon kind) {
   constexpr int kFace = kIcon;
-  if (kind == HelpIcon::A || kind == HelpIcon::B) return kFace;
+  constexpr int kTrigW = 44;
+  constexpr int kTrigGap = 8;
+  if (kind == HelpIcon::A || kind == HelpIcon::B || kind == HelpIcon::X || kind == HelpIcon::Y)
+    return kFace;
   if (kind == HelpIcon::Start) return menu_button_width();
-  if (kind == HelpIcon::Stick) return 28 * 2 + 4 + 8 + kStick;
-  if (kind == HelpIcon::StickR) return kStick;
-  if (kind == HelpIcon::Speed) return 44 * 2 + 8;
+  if (kind == HelpIcon::Stick) return kTrigW * 2 + kTrigGap + 8 + kStick;
+  if (kind == HelpIcon::StickR || kind == HelpIcon::StickR3) return kStick;
+  if (kind == HelpIcon::Speed) return kTrigW * 2 + kTrigGap;
   if (kind == HelpIcon::SpeedReset) return 96;
   return 0;
 }
@@ -505,6 +300,10 @@ int paint_help_icons(HudCanvas& c, int x, int y, int h, HelpIcon kind) {
     paint_face_button(c, QRect(x, face_y, kFace, kFace), kind == HelpIcon::A);
     return kFace;
   }
+  if (kind == HelpIcon::X || kind == HelpIcon::Y) {
+    paint_xy_face_button(c, QRect(x, face_y, kFace, kFace), kind == HelpIcon::Y);
+    return kFace;
+  }
   if (kind == HelpIcon::Start) {
     const int start_h = start_icon_height();
     const int by = y + (h - start_h) / 2;
@@ -513,20 +312,25 @@ int paint_help_icons(HudCanvas& c, int x, int y, int h, HelpIcon kind) {
     return start_w;
   }
   if (kind == HelpIcon::Stick) {
-    constexpr int kBarW = 28;
-    constexpr int kBarH = 22;
-    constexpr int kBarGap = 4;
-    const int bar_y = y + (h - kBarH) / 2;
-    paint_square_button(c, QRect(x, bar_y, kBarW, kBarH), QStringLiteral("L"));
-    paint_square_button(c, QRect(x + kBarW + kBarGap, bar_y, kBarW, kBarH), QStringLiteral("R"));
-    const int sx = x + kBarW * 2 + kBarGap + 8;
+    constexpr int kTrigW = 44;
+    constexpr int kTrigH = 30;
+    constexpr int kTrigGap = 8;
+    const int by = y + (h - kTrigH) / 2;
+    paint_trigger_button(c, QRect(x, by, kTrigW, kTrigH), QStringLiteral("L1"));
+    paint_trigger_button(c, QRect(x + kTrigW + kTrigGap, by, kTrigW, kTrigH), QStringLiteral("R1"));
+    const int sx = x + kTrigW * 2 + kTrigGap + 8;
     const int sy = y + (h - kStick) / 2;
-    paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"));
+    paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"), StickMotion::AxisLR);
     return help_icon_width(kind);
   }
   if (kind == HelpIcon::StickR) {
     const int sy = y + (h - kStick) / 2;
-    paint_stick_icon(c, QRect(x, sy, kStick, kStick), QStringLiteral("R"));
+    paint_stick_icon(c, QRect(x, sy, kStick, kStick), QStringLiteral("R"), StickMotion::Plain);
+    return kStick;
+  }
+  if (kind == HelpIcon::StickR3) {
+    const int sy = y + (h - kStick) / 2;
+    paint_stick_icon(c, QRect(x, sy, kStick, kStick), QStringLiteral("R"), StickMotion::Click);
     return kStick;
   }
   if (kind == HelpIcon::Speed) {
@@ -577,6 +381,20 @@ int paint_ab_footer(HudCanvas& c, int right, int y, int h, const QString& a_labe
   return x;
 }
 
+/** Right-aligned Options/Menu chip + Close. Returns the left edge of the cluster. */
+int paint_option_close_footer(HudCanvas& c, int right, int y, int h, const QFont& font) {
+  const QString close = VRP_TR("Close");
+  const int tw = QFontMetrics(font).horizontalAdvance(close);
+  const int start_h = start_icon_height();
+  const int start_w = menu_button_width();
+  int x = right - tw;
+  paint_footer_label(c, x, y, h, close, font);
+  x -= 6 + start_w;
+  const int by = y + (h - start_h) / 2;
+  paint_start_button(c, QRect(x, by, start_w, start_h));
+  return x;
+}
+
 int paint_stick_a_cluster(HudCanvas& c, int x, int y, int h, DpadDir dir, const QString& label,
                           const QFont& font) {
   constexpr int kDpad = 26;
@@ -597,16 +415,16 @@ int paint_dpad_lr_cluster(HudCanvas& c, int x, int y, int h, const QString& labe
 }
 
 int paint_lr_stick_cluster(HudCanvas& c, int x, int y, int h, const QString& label, const QFont& font) {
-  constexpr int kW = 22;
-  constexpr int kH = 16;
-  constexpr int kGap = 2;
+  constexpr int kW = 36;
+  constexpr int kH = 22;
+  constexpr int kGap = 4;
   constexpr int kStick = 26;
   const int by = y + (h - kH) / 2;
-  paint_square_button(c, QRect(x, by, kW, kH), QStringLiteral("L"));
-  paint_square_button(c, QRect(x + kW + kGap, by, kW, kH), QStringLiteral("R"));
+  paint_trigger_button(c, QRect(x, by, kW, kH), QStringLiteral("L1"));
+  paint_trigger_button(c, QRect(x + kW + kGap, by, kW, kH), QStringLiteral("R1"));
   const int sx = x + kW * 2 + kGap + 8;
   const int sy = y + (h - kStick) / 2;
-  paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"));
+  paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"), StickMotion::AxisLR);
   return paint_footer_label(c, sx + kStick + 4, y, h, label, font) + 14;
 }
 
@@ -619,7 +437,7 @@ int paint_dpad_ud_stick_cluster(HudCanvas& c, int x, int y, int h, const QString
   paint_dpad(c, QRect(x + kDpad + kGap, dy, kDpad, kDpad), DpadDir::Down);
   const int sx = x + kDpad * 2 + kGap + 8;
   const int sy = y + (h - kStick) / 2;
-  paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"));
+  paint_stick_icon(c, QRect(sx, sy, kStick, kStick), QStringLiteral("L"), StickMotion::AxisUD);
   return paint_footer_label(c, sx + kStick + 4, y, h, label, font) + 14;
 }
 
@@ -1044,8 +862,10 @@ void paint_seek_bar_only(HudCanvas& c, const VrMenu::Snapshot& snap, int width, 
   paint_scrub_bar(c, snap, panel.bar, panel.time, hint_font);
 }
 
-HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height, bool sony_face) {
-  sony_face_buttons = sony_face;
+HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height, bool sony_face,
+                             bool menu_option) {
+  sony_face_buttons = sony_face || menu_option;
+  menu_button_option = menu_option || sony_face;
   HudCanvas& canvas = shared_hud_canvas();
   canvas.begin(width, height);
   const QFont title_font = deUiFont(22, QFont::DemiBold);
@@ -1070,7 +890,10 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
               QColor(230, 240, 255), Qt::AlignVCenter | Qt::AlignLeft);
 
   const QRect foot(side + 16, height - 44, content_w - 32, 40);
-  paint_ab_footer(canvas, foot.right(), foot.y(), foot.height(), VRP_TR("Decide"), VRP_TR("Back"), body_font);
+  const int option_left =
+      paint_option_close_footer(canvas, foot.right(), foot.y(), foot.height(), body_font);
+  paint_ab_footer(canvas, option_left - 14, foot.y(), foot.height(), VRP_TR("Decide"), VRP_TR("Back"),
+                  body_font);
   if (snap.screen == VrMenu::Screen::Browser) {
     paint_dpad_ud_stick_cluster(canvas, foot.x(), foot.y(), foot.height(), VRP_TR("Select"), body_font);
   }
@@ -1148,10 +971,29 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
   return canvas.take();
 }
 
+HudPaintResult paint_hud_toast(const QString& text, int width, int height) {
+  HudCanvas& canvas = shared_hud_canvas();
+  canvas.begin(width, height);
+  if (text.isEmpty()) return canvas.take();
+  const QFont font = deUiFont(20, QFont::DemiBold);
+  const QFontMetrics fm(font);
+  const int pad_x = 28;
+  const int pad_y = 16;
+  const int tw = fm.horizontalAdvance(text);
+  const int th = fm.height();
+  const int box_w = tw + pad_x * 2;
+  const int box_h = th + pad_y * 2;
+  const QRect box((width - box_w) / 2, height / 3 - box_h / 2, box_w, box_h);
+  canvas.rounded(box, QColor(16, 20, 30, 220), 12);
+  canvas.text(box, text, font, QColor(240, 245, 252), Qt::AlignCenter);
+  return canvas.take();
+}
+
 HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool sony_face,
                                    bool menu_option) {
-  sony_face_buttons = sony_face;
-  menu_button_option = menu_option;
+  // Flat seat uses Y (XInput) or △ (Sony). Keep face style in sync with Options branding.
+  sony_face_buttons = sony_face || menu_option;
+  menu_button_option = menu_option || sony_face;
   HudCanvas& canvas = shared_hud_canvas();
   canvas.begin(width, height);
 
@@ -1160,6 +1002,7 @@ HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool
     const char* name;
     const char* action;
   };
+  // HelpIcon::Y paints △ when sony_face_buttons, otherwise the letter Y.
   const Row rows[] = {
       {HelpIcon::Start, "long-press", "Recenter"},
       {HelpIcon::Start, nullptr, "File dialog"},
@@ -1167,9 +1010,10 @@ HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool
       {HelpIcon::A, nullptr, "Play or pause"},
       {HelpIcon::Stick, nullptr, "Seek"},
       {HelpIcon::StickR, nullptr, "Look"},
-      {HelpIcon::B, "long-press", "Reset view"},
+      {HelpIcon::StickR3, nullptr, "Reset view"},
       {HelpIcon::Speed, nullptr, "Playback speed"},
       {HelpIcon::SpeedReset, nullptr, "Speed ×1"},
+      {HelpIcon::Y, nullptr, "Flat seat (Near/Cinema/Far)"},
   };
 
   const QFont title_font = deUiFont(22, QFont::DemiBold);

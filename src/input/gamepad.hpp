@@ -30,7 +30,11 @@ class GamepadInput {
     bool back = false;     // B edge
     bool back_held = false;  // B level (for long-press)
     bool menu_toggle = false;  // Start/Guide short press
-    bool recenter = false;     // Start/Guide long press
+    /** Y / △ edge. Flat scale cycle when menus are closed. */
+    bool face_y = false;
+    bool recenter = false;     // Start/Guide / Options long press
+    /** Right stick click (R3). Clears stick look offset. */
+    bool view_reset = false;
     bool seek_back = false;    // LB edge (repeat)
     bool seek_forward = false; // RB edge (repeat)
     bool seek_back_held = false;
@@ -64,6 +68,8 @@ class GamepadInput {
   void* controller_ = nullptr;
   bool prev_a_ = false;
   bool prev_b_ = false;
+  bool prev_y_ = false;
+  bool prev_r3_ = false;
   bool lb_held_ = false;
   bool rb_held_ = false;
   bool lb_repeating_ = false;
