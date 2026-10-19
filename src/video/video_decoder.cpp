@@ -1116,8 +1116,9 @@ void VideoDecoder::fail_open(const std::string& path, const std::string& reason)
 void VideoDecoder::stop_thumbnail_build() {
   thumbs_cancel_.store(true);
   thumbs_gen_.fetch_add(1);
-  // Detach — joining can stall the XR thread for seconds on high-bitrate files.
-  if (thumbs_thread_.joinable()) thumbs_thread_.detach();
+  // Join so a cancelled NVDEC thumb worker cannot hold cuda_decode_mu across an
+  // Hz reconnect (detached workers made the next open_media look "not ready").
+  if (thumbs_thread_.joinable()) thumbs_thread_.join();
 }
 
 void VideoDecoder::start_thumbnail_build(std::function<void(ThumbnailStrip)> on_done, int max_thumbs,
@@ -1895,12 +1896,25 @@ void VideoTexture::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue, u
   sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
   VRP_CHECK(vkCreateSampler(device_, &sci, nullptr, &sampler_) == VK_SUCCESS, "sampler");
 
+  (void)upload_idle_screen();
+}
+
+bool VideoTexture::upload_idle_screen() {
+  // Soft slate panel — alpha ~0.35 so the sky shows through until a video binds.
   VideoFrame ph;
   ph.width = 2;
   ph.height = 2;
-  ph.rgba = {20, 20, 40, 255, 20, 20, 40, 255, 20, 20, 40, 255, 20, 20, 40, 255};
-  (void)try_upload(ph);
-  (void)poll_present();
+  constexpr uint8_t r = 36, g = 42, b = 56, a = 90;
+  ph.rgba = {r, g, b, a, r, g, b, a, r, g, b, a, r, g, b, a};
+  for (int i = 0; i < 64; ++i) {
+    if (try_upload(ph)) break;
+    wait_fence();
+  }
+  for (int i = 0; i < 64; ++i) {
+    if (poll_present()) return true;
+    wait_fence();
+  }
+  return view() != VK_NULL_HANDLE;
 }
 
 void VideoTexture::shutdown() {

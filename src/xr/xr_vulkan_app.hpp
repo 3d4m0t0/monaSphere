@@ -165,6 +165,8 @@ class XrVulkanApp {
     bool menu_toggle = false;
     /** Y / △. Flat seat preset cycle when applicable. */
     bool flat_scale = false;
+    /** X / □. Milky Way phase tune when applicable. */
+    bool milkyway_tune = false;
     /** Right stick click (R3). Clears stick look offset. */
     bool view_reset = false;
     /** Left / right trigger held (L2 / R2). */
@@ -239,6 +241,7 @@ class XrVulkanApp {
   XrAction back_action_ = XR_NULL_HANDLE;
   XrAction menu_toggle_action_ = XR_NULL_HANDLE;
   XrAction flat_scale_action_ = XR_NULL_HANDLE;
+  XrAction milkyway_tune_action_ = XR_NULL_HANDLE;
   XrAction view_reset_action_ = XR_NULL_HANDLE;
   XrAction l2_action_ = XR_NULL_HANDLE;
   XrAction r2_action_ = XR_NULL_HANDLE;

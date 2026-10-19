@@ -100,7 +100,12 @@ void Fsr1Upscaler::shutdown() {
   destroy_pipelines();
   destroy_rt(src_rt_);
   destroy_rt(easu_rt_);
-  destroy_rt(out_rt_);
+  destroy_rt(out_rt_[0]);
+  destroy_rt(out_rt_[1]);
+  out_front_ = 0;
+  out_back_ = 1;
+  in_flight_ = false;
+  pending_w_ = pending_h_ = 0;
   out_view_ = VK_NULL_HANDLE;
   out_w_ = out_h_ = 0;
 
@@ -406,9 +411,24 @@ void Fsr1Upscaler::barrier_rw(VkCommandBuffer cmd, VkImage image, VkAccessFlags 
   vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
+bool Fsr1Upscaler::poll() {
+  if (!device_ || !in_flight_ || !fence_) return false;
+  if (vkGetFenceStatus(device_, fence_) != VK_SUCCESS) return false;
+  out_front_ = out_back_;
+  out_view_ = out_rt_[out_front_].view;
+  out_w_ = pending_w_;
+  out_h_ = pending_h_;
+  in_flight_ = false;
+  return true;
+}
+
 bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_sampler, int src_w,
                            int src_h, int nv12) {
   if (!enabled() || !device_ || !src_y || !src_sampler || src_w < 16 || src_h < 16) return false;
+
+  // Finish prior async pass first; never start a second submit on the same fence/cmd.
+  bool published = poll();
+  if (in_flight_) return false;
 
   const float scale = fsr_mode_scale(mode_);
   int dst_w = static_cast<int>(std::lround(static_cast<float>(src_w) * scale));
@@ -428,11 +448,12 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
   dst_w &= ~1;
   dst_h &= ~1;
 
+  out_back_ = 1 - out_front_;
   const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   ensure_rt(src_rt_, src_w, src_h, usage);
   ensure_rt(easu_rt_, dst_w, dst_h, usage);
-  ensure_rt(out_rt_, dst_w, dst_h, usage);
+  ensure_rt(out_rt_[out_back_], dst_w, dst_h, usage);
 
   BlitUbo blit{static_cast<uint32_t>(src_w), static_cast<uint32_t>(src_h),
                static_cast<uint32_t>(nv12), 0};
@@ -465,9 +486,8 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
 
   update_blit_set(src_y, src_uv, src_sampler, nv12);
   update_fsr_set(easu_set_, easu_ubo_, src_rt_.view, easu_rt_.view);
-  update_fsr_set(rcas_set_, rcas_ubo_, easu_rt_.view, out_rt_.view);
+  update_fsr_set(rcas_set_, rcas_ubo_, easu_rt_.view, out_rt_[out_back_].view);
 
-  vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
   vkResetFences(device_, 1, &fence_);
   vkResetCommandBuffer(cmd_, 0);
 
@@ -491,14 +511,14 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
     vkCmdPipelineBarrier(cmd_, src_s, dst_s, 0, 0, nullptr, 0, nullptr, 1, &b);
   };
 
-  // Undefined → GENERAL for storage targets
+  // Undefined → GENERAL for storage targets (back buffer only for output).
   transition(src_rt_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
              VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
   transition(easu_rt_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
              VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-  transition(out_rt_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+  transition(out_rt_[out_back_].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
              VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
@@ -524,13 +544,13 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
              VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-  // 3) RCAS
+  // 3) RCAS → back buffer (front stays stable for the eye pass).
   vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, rcas_pipe_);
   vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_layout_, 0, 1, &rcas_set_, 0,
                           nullptr);
   vkCmdDispatch(cmd_, groups_x, groups_y, 1);
 
-  transition(out_rt_.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+  transition(out_rt_[out_back_].image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
              VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
 
@@ -545,17 +565,13 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
   } else {
     VRP_CHECK(vkQueueSubmit(queue_, 1, &si, fence_) == VK_SUCCESS, "fsr submit");
   }
-  // Bound wait — scene will sample after fence in next prepare, but we need completion before
-  // descriptor bind this frame.
-  vkWaitForFences(device_, 1, &fence_, VK_TRUE, 50'000'000ull);
-  if (vkGetFenceStatus(device_, fence_) != VK_SUCCESS) {
-    vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
-  }
+  pending_w_ = dst_w;
+  pending_h_ = dst_h;
+  in_flight_ = true;
 
-  out_view_ = out_rt_.view;
-  out_w_ = dst_w;
-  out_h_ = dst_h;
-  return true;
+  // Fast path: publish immediately when the GPU already finished.
+  if (poll()) published = true;
+  return published;
 }
 
 }  // namespace vrp

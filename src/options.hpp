@@ -59,8 +59,8 @@ struct PlayerOptions {
   StereoLayout stereo = StereoLayout::Mono;
   /** Full: each eye already has its display aspect. Half: the eye is squeezed into the frame. */
   bool stereo_full = true;
-  float flat_fov_deg = 70.f;
-  float screen_distance = 4.f;
+  float flat_fov_deg = 70.f;       // Cinema seat default
+  float screen_distance = 12.f;    // matches kFlatScalePresets "Cinema"
   bool mute = false;
   bool clear_only = false;  // debug: skip video, solid color
   ControllerProfile controller_profile = ControllerProfile::Gamepad;

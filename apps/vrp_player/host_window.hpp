@@ -73,6 +73,8 @@ class HostWindow : public QMainWindow {
   void onHzAction(QAction* action);
   void showAboutDialog();
   void onRuntimeChosen(bool wivrn);
+  /** Auto (preferred_hz_==0) maps to 90 Hz; explicit 90/120 unchanged. */
+  int effectivePreferredHz() const { return preferred_hz_ <= 0 ? 90 : preferred_hz_; }
 
  private:
   /** Start owned monado-service. If allow_adopt is false, never attach to a pre-existing IPC
@@ -230,6 +232,12 @@ class HostWindow : public QMainWindow {
   std::mutex video_mu_;
   std::string pending_video_;
   std::atomic<bool> video_pending_{false};
+  /** Last media in the XR session — restored after an Hz-driven reconnect. */
+  std::mutex session_media_mu_;
+  std::string session_video_path_;
+  double session_video_pos_ = 0.0;
+  std::atomic<bool> session_play_wanted_{false};
+  std::atomic<bool> resume_media_after_hz_{false};
   std::mutex audio_mu_;
   std::string audio_device_;
   std::atomic<bool> audio_reopen_{false};
@@ -281,7 +289,7 @@ class HostWindow : public QMainWindow {
   QStringList audio_device_ids_;
   QStringList audio_device_labels_;
 
-  int preferred_hz_ = 0;               // 0 = auto, else 90 / 120
+  int preferred_hz_ = 0;               // 0 = auto (→ 90 Hz), else 90 / 120
   int seek_thumb_count_ = vrp::kSeekThumbCount;
   int seek_thumb_edge_ = vrp::kSeekThumbMaxEdge;
   /** monasphere.conf `hwaccel`. 0 forces software decode for playback and seek thumbs. */

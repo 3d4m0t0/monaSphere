@@ -290,6 +290,11 @@ class VideoTexture {
   bool try_upload(const VideoFrame& frame);
   /** True when the display slot changed — caller should set_texture(view(), sampler()). */
   bool poll_present();
+  /**
+   * Semi-transparent flat panel used when no video is showing (startup / after Stop).
+   * Blocks briefly if a previous upload is in flight. Returns true when presentable.
+   */
+  bool upload_idle_screen();
 
   VkImageView view() const { return slots_[display_].view; }
   VkSampler sampler() const { return sampler_; }

@@ -22,12 +22,20 @@ class Fsr1Upscaler {
   bool enabled() const { return mode_ != FsrMode::Off; }
 
   /**
-   * Upscale current video frame into an internal RGBA texture.
-   * Returns true when output() should be bound for scene sampling.
+   * Upscale current video frame into an internal RGBA texture (ping-pong back buffer).
+   * Non-blocking: returns false if a prior submit is still in flight, or if the new
+   * submit has not finished yet. Returns true when output_view() was published and
+   * is safe to bind (front buffer is stable while the next pass writes the back).
    * nv12: 0=RGBA src_y only, 1=limited, 2=full-range.
    */
   bool process(VkImageView src_y, VkImageView src_uv, VkSampler src_sampler, int src_w, int src_h,
                int nv12);
+
+  /** Finish a completed async pass without starting new work. True if front was updated. */
+  bool poll();
+
+  /** True while a compute submit is outstanding (safe to sample output_view front). */
+  bool busy() const { return in_flight_; }
 
   VkImageView output_view() const { return out_view_; }
   VkSampler output_sampler() const { return sampler_; }
@@ -105,9 +113,14 @@ class Fsr1Upscaler {
   VkDeviceMemory rcas_ubo_mem_ = VK_NULL_HANDLE;
   void* rcas_ubo_map_ = nullptr;
 
-  Rt src_rt_{};   // video-res RGBA
-  Rt easu_rt_{};  // upscaled
-  Rt out_rt_{};   // after RCAS
+  Rt src_rt_{};     // video-res RGBA (internal)
+  Rt easu_rt_{};    // upscaled (internal)
+  Rt out_rt_[2]{};  // RCAS ping-pong; scene samples front only
+  int out_front_ = 0;
+  int out_back_ = 1;
+  bool in_flight_ = false;
+  int pending_w_ = 0;
+  int pending_h_ = 0;
   VkImageView out_view_ = VK_NULL_HANDLE;
   int out_w_ = 0;
   int out_h_ = 0;

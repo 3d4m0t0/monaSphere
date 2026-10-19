@@ -21,7 +21,9 @@ extern "C" {
 namespace vrp {
 namespace {
 
-constexpr uint64_t kFenceTimeoutNs = 50'000'000ull;
+// Eye submits and copies can stack after a Monado/Hz reconnect; 50ms was too
+// short and permanently stuck create_failed_ on a single timeout.
+constexpr uint64_t kFenceTimeoutNs = 500'000'000ull;
 
 #if defined(VRP_HAS_FFMPEG)
 bool frame_is_full_range(const AVFrame* f, bool hint) {
@@ -511,11 +513,16 @@ bool CudaNv12Texture::transition_all_to_shader_read() {
 
 bool CudaNv12Texture::ensure_size(int width, int height) {
   // Caller must hold slots_mu_ (try_copy) or be the only user (reset already drained).
-  if (width == width_ && height == height_ && slots_[0].y.image && slots_[1].y.image) return true;
+  if (width == width_ && height == height_ && slots_[0].y.image && slots_[1].y.image &&
+      layouts_ready_) {
+    return true;
+  }
   if (create_failed_) return false;
 
   VRP_LOG("CudaNv12Texture: ensure_size %dx%d → %dx%d", width_, height_, width, height);
-  valid_.store(false);
+  valid_.store(false, std::memory_order_release);
+  layouts_ready_ = false;
+  // Finish any prior layout submit before tearing down images.
   if (!wait_fence_timeout(kFenceTimeoutNs)) {
     set_error("fence timeout on resize");
     return false;
@@ -530,6 +537,8 @@ bool CudaNv12Texture::ensure_size(int width, int height) {
     create_failed_ = true;
     return false;
   }
+  // vkQueueSubmit here races Monado's xrEndFrame on the same graphics queue unless
+  // end_frame holds queue_mu_ (see XrVulkanApp::end_frame).
   if (!transition_all_to_shader_read()) {
     set_error("layout transition failed");
     destroy_slots();
@@ -537,9 +546,8 @@ bool CudaNv12Texture::ensure_size(int width, int height) {
     return false;
   }
   layouts_ready_ = true;
-  valid_.store(false);
+  valid_.store(false, std::memory_order_release);
   present_gen_.store(0);
-  // bound_gen left; XR will see new present_gen
   set_error("ok");
   VRP_LOG("CudaNv12Texture: LINEAR slots ready %dx%d", width, height);
   return true;
@@ -619,8 +627,10 @@ bool CudaNv12Texture::try_copy_from_cuda(const AVFrame* cuda_frame, void* cu_con
 
   std::lock_guard<std::mutex> slot_lock(slots_mu_);
   if (!ensure_size(w, h)) {
-    create_failed_ = true;
-    return fail(last_error().empty() ? "ensure_size" : last_error().c_str());
+    // Fence timeout is transient — allow the next frame to retry.
+    const std::string why = last_error();
+    if (why.find("fence timeout") == std::string::npos) create_failed_ = true;
+    return fail(why.empty() ? "ensure_size" : why.c_str());
   }
   if (!ensure_cuda_imports()) {
     create_failed_ = true;

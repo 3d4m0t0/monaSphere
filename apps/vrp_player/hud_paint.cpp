@@ -772,7 +772,7 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
         switch (i) {
           case 1: label = QStringLiteral("90Hz"); break;
           case 2: label = QStringLiteral("120Hz"); break;
-          default: label = VRP_TR("Auto"); break;
+          default: label = VRP_TR("Auto 90Hz"); break;
         }
       } else {
         const FormatChoice choice = format_menu_at(snap.projection, i);
@@ -975,17 +975,21 @@ HudPaintResult paint_hud_toast(const QString& text, int width, int height) {
   HudCanvas& canvas = shared_hud_canvas();
   canvas.begin(width, height);
   if (text.isEmpty()) return canvas.take();
-  const QFont font = deUiFont(20, QFont::DemiBold);
+  const QFont font = deUiFont(18, QFont::DemiBold);
   const QFontMetrics fm(font);
+  const QStringList lines = text.split(QLatin1Char('\n'));
+  int tw = 0;
+  for (const QString& line : lines) tw = std::max(tw, fm.horizontalAdvance(line));
+  const int nlines = static_cast<int>(lines.size());
+  const int th = fm.height() * std::max(1, nlines) + fm.leading() * std::max(0, nlines - 1);
   const int pad_x = 28;
   const int pad_y = 16;
-  const int tw = fm.horizontalAdvance(text);
-  const int th = fm.height();
   const int box_w = tw + pad_x * 2;
   const int box_h = th + pad_y * 2;
   const QRect box((width - box_w) / 2, height / 3 - box_h / 2, box_w, box_h);
   canvas.rounded(box, QColor(16, 20, 30, 220), 12);
-  canvas.text(box, text, font, QColor(240, 245, 252), Qt::AlignCenter);
+  canvas.text(box, text, font, QColor(240, 245, 252),
+              Qt::AlignCenter | Qt::TextWordWrap);
   return canvas.take();
 }
 

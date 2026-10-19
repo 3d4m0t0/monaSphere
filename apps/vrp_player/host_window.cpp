@@ -626,7 +626,7 @@ void HostWindow::maybeAutoConnectHeadset() {
     }
     setHealth("Wait", "Starting Monado…");
     resolvePreferredDisplayMode();
-    if (monado_hz_require_owned_ || (preferred_hz_ > 0 && monado_desired_mode_ >= 0)) {
+    if (monado_hz_require_owned_ || monado_desired_mode_ >= 0) {
       startOwnedMonado(/*allow_external_adopt=*/false);
     } else {
       startMonado();
@@ -636,7 +636,7 @@ void HostWindow::maybeAutoConnectHeadset() {
 
   // A leftover compositor was not started with this hz=. Replace it before connecting.
   resolvePreferredDisplayMode();
-  if (preferred_hz_ > 0 && monado_desired_mode_ >= 0 &&
+  if (monado_desired_mode_ >= 0 &&
       (monado_hz_require_owned_ || monado_external_ || !monado_ ||
        monado_->state() == QProcess::NotRunning)) {
     appendLog(tr("Auto-connect: replace external Monado for Hz"));
@@ -1096,6 +1096,9 @@ QString legacyQtValue(const QString& group, const QString& key) {
 void HostWindow::saveAppConf() const {
   setMonasphereConfKey(QStringLiteral("fsr"), QString::number(static_cast<int>(preferred_fsr_)));
   setMonasphereConfKey(QStringLiteral("runtime"), usingWivrn() ? QStringLiteral("wivrn") : QStringLiteral("monado"));
+  setMonasphereConfKey(QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("flat_distance"),
+                       QString::number(static_cast<double>(opt_.screen_distance), 'f', 2));
 }
 
 void HostWindow::loadAppConf() {
@@ -1134,6 +1137,9 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("thumb_edge"), QString::number(vrp::kSeekThumbMaxEdge)},
       {QStringLiteral("hwaccel"), QStringLiteral("1")},
       {QStringLiteral("thumb_jpeg"), QStringLiteral("1")},
+      {QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2)},
+      {QStringLiteral("flat_distance"),
+       QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
   };
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   ensureMonasphereConfKeys(defaults);
@@ -1203,6 +1209,14 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const int v = line.mid(11).toInt(&ok);
       if (ok && (v == 0 || v == 1)) thumb_jpeg_ = v != 0;
+    } else if (line.startsWith(QStringLiteral("flat_fov="))) {
+      bool ok = false;
+      const float v = line.mid(9).toFloat(&ok);
+      if (ok && v >= 20.f && v <= 140.f) opt_.flat_fov_deg = v;
+    } else if (line.startsWith(QStringLiteral("flat_distance="))) {
+      bool ok = false;
+      const float v = line.mid(14).toFloat(&ok);
+      if (ok && v >= 2.f && v <= 40.f) opt_.screen_distance = v;
     }
   }
   user.close();
@@ -1508,7 +1522,7 @@ void HostWindow::rebuildHzMenu() {
     const char* label;
   };
   const Item items[] = {
-      {0, QT_TR_NOOP("Auto")},
+      {0, QT_TR_NOOP("Auto (90 Hz)")},
       {90, QT_TR_NOOP("90 Hz")},
       {120, QT_TR_NOOP("120 Hz")},
   };
@@ -2133,9 +2147,9 @@ void HostWindow::applyMonadoPacingEnv(QProcessEnvironment& env) const {
 }
 
 void HostWindow::resolvePreferredDisplayMode() {
-  if (usingWivrn() || preferred_hz_ <= 0 || monado_desired_mode_ >= 0) return;
+  if (usingWivrn() || monado_desired_mode_ >= 0) return;
   if (monado_mode_hz_.isEmpty()) ensureMonadoModeTable();
-  const int idx = findModeIndexForHz(preferred_hz_);
+  const int idx = findModeIndexForHz(effectivePreferredHz());
   if (idx >= 0) monado_desired_mode_ = idx;
 }
 
@@ -2309,11 +2323,12 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
       return;
     }
     if (from_ui) {
-      appendLog(tr("Refresh: %1").arg(preferred_hz_ <= 0 ? tr("Auto") : tr("%1 Hz").arg(preferred_hz_)));
+      appendLog(tr("Refresh: %1").arg(preferred_hz_ <= 0 ? tr("Auto (90 Hz)")
+                                                         : tr("%1 Hz").arg(preferred_hz_)));
     }
     std::lock_guard<std::mutex> lock(xr_app_mu_);
     if (xr_app_ && xr_app_->has_display_refresh_rate_ext()) {
-      const float pref = preferred_hz_ <= 0 ? 0.f : static_cast<float>(preferred_hz_);
+      const float pref = static_cast<float>(effectivePreferredHz());
       xr_app_->set_preferred_display_refresh_hz(pref);
       if (!xr_app_->request_display_refresh_rate(pref)) {
         appendLog(tr("OpenXR Hz switch failed"));
@@ -2332,8 +2347,9 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
     return;
   }
 
+  const int want_hz = effectivePreferredHz();
   const QString want_label =
-      preferred_hz_ <= 0 ? tr("Auto") : tr("%1 Hz").arg(preferred_hz_);
+      preferred_hz_ <= 0 ? tr("Auto (90 Hz)") : tr("%1 Hz").arg(preferred_hz_);
   if (from_ui) {
     appendLog(tr("Refresh: %1").arg(want_label));
   }
@@ -2342,7 +2358,7 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
   if (!force_monado_restart) {
     std::lock_guard<std::mutex> lock(xr_app_mu_);
     if (xr_app_) {
-      const float pref = preferred_hz_ <= 0 ? 0.f : static_cast<float>(preferred_hz_);
+      const float pref = static_cast<float>(want_hz);
       xr_app_->set_preferred_display_refresh_hz(pref);
       if (xr_app_->has_display_refresh_rate_ext()) {
         if (xr_app_->request_display_refresh_rate(pref)) {
@@ -2354,15 +2370,16 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
           }
           appendLog(tr("OpenXR refresh → %1 (rates: %2)").arg(want_label).arg(list.isEmpty() ? tr("none") : list));
           // FB get can lie / lag — verify measured period shortly; fall back to Monado restart.
-          const int want = preferred_hz_;
-          QTimer::singleShot(1200, this, [this, want] {
-            if (shutting_down_.load() || want <= 0 || preferred_hz_ != want) return;
+          const int conf_hz = preferred_hz_;
+          const int expect = want_hz;
+          QTimer::singleShot(1200, this, [this, conf_hz, expect] {
+            if (shutting_down_.load() || preferred_hz_ != conf_hz) return;
             double measured = 0.0;
             {
               std::lock_guard<std::mutex> lock(xr_app_mu_);
               if (xr_app_) measured = xr_app_->status().display_hz;
             }
-            if (measured > 0.0 && std::fabs(measured - static_cast<double>(want)) > 5.0) {
+            if (measured > 0.0 && std::fabs(measured - static_cast<double>(expect)) > 5.0) {
               appendLog(tr("Still %1 Hz after OpenXR — restart Monado")
                             .arg(measured, 0, 'f', 1));
               applyPreferredRefreshRate(/*from_ui=*/false, /*force_monado_restart=*/true);
@@ -2380,32 +2397,29 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
   }
 
   // Pick DESIRED_MODE while mode table is still available (probe if empty).
-  if (preferred_hz_ > 0) {
-    ensureMonadoModeTable();
-    const int idx = findModeIndexForHz(preferred_hz_);
+  // Auto resolves to 90 Hz so Monado does not boot into 120 by default.
+  ensureMonadoModeTable();
+  {
+    const int idx = findModeIndexForHz(want_hz);
     if (idx >= 0) {
       monado_desired_mode_ = idx;
       appendLog(QString("XRT_COMPOSITOR_DESIRED_MODE=%1 (≈%2 Hz)")
                     .arg(idx)
                     .arg(monado_mode_hz_.value(idx), 0, 'f', 1));
+      monado_hz_restarted_ = true;  // already decided; avoid double-restart on PRINT_MODES
     } else {
       monado_desired_mode_ = -1;
-      appendLog(tr("No mode for %1 Hz — rescan after restart").arg(preferred_hz_));
+      appendLog(tr("No mode for %1 Hz — rescan after restart").arg(want_hz));
       monado_mode_hz_.clear();
       monado_mode_pixels_.clear();
       monado_hz_restarted_ = false;
     }
-  } else {
-    monado_desired_mode_ = -1;
-    monado_hz_restarted_ = true;  // auto: no post-start mode chase
-  }
-  if (preferred_hz_ > 0 && monado_desired_mode_ >= 0) {
-    monado_hz_restarted_ = true;  // already decided; avoid double-restart on PRINT_MODES
   }
   monado_hz_mismatch_retried_ = false;
 
   // End XR session first (do not stop Monado here — we restart it with new env next).
   if (xr_running_.load() || xr_thread_.joinable()) {
+    resume_media_after_hz_.store(true);
     user_suppressed_auto_connect_ = false;  // reconnect after Monado comes back
     if (!shutdownXrSession(8000, /*stop_monado=*/false)) {
       appendLog(tr("XR detach timeout — restart continues"));
@@ -2415,7 +2429,7 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
     syncDisconnectedUi(tr("Hz change — restarting"));
   }
 
-  if (monado_external_ && preferred_hz_ <= 0) {
+  if (monado_external_ && preferred_hz_ <= 0 && monado_desired_mode_ < 0) {
     appendLog(tr("External Monado: restart it, then reconnect"));
     return;
   }
@@ -2432,12 +2446,12 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
 
 void HostWindow::maybeRestartMonadoForHz() {
   if (monado_external_ || monado_hz_restarted_) return;
-  if (preferred_hz_ <= 0) return;
   if (monado_mode_hz_.isEmpty()) return;
-  const int idx = findModeIndexForHz(preferred_hz_);
+  const int want_hz = effectivePreferredHz();
+  const int idx = findModeIndexForHz(want_hz);
   if (idx < 0) {
     appendLog(tr("No display mode near %1 Hz")
-                  .arg(preferred_hz_));
+                  .arg(want_hz));
     monado_hz_restarted_ = true;
     return;
   }
@@ -2455,6 +2469,7 @@ void HostWindow::maybeRestartMonadoForHz() {
       this,
       [this] {
         if (xr_running_.load() || xr_thread_.joinable()) {
+          resume_media_after_hz_.store(true);
           user_suppressed_auto_connect_ = false;
           if (!shutdownXrSession(8000, /*stop_monado=*/false)) {
             if (xr_thread_.joinable()) xr_thread_.detach();
@@ -2848,7 +2863,7 @@ void HostWindow::xrThreadMain() {
 
     vrp::XrVulkanApp xr;
     xr.set_controller_prefs(opt_.controller_profile, opt_.controller_hand);
-    xr.set_preferred_display_refresh_hz(preferred_hz_ <= 0 ? 0.f : static_cast<float>(preferred_hz_));
+    xr.set_preferred_display_refresh_hz(static_cast<float>(effectivePreferredHz()));
     xr.init(&xr_stop_, report_progress);
     {
       std::lock_guard<std::mutex> lock(xr_app_mu_);
@@ -3023,6 +3038,14 @@ void HostWindow::xrThreadMain() {
     };
 
     bool vaapi_hud_pending = true;
+    bool pending_video_rebind = false;
+    bool fsr_need_process = false;
+    VkImageView fsr_src_y = VK_NULL_HANDLE;
+    VkImageView fsr_src_uv = VK_NULL_HANDLE;
+    VkSampler fsr_src_samp = VK_NULL_HANDLE;
+    int fsr_src_w = 0;
+    int fsr_src_h = 0;
+    int fsr_src_nv12 = 0;
     bool thumb_latched = false;
     bool seek_settle = false;
     std::chrono::steady_clock::time_point seek_settle_from{};
@@ -3032,6 +3055,8 @@ void HostWindow::xrThreadMain() {
     bool stop_upload_sent = false;
     uint64_t stop_seq = 0;
     double stop_pts = -1.0;
+    // Translucent flat panel (startup / after Stop) until playback shows frames again.
+    bool show_idle_screen = true;
     bool have_pending_thumb = false;
     int thumb_idx = -1;
     vrp::VideoFrame pending_thumb;
@@ -3045,9 +3070,34 @@ void HostWindow::xrThreadMain() {
       stop_upload_sent = false;
       stop_seq = 0;
       stop_pts = -1.0;
+      show_idle_screen = true;
       have_pending_thumb = false;
       thumb_idx = -1;
       pending_thumb = {};
+      pending_video_rebind = false;
+      fsr_need_process = false;
+      fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
+      fsr_src_samp = VK_NULL_HANDLE;
+      fsr_src_w = fsr_src_h = 0;
+      fsr_src_nv12 = 0;
+
+      // Wait for the eye GPU to finish BEFORE halt_decode. Returning false after a
+      // halt left the demux/decode threads dead while is_open() stayed true — play
+      // after an Hz reconnect then did nothing / looked like "device not ready".
+      if (!scene.wait_previous_submit(0)) {
+        VRP_LOG("open_media: waiting for previous eye submit");
+        while (!xr_stop_.load() && !scene.wait_previous_submit(100'000'000ull)) {
+        }
+      }
+      if (xr_stop_.load()) {
+        VRP_LOG("open_media: cancelled (xr_stop before halt)");
+        return false;
+      }
+      if (!scene.wait_previous_submit(2'000'000'000ull)) {
+        VRP_ERR("open_media: GPU still busy after wait");
+        return false;
+      }
+
       // Keep miniaudio alive and muted so silence keeps flushing HMD/Pulse during the switch.
       // Closing the device mid-switch is what left the previous file's audio in the sink.
       if (audio.is_open()) audio.mute_output();
@@ -3060,17 +3110,9 @@ void HostWindow::xrThreadMain() {
       pending_upload = {};
       cuda_tex.drain_copies();
 
-      // Stop further BC7 submits, but keep the images until the eye frame that may
-      // still sample them has finished. Destroying them on a 50ms timeout faulted the
-      // GPU on the next file and the HMD stopped receiving frames.
+      // Stop further BC7 submits; images are safe to drop now that the eye fence is idle.
       const uint64_t bc7_build = bc7.begin_build();
-      if (!scene.wait_previous_submit(0)) {
-        VRP_LOG("BC1 thumbs: waiting for the frame that still samples the old images");
-        while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
-        }
-      }
-      const bool gpu_idle = scene.wait_previous_submit(0);
-      if (!gpu_idle) return false;
+      (void)texture.upload_idle_screen();
       scene.set_texture(texture.view(), texture.sampler());
       cuda_tex.reset_slots(decoder.cuda_context());
       vaapi_tex.reset();
@@ -3196,6 +3238,10 @@ void HostWindow::xrThreadMain() {
           audio.clear_file();
         }
       }
+      if (ok) {
+        std::lock_guard<std::mutex> lock(session_media_mu_);
+        session_video_path_ = path;
+      }
       return ok;
     };
 
@@ -3204,7 +3250,26 @@ void HostWindow::xrThreadMain() {
     bool play_wanted = false;
     bool was_scrubbing = false;
 
-    if (!opt_.video_path.empty() && !opt_.clear_only) {
+    std::string resume_path;
+    double resume_pos = 0.0;
+    bool resume_play = false;
+    bool pending_hz_resume = false;
+    int hz_resume_attempts = 0;
+    auto last_hz_resume_try = std::chrono::steady_clock::time_point{};
+    if (resume_media_after_hz_.exchange(false)) {
+      std::lock_guard<std::mutex> lock(session_media_mu_);
+      resume_path = session_video_path_;
+      resume_pos = session_video_pos_;
+      resume_play = session_play_wanted_.load();
+      pending_hz_resume = !resume_path.empty() && !opt_.clear_only;
+      // HMD Pulse sink often reappears only after the new session is focused —
+      // refresh the route once the XR loop is pumping.
+      if (pending_hz_resume) audio_reopen_.store(true);
+    }
+
+    // Defer Hz resume until the OpenXR session is RUNNING (see main loop). Opening
+    // immediately after Monado restart raced display/audio bring-up and left play stuck.
+    if (!pending_hz_resume && !opt_.video_path.empty() && !opt_.clear_only) {
       if (!open_media(opt_.video_path)) {
         QMetaObject::invokeMethod(
             this,
@@ -3212,6 +3277,8 @@ void HostWindow::xrThreadMain() {
             Qt::QueuedConnection);
       } else {
         play_wanted = true;
+        show_idle_screen = false;
+        session_play_wanted_.store(true);
         decoder.play();
       }
     }
@@ -3231,6 +3298,7 @@ void HostWindow::xrThreadMain() {
     float look_yaw = 0.f;
     float look_pitch = 0.f;
     int flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
+    int milkyway_gain_step = 1;  // 0=dim, 1=normal, 2=bright
 
     while (!xr_stop_.load() && xr.pump_events()) {
       bool help_shown = false;
@@ -3263,6 +3331,7 @@ void HostWindow::xrThreadMain() {
         const bool active = decoder.is_playing() || decoder.is_priming();
         if (!active) {
           play_wanted = true;
+          show_idle_screen = false;
           decoder.play();
         } else {
           play_wanted = false;
@@ -3308,6 +3377,38 @@ void HostWindow::xrThreadMain() {
         requestHudPaint();
       }
 
+      if (pending_hz_resume && xr.is_session_running()) {
+        const auto resume_now = std::chrono::steady_clock::now();
+        if (hz_resume_attempts == 0 ||
+            resume_now - last_hz_resume_try >= std::chrono::milliseconds(400)) {
+          last_hz_resume_try = resume_now;
+          ++hz_resume_attempts;
+          if (open_media(resume_path)) {
+            pending_hz_resume = false;
+            if (resume_pos > 0.25) decoder.seek_to(resume_pos);
+            play_wanted = resume_play;
+            show_idle_screen = !play_wanted;
+            session_play_wanted_.store(play_wanted);
+            if (play_wanted) decoder.play();
+            QMetaObject::invokeMethod(
+                this,
+                [this, resume_play] {
+                  appendLog(resume_play ? tr("Resumed playback after Hz change")
+                                        : tr("Restored video after Hz change"));
+                },
+                Qt::QueuedConnection);
+          } else if (hz_resume_attempts >= 5) {
+            pending_hz_resume = false;
+            const QString err = QString::fromStdString(
+                decoder.info().error.empty() ? "open failed" : decoder.info().error);
+            QMetaObject::invokeMethod(
+                this,
+                [this, err] { appendLog(tr("Resume after Hz change failed: %1").arg(err)); },
+                Qt::QueuedConnection);
+          }
+        }
+      }
+
       if (video_pending_.exchange(false)) {
         std::string path;
         {
@@ -3316,12 +3417,15 @@ void HostWindow::xrThreadMain() {
         }
         if (!path.empty()) {
           if (!open_media(path)) {
+            const QString err = QString::fromStdString(
+                decoder.info().error.empty() ? "GPU busy or open failed" : decoder.info().error);
             QMetaObject::invokeMethod(
                 this,
-                [this] { appendLog(tr("Cannot play video this session")); },
+                [this, err] { appendLog(tr("Cannot play video this session: %1").arg(err)); },
                 Qt::QueuedConnection);
           } else {
             play_wanted = true;
+            show_idle_screen = false;
             decoder.play();
           }
         }
@@ -3335,6 +3439,7 @@ void HostWindow::xrThreadMain() {
       bool pad_nav_left = false;
       bool pad_nav_right = false;
       bool pad_face_y = false;
+      bool pad_face_x = false;
       const bool want_gamepad = gamepad_enabled_.load();
       if (want_gamepad) {
         gamepad_sdl_owned_.store(true);
@@ -3392,6 +3497,7 @@ void HostWindow::xrThreadMain() {
             input.recenter = input.recenter || gp.recenter;
             input.view_reset = input.view_reset || gp.view_reset;
             pad_face_y = gp.face_y;
+            pad_face_x = gp.face_x;
           } else {
             last_gamepad_name.clear();
             last_gamepad_connection.clear();
@@ -3443,10 +3549,10 @@ void HostWindow::xrThreadMain() {
 
       // Flat scale: Y/△ cycles Near→Cinema→Far (fixed cinema screen width; FOV follows
       // distance). XR triangle is flat_scale; Options/menu stays menu_toggle.
+      // Allowed with or without a video so the idle translucent screen can be seated too.
       const bool menus_closed =
           !menu.visible() && !menu.controls_visible() && !controls_help_.load();
-      const bool can_flat_scale =
-          opt_.projection == vrp::ProjectionMode::Flat && menus_closed && decoder.is_open();
+      const bool can_flat_scale = opt_.projection == vrp::ProjectionMode::Flat && menus_closed;
       const bool scale_press = pad_face_y || input.flat_scale;
       if (can_flat_scale && scale_press) {
         flat_scale_index = vrp::next_flat_scale_preset(flat_scale_index);
@@ -3454,6 +3560,10 @@ void HostWindow::xrThreadMain() {
         opt_.flat_fov_deg = preset.fov_deg;
         opt_.screen_distance = preset.distance_m;
         scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
+        setMonasphereConfKey(QStringLiteral("flat_fov"),
+                             QString::number(static_cast<double>(preset.fov_deg), 'f', 2));
+        setMonasphereConfKey(QStringLiteral("flat_distance"),
+                             QString::number(static_cast<double>(preset.distance_m), 'f', 2));
         const QString toast =
             QStringLiteral("%1  %2° / %3 m")
                 .arg(QString::fromUtf8(preset.name))
@@ -3462,6 +3572,19 @@ void HostWindow::xrThreadMain() {
         showHudToast(toast);
         QMetaObject::invokeMethod(
             this, [this, toast] { appendLog(tr("Flat scale: %1").arg(toast)); }, Qt::QueuedConnection);
+      }
+
+      // □ / X: cycle Milky Way intensity (Gaia equirect gain).
+      const bool tune_press = pad_face_x || input.milkyway_tune;
+      if (menus_closed && tune_press) {
+        milkyway_gain_step = (milkyway_gain_step + 1) % 3;
+        static constexpr float kMwGains[] = {0.70f, 1.00f, 1.40f};
+        const float g = kMwGains[milkyway_gain_step];
+        scene.set_milkyway_gain(g);
+        const QString toast = QStringLiteral("MW gain %1").arg(g, 0, 'f', 2);
+        showHudToast(toast, 2800);
+        QMetaObject::invokeMethod(
+            this, [this, toast] { appendLog(tr("Milky Way: %1").arg(toast)); }, Qt::QueuedConnection);
       }
       if (hud_toast_active_.load() && !hudToastActive()) {
         {
@@ -3506,10 +3629,14 @@ void HostWindow::xrThreadMain() {
       if (menu.visible() != menu_was || menu.controls_visible() != controls_was) requestHudPaint();
       if (menu_out.open_video) {
         if (!open_media(menu_out.video_path)) {
+          const QString err = QString::fromStdString(
+              decoder.info().error.empty() ? "GPU busy or open failed" : decoder.info().error);
           QMetaObject::invokeMethod(
-              this, [this] { appendLog(tr("HMD: cannot open video")); }, Qt::QueuedConnection);
+              this, [this, err] { appendLog(tr("HMD: cannot open video: %1").arg(err)); },
+              Qt::QueuedConnection);
         } else {
           play_wanted = true;
+          show_idle_screen = false;
           decoder.play();
         }
         requestHudPaint();
@@ -3522,6 +3649,7 @@ void HostWindow::xrThreadMain() {
           audio.pause();
         } else {
           play_wanted = true;
+          show_idle_screen = false;
           decoder.play();
         }
       }
@@ -3551,6 +3679,7 @@ void HostWindow::xrThreadMain() {
       }
       if (menu_out.play) {
         play_wanted = true;
+        show_idle_screen = false;
         decoder.play();
       }
       if (menu_out.pause) {
@@ -3560,11 +3689,27 @@ void HostWindow::xrThreadMain() {
       }
       if (menu_out.stop) {
         play_wanted = false;
+        show_idle_screen = true;
         decoder.pause();
         decoder.seek_to(menu.place_seek_bar(0.0));
         // Must seek audio demuxer to 0 as well — pause alone leaves decode at the stop point,
         // so the next play() can briefly emit that PCM (and Pulse may still hold it).
         if (audio.is_open()) audio.stop();
+        // Same translucent flat panel as startup (sky shows through) until play resumes.
+        if (!scene.wait_previous_submit(0)) {
+          while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
+          }
+        }
+        pending_video_rebind = false;
+        fsr_need_process = false;
+        fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
+        fsr_src_samp = VK_NULL_HANDLE;
+        (void)texture.upload_idle_screen();
+        scene.set_texture(texture.view(), texture.sampler());
+        thumb_latched = false;
+        wait_stop_frame = false;
+        stop_frame_shown = false;
+        requestHudPaint();
       }
       if (menu_out.rate_changed) {
         decoder.set_rate(menu_out.rate);
@@ -3695,6 +3840,12 @@ void HostWindow::xrThreadMain() {
       menu.set_playback(decoder.is_playing() || decoder.is_priming(), decoder.position());
       menu.set_volume(audio.volume());
       menu.set_preferred_hz(preferred_hz_);
+      session_play_wanted_.store(play_wanted);
+      if (decoder.is_open()) {
+        std::lock_guard<std::mutex> lock(session_media_mu_);
+        session_video_path_ = decoder.info().path;
+        session_video_pos_ = decoder.position();
+      }
       {
         const auto st_hz = xr.status();
         if (st_hz.display_hz > 0.0) menu.set_display_hz(static_cast<float>(st_hz.display_hz));
@@ -3868,8 +4019,10 @@ void HostWindow::xrThreadMain() {
       const bool show_thumb =
           thumb_latched && (scrubbing || stop_seek_pending || (wait_stop_frame && !reveal_stop));
       const bool seek_visual = show_thumb && !reveal_stop;
-      // Only wait when rebinding — avoid stalling every XR frame.
-      if (!seek_visual && !opt_.clear_only && decoder.is_open()) {
+      // Stage video binds for flush after the eye-submit fence inside render_frame.
+      // Do not wait here — wait(0) almost always fails while the previous frame is in flight.
+      // Idle translucent panel (startup / Stop) must not be overwritten by a paused seek frame.
+      if (!seek_visual && !opt_.clear_only && decoder.is_open() && !show_idle_screen) {
         bool video_updated = false;
         int nv12_mode = 0;
         VkImageView src_y = VK_NULL_HANDLE;
@@ -3886,11 +4039,8 @@ void HostWindow::xrThreadMain() {
           src_w = decoder.display_width() > 0 ? decoder.display_width() : decoder.width();
           src_h = decoder.display_height() > 0 ? decoder.display_height() : decoder.height();
           if (cuda_tex.poll_present()) {
-            (void)scene.wait_previous_submit(10'000'000ull);
+            pending_video_rebind = true;
             video_updated = true;
-          }
-          if ((video_updated || force_fsr_refresh) && !fsr.enabled() && src_y && src_samp) {
-            scene.set_nv12_texture(src_y, src_uv, src_samp, cuda_tex.full_range());
           }
           vrp::VideoFrame discard;
           (void)decoder.update(dt, discard);
@@ -3902,11 +4052,8 @@ void HostWindow::xrThreadMain() {
           src_w = vaapi_tex.width();
           src_h = vaapi_tex.height();
           if (vaapi_tex.poll_present()) {
-            (void)scene.wait_previous_submit(10'000'000ull);
+            pending_video_rebind = true;
             video_updated = true;
-          }
-          if ((video_updated || force_fsr_refresh) && !fsr.enabled() && src_y && src_samp) {
-            scene.set_nv12_texture(src_y, src_uv, src_samp, vaapi_tex.full_range());
           }
           if (vaapi_hud_pending) {
             menu.set_output_note("0-copy NV12");
@@ -3924,6 +4071,7 @@ void HostWindow::xrThreadMain() {
             if (reveal_stop) stop_upload_sent = true;
           }
           if (texture.poll_present() && (!reveal_stop || stop_upload_sent)) {
+            pending_video_rebind = true;
             video_updated = true;
           }
           src_y = texture.view();
@@ -3931,19 +4079,49 @@ void HostWindow::xrThreadMain() {
           src_samp = texture.sampler();
           src_w = texture.width();
           src_h = texture.height();
-          if ((video_updated || force_fsr_refresh) && !fsr.enabled() && src_y && src_samp) {
-            scene.set_texture(src_y, src_samp);
-          }
         }
 
-        if (fsr.enabled() && (video_updated || force_fsr_refresh) && src_y && src_samp && src_w > 0 &&
-            src_h > 0) {
-          if (fsr.process(src_y, src_uv, src_samp, src_w, src_h, nv12_mode)) {
-            (void)scene.wait_previous_submit(10'000'000ull);
-            scene.set_texture_gamma(fsr.output_view(), fsr.output_sampler());
+        if (force_fsr_refresh) pending_video_rebind = true;
+
+        // XR critical path: only publish completed FSR / queue raw. Never submit FSR here —
+        // compute + queue contention before end_frame causes head-turn jitter.
+        if (fsr.enabled()) {
+          if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
+            scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+            force_fsr_refresh = false;
           }
+          if (pending_video_rebind && src_y && src_samp && src_w > 0 && src_h > 0) {
+            fsr_src_y = src_y;
+            fsr_src_uv = src_uv ? src_uv : src_y;
+            fsr_src_samp = src_samp;
+            fsr_src_w = src_w;
+            fsr_src_h = src_h;
+            fsr_src_nv12 = nv12_mode;
+            fsr_need_process = true;
+            // Bootstrap until the first FSR front buffer exists.
+            if (!fsr.output_view()) {
+              if (decoder.gpu_path_active() || decoder.vaapi_path_active()) {
+                scene.queue_nv12_texture(src_y, src_uv ? src_uv : src_y, src_samp,
+                                         decoder.gpu_path_active() ? cuda_tex.full_range()
+                                                                   : vaapi_tex.full_range());
+              } else {
+                scene.queue_texture(src_y, src_samp);
+              }
+            }
+            pending_video_rebind = false;
+            force_fsr_refresh = false;
+          }
+        } else if (pending_video_rebind && src_y && src_samp && src_w > 0 && src_h > 0) {
+          if (decoder.gpu_path_active()) {
+            scene.queue_nv12_texture(src_y, src_uv, src_samp, cuda_tex.full_range());
+          } else if (decoder.vaapi_path_active()) {
+            scene.queue_nv12_texture(src_y, src_uv, src_samp, vaapi_tex.full_range());
+          } else {
+            scene.queue_texture(src_y, src_samp);
+          }
+          pending_video_rebind = false;
+          force_fsr_refresh = false;
         }
-        force_fsr_refresh = false;
         if (reveal_stop && video_updated) stop_frame_shown = true;
       }
 
@@ -4174,6 +4352,23 @@ void HostWindow::xrThreadMain() {
       std::vector<XrCompositionLayerBaseHeader*> layers = {
           reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
       xr.end_frame(fi, layers);
+
+      // FSR after end_frame so predictedDisplayTime submit is not delayed by upscale.
+      if (fsr.enabled()) {
+        if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
+          scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+        }
+        if (fsr_need_process && !fsr.busy() && fsr_src_y && fsr_src_samp && fsr_src_w > 0 &&
+            fsr_src_h > 0) {
+          (void)fsr.process(fsr_src_y, fsr_src_uv ? fsr_src_uv : fsr_src_y, fsr_src_samp, fsr_src_w,
+                            fsr_src_h, fsr_src_nv12);
+          fsr_need_process = false;
+          if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
+            scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+          }
+        }
+      }
+
       const double frame_ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frame_t0).count();
       xr.note_frame_ms(frame_ms);
@@ -4184,7 +4379,7 @@ void HostWindow::xrThreadMain() {
         if (!logged_session_refresh_hz_ && cur.display_hz > 0.0) {
           logged_session_refresh_hz_ = true;
           const double hz = cur.display_hz;
-          const int want = preferred_hz_;
+          const int want = effectivePreferredHz();
           QMetaObject::invokeMethod(
               this,
               [this, hz, want] {

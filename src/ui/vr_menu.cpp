@@ -274,7 +274,7 @@ const char* VrMenu::hz_option_label(int index) {
   switch (index) {
     case 1: return "90Hz";
     case 2: return "120Hz";
-    default: return "Auto";
+    default: return "Auto 90Hz";
   }
 }
 
