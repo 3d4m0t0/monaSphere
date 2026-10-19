@@ -1,10 +1,24 @@
-SPDX-License-Identifier: CC0-1.0
+SPDX-License-Identifier: CC0-1.0 AND CC-BY-SA-3.0-IGO
 
-The bright-star catalog in this directory (`stars_wikidata.bin`) is derived from
-Wikidata structured data, which is dedicated to the public domain under the
+## CC0-1.0 — Wikidata catalogs
+
+The bright-star catalog (`stars_wikidata.bin`) and nebula catalog
+(`nebulae_wikidata.bin`) in this directory are derived from Wikidata
+structured data, which is dedicated to the public domain under the
 Creative Commons CC0 1.0 Universal Public Domain Dedication:
 
   https://creativecommons.org/publicdomain/zero/1.0/
 
-See README_stars.md for catalog contents and how to regenerate the file.
+See README_stars.md and README_nebulae.md for contents and how to regenerate.
 Attribution to Wikidata is appreciated but not required by CC0.
+
+## CC BY-SA 3.0 IGO — Gaia Milky Way sky
+
+`gaia_sky_edr3_equirect.jpg` is derived from ESA/Gaia/DPAC “The colour of the
+sky from Gaia’s Early Data Release 3” (cartesian / equirectangular plate).
+Licence: Creative Commons Attribution-ShareAlike 3.0 IGO.
+
+  https://creativecommons.org/licenses/by-sa/3.0/igo/
+
+Acknowledgement: A. Moitinho (and Gaia DPAC).
+See README_milkyway.md for projection rules and refresh (`tools/fetch_gaia_sky.py`).

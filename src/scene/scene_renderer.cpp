@@ -1,14 +1,26 @@
 #include "scene/scene_renderer.hpp"
 #include "starfield/starfield.hpp"
+#include "common.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#if defined(VRP_HAS_FFMPEG)
+extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+}
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -201,8 +213,9 @@ std::vector<GridVert> build_comfort_grid() {
   // ±90° are the poles: every meridian ends there, so those latitudes are the meeting points.
   constexpr float kRadius = 80.f;
   constexpr float kStep = 3.f;
-  const float half_w = kRadius * std::tan(0.18f * static_cast<float>(M_PI) / 180.f);
-  const float equator_w = half_w * 4.f;
+  // Thin ribbons (was 0.18°); equator stays a bit stronger for orientation.
+  const float half_w = kRadius * std::tan(0.07f * static_cast<float>(M_PI) / 180.f);
+  const float equator_w = half_w * 2.2f;
   const GridCol line{0.78f, 0.84f, 0.90f};
   const GridCol equator{1.f, 1.f, 1.f};
   std::vector<GridVert> verts;
@@ -228,6 +241,247 @@ std::vector<GridVert> build_comfort_grid() {
   return verts;
 }
 
+#if defined(VRP_HAS_FFMPEG)
+bool load_jpeg_rgba(const std::string& path, std::vector<uint8_t>& rgba, int& w, int& h) {
+  rgba.clear();
+  w = h = 0;
+  AVFormatContext* fmt = nullptr;
+  if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
+  if (avformat_find_stream_info(fmt, nullptr) < 0) {
+    avformat_close_input(&fmt);
+    return false;
+  }
+  int si = av_find_best_stream(fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+  if (si < 0) {
+    avformat_close_input(&fmt);
+    return false;
+  }
+  const AVCodec* dec = avcodec_find_decoder(fmt->streams[si]->codecpar->codec_id);
+  AVCodecContext* ctx = dec ? avcodec_alloc_context3(dec) : nullptr;
+  if (!ctx || avcodec_parameters_to_context(ctx, fmt->streams[si]->codecpar) < 0 ||
+      avcodec_open2(ctx, dec, nullptr) < 0) {
+    if (ctx) avcodec_free_context(&ctx);
+    avformat_close_input(&fmt);
+    return false;
+  }
+  AVPacket* pkt = av_packet_alloc();
+  AVFrame* frame = av_frame_alloc();
+  bool ok = false;
+  while (av_read_frame(fmt, pkt) >= 0) {
+    if (pkt->stream_index != si) {
+      av_packet_unref(pkt);
+      continue;
+    }
+    if (avcodec_send_packet(ctx, pkt) == 0 && avcodec_receive_frame(ctx, frame) == 0) {
+      SwsContext* sws =
+          sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
+                         frame->width, frame->height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr,
+                         nullptr);
+      if (sws) {
+        w = frame->width;
+        h = frame->height;
+        const int row = w * 4;
+        const int stride = (row + 63) & ~63;
+        std::vector<uint8_t> padded(static_cast<size_t>(stride) * static_cast<size_t>(h) + 64);
+        uint8_t* dst[4] = {padded.data(), nullptr, nullptr, nullptr};
+        int dst_stride[4] = {stride, 0, 0, 0};
+        sws_scale(sws, frame->data, frame->linesize, 0, h, dst, dst_stride);
+        rgba.resize(static_cast<size_t>(row) * static_cast<size_t>(h));
+        for (int y = 0; y < h; ++y) {
+          std::memcpy(rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row),
+                      padded.data() + static_cast<size_t>(y) * static_cast<size_t>(stride),
+                      static_cast<size_t>(row));
+        }
+        sws_freeContext(sws);
+        ok = true;
+      }
+      av_packet_unref(pkt);
+      break;
+    }
+    av_packet_unref(pkt);
+  }
+  av_frame_free(&frame);
+  av_packet_free(&pkt);
+  avcodec_free_context(&ctx);
+  avformat_close_input(&fmt);
+  if (!ok) {
+    rgba.clear();
+    w = h = 0;
+  }
+  return ok;
+}
+#else
+bool load_jpeg_rgba(const std::string&, std::vector<uint8_t>& rgba, int& w, int& h) {
+  rgba.clear();
+  w = h = 0;
+  return false;
+}
+#endif
+
+/**
+ * Gaia EDR3 colour equirect is a star-density photograph (1.8B stars), not a
+ * painted nebula — the “particles” are real density speckles. For a VR backdrop
+ * we collapse that grain into a continuous glow while keeping large dust lanes.
+ *
+ * Pipeline: wide low-pass base + residual shrink (kill bright speckles harder
+ * than dark dust). Then seal ℓ=±180° for REPEAT sampling.
+ */
+void denoise_equirect_rgba(std::vector<uint8_t>& rgba, int w, int h) {
+  if (w < 16 || h < 8 || rgba.size() < static_cast<size_t>(w) * static_cast<size_t>(h) * 4u) return;
+  const int row = w * 4;
+  const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+  std::vector<float> src(n * 3u), blur(n * 3u), tmp(n * 3u), wide(n * 3u);
+
+  for (size_t i = 0; i < n; ++i) {
+    src[i * 3u + 0] = rgba[i * 4u + 0];
+    src[i * 3u + 1] = rgba[i * 4u + 1];
+    src[i * 3u + 2] = rgba[i * 4u + 2];
+  }
+
+  auto idx = [&](int x, int y) -> size_t {
+    x = ((x % w) + w) % w;
+    y = std::clamp(y, 0, h - 1);
+    return static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
+  };
+
+  constexpr float kW[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
+  constexpr float kWsum = 16.f;
+  auto sep_blur = [&](const std::vector<float>& in, std::vector<float>& out) {
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        float acc[3] = {0.f, 0.f, 0.f};
+        for (int k = -2; k <= 2; ++k) {
+          const size_t i = idx(x + k, y);
+          const float ww = kW[k + 2];
+          acc[0] += in[i * 3u + 0] * ww;
+          acc[1] += in[i * 3u + 1] * ww;
+          acc[2] += in[i * 3u + 2] * ww;
+        }
+        const size_t o = idx(x, y);
+        tmp[o * 3u + 0] = acc[0] / kWsum;
+        tmp[o * 3u + 1] = acc[1] / kWsum;
+        tmp[o * 3u + 2] = acc[2] / kWsum;
+      }
+    }
+    for (int y = 0; y < h; ++y) {
+      for (int x = 0; x < w; ++x) {
+        float acc[3] = {0.f, 0.f, 0.f};
+        for (int k = -2; k <= 2; ++k) {
+          const size_t i = idx(x, y + k);
+          const float ww = kW[k + 2];
+          acc[0] += tmp[i * 3u + 0] * ww;
+          acc[1] += tmp[i * 3u + 1] * ww;
+          acc[2] += tmp[i * 3u + 2] * ww;
+        }
+        const size_t o = idx(x, y);
+        out[o * 3u + 0] = acc[0] / kWsum;
+        out[o * 3u + 1] = acc[1] / kWsum;
+        out[o * 3u + 2] = acc[2] / kWsum;
+      }
+    }
+  };
+
+  // Asymmetric residual: bright speckles (stars) die; dark residuals (dust) stay.
+  auto residual_shrink = [&](float grain_lo, float grain_hi, float keep_bright, float keep_dark) {
+    sep_blur(src, blur);
+    for (size_t i = 0; i < n; ++i) {
+      const float ol =
+          0.2126f * src[i * 3u] + 0.7152f * src[i * 3u + 1] + 0.0722f * src[i * 3u + 2];
+      const float bl =
+          0.2126f * blur[i * 3u] + 0.7152f * blur[i * 3u + 1] + 0.0722f * blur[i * 3u + 2];
+      const float d_luma = ol - bl;
+      const float ad = std::fabs(d_luma);
+      float t = (ad - grain_lo) / (grain_hi - grain_lo);
+      t = std::clamp(t, 0.f, 1.f);
+      t = t * t * (3.f - 2.f * t);
+      const float keep_base = (d_luma >= 0.f) ? keep_bright : keep_dark;
+      const float keep = keep_base + (1.f - keep_base) * t;
+      for (int c = 0; c < 3; ++c) {
+        const float d = src[i * 3u + static_cast<size_t>(c)] - blur[i * 3u + static_cast<size_t>(c)];
+        src[i * 3u + static_cast<size_t>(c)] = blur[i * 3u + static_cast<size_t>(c)] + d * keep;
+      }
+    }
+  };
+  // Pass 1–2: strip star density grain. Pass 3: gentle mop-up.
+  residual_shrink(2.f, 40.f, 0.015f, 0.55f);
+  residual_shrink(1.5f, 28.f, 0.02f, 0.45f);
+  residual_shrink(1.f, 18.f, 0.04f, 0.35f);
+
+  // Anchor to a wide low-pass so gaps between speckles fill into continuous glow,
+  // while still allowing the residual-shrunk dust structure through.
+  wide = src;
+  for (int pass = 0; pass < 3; ++pass) {
+    sep_blur(wide, blur);
+    wide.swap(blur);
+  }
+  for (size_t i = 0; i < n; ++i) {
+    const float sl =
+        0.2126f * src[i * 3u] + 0.7152f * src[i * 3u + 1] + 0.0722f * src[i * 3u + 2];
+    const float wl =
+        0.2126f * wide[i * 3u] + 0.7152f * wide[i * 3u + 1] + 0.0722f * wide[i * 3u + 2];
+    // Mostly wide fill (closes star-density holes). If structured src is darker,
+    // keep more of it so dust lanes are not washed out.
+    const float w_src = (sl < wl) ? 0.55f : 0.28f;
+    for (int c = 0; c < 3; ++c) {
+      const float s = src[i * 3u + static_cast<size_t>(c)];
+      const float wde = wide[i * 3u + static_cast<size_t>(c)];
+      src[i * 3u + static_cast<size_t>(c)] = w_src * s + (1.f - w_src) * wde;
+    }
+  }
+
+  for (size_t i = 0; i < n; ++i) {
+    for (int c = 0; c < 3; ++c) {
+      rgba[i * 4u + static_cast<size_t>(c)] =
+          static_cast<uint8_t>(std::clamp(src[i * 3u + static_cast<size_t>(c)] + 0.5f, 0.f, 255.f));
+    }
+    rgba[i * 4u + 3] = 255;
+  }
+
+  // Seal longitude join from a snapshot so L/R do not chase each other, then
+  // force several edge columns equal for REPEAT bilinear.
+  constexpr int kSeam = 48;
+  std::vector<uint8_t> seam_snap(static_cast<size_t>(kSeam) * 2u * 3u);
+  for (int y = 0; y < h; ++y) {
+    for (int i = 0; i < kSeam; ++i) {
+      const uint8_t* Lp =
+          rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row) + static_cast<size_t>(i) * 4u;
+      const uint8_t* Rp = rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row) +
+                          static_cast<size_t>(w - 1 - i) * 4u;
+      for (int c = 0; c < 3; ++c) {
+        seam_snap[static_cast<size_t>(i) * 6u + static_cast<size_t>(c)] = Lp[c];
+        seam_snap[static_cast<size_t>(i) * 6u + 3u + static_cast<size_t>(c)] = Rp[c];
+      }
+    }
+    for (int i = 0; i < kSeam; ++i) {
+      const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(kSeam);
+      // Stay near 50/50 longer across the band, then ease out.
+      const float a = std::pow(0.5f * (1.f + std::cos(t * static_cast<float>(M_PI))), 0.65f);
+      uint8_t* Lp =
+          rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row) + static_cast<size_t>(i) * 4u;
+      uint8_t* Rp = rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row) +
+                    static_cast<size_t>(w - 1 - i) * 4u;
+      for (int c = 0; c < 3; ++c) {
+        const float L0 = seam_snap[static_cast<size_t>(i) * 6u + static_cast<size_t>(c)];
+        const float R0 = seam_snap[static_cast<size_t>(i) * 6u + 3u + static_cast<size_t>(c)];
+        const float mid = 0.5f * (L0 + R0);
+        Lp[c] = static_cast<uint8_t>(std::clamp(L0 * (1.f - a) + mid * a + 0.5f, 0.f, 255.f));
+        Rp[c] = static_cast<uint8_t>(std::clamp(R0 * (1.f - a) + mid * a + 0.5f, 0.f, 255.f));
+      }
+    }
+    // Identical wrap columns (and next inward) so bilinear across u=0 has no step.
+    for (int i = 0; i < 3; ++i) {
+      uint8_t* L = rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row) +
+                   static_cast<size_t>(i) * 4u;
+      uint8_t* R = rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row) +
+                   static_cast<size_t>(w - 1 - i) * 4u;
+      for (int c = 0; c < 3; ++c) {
+        const uint8_t avg = static_cast<uint8_t>((static_cast<int>(L[c]) + static_cast<int>(R[c]) + 1) / 2);
+        L[c] = R[c] = avg;
+      }
+    }
+  }
+}
+
 }  // namespace
 
 void SceneRenderer::init(XrVulkanApp& app, const std::string& shader_dir) {
@@ -240,7 +494,6 @@ void SceneRenderer::init(XrVulkanApp& app, const std::string& shader_dir) {
   if (!app.swapchains().empty()) {
     create_pipelines(app.swapchains()[0].format);
   }
-
   cmds_.resize(2);
   VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
   ai.commandPool = app.command_pool();
@@ -251,6 +504,8 @@ void SceneRenderer::init(XrVulkanApp& app, const std::string& shader_dir) {
   VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
   fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
   VRP_CHECK(vkCreateFence(device_, &fci, nullptr, &submit_fence_) == VK_SUCCESS, "scene fence");
+
+  load_milkyway_sky_texture();
 }
 
 void SceneRenderer::shutdown() {
@@ -263,14 +518,51 @@ void SceneRenderer::shutdown() {
   if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
   if (grid_pipeline_) vkDestroyPipeline(device_, grid_pipeline_, nullptr);
   if (star_pipeline_) vkDestroyPipeline(device_, star_pipeline_, nullptr);
+  if (nebula_pipeline_) vkDestroyPipeline(device_, nebula_pipeline_, nullptr);
+  if (moon_pipeline_) vkDestroyPipeline(device_, moon_pipeline_, nullptr);
+  if (milkyway_pipeline_) vkDestroyPipeline(device_, milkyway_pipeline_, nullptr);
   if (layout_) vkDestroyPipelineLayout(device_, layout_, nullptr);
   if (grid_layout_) vkDestroyPipelineLayout(device_, grid_layout_, nullptr);
+  if (milkyway_layout_) vkDestroyPipelineLayout(device_, milkyway_layout_, nullptr);
+  if (moon_layout_) vkDestroyPipelineLayout(device_, moon_layout_, nullptr);
+  if (milkyway_pool_) {
+    vkDestroyDescriptorPool(device_, milkyway_pool_, nullptr);
+    milkyway_pool_ = VK_NULL_HANDLE;
+    milkyway_dset_ = VK_NULL_HANDLE;
+  }
+  if (milkyway_dsl_) {
+    vkDestroyDescriptorSetLayout(device_, milkyway_dsl_, nullptr);
+    milkyway_dsl_ = VK_NULL_HANDLE;
+  }
+  if (milkyway_samp_) {
+    vkDestroySampler(device_, milkyway_samp_, nullptr);
+    milkyway_samp_ = VK_NULL_HANDLE;
+  }
+  if (milkyway_view_) {
+    vkDestroyImageView(device_, milkyway_view_, nullptr);
+    milkyway_view_ = VK_NULL_HANDLE;
+  }
+  if (milkyway_img_) {
+    vkDestroyImage(device_, milkyway_img_, nullptr);
+    milkyway_img_ = VK_NULL_HANDLE;
+  }
+  if (milkyway_img_mem_) {
+    vkFreeMemory(device_, milkyway_img_mem_, nullptr);
+    milkyway_img_mem_ = VK_NULL_HANDLE;
+  }
+  milkyway_sky_ok_ = false;
   if (vert_) vkDestroyShaderModule(device_, vert_, nullptr);
   if (frag_) vkDestroyShaderModule(device_, frag_, nullptr);
   if (grid_vert_) vkDestroyShaderModule(device_, grid_vert_, nullptr);
   if (grid_frag_) vkDestroyShaderModule(device_, grid_frag_, nullptr);
   if (star_vert_) vkDestroyShaderModule(device_, star_vert_, nullptr);
   if (star_frag_) vkDestroyShaderModule(device_, star_frag_, nullptr);
+  if (nebula_vert_) vkDestroyShaderModule(device_, nebula_vert_, nullptr);
+  if (nebula_frag_) vkDestroyShaderModule(device_, nebula_frag_, nullptr);
+  if (moon_vert_) vkDestroyShaderModule(device_, moon_vert_, nullptr);
+  if (moon_frag_) vkDestroyShaderModule(device_, moon_frag_, nullptr);
+  if (milkyway_vert_) vkDestroyShaderModule(device_, milkyway_vert_, nullptr);
+  if (milkyway_frag_) vkDestroyShaderModule(device_, milkyway_frag_, nullptr);
   if (dset_) {
     // freed with pool
   }
@@ -292,11 +584,213 @@ void SceneRenderer::shutdown() {
   destroy_buf(ibo_sphere_, ibo_sphere_mem_);
   destroy_buf(vbo_grid_, vbo_grid_mem_);
   destroy_buf(vbo_stars_, vbo_stars_mem_);
+  destroy_buf(vbo_nebulae_, vbo_nebulae_mem_);
+  destroy_buf(vbo_moon_, vbo_moon_mem_);
+  destroy_buf(vbo_milkyway_, vbo_milkyway_mem_);
+  destroy_buf(ibo_milkyway_, ibo_milkyway_mem_);
   pipeline_ = VK_NULL_HANDLE;
   grid_pipeline_ = VK_NULL_HANDLE;
   star_pipeline_ = VK_NULL_HANDLE;
+  nebula_pipeline_ = VK_NULL_HANDLE;
+  moon_pipeline_ = VK_NULL_HANDLE;
+  milkyway_pipeline_ = VK_NULL_HANDLE;
   layout_ = VK_NULL_HANDLE;
   grid_layout_ = VK_NULL_HANDLE;
+  milkyway_layout_ = VK_NULL_HANDLE;
+  moon_layout_ = VK_NULL_HANDLE;
+}
+
+void SceneRenderer::set_milkyway_gain(float gain_mul) {
+  milkyway_gain_mul_ = std::clamp(gain_mul, 0.2f, 2.5f);
+}
+
+float SceneRenderer::milkyway_gain() const { return milkyway_gain_mul_; }
+
+void SceneRenderer::load_milkyway_sky_texture() {
+  milkyway_sky_ok_ = false;
+  if (!device_ || !milkyway_dset_ || !app_) return;
+  std::vector<uint8_t> rgba;
+  int w = 0, h = 0;
+  const std::string path = shader_dir_ + "/gaia_sky_edr3_equirect.jpg";
+  if (!load_jpeg_rgba(path, rgba, w, h) || w <= 0 || h <= 0) {
+    VRP_LOG("milkyway: Gaia sky texture missing (%s)", path.c_str());
+    return;
+  }
+  // Kill JPEG grain + blend the longitude join before upload (U wraps, V clamps).
+  denoise_equirect_rgba(rgba, w, h);
+
+  const uint32_t uw = static_cast<uint32_t>(w);
+  const uint32_t uh = static_cast<uint32_t>(h);
+  uint32_t mip_levels = 1;
+  {
+    uint32_t mw = uw, mh = uh;
+    while (mw > 1u || mh > 1u) {
+      mw = std::max(1u, mw / 2u);
+      mh = std::max(1u, mh / 2u);
+      ++mip_levels;
+    }
+  }
+
+  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = VK_FORMAT_R8G8B8A8_UNORM;  // JPEG bytes are sRGB; linearize in shader
+  ici.extent = {uw, uh, 1};
+  ici.mipLevels = mip_levels;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VRP_CHECK(vkCreateImage(device_, &ici, nullptr, &milkyway_img_) == VK_SUCCESS, "mw image");
+  VkMemoryRequirements req{};
+  vkGetImageMemoryRequirements(device_, milkyway_img_, &req);
+  VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  mai.allocationSize = req.size;
+  mai.memoryTypeIndex = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  VRP_CHECK(vkAllocateMemory(device_, &mai, nullptr, &milkyway_img_mem_) == VK_SUCCESS, "mw img mem");
+  vkBindImageMemory(device_, milkyway_img_, milkyway_img_mem_, 0);
+
+  VkBuffer staging = VK_NULL_HANDLE;
+  VkDeviceMemory staging_mem = VK_NULL_HANDLE;
+  const VkDeviceSize bytes = static_cast<VkDeviceSize>(rgba.size());
+  {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = bytes;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    VRP_CHECK(vkCreateBuffer(device_, &bci, nullptr, &staging) == VK_SUCCESS, "mw staging");
+    VkMemoryRequirements breq{};
+    vkGetBufferMemoryRequirements(device_, staging, &breq);
+    VkMemoryAllocateInfo bmai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    bmai.allocationSize = breq.size;
+    bmai.memoryTypeIndex =
+        find_memory(breq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VRP_CHECK(vkAllocateMemory(device_, &bmai, nullptr, &staging_mem) == VK_SUCCESS, "mw staging mem");
+    vkBindBufferMemory(device_, staging, staging_mem, 0);
+    void* mapped = nullptr;
+    vkMapMemory(device_, staging_mem, 0, bytes, 0, &mapped);
+    std::memcpy(mapped, rgba.data(), rgba.size());
+    vkUnmapMemory(device_, staging_mem);
+  }
+
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cai.commandPool = app_->command_pool();
+  cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cai.commandBufferCount = 1;
+  VRP_CHECK(vkAllocateCommandBuffers(device_, &cai, &cmd) == VK_SUCCESS, "mw cmd");
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &bi);
+  VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  to_dst.srcAccessMask = 0;
+  to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_dst.image = milkyway_img_;
+  to_dst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                       nullptr, 1, &to_dst);
+  VkBufferImageCopy copy{};
+  copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+  copy.imageExtent = {uw, uh, 1};
+  vkCmdCopyBufferToImage(cmd, staging, milkyway_img_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+  // mip0: TRANSFER_DST → TRANSFER_SRC for blit chain.
+  {
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.image = milkyway_img_;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+  }
+
+  uint32_t src_w = uw, src_h = uh;
+  for (uint32_t level = 1; level < mip_levels; ++level) {
+    const uint32_t dst_w = std::max(1u, src_w / 2u);
+    const uint32_t dst_h = std::max(1u, src_h / 2u);
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level - 1, 0, 1};
+    blit.srcOffsets[0] = {0, 0, 0};
+    blit.srcOffsets[1] = {static_cast<int32_t>(src_w), static_cast<int32_t>(src_h), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, 1};
+    blit.dstOffsets[0] = {0, 0, 0};
+    blit.dstOffsets[1] = {static_cast<int32_t>(dst_w), static_cast<int32_t>(dst_h), 1};
+    vkCmdBlitImage(cmd, milkyway_img_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, milkyway_img_,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    // Promote this level to SRC for the next blit (last level goes to SAMPLE below).
+    VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    b.image = milkyway_img_;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &b);
+    src_w = dst_w;
+    src_h = dst_h;
+  }
+
+  // All mips are TRANSFER_SRC → SHADER_READ_ONLY.
+  {
+    VkImageMemoryBarrier to_sample{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_sample.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    to_sample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_sample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    to_sample.image = milkyway_img_;
+    to_sample.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr,
+                         0, nullptr, 1, &to_sample);
+  }
+  vkEndCommandBuffer(cmd);
+  {
+    std::lock_guard<std::mutex> qlock(app_->queue_mutex());
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    VRP_CHECK(vkQueueSubmit(app_->queue(), 1, &si, VK_NULL_HANDLE) == VK_SUCCESS, "mw upload");
+    vkQueueWaitIdle(app_->queue());
+  }
+  vkFreeCommandBuffers(device_, app_->command_pool(), 1, &cmd);
+  vkDestroyBuffer(device_, staging, nullptr);
+  vkFreeMemory(device_, staging_mem, nullptr);
+
+  VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  ivci.image = milkyway_img_;
+  ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  ivci.format = VK_FORMAT_R8G8B8A8_UNORM;
+  ivci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, mip_levels, 0, 1};
+  VRP_CHECK(vkCreateImageView(device_, &ivci, nullptr, &milkyway_view_) == VK_SUCCESS, "mw view");
+
+  VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+  sci.magFilter = VK_FILTER_LINEAR;
+  sci.minFilter = VK_FILTER_LINEAR;
+  sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+  sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+  sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+  sci.minLod = 0.f;
+  sci.maxLod = static_cast<float>(mip_levels);
+  VRP_CHECK(vkCreateSampler(device_, &sci, nullptr, &milkyway_samp_) == VK_SUCCESS, "mw samp");
+
+  VkDescriptorImageInfo ii{};
+  ii.sampler = milkyway_samp_;
+  ii.imageView = milkyway_view_;
+  ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = milkyway_dset_;
+  write.dstBinding = 0;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  write.pImageInfo = &ii;
+  vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+  milkyway_sky_ok_ = true;
+  VRP_LOG("milkyway: Gaia sky %dx%d (%u mips, edge-preserve denoise)", w, h, mip_levels);
 }
 
 void SceneRenderer::set_projection(ProjectionMode mode, StereoLayout stereo, float flat_fov_deg,
@@ -322,6 +816,7 @@ void SceneRenderer::set_comfort_grid(bool on) { comfort_grid_ = on; }
 
 void SceneRenderer::set_texture(VkImageView view, VkSampler sampler) {
   if (!view || !sampler || !dset_) return;
+  queued_tex_ = QueuedTex::None;
   nv12_ = false;
   nv12_full_range_ = false;
   rgba_gamma_ = false;
@@ -350,6 +845,7 @@ void SceneRenderer::set_texture_gamma(VkImageView view, VkSampler sampler) {
 
 void SceneRenderer::set_nv12_texture(VkImageView y, VkImageView uv, VkSampler sampler, bool full_range) {
   if (!y || !uv || !sampler || !dset_) return;
+  queued_tex_ = QueuedTex::None;
   nv12_ = true;
   nv12_full_range_ = full_range;
   rgba_gamma_ = false;
@@ -371,6 +867,51 @@ void SceneRenderer::set_nv12_texture(VkImageView y, VkImageView uv, VkSampler sa
     w[i].pImageInfo = &ii[i];
   }
   vkUpdateDescriptorSets(device_, 2, w, 0, nullptr);
+}
+
+void SceneRenderer::queue_texture(VkImageView view, VkSampler sampler) {
+  if (!view || !sampler) return;
+  queued_tex_ = QueuedTex::Rgba;
+  queued_y_ = view;
+  queued_uv_ = view;
+  queued_samp_ = sampler;
+  queued_nv12_full_ = false;
+}
+
+void SceneRenderer::queue_texture_gamma(VkImageView view, VkSampler sampler) {
+  if (!view || !sampler) return;
+  queued_tex_ = QueuedTex::RgbaGamma;
+  queued_y_ = view;
+  queued_uv_ = view;
+  queued_samp_ = sampler;
+  queued_nv12_full_ = false;
+}
+
+void SceneRenderer::queue_nv12_texture(VkImageView y, VkImageView uv, VkSampler sampler,
+                                       bool full_range) {
+  if (!y || !uv || !sampler) return;
+  queued_tex_ = QueuedTex::Nv12;
+  queued_y_ = y;
+  queued_uv_ = uv;
+  queued_samp_ = sampler;
+  queued_nv12_full_ = full_range;
+}
+
+void SceneRenderer::flush_queued_texture() {
+  if (queued_tex_ == QueuedTex::None) return;
+  const QueuedTex kind = queued_tex_;
+  const VkImageView y = queued_y_;
+  const VkImageView uv = queued_uv_;
+  const VkSampler samp = queued_samp_;
+  const bool full = queued_nv12_full_;
+  queued_tex_ = QueuedTex::None;
+  if (kind == QueuedTex::Nv12) {
+    set_nv12_texture(y, uv, samp, full);
+  } else if (kind == QueuedTex::RgbaGamma) {
+    set_texture_gamma(y, samp);
+  } else {
+    set_texture(y, samp);
+  }
 }
 
 void SceneRenderer::set_hud_texture(VkImageView view, VkSampler sampler, bool visible) {
@@ -503,6 +1044,34 @@ void SceneRenderer::create_descriptors() {
   VRP_CHECK(vkAllocateDescriptorSets(device_, &ai, &dset_) == VK_SUCCESS, "dset");
   VRP_CHECK(vkAllocateDescriptorSets(device_, &ai, &hud_dset_) == VK_SUCCESS, "hud dset");
   VRP_CHECK(vkAllocateDescriptorSets(device_, &ai, &thumb_dset_) == VK_SUCCESS, "thumb dset");
+
+  // Milky Way Gaia equirect texture (bound after load_milkyway_sky_texture).
+  {
+    VkDescriptorSetLayoutBinding samp{};
+    samp.binding = 0;
+    samp.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    samp.descriptorCount = 1;
+    samp.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo mw_lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    mw_lci.bindingCount = 1;
+    mw_lci.pBindings = &samp;
+    VRP_CHECK(vkCreateDescriptorSetLayout(device_, &mw_lci, nullptr, &milkyway_dsl_) == VK_SUCCESS,
+              "mw dsl");
+
+    VkDescriptorPoolSize mw_ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolCreateInfo mw_pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    mw_pci.poolSizeCount = 1;
+    mw_pci.pPoolSizes = &mw_ps;
+    mw_pci.maxSets = 1;
+    VRP_CHECK(vkCreateDescriptorPool(device_, &mw_pci, nullptr, &milkyway_pool_) == VK_SUCCESS,
+              "mw dpool");
+
+    VkDescriptorSetAllocateInfo mw_ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    mw_ai.descriptorPool = milkyway_pool_;
+    mw_ai.descriptorSetCount = 1;
+    mw_ai.pSetLayouts = &milkyway_dsl_;
+    VRP_CHECK(vkAllocateDescriptorSets(device_, &mw_ai, &milkyway_dset_) == VK_SUCCESS, "mw dset");
+  }
 }
 
 void SceneRenderer::build_meshes() {
@@ -604,7 +1173,19 @@ void SceneRenderer::build_meshes() {
     upload(grid.data(), grid.size() * sizeof(GridVert), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_grid_, vbo_grid_mem_);
   }
 
-  // Slightly outside the comfort grid (radius 80) so stars stay behind the cage.
+  // Galactic-plane glow sphere (outside stars). Soft band in milkyway.frag.
+  {
+    auto [mw_v, mw_i] = starfield::build_sky_sphere(98.f, 256, 128);
+    milkyway_index_count_ = static_cast<uint32_t>(mw_i.size());
+    if (!mw_v.empty() && !mw_i.empty()) {
+      upload(mw_v.data(), mw_v.size() * sizeof(starfield::SkyVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+             vbo_milkyway_, vbo_milkyway_mem_);
+      upload(mw_i.data(), mw_i.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT, ibo_milkyway_,
+             ibo_milkyway_mem_);
+    }
+  }
+
+  // Stars as soft discs; outside the comfort grid.
   starfield::MeshOptions star_opt;
   star_opt.radius = 95.f;
   const auto catalog = starfield::load_catalog(shader_dir_ + "/stars_wikidata.bin");
@@ -614,6 +1195,19 @@ void SceneRenderer::build_meshes() {
     upload(stars.data(), stars.size() * sizeof(StarVert), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_stars_,
            vbo_stars_mem_);
   }
+
+  // Nebulae: larger colored soft discs (behind stars).
+  const auto nebulae = starfield::load_deepsky_catalog(shader_dir_ + "/nebulae_wikidata.bin");
+  const std::vector<StarVert> neb_mesh = starfield::build_mesh(nebulae, starfield::nebula_mesh_options());
+  nebula_vert_count_ = static_cast<uint32_t>(neb_mesh.size());
+  if (!neb_mesh.empty()) {
+    upload(neb_mesh.data(), neb_mesh.size() * sizeof(StarVert), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_nebulae_,
+           vbo_nebulae_mem_);
+  }
+
+  // Unit quad corners for the Moon billboard (−1..1).
+  const float moon_quad[] = {-1.f, -1.f, 1.f, -1.f, 1.f, 1.f, -1.f, -1.f, 1.f, 1.f, -1.f, 1.f};
+  upload(moon_quad, sizeof(moon_quad), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_moon_, vbo_moon_mem_);
 }
 
 void SceneRenderer::create_pipelines(VkFormat /*format*/) {
@@ -856,6 +1450,161 @@ void SceneRenderer::create_pipelines(VkFormat /*format*/) {
   star_gp.subpass = 0;
   VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &star_gp, nullptr, &star_pipeline_) == VK_SUCCESS,
             "star pipeline");
+
+  nebula_vert_ = load_shader(shader_dir_ + "/nebula.vert.spv");
+  nebula_frag_ = load_shader(shader_dir_ + "/nebula.frag.spv");
+  VkPipelineShaderStageCreateInfo neb_stages[2]{};
+  neb_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  neb_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  neb_stages[0].module = nebula_vert_;
+  neb_stages[0].pName = "main";
+  neb_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  neb_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  neb_stages[1].module = nebula_frag_;
+  neb_stages[1].pName = "main";
+  VkGraphicsPipelineCreateInfo neb_gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  neb_gp.stageCount = 2;
+  neb_gp.pStages = neb_stages;
+  neb_gp.pVertexInputState = &star_vi;
+  neb_gp.pInputAssemblyState = &grid_ia;
+  neb_gp.pViewportState = &vp;
+  neb_gp.pRasterizationState = &grid_rs;
+  neb_gp.pMultisampleState = &ms;
+  neb_gp.pColorBlendState = &star_cb;
+  neb_gp.pDynamicState = &dyn;
+  neb_gp.layout = grid_layout_;
+  neb_gp.renderPass = app_->color_pass();
+  neb_gp.subpass = 0;
+  VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &neb_gp, nullptr, &nebula_pipeline_) == VK_SUCCESS,
+            "nebula pipeline");
+
+  milkyway_vert_ = load_shader(shader_dir_ + "/milkyway.vert.spv");
+  milkyway_frag_ = load_shader(shader_dir_ + "/milkyway.frag.spv");
+  struct MilkywayPush {
+    float mvp[16];
+    float gain_mul;
+    uint32_t pad[3];
+  };
+  VkPushConstantRange mw_pcr{};
+  mw_pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+  mw_pcr.size = sizeof(MilkywayPush);
+  VkPipelineLayoutCreateInfo mw_pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  mw_pl.setLayoutCount = 1;
+  mw_pl.pSetLayouts = &milkyway_dsl_;
+  mw_pl.pushConstantRangeCount = 1;
+  mw_pl.pPushConstantRanges = &mw_pcr;
+  VRP_CHECK(vkCreatePipelineLayout(device_, &mw_pl, nullptr, &milkyway_layout_) == VK_SUCCESS, "mw layout");
+
+  VkPipelineShaderStageCreateInfo mw_stages[2]{};
+  mw_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  mw_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  mw_stages[0].module = milkyway_vert_;
+  mw_stages[0].pName = "main";
+  mw_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  mw_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  mw_stages[1].module = milkyway_frag_;
+  mw_stages[1].pName = "main";
+
+  VkVertexInputBindingDescription mw_bind{};
+  mw_bind.binding = 0;
+  mw_bind.stride = sizeof(starfield::SkyVertex);
+  mw_bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+  VkVertexInputAttributeDescription mw_attr{};
+  mw_attr.location = 0;
+  mw_attr.binding = 0;
+  mw_attr.format = VK_FORMAT_R32G32B32_SFLOAT;
+  mw_attr.offset = 0;
+  VkPipelineVertexInputStateCreateInfo mw_vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  mw_vi.vertexBindingDescriptionCount = 1;
+  mw_vi.pVertexBindingDescriptions = &mw_bind;
+  mw_vi.vertexAttributeDescriptionCount = 1;
+  mw_vi.pVertexAttributeDescriptions = &mw_attr;
+
+  VkGraphicsPipelineCreateInfo mw_gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  mw_gp.stageCount = 2;
+  mw_gp.pStages = mw_stages;
+  mw_gp.pVertexInputState = &mw_vi;
+  mw_gp.pInputAssemblyState = &grid_ia;
+  mw_gp.pViewportState = &vp;
+  mw_gp.pRasterizationState = &grid_rs;
+  mw_gp.pMultisampleState = &ms;
+  mw_gp.pColorBlendState = &star_cb;
+  mw_gp.pDynamicState = &dyn;
+  mw_gp.layout = milkyway_layout_;
+  mw_gp.renderPass = app_->color_pass();
+  mw_gp.subpass = 0;
+  VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &mw_gp, nullptr, &milkyway_pipeline_) == VK_SUCCESS,
+            "milkyway pipeline");
+
+  moon_vert_ = load_shader(shader_dir_ + "/moon.vert.spv");
+  moon_frag_ = load_shader(shader_dir_ + "/moon.frag.spv");
+  struct MoonPush {
+    float mvp[16];
+    float moon_dir[4];
+    float sun_dir[4];
+  };
+  VkPushConstantRange moon_pcr{};
+  moon_pcr.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+  moon_pcr.size = sizeof(MoonPush);
+  VkPipelineLayoutCreateInfo moon_plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  moon_plci.pushConstantRangeCount = 1;
+  moon_plci.pPushConstantRanges = &moon_pcr;
+  VRP_CHECK(vkCreatePipelineLayout(device_, &moon_plci, nullptr, &moon_layout_) == VK_SUCCESS, "moon layout");
+
+  VkPipelineShaderStageCreateInfo moon_stages[2]{};
+  moon_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  moon_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  moon_stages[0].module = moon_vert_;
+  moon_stages[0].pName = "main";
+  moon_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  moon_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  moon_stages[1].module = moon_frag_;
+  moon_stages[1].pName = "main";
+
+  VkVertexInputBindingDescription moon_bind{};
+  moon_bind.binding = 0;
+  moon_bind.stride = sizeof(float) * 2;
+  moon_bind.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+  VkVertexInputAttributeDescription moon_attr{};
+  moon_attr.location = 0;
+  moon_attr.binding = 0;
+  moon_attr.format = VK_FORMAT_R32G32_SFLOAT;
+  moon_attr.offset = 0;
+  VkPipelineVertexInputStateCreateInfo moon_vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+  moon_vi.vertexBindingDescriptionCount = 1;
+  moon_vi.pVertexBindingDescriptions = &moon_bind;
+  moon_vi.vertexAttributeDescriptionCount = 1;
+  moon_vi.pVertexAttributeDescriptions = &moon_attr;
+
+  VkPipelineColorBlendAttachmentState moon_blend{};
+  moon_blend.blendEnable = VK_TRUE;
+  moon_blend.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+  moon_blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  moon_blend.colorBlendOp = VK_BLEND_OP_ADD;
+  moon_blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+  moon_blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+  moon_blend.alphaBlendOp = VK_BLEND_OP_ADD;
+  moon_blend.colorWriteMask =
+      VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+  VkPipelineColorBlendStateCreateInfo moon_cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+  moon_cb.attachmentCount = 1;
+  moon_cb.pAttachments = &moon_blend;
+
+  VkGraphicsPipelineCreateInfo moon_gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+  moon_gp.stageCount = 2;
+  moon_gp.pStages = moon_stages;
+  moon_gp.pVertexInputState = &moon_vi;
+  moon_gp.pInputAssemblyState = &grid_ia;
+  moon_gp.pViewportState = &vp;
+  moon_gp.pRasterizationState = &grid_rs;
+  moon_gp.pMultisampleState = &ms;
+  moon_gp.pColorBlendState = &moon_cb;
+  moon_gp.pDynamicState = &dyn;
+  moon_gp.layout = moon_layout_;
+  moon_gp.renderPass = app_->color_pass();
+  moon_gp.subpass = 0;
+  VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &moon_gp, nullptr, &moon_pipeline_) == VK_SUCCESS,
+            "moon pipeline");
 }
 
 void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapchain& sc,
@@ -898,19 +1647,75 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   }
   Mat4 proj = projection_fov(view.fov, 0.05f, 100.f);
 
-  // Celestial background (Wikidata stars). Drawn before video; turns with content look.
+  // Celestial background: galactic band, then stars. Turns with content look.
+  Mat4 sky_model = Mat4::identity();
+  sky_model.m[12] = head.m[12];
+  sky_model.m[13] = head.m[13];
+  sky_model.m[14] = head.m[14];
+  const Mat4 sky_mvp = Mat4::mul(proj, Mat4::mul(content_view, sky_model));
+  if (milkyway_sky_ok_ && milkyway_pipeline_ && milkyway_layout_ && milkyway_dset_ && vbo_milkyway_ &&
+      ibo_milkyway_ && milkyway_index_count_ >= 3) {
+    struct MilkywayPush {
+      float mvp[16];
+      float gain_mul;
+      uint32_t pad[3];
+    } mw_pc{};
+    std::memcpy(mw_pc.mvp, &sky_mvp, sizeof(mw_pc.mvp));
+    mw_pc.gain_mul = milkyway_gain_mul_;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, milkyway_pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, milkyway_layout_, 0, 1, &milkyway_dset_, 0,
+                            nullptr);
+    vkCmdPushConstants(cmd, milkyway_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(mw_pc), &mw_pc);
+    VkDeviceSize mw_off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_milkyway_, &mw_off);
+    vkCmdBindIndexBuffer(cmd, ibo_milkyway_, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd, milkyway_index_count_, 1, 0, 0, 0);
+  }
+  if (nebula_pipeline_ && vbo_nebulae_ && nebula_vert_count_ >= 6) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, nebula_pipeline_);
+    vkCmdPushConstants(cmd, grid_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(sky_mvp), &sky_mvp);
+    VkDeviceSize neb_off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_nebulae_, &neb_off);
+    vkCmdDraw(cmd, nebula_vert_count_, 1, 0, 0);
+  }
   if (star_pipeline_ && vbo_stars_ && star_vert_count_ >= 6) {
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, star_pipeline_);
-    Mat4 star_model = Mat4::identity();
-    star_model.m[12] = head.m[12];
-    star_model.m[13] = head.m[13];
-    star_model.m[14] = head.m[14];
-    const Mat4 star_mvp = Mat4::mul(proj, Mat4::mul(content_view, star_model));
     vkCmdPushConstants(cmd, grid_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(star_mvp), &star_mvp);
+                       sizeof(sky_mvp), &sky_mvp);
     VkDeviceSize star_off = 0;
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_stars_, &star_off);
     vkCmdDraw(cmd, star_vert_count_, 1, 0, 0);
+  }
+  if (moon_pipeline_ && moon_layout_ && vbo_moon_) {
+    const auto now = std::chrono::system_clock::now();
+    const auto unix_sec =
+        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    const starfield::MoonState moon = starfield::moon_at_unix(static_cast<std::int64_t>(unix_sec));
+    // Slightly larger than true angular diameter so it reads at sky-backdrop distance.
+    const float half_ang = 0.5f * moon.ang_diam_deg * 1.55f * static_cast<float>(M_PI) / 180.f;
+    const float half_size = 92.f * std::tan(half_ang);
+    struct MoonPush {
+      float mvp[16];
+      float moon_dir[4];
+      float sun_dir[4];
+    } moon_pc{};
+    std::memcpy(moon_pc.mvp, &sky_mvp, sizeof(moon_pc.mvp));
+    moon_pc.moon_dir[0] = moon.x;
+    moon_pc.moon_dir[1] = moon.y;
+    moon_pc.moon_dir[2] = moon.z;
+    moon_pc.moon_dir[3] = half_size;
+    moon_pc.sun_dir[0] = moon.sun_x;
+    moon_pc.sun_dir[1] = moon.sun_y;
+    moon_pc.sun_dir[2] = moon.sun_z;
+    moon_pc.sun_dir[3] = 0.f;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, moon_pipeline_);
+    vkCmdPushConstants(cmd, moon_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(moon_pc), &moon_pc);
+    VkDeviceSize moon_off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_moon_, &moon_off);
+    vkCmdDraw(cmd, 6, 1, 0, 0);
   }
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
@@ -1071,16 +1876,13 @@ void SceneRenderer::render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo&
                                  std::vector<XrCompositionLayerProjectionView>& proj_views,
                                  XrCompositionLayerProjection& layer) {
   if (submit_fence_) {
-    vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, 25'000'000ull);
-    // If still busy, wait a bit more but never skip the eye submit after begin_frame.
-    if (vkGetFenceStatus(device_, submit_fence_) != VK_SUCCESS) {
-      vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, 50'000'000ull);
-    }
-    if (vkGetFenceStatus(device_, submit_fence_) != VK_SUCCESS) {
-      vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, UINT64_MAX);
-    }
+    // Must finish the previous eye submit before rewriting its command buffers.
+    // Never skip the layer: empty end_frame causes reprojection ghosting on head turn.
+    vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, UINT64_MAX);
     vkResetFences(device_, 1, &submit_fence_);
   }
+  // Descriptors are idle now — apply any video rebind staged from the XR loop.
+  flush_queued_texture();
 
   if (hud_pending_dirty_ && hud_mapped_) {
     hud_vert_count_ = static_cast<uint32_t>(hud_pending_.size());

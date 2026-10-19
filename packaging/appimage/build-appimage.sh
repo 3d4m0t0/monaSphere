@@ -108,6 +108,7 @@ mkdir -p "$doc"
 cp "$root/LICENSE" "$root/THIRD_PARTY.md" "$doc/"
 cp "$root/data/LICENSE" "$doc/stars-CC0-LICENSE"
 cp "$root/data/README_stars.md" "$doc/"
+cp "$root/data/README_nebulae.md" "$doc/"
 cp "$deps/ffmpeg-$ffmpeg_version/COPYING.LGPLv2.1" "$doc/ffmpeg-COPYING.LGPLv2.1"
 if [ -f /usr/share/doc/qt6-base-dev/copyright ]; then
   cp /usr/share/doc/qt6-base-dev/copyright "$doc/Qt-copyright"
@@ -253,6 +254,26 @@ if [ ! -f "$appdir/usr/share/monasphere/shaders/scene.vert.spv" ]; then
 fi
 if [ ! -f "$appdir/usr/share/monasphere/shaders/stars_wikidata.bin" ]; then
   echo "AppDir is missing star catalog" >&2
+  exit 1
+fi
+if [ ! -f "$appdir/usr/share/monasphere/shaders/nebulae_wikidata.bin" ]; then
+  echo "AppDir is missing nebula catalog" >&2
+  exit 1
+fi
+if [ ! -f "$appdir/usr/share/monasphere/shaders/gaia_sky_edr3_equirect.jpg" ]; then
+  echo "AppDir is missing Gaia sky equirect texture" >&2
+  exit 1
+fi
+if [ ! -f "$appdir/usr/share/monasphere/shaders/milkyway.frag.spv" ]; then
+  echo "AppDir is missing milkyway shaders" >&2
+  exit 1
+fi
+if [ ! -f "$appdir/usr/share/monasphere/shaders/nebula.frag.spv" ]; then
+  echo "AppDir is missing nebula shaders" >&2
+  exit 1
+fi
+if [ ! -f "$appdir/usr/share/monasphere/shaders/moon.frag.spv" ]; then
+  echo "AppDir is missing moon shaders" >&2
   exit 1
 fi
 if [ ! -f "$appdir/usr/plugins/platforms/libqxcb.so" ] \

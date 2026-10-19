@@ -28,6 +28,13 @@ class SceneRenderer {
   /** RGBA video that is still gamma-encoded (e.g. FSR1 output). Linearized like NV12. */
   void set_texture_gamma(VkImageView view, VkSampler sampler);
   void set_nv12_texture(VkImageView y, VkImageView uv, VkSampler sampler, bool full_range = false);
+  /**
+   * Stage a video descriptor update applied after the previous eye submit finishes
+   * (inside render_frame). Safe from the XR loop without an extra fence wait.
+   */
+  void queue_texture(VkImageView view, VkSampler sampler);
+  void queue_texture_gamma(VkImageView view, VkSampler sampler);
+  void queue_nv12_texture(VkImageView y, VkImageView uv, VkSampler sampler, bool full_range = false);
   /** HUD atlas (RGBA). Empty view clears overlay. */
   void set_hud_texture(VkImageView view, VkSampler sampler, bool visible);
   /**
@@ -49,6 +56,10 @@ class SceneRenderer {
   /** Wait for previous eye submit. Returns false on timeout (do not rewrite descriptors). */
   bool wait_previous_submit(uint64_t timeout_ns = 8'000'000ull);
 
+  /** Milky Way intensity multiplier (□ / X cycles). Sky comes from Gaia equirect JPEG. */
+  void set_milkyway_gain(float gain_mul);
+  float milkyway_gain() const;
+
   // Render both eye swapchains for the current frame; fills projection layers.
   void render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo& frame,
                     std::vector<XrCompositionLayerProjectionView>& proj_views,
@@ -63,6 +74,7 @@ class SceneRenderer {
   void create_pipelines(VkFormat format);
   void build_meshes();
   void create_descriptors();
+  void flush_queued_texture();
   uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags flags) const;
   VkShaderModule load_shader(const std::string& path);
   void draw_view(uint32_t view_index, const XrView& view, ViewSwapchain& sc, uint32_t image_index,
@@ -96,6 +108,40 @@ class SceneRenderer {
   VkDeviceMemory vbo_stars_mem_ = VK_NULL_HANDLE;
   uint32_t star_vert_count_ = 0;
 
+  VkPipeline nebula_pipeline_ = VK_NULL_HANDLE;
+  VkShaderModule nebula_vert_ = VK_NULL_HANDLE;
+  VkShaderModule nebula_frag_ = VK_NULL_HANDLE;
+  VkBuffer vbo_nebulae_ = VK_NULL_HANDLE;
+  VkDeviceMemory vbo_nebulae_mem_ = VK_NULL_HANDLE;
+  uint32_t nebula_vert_count_ = 0;
+
+  VkPipeline moon_pipeline_ = VK_NULL_HANDLE;
+  VkPipelineLayout moon_layout_ = VK_NULL_HANDLE;
+  VkShaderModule moon_vert_ = VK_NULL_HANDLE;
+  VkShaderModule moon_frag_ = VK_NULL_HANDLE;
+  VkBuffer vbo_moon_ = VK_NULL_HANDLE;
+  VkDeviceMemory vbo_moon_mem_ = VK_NULL_HANDLE;
+
+  VkPipeline milkyway_pipeline_ = VK_NULL_HANDLE;
+  VkPipelineLayout milkyway_layout_ = VK_NULL_HANDLE;
+  VkShaderModule milkyway_vert_ = VK_NULL_HANDLE;
+  VkShaderModule milkyway_frag_ = VK_NULL_HANDLE;
+  VkBuffer vbo_milkyway_ = VK_NULL_HANDLE;
+  VkDeviceMemory vbo_milkyway_mem_ = VK_NULL_HANDLE;
+  VkBuffer ibo_milkyway_ = VK_NULL_HANDLE;
+  VkDeviceMemory ibo_milkyway_mem_ = VK_NULL_HANDLE;
+  uint32_t milkyway_index_count_ = 0;
+  float milkyway_gain_mul_ = 1.f;
+  bool milkyway_sky_ok_ = false;
+  VkDescriptorSetLayout milkyway_dsl_ = VK_NULL_HANDLE;
+  VkDescriptorPool milkyway_pool_ = VK_NULL_HANDLE;
+  VkDescriptorSet milkyway_dset_ = VK_NULL_HANDLE;
+  VkImage milkyway_img_ = VK_NULL_HANDLE;
+  VkDeviceMemory milkyway_img_mem_ = VK_NULL_HANDLE;
+  VkImageView milkyway_view_ = VK_NULL_HANDLE;
+  VkSampler milkyway_samp_ = VK_NULL_HANDLE;
+  void load_milkyway_sky_texture();
+
   VkDescriptorSetLayout dsl_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_ = VK_NULL_HANDLE;
   VkDescriptorSet dset_ = VK_NULL_HANDLE;
@@ -126,6 +172,12 @@ class SceneRenderer {
   bool nv12_ = false;
   bool nv12_full_range_ = false;
   bool rgba_gamma_ = false;  // FSR / CPU video: gamma RGB needing srgb_to_linear
+  enum class QueuedTex : uint8_t { None, Rgba, RgbaGamma, Nv12 };
+  QueuedTex queued_tex_ = QueuedTex::None;
+  VkImageView queued_y_ = VK_NULL_HANDLE;
+  VkImageView queued_uv_ = VK_NULL_HANDLE;
+  VkSampler queued_samp_ = VK_NULL_HANDLE;
+  bool queued_nv12_full_ = false;
   bool hud_visible_ = false;
   float hud_distance_ = 1.5f;
   float hud_half_w_ = 0.55f;

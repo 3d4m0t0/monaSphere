@@ -7,10 +7,15 @@ All-sky star catalog + soft-disc mesh builder. **No Qt / Vulkan / OpenXR** — o
 | Piece | Path |
 |-------|------|
 | API | `starfield.hpp` / `starfield.cpp` |
-| Catalog (Wikidata / CC0) | `data/stars_wikidata.bin` |
-| Catalog notes | `data/README_stars.md` |
-| Fetch / regenerate | `tools/fetch_wikidata_stars.py` |
-| Example shaders | `shaders/star.vert`, `shaders/star.frag` |
+| Star catalog (Wikidata / CC0) | `data/stars_wikidata.bin` |
+| Nebula catalog (Wikidata / CC0) | `data/nebulae_wikidata.bin` |
+| Catalog notes | `data/README_stars.md`, `data/README_nebulae.md` |
+| Fetch / regenerate | `tools/fetch_wikidata_stars.py`, `tools/fetch_wikidata_nebulae.py` |
+| Example shaders | `shaders/star.*`, `shaders/nebula.*`, `shaders/moon.*` |
+| Sky sphere helper | `build_sky_sphere()` — used by the app with Gaia milkyway shaders |
+
+The Milky Way **texture** (Gaia EDR3 equirect) lives in the player, not in this
+library. See [`data/README_milkyway.md`](../../data/README_milkyway.md).
 
 ## CMake
 
@@ -23,13 +28,14 @@ target_link_libraries(your_app PRIVATE vrp_starfield)
 #include "starfield/starfield.hpp"
 
 auto stars = vrp::starfield::load_catalog("stars_wikidata.bin");
-auto mesh = vrp::starfield::build_mesh(stars);  // 6 verts / star, triangle list
-// Upload mesh to your GPU. Vertex layout: pos3, color3, uv2 (see Vertex).
-// Draw with additive blending; fragment shader soft-circles via UV.
+auto mesh = vrp::starfield::build_mesh(stars);
+auto [sky_v, sky_i] = vrp::starfield::build_sky_sphere(98.f);
+// App: sample Gaia equirect on sky_v (additive), then draw star discs.
 ```
 
 ## License
 
 - Library code: [MIT](../../LICENSE) (same as monaSphere)
-- Star data: [CC0 1.0](../../data/LICENSE) (Wikidata); see [`data/README_stars.md`](../../data/README_stars.md)
-- Combined package SPDX when shipping both: `MIT AND CC0-1.0`
+- Star / nebula data: [CC0 1.0](../../data/LICENSE) (Wikidata)
+- Combined package SPDX when shipping catalogs: `MIT AND CC0-1.0`
+  (add `AND CC-BY-SA-3.0-IGO` if shipping the Gaia sky JPEG with the app)

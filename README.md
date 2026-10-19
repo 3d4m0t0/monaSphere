@@ -214,9 +214,9 @@ cmake --build build
 
 Gamepad/HUD control icons live in the static library `vrp_gamepad_icons` (`src/ui/gamepad_icons.hpp`), depending only on Qt6::Gui. Other projects can link that target and call `vrp::icons::paint_*` / `render_*`.
 
-全天の星カタログとメッシュ生成は静的ライブラリ `vrp_starfield`（`src/starfield/starfield.hpp`）。依存は C++ 標準ライブラリのみ（Qt / Vulkan 不要）。`load_catalog` / `build_mesh` と `shaders/star.*`、`data/stars_wikidata.bin`（Wikidata / CC0）を利用する。詳細は [`src/starfield/README.md`](src/starfield/README.md)。
+全天の星カタログとメッシュ生成は静的ライブラリ `vrp_starfield`（`src/starfield/starfield.hpp`）。依存は C++ 標準ライブラリのみ。天の川は Gaia EDR3 **cartesian equirect**（`data/gaia_sky_edr3_equirect.jpg`、CC BY-SA 3.0 IGO）を `shaders/milkyway.*` で球に貼る（Hammer 不可）。再取得は `tools/fetch_gaia_sky.py`。詳細は [`data/README_milkyway.md`](data/README_milkyway.md) / [`src/starfield/README.md`](src/starfield/README.md)。
 
-All-sky stars are in `vrp_starfield` (`src/starfield/starfield.hpp`): stdlib only. Use `load_catalog` / `build_mesh` with `shaders/star.*` and `data/stars_wikidata.bin` (Wikidata / CC0). See [`src/starfield/README.md`](src/starfield/README.md).
+All-sky stars are in `vrp_starfield` (`src/starfield/starfield.hpp`): stdlib only. The Milky Way backdrop samples the Gaia EDR3 **cartesian equirect** (`data/gaia_sky_edr3_equirect.jpg`, CC BY-SA 3.0 IGO) via `shaders/milkyway.*` (not Hammer). Refresh with `tools/fetch_gaia_sky.py`. See [`data/README_milkyway.md`](data/README_milkyway.md).
 
 実行例 / Run:
 

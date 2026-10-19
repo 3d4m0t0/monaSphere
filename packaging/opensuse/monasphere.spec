@@ -1,15 +1,15 @@
 #
 # spec file for package monasphere
 #
-# 方針: ffmpeg-N-mini-devel でビルド（ソース MIT）。同梱星カタログは CC0。
-# Policy: build against ffmpeg-N-mini-devel (source MIT). Bundled star catalog is CC0.
+# 方針: ffmpeg-N-mini-devel でビルド（ソース MIT）。星カタログ CC0、Gaia 天の川 CC BY-SA 3.0 IGO。
+# Policy: ffmpeg-N-mini-devel (MIT source). Star catalog CC0; Gaia sky CC BY-SA 3.0 IGO.
 #
 
 Name:           monasphere
 Version:        1.0.0
 Release:        dev.20261014
 Summary:        Native Linux VR video player (OpenXR / Vulkan)
-License:        MIT AND CC0-1.0
+License:        MIT AND CC0-1.0 AND CC-BY-SA-3.0-IGO
 Group:          Productivity/Multimedia/Video/Players
 URL:            https://github.com/3d4m0t0/monaSphere
 Source:         %{name}-%{version}.tar.xz
@@ -46,10 +46,11 @@ Requires:       libswresample.so.6()(64bit)
 monaSphere (command: monasphere) is a Linux-native VR video player using
 Vulkan and OpenXR (Monado). Flat / 180 / 360 projection, FSR1, host UI.
 
-Built against openSUSE ffmpeg-*-mini (LGPL). Source is MIT; the bundled
-Wikidata-derived star catalog is CC0-1.0 (License: MIT AND CC0-1.0).
-Codecs at runtime follow the FFmpeg libraries that provide the same SONAME
-on the user's system. This package does not promise a codec set.
+Built against openSUSE ffmpeg-*-mini (LGPL). Source is MIT; bundled Wikidata
+star/nebula catalogs are CC0-1.0; Gaia EDR3 sky JPEG is CC BY-SA 3.0 IGO
+(License: MIT AND CC0-1.0 AND CC-BY-SA-3.0-IGO). Codecs at runtime follow the
+FFmpeg libraries that provide the same SONAME. This package does not promise
+a codec set.
 
 %prep
 %autosetup -n %{name}-%{version}

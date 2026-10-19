@@ -83,6 +83,12 @@ set(VRP_SHADERS
   ${CMAKE_SOURCE_DIR}/shaders/grid.frag
   ${CMAKE_SOURCE_DIR}/shaders/star.vert
   ${CMAKE_SOURCE_DIR}/shaders/star.frag
+  ${CMAKE_SOURCE_DIR}/shaders/nebula.vert
+  ${CMAKE_SOURCE_DIR}/shaders/nebula.frag
+  ${CMAKE_SOURCE_DIR}/shaders/milkyway.vert
+  ${CMAKE_SOURCE_DIR}/shaders/milkyway.frag
+  ${CMAKE_SOURCE_DIR}/shaders/moon.vert
+  ${CMAKE_SOURCE_DIR}/shaders/moon.frag
 )
 set(VRP_SPV_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${VRP_SPV_DIR})
@@ -276,6 +282,10 @@ add_custom_command(TARGET vrp_player POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${VRP_SPV_DIR} $<TARGET_FILE_DIR:vrp_player>/shaders
   COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/data/stars_wikidata.bin
           $<TARGET_FILE_DIR:vrp_player>/shaders/stars_wikidata.bin
+  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/data/nebulae_wikidata.bin
+          $<TARGET_FILE_DIR:vrp_player>/shaders/nebulae_wikidata.bin
+  COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/data/gaia_sky_edr3_equirect.jpg
+          $<TARGET_FILE_DIR:vrp_player>/shaders/gaia_sky_edr3_equirect.jpg
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:vrp_player>/translations
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/translations $<TARGET_FILE_DIR:vrp_player>/translations
 )
@@ -287,8 +297,16 @@ install(FILES ${CMAKE_SOURCE_DIR}/src/starfield/starfield.hpp DESTINATION includ
 install(FILES
   ${CMAKE_SOURCE_DIR}/shaders/star.vert
   ${CMAKE_SOURCE_DIR}/shaders/star.frag
+  ${CMAKE_SOURCE_DIR}/shaders/nebula.vert
+  ${CMAKE_SOURCE_DIR}/shaders/nebula.frag
+  ${CMAKE_SOURCE_DIR}/shaders/milkyway.vert
+  ${CMAKE_SOURCE_DIR}/shaders/milkyway.frag
+  ${CMAKE_SOURCE_DIR}/shaders/moon.vert
+  ${CMAKE_SOURCE_DIR}/shaders/moon.frag
   ${CMAKE_SOURCE_DIR}/data/LICENSE
   ${CMAKE_SOURCE_DIR}/data/README_stars.md
+  ${CMAKE_SOURCE_DIR}/data/README_nebulae.md
+  ${CMAKE_SOURCE_DIR}/data/README_milkyway.md
   DESTINATION share/vrp/starfield)
 install(FILES ${CMAKE_SOURCE_DIR}/src/starfield/README.md DESTINATION share/doc/vrp_starfield)
 install(FILES ${CMAKE_SOURCE_DIR}/icons/hicolor/256x256/apps/monasphere.png
@@ -298,9 +316,15 @@ install(FILES ${CMAKE_SOURCE_DIR}/data/monasphere.desktop
 install(DIRECTORY ${VRP_SPV_DIR}/ DESTINATION share/monasphere/shaders)
 install(FILES ${CMAKE_SOURCE_DIR}/data/stars_wikidata.bin
   DESTINATION share/monasphere/shaders)
+install(FILES ${CMAKE_SOURCE_DIR}/data/nebulae_wikidata.bin
+  DESTINATION share/monasphere/shaders)
+install(FILES ${CMAKE_SOURCE_DIR}/data/gaia_sky_edr3_equirect.jpg
+  DESTINATION share/monasphere/shaders)
 install(FILES
   ${CMAKE_SOURCE_DIR}/data/LICENSE
   ${CMAKE_SOURCE_DIR}/data/README_stars.md
+  ${CMAKE_SOURCE_DIR}/data/README_nebulae.md
+  ${CMAKE_SOURCE_DIR}/data/README_milkyway.md
   DESTINATION share/monasphere/shaders)
 install(FILES ${CMAKE_SOURCE_DIR}/THIRD_PARTY.md
   DESTINATION share/doc/monasphere
