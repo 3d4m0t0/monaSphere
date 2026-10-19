@@ -27,7 +27,7 @@ them as lon/lat puts the left/right tips at the poles and opens black gaps.
 3. Seal ℓ=±180° (cosine band + identical wrap columns) for `REPEAT` sampling.
 4. Upload with a full mip chain; fragment shader uses direction-based `textureLod`
    so the longitude cut does not spike automatic mip derivatives.
-5. Pad **X** / `milkyway_tune` cycles gain (`SceneRenderer::set_milkyway_gain`).
+5. Gain defaults to `1.0` via `monasphere.conf` `milkyway_gain` (no in-app control).
 
 Point stars remain `stars_wikidata.bin`; this texture is the soft density backdrop only.
 

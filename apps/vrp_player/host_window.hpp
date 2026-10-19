@@ -296,6 +296,8 @@ class HostWindow : public QMainWindow {
   bool hwaccel_ = true;
   /** monasphere.conf `thumb_jpeg`. 1 stores seek thumbs as JPEG in main memory. */
   bool thumb_jpeg_ = true;
+  /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */
+  float milkyway_gain_ = 1.f;
   vrp::FsrMode preferred_fsr_ = vrp::FsrMode::Quality;
   std::atomic<int> fsr_req_{-1};       // -1 none; else FsrMode
   int monado_desired_mode_ = -1;       // cached XRT_COMPOSITOR_DESIRED_MODE

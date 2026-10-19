@@ -35,6 +35,12 @@ std::mutex& cuda_decode_mu() {
   return mu;
 }
 
+/** Browser preview and seek-thumb strip share libav; do not run them together. */
+std::mutex& ffmpeg_offline_mu() {
+  static std::mutex mu;
+  return mu;
+}
+
 namespace {
 
 #if defined(VRP_HAS_FFMPEG)
@@ -344,6 +350,7 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
   strip.status = "FFmpeg なし";
   return strip;
 #else
+  std::lock_guard<std::mutex> offline(ffmpeg_offline_mu());
   AVFormatContext* fmt = nullptr;
   if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) {
     strip.status = "ファイルを開けません";
@@ -586,7 +593,8 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
   (void)max_edge;
   return false;
 #else
-  max_edge = std::max(64, std::min(max_edge, 4096));
+  std::lock_guard<std::mutex> offline(ffmpeg_offline_mu());
+  max_edge = std::max(64, std::min(max_edge, 2048));
   AVFormatContext* fmt = nullptr;
   if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
   if (avformat_find_stream_info(fmt, nullptr) < 0) {
@@ -613,15 +621,25 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
     return false;
   }
   AVCodecContext* codec = avcodec_alloc_context3(dec);
-  avcodec_parameters_to_context(codec, st->codecpar);
+  if (!codec) {
+    avformat_close_input(&fmt);
+    return false;
+  }
+  if (avcodec_parameters_to_context(codec, st->codecpar) < 0) {
+    avcodec_free_context(&codec);
+    avformat_close_input(&fmt);
+    return false;
+  }
   codec->thread_count = 1;
   codec->get_format = avcodec_default_get_format;
+  // Browser thumbs stay on the CPU path — never attach NVDEC here.
+  codec->hw_device_ctx = nullptr;
   if (avcodec_open2(codec, dec, nullptr) < 0) {
     avcodec_free_context(&codec);
     avformat_close_input(&fmt);
     return false;
   }
-  if (t > 0) {
+  if (t > 0 && st->time_base.den > 0) {
     const int64_t ts = static_cast<int64_t>(t / av_q2d(st->time_base));
     av_seek_frame(fmt, vstream, ts, AVSEEK_FLAG_BACKWARD);
     avcodec_flush_buffers(codec);
@@ -630,10 +648,19 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
   AVFrame* frame = av_frame_alloc();
   AVFrame* rgba = av_frame_alloc();
   AVPacket* packet = av_packet_alloc();
+  if (!frame || !rgba || !packet) {
+    av_frame_free(&rgba);
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec);
+    avformat_close_input(&fmt);
+    return false;
+  }
   SwsContext* sws = nullptr;
   uint8_t* rgba_buf = nullptr;
   int dst_w = 0;
   int dst_h = 0;
+  int rgba_buf_size = 0;
 
   bool ok = false;
   bool scale_failed = false;
@@ -648,6 +675,12 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
     }
     av_packet_unref(packet);
     while (avcodec_receive_frame(codec, frame) == 0) {
+      if (frame->width < 2 || frame->height < 2 || frame->format < 0 || !frame->data[0]) continue;
+      // Reject hardware frames — preview is software-only.
+      if (frame->format == AV_PIX_FMT_CUDA || frame->format == AV_PIX_FMT_VAAPI ||
+          frame->format == AV_PIX_FMT_DRM_PRIME || frame->format == AV_PIX_FMT_VULKAN) {
+        continue;
+      }
       if (!sws) {
         dst_w = std::max(2, frame->width);
         dst_h = std::max(2, frame->height);
@@ -659,9 +692,22 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
         }
         dst_w &= ~1;
         dst_h &= ~1;
-        rgba_buf = static_cast<uint8_t*>(av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, dst_w, dst_h, 1)));
-        if (!rgba_buf) break;
-        av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, dst_w, dst_h, 1);
+        rgba_buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, dst_w, dst_h, 1);
+        if (rgba_buf_size <= 0) {
+          scale_failed = true;
+          break;
+        }
+        rgba_buf = static_cast<uint8_t*>(av_malloc(static_cast<size_t>(rgba_buf_size)));
+        if (!rgba_buf) {
+          scale_failed = true;
+          break;
+        }
+        if (av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, dst_w, dst_h, 1) < 0) {
+          av_free(rgba_buf);
+          rgba_buf = nullptr;
+          scale_failed = true;
+          break;
+        }
         sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), dst_w,
                              dst_h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
         if (!sws) {
@@ -671,19 +717,28 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
           break;
         }
       }
-      sws_scale(sws, frame->data, frame->linesize, 0, frame->height, rgba->data, rgba->linesize);
-      const size_t need = static_cast<size_t>(dst_w) * static_cast<size_t>(dst_h) * 4;
-      out_rgba.resize(need);
+      if (sws_scale(sws, frame->data, frame->linesize, 0, frame->height, rgba->data, rgba->linesize) <= 0) {
+        continue;
+      }
+      if (!rgba->data[0] || rgba->linesize[0] < dst_w * 4) continue;
+      const size_t row = static_cast<size_t>(dst_w) * 4u;
+      const size_t need = row * static_cast<size_t>(dst_h);
+      try {
+        out_rgba.resize(need);
+      } catch (...) {
+        scale_failed = true;
+        break;
+      }
       for (int y = 0; y < dst_h; ++y) {
-        std::memcpy(out_rgba.data() + static_cast<size_t>(y * dst_w * 4),
-                    rgba->data[0] + y * rgba->linesize[0], static_cast<size_t>(dst_w * 4));
+        std::memcpy(out_rgba.data() + static_cast<size_t>(y) * row, rgba->data[0] + y * rgba->linesize[0],
+                    row);
       }
       out_w = dst_w;
       out_h = dst_h;
       ok = true;
       break;
     }
-    if (ok) break;
+    if (ok || scale_failed) break;
   }
 
   if (sws) sws_freeContext(sws);

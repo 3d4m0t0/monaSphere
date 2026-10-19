@@ -22,6 +22,8 @@ class CudaNv12Texture;
 
 /** Playback NVDEC and thumbnail NVDEC must not enter CUDA at the same time. */
 std::mutex& cuda_decode_mu();
+/** Browser file preview and seek-thumb strip must not decode offline in parallel. */
+std::mutex& ffmpeg_offline_mu();
 class VaapiNv12Texture;
 
 struct VideoFrame {

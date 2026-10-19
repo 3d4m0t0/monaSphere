@@ -1099,6 +1099,8 @@ void HostWindow::saveAppConf() const {
   setMonasphereConfKey(QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2));
   setMonasphereConfKey(QStringLiteral("flat_distance"),
                        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("milkyway_gain"),
+                       QString::number(static_cast<double>(milkyway_gain_), 'f', 2));
 }
 
 void HostWindow::loadAppConf() {
@@ -1140,6 +1142,7 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2)},
       {QStringLiteral("flat_distance"),
        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
+      {QStringLiteral("milkyway_gain"), QStringLiteral("1.00")},
   };
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   ensureMonasphereConfKeys(defaults);
@@ -1217,6 +1220,10 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
       if (ok && v >= 2.f && v <= 40.f) opt_.screen_distance = v;
+    } else if (line.startsWith(QStringLiteral("milkyway_gain="))) {
+      bool ok = false;
+      const float v = line.mid(14).toFloat(&ok);
+      if (ok && v >= 0.2f && v <= 2.5f) milkyway_gain_ = v;
     }
   }
   user.close();
@@ -2894,6 +2901,8 @@ void HostWindow::xrThreadMain() {
     vrp::SceneRenderer scene;
     scene.init(xr, shader_dir_.toStdString());
     scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
+    scene.set_content_aspect(16.f / 9.f);
+    scene.set_milkyway_gain(milkyway_gain_);
 
     vrp::Fsr1Upscaler fsr;
     fsr.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
@@ -2996,7 +3005,11 @@ void HostWindow::xrThreadMain() {
         self->vr_menu_ = nullptr;
       }
     } clear_menu{this};
-    requestHudPaint();
+    auto hud_paint = [&] {
+      menu.publish_hud_snapshot();
+      requestHudPaint();
+    };
+    hud_paint();
 
     vrp::GamepadInput gamepad;
     bool gamepad_was = false;
@@ -3005,36 +3018,85 @@ void HostWindow::xrThreadMain() {
     std::string last_gamepad_connection;
 
     std::atomic<bool> preview_busy{false};
+    std::atomic<uint64_t> preview_gen{0};
+    std::thread preview_thread;
+    std::mutex preview_result_mu;
+    struct PreviewResult {
+      uint64_t gen = 0;
+      bool pending = false;
+      bool ok = false;
+      std::string path;
+      std::vector<uint8_t> rgba;
+      int w = 0;
+      int h = 0;
+    } preview_result;
     std::string preview_path_done;
     std::string preview_wait_path;
     std::string highlight_row;
     auto preview_wait_since = std::chrono::steady_clock::now();
+    auto join_preview_worker = [&] {
+      preview_gen.fetch_add(1, std::memory_order_acq_rel);
+      if (preview_thread.joinable()) preview_thread.join();
+      preview_busy.store(false, std::memory_order_release);
+      std::lock_guard<std::mutex> lock(preview_result_mu);
+      preview_result = {};
+    };
     auto request_preview = [&](const std::string& path) {
       if (path.empty()) {
-        if (!preview_path_done.empty() || preview_busy.load()) {
+        if (!preview_path_done.empty() || preview_busy.load(std::memory_order_acquire)) {
+          preview_gen.fetch_add(1, std::memory_order_acq_rel);
           preview_path_done.clear();
           menu.clear_preview();
-          requestHudPaint();
+          hud_paint();
         }
         return;
       }
-      if (path == preview_path_done || preview_busy.load()) return;
-      preview_busy.store(true);
-      std::thread([&, path] {
+      if (path == preview_path_done || preview_busy.load(std::memory_order_acquire)) return;
+      if (preview_thread.joinable()) preview_thread.join();
+      preview_busy.store(true, std::memory_order_release);
+      const uint64_t gen = preview_gen.fetch_add(1, std::memory_order_acq_rel) + 1;
+      {
+        std::lock_guard<std::mutex> lock(preview_result_mu);
+        preview_result = {};
+      }
+      preview_thread = std::thread([&, path, gen] {
         std::vector<uint8_t> rgba;
         int pw = 0;
         int ph = 0;
-        const bool ok = vrp::extract_video_preview(path, 2048, rgba, pw, ph);
-        if (ok && pw > 0 && ph > 0 && !xr_stop_.load() && !shutting_down_.load()) {
-          // Drop if selection moved away while decoding the thumb.
-          if (menu.highlighted_video_path() == path) {
-            menu.set_preview(std::move(rgba), pw, ph);
-            preview_path_done = path;
-            requestHudPaint();
+        const bool ok = vrp::extract_video_preview(path, 1024, rgba, pw, ph);
+        {
+          std::lock_guard<std::mutex> lock(preview_result_mu);
+          if (preview_gen.load(std::memory_order_acquire) == gen) {
+            preview_result.gen = gen;
+            preview_result.pending = true;
+            preview_result.ok = ok && pw > 0 && ph > 0;
+            preview_result.path = path;
+            preview_result.rgba = std::move(rgba);
+            preview_result.w = pw;
+            preview_result.h = ph;
           }
         }
-        preview_busy.store(false);
-      }).detach();
+        preview_busy.store(false, std::memory_order_release);
+      });
+    };
+    auto apply_preview_result = [&] {
+      PreviewResult done;
+      {
+        std::lock_guard<std::mutex> lock(preview_result_mu);
+        if (!preview_result.pending) return;
+        if (preview_result.gen != preview_gen.load(std::memory_order_acquire)) {
+          preview_result.pending = false;
+          return;
+        }
+        done = std::move(preview_result);
+        preview_result = {};
+        done.pending = true;
+      }
+      if (!done.ok || xr_stop_.load() || shutting_down_.load()) return;
+      if (menu.highlighted_video_path() != done.path) return;
+      menu.set_preview(std::move(done.rgba), done.w, done.h);
+      preview_path_done = done.path;
+      hud_paint();
     };
 
     bool vaapi_hud_pending = true;
@@ -3106,7 +3168,9 @@ void HostWindow::xrThreadMain() {
       // Stop video decode but keep NVDEC CUDA context alive until after slot teardown.
       // Do NOT audio.close() here — device stays up pumping silence.
       decoder.halt_decode();
+      // Release ffmpeg_offline_mu (seek thumbs) before joining the browser preview worker.
       decoder.stop_thumbnail_build();
+      join_preview_worker();
       pending_upload = {};
       cuda_tex.drain_copies();
 
@@ -3213,7 +3277,7 @@ void HostWindow::xrThreadMain() {
                                 vrp::stereo_detect_name(opt_.stereo, opt_.stereo_full))));
             },
             Qt::QueuedConnection);
-        requestHudPaint();
+        hud_paint();
         if (!opt_.mute) {
           std::string adev;
           {
@@ -3298,7 +3362,6 @@ void HostWindow::xrThreadMain() {
     float look_yaw = 0.f;
     float look_pitch = 0.f;
     int flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
-    int milkyway_gain_step = 1;  // 0=dim, 1=normal, 2=bright
 
     while (!xr_stop_.load() && xr.pump_events()) {
       bool help_shown = false;
@@ -3344,7 +3407,7 @@ void HostWindow::xrThreadMain() {
         if (menu.arm_seek_delta(cmd == 2 ? -10.0 : 10.0, target)) {
           decoder.seek_to(target);
           audio.pause();
-          requestHudPaint();
+          hud_paint();
         }
       }
       if (cmd == 4 && xr.recenter()) {
@@ -3374,7 +3437,7 @@ void HostWindow::xrThreadMain() {
         fsr.set_mode(mode);
         menu.set_fsr(mode);
         force_fsr_refresh = true;
-        requestHudPaint();
+        hud_paint();
       }
 
       if (pending_hz_resume && xr.is_session_running()) {
@@ -3439,7 +3502,6 @@ void HostWindow::xrThreadMain() {
       bool pad_nav_left = false;
       bool pad_nav_right = false;
       bool pad_face_y = false;
-      bool pad_face_x = false;
       const bool want_gamepad = gamepad_enabled_.load();
       if (want_gamepad) {
         gamepad_sdl_owned_.store(true);
@@ -3497,7 +3559,6 @@ void HostWindow::xrThreadMain() {
             input.recenter = input.recenter || gp.recenter;
             input.view_reset = input.view_reset || gp.view_reset;
             pad_face_y = gp.face_y;
-            pad_face_x = gp.face_x;
           } else {
             last_gamepad_name.clear();
             last_gamepad_connection.clear();
@@ -3543,7 +3604,7 @@ void HostWindow::xrThreadMain() {
         // Face icons follow HMD or pad. Options label follows the same Sony source.
         const bool sony = hmd_sony || pad_sony;
         const bool option = sony;
-        if (face_sony_.exchange(sony) != sony || menu_option_.exchange(option) != option) requestHudPaint();
+        if (face_sony_.exchange(sony) != sony || menu_option_.exchange(option) != option) hud_paint();
       }
       decoder.set_seek_scrubbing(false);
 
@@ -3574,25 +3635,13 @@ void HostWindow::xrThreadMain() {
             this, [this, toast] { appendLog(tr("Flat scale: %1").arg(toast)); }, Qt::QueuedConnection);
       }
 
-      // □ / X: cycle Milky Way intensity (Gaia equirect gain).
-      const bool tune_press = pad_face_x || input.milkyway_tune;
-      if (menus_closed && tune_press) {
-        milkyway_gain_step = (milkyway_gain_step + 1) % 3;
-        static constexpr float kMwGains[] = {0.70f, 1.00f, 1.40f};
-        const float g = kMwGains[milkyway_gain_step];
-        scene.set_milkyway_gain(g);
-        const QString toast = QStringLiteral("MW gain %1").arg(g, 0, 'f', 2);
-        showHudToast(toast, 2800);
-        QMetaObject::invokeMethod(
-            this, [this, toast] { appendLog(tr("Milky Way: %1").arg(toast)); }, Qt::QueuedConnection);
-      }
       if (hud_toast_active_.load() && !hudToastActive()) {
         {
           std::lock_guard<std::mutex> lock(hud_toast_mu_);
           hud_toast_.clear();
         }
         hud_toast_active_.store(false);
-        requestHudPaint();
+        hud_paint();
       }
 
       vrp::VrMenu::PadInput pad;
@@ -3626,7 +3675,29 @@ void HostWindow::xrThreadMain() {
         menu.set_thumb_bar_force(false);
       }
       const auto menu_out = menu.update(pad, ui_dt);
-      if (menu.visible() != menu_was || menu.controls_visible() != controls_was) requestHudPaint();
+      if (menu.visible() != menu_was || menu.controls_visible() != controls_was) hud_paint();
+      auto apply_projection = [&](vrp::ProjectionMode proj, vrp::StereoLayout stereo, bool stereo_full) {
+        opt_.projection = proj;
+        opt_.stereo = stereo;
+        opt_.stereo_full = stereo_full;
+        flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
+        scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
+        menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
+        if (decoder.is_open()) {
+          const auto& info = decoder.info();
+          scene.set_content_aspect(vrp::frame_display_aspect(static_cast<float>(info.width),
+                                                             static_cast<float>(info.height), opt_.stereo,
+                                                             opt_.stereo_full));
+        }
+      };
+      auto restore_media_projection = [&] {
+        if (!decoder.is_open()) return;
+        const std::string& path = decoder.info().path;
+        if (path.empty()) return;
+        vrp::detect_format_from_filename(path, opt_.projection, opt_.stereo, opt_.stereo_full);
+        apply_projection(opt_.projection, opt_.stereo, opt_.stereo_full);
+      };
+
       if (menu_out.open_video) {
         if (!open_media(menu_out.video_path)) {
           const QString err = QString::fromStdString(
@@ -3639,7 +3710,7 @@ void HostWindow::xrThreadMain() {
           show_idle_screen = false;
           decoder.play();
         }
-        requestHudPaint();
+        hud_paint();
       } else if (menu_out.play_toggle) {
         // Do not also handle raw input.confirm this frame — open_video closes the menu while
         // confirm is still true and would immediately pause.
@@ -3650,22 +3721,13 @@ void HostWindow::xrThreadMain() {
         } else {
           play_wanted = true;
           show_idle_screen = false;
+          // Stop left us on Flat idle; put 180/360 back before the first frame.
+          restore_media_projection();
           decoder.play();
         }
       }
       if (menu_out.apply_format) {
-        opt_.projection = menu_out.projection;
-        opt_.stereo = menu_out.stereo;
-        opt_.stereo_full = menu_out.stereo_full;
-        flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
-        scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
-        menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
-        if (decoder.is_open()) {
-          const auto& info = decoder.info();
-          scene.set_content_aspect(vrp::frame_display_aspect(static_cast<float>(info.width),
-                                                             static_cast<float>(info.height), opt_.stereo,
-                                                             opt_.stereo_full));
-        }
+        apply_projection(menu_out.projection, menu_out.stereo, menu_out.stereo_full);
         QMetaObject::invokeMethod(
             this,
             [this] {
@@ -3675,11 +3737,12 @@ void HostWindow::xrThreadMain() {
                                 vrp::stereo_detect_name(opt_.stereo, opt_.stereo_full))));
             },
             Qt::QueuedConnection);
-        requestHudPaint();
+        hud_paint();
       }
       if (menu_out.play) {
         play_wanted = true;
         show_idle_screen = false;
+        restore_media_projection();
         decoder.play();
       }
       if (menu_out.pause) {
@@ -3695,7 +3758,11 @@ void HostWindow::xrThreadMain() {
         // Must seek audio demuxer to 0 as well — pause alone leaves decode at the stop point,
         // so the next play() can briefly emit that PCM (and Pulse may still hold it).
         if (audio.is_open()) audio.stop();
-        // Same translucent flat panel as startup (sky shows through) until play resumes.
+        // Idle placeholder is a flat panel — leave 180/360 so the sky/seat stay readable.
+        // Keep Near/Cinema/Far seat (fov/distance); restore the panel's physical 16:9 size
+        // so a 2:1 VR frame does not leave a oversized idle screen.
+        apply_projection(vrp::ProjectionMode::Flat, vrp::StereoLayout::Mono, true);
+        scene.set_content_aspect(16.f / 9.f);
         if (!scene.wait_previous_submit(0)) {
           while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
           }
@@ -3704,12 +3771,17 @@ void HostWindow::xrThreadMain() {
         fsr_need_process = false;
         fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
         fsr_src_samp = VK_NULL_HANDLE;
+        fsr_src_w = fsr_src_h = 0;
+        fsr_src_nv12 = 0;
+        // Drain an in-flight FSR pass without rebinding it — otherwise the post-end_frame
+        // poll queues the last video frame over the idle slate on the next eye submit.
+        (void)fsr.poll();
         (void)texture.upload_idle_screen();
         scene.set_texture(texture.view(), texture.sampler());
         thumb_latched = false;
         wait_stop_frame = false;
         stop_frame_shown = false;
-        requestHudPaint();
+        hud_paint();
       }
       if (menu_out.rate_changed) {
         decoder.set_rate(menu_out.rate);
@@ -3722,7 +3794,7 @@ void HostWindow::xrThreadMain() {
           audio.pause();
           decoder.play();
         }
-        requestHudPaint();
+        hud_paint();
       }
       if (menu_out.fsr_changed) {
         fsr.set_mode(menu_out.fsr);
@@ -3738,7 +3810,7 @@ void HostWindow::xrThreadMain() {
               appendLog(QString("FSR1: %1").arg(QString::fromUtf8(vrp::fsr_mode_name(mode))));
             },
             Qt::QueuedConnection);
-        requestHudPaint();
+        hud_paint();
       }
       if (menu_out.refresh_hz_restart) {
         preferred_hz_ = menu_out.preferred_hz;
@@ -3754,12 +3826,12 @@ void HostWindow::xrThreadMain() {
               applyPreferredRefreshRate(/*from_ui=*/true, /*force_monado_restart=*/true);
             },
             Qt::QueuedConnection);
-        requestHudPaint();
+        hud_paint();
       }
       if (std::fabs(menu_out.volume_delta) > 0.f) {
         audio.set_volume(audio.volume() + menu_out.volume_delta);
         menu.set_volume(audio.volume());
-        requestHudPaint();
+        hud_paint();
       }
       // The bar moves on its own. Playback pauses and a prebuilt thumb fills the screen.
       // On release, one seek and the still stays up. Playback starts 0.5s after the
@@ -3780,7 +3852,7 @@ void HostWindow::xrThreadMain() {
         stop_upload_sent = false;
         seek_settle = true;
         seek_settle_from = now;
-        requestHudPaint();
+        hud_paint();
       };
       if (scrubbing) {
         if (!was_scrubbing) menu.clear_seek_bar_drawn();
@@ -3857,24 +3929,27 @@ void HostWindow::xrThreadMain() {
       static bool seek_overlay_was = false;
       const bool seek_overlay = menu.seek_bar_only();
       if (seek_overlay != seek_overlay_was) {
-        requestHudPaint();
+        hud_paint();
         seek_overlay_was = seek_overlay;
       }
       if (menu.visible() || menu.controls_visible() || seek_overlay) {
+        apply_preview_result();
         // Decode a thumbnail only after the highlight has stayed put.
         const std::string preview_hi = menu.highlighted_video_path();
         const std::string row_hi = menu.highlighted_row_id();
+        bool hud_dirty = false;
         if (row_hi != highlight_row) {
           highlight_row = row_hi;
           if (preview_hi != preview_wait_path) {
             preview_wait_path = preview_hi;
             preview_wait_since = now;
             if (preview_path_done != preview_hi) {
+              preview_gen.fetch_add(1, std::memory_order_acq_rel);
               preview_path_done.clear();
               menu.clear_preview();
             }
           }
-          requestHudPaint();
+          hud_dirty = true;
         }
         // One seek-bar paint per UI update. The clock does not wait on that paint.
         if (ui_dt > 0.f && (menu.list_gliding() || menu.seek_gliding())) {
@@ -3886,15 +3961,15 @@ void HostWindow::xrThreadMain() {
               seek_paint_pixels = 0;
             }
           }
-          requestHudPaint();
+          hud_dirty = true;
         }
         if (!preview_hi.empty() && now - preview_wait_since >= std::chrono::milliseconds(450)) {
           request_preview(preview_hi);
         }
         static auto last_hud_paint = std::chrono::steady_clock::time_point{};
-        if (now - last_hud_paint > std::chrono::milliseconds(100)) {
+        if (hud_dirty || now - last_hud_paint > std::chrono::milliseconds(100)) {
           last_hud_paint = now;
-          requestHudPaint();
+          hud_paint();
         }
       }
 
@@ -3988,7 +4063,7 @@ void HostWindow::xrThreadMain() {
           help_drawn_sec = sec;
         } else if (sec != help_drawn_sec) {
           help_drawn_sec = sec;
-          requestHudPaint();
+          hud_paint();
         }
         if (!help_shown && controls_help_.load()) {
           const bool used = input.confirm || input.back || input.menu_toggle || input.seek_back ||
@@ -4354,7 +4429,8 @@ void HostWindow::xrThreadMain() {
       xr.end_frame(fi, layers);
 
       // FSR after end_frame so predictedDisplayTime submit is not delayed by upscale.
-      if (fsr.enabled()) {
+      // Skip while the idle slate is up — a late poll must not replace Stop's Flat panel.
+      if (fsr.enabled() && !show_idle_screen) {
         if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
           scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
         }
@@ -4367,6 +4443,9 @@ void HostWindow::xrThreadMain() {
             scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
           }
         }
+      } else if (fsr.enabled() && show_idle_screen) {
+        (void)fsr.poll();
+        fsr_need_process = false;
       }
 
       const double frame_ms =
@@ -4448,6 +4527,8 @@ void HostWindow::xrThreadMain() {
       }
     }
 
+    decoder.stop_thumbnail_build();
+    join_preview_worker();
     decoder.halt_decode();
     audio.close();
     VRP_LOG("teardown: halt decode done");

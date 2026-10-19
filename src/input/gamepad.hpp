@@ -32,8 +32,6 @@ class GamepadInput {
     bool menu_toggle = false;  // Start/Guide short press
     /** Y / △ edge. Flat scale cycle when menus are closed. */
     bool face_y = false;
-    /** X / □ edge. Milky Way phase tune when menus are closed. */
-    bool face_x = false;
     bool recenter = false;     // Start/Guide / Options long press
     /** Right stick click (R3). Clears stick look offset. */
     bool view_reset = false;
@@ -71,7 +69,6 @@ class GamepadInput {
   bool prev_a_ = false;
   bool prev_b_ = false;
   bool prev_y_ = false;
-  bool prev_x_ = false;
   bool prev_r3_ = false;
   bool lb_held_ = false;
   bool rb_held_ = false;

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -110,7 +111,8 @@ class VrMenu {
     float display_hz = 0.f; // measured / reported
     int preview_w = 0;
     int preview_h = 0;
-    std::vector<uint8_t> preview_rgba;
+    /** Shared with the live menu buffer so HUD paints do not deep-copy megabytes. */
+    std::shared_ptr<const std::vector<uint8_t>> preview_rgba;
   };
 
   struct Output {
@@ -216,6 +218,12 @@ class VrMenu {
   void clear_seek_bar_drawn();
   double place_seek_bar(double sec);
   Screen screen() const { return screen_; }
+  /**
+   * XR thread: copy live menu state into the HUD-facing snapshot.
+   * Call after menu mutations for the frame so Qt HUD paints never race live fields.
+   */
+  void publish_hud_snapshot();
+  /** Qt HUD thread: locked copy of the last publish_hud_snapshot(). */
   Snapshot snapshot() const;
   /** Browser row under the cursor, including directories. Empty outside the file list. */
   std::string highlighted_row_id() const;
@@ -359,9 +367,10 @@ class VrMenu {
   std::string info_output_note_;
   std::string info_display_hz_;
 
-  std::vector<uint8_t> preview_rgba_;
+  std::shared_ptr<const std::vector<uint8_t>> preview_rgba_;
   int preview_w_ = 0;
   int preview_h_ = 0;
+  Snapshot published_;
 
   float nav_cooldown_ = 0;
   uint64_t gen_ = 1;

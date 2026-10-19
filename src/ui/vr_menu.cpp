@@ -322,16 +322,15 @@ void VrMenu::apply_format_index(int index) {
 }
 
 void VrMenu::set_preview(std::vector<uint8_t> rgba, int w, int h) {
-  std::lock_guard lock(mu_);
-  preview_rgba_ = std::move(rgba);
+  auto buf = std::make_shared<const std::vector<uint8_t>>(std::move(rgba));
+  preview_rgba_ = std::move(buf);
   preview_w_ = w;
   preview_h_ = h;
   ++gen_;
 }
 
 void VrMenu::clear_preview() {
-  std::lock_guard lock(mu_);
-  preview_rgba_.clear();
+  preview_rgba_.reset();
   preview_w_ = preview_h_ = 0;
   ++gen_;
 }
@@ -1359,8 +1358,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   return out;
 }
 
-VrMenu::Snapshot VrMenu::snapshot() const {
-  std::lock_guard lock(mu_);
+void VrMenu::publish_hud_snapshot() {
   Snapshot s;
   s.gen = gen_;
   s.visible = visible_;
@@ -1437,7 +1435,13 @@ VrMenu::Snapshot VrMenu::snapshot() const {
   s.preview_w = preview_w_;
   s.preview_h = preview_h_;
   s.preview_rgba = preview_rgba_;
-  return s;
+  std::lock_guard lock(mu_);
+  published_ = std::move(s);
+}
+
+VrMenu::Snapshot VrMenu::snapshot() const {
+  std::lock_guard lock(mu_);
+  return published_;
 }
 
 std::string VrMenu::highlighted_row_id() const {

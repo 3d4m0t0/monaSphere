@@ -138,7 +138,7 @@ void XrVulkanApp::shutdown() {
   actions_ready_ = false;
   play_action_ = seek_back_action_ = seek_fwd_action_ = recenter_action_ = XR_NULL_HANDLE;
   navigate_action_ = confirm_action_ = back_action_ = menu_toggle_action_ = XR_NULL_HANDLE;
-  flat_scale_action_ = milkyway_tune_action_ = view_reset_action_ = XR_NULL_HANDLE;
+  flat_scale_action_ = view_reset_action_ = XR_NULL_HANDLE;
   look_action_ = XR_NULL_HANDLE;
   l2_action_ = r2_action_ = XR_NULL_HANDLE;
   menu_btn_down_ = false;
@@ -629,7 +629,6 @@ void XrVulkanApp::create_actions() {
   make_bool("back", "Back", &back_action_);
   make_bool("menu_toggle", "Menu Toggle", &menu_toggle_action_);
   make_bool("flat_scale", "Flat Scale", &flat_scale_action_);
-  make_bool("milkyway_tune", "Milky Way Tune", &milkyway_tune_action_);
   make_bool("view_reset", "Reset View", &view_reset_action_);
   make_bool("rate_slower", "Slower", &l2_action_);
   make_bool("rate_faster", "Faster", &r2_action_);
@@ -696,7 +695,6 @@ void XrVulkanApp::create_actions() {
                       {back_action_, hand_path("right", "b/click")},
                       {menu_toggle_action_, hand_path("left", "menu/click")},
                       {flat_scale_action_, hand_path("left", "y/click")},
-                      {milkyway_tune_action_, hand_path("left", "x/click")},
                       {view_reset_action_, hand_path("right", "thumbstick/click")},
                       {play_action_, hand_path(primary, "squeeze/click")},
                       {seek_back_action_, hand_path(secondary, left ? "a/click" : "x/click")},
@@ -1112,7 +1110,6 @@ XrVulkanApp::InputState XrVulkanApp::poll_actions() {
   st.back = edge(back_action_);
   st.back_held = action_down(back_action_);
   st.flat_scale = edge(flat_scale_action_);
-  st.milkyway_tune = edge(milkyway_tune_action_);
   st.view_reset = edge(view_reset_action_);
 
   // Options / menu button: short release toggles the file dialog; long press recenters.
