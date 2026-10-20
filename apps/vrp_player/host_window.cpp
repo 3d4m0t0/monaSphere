@@ -1101,6 +1101,8 @@ void HostWindow::saveAppConf() const {
                        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2));
   setMonasphereConfKey(QStringLiteral("milkyway_gain"),
                        QString::number(static_cast<double>(milkyway_gain_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("surround_gain"),
+                       QString::number(static_cast<double>(surround_gain_), 'f', 2));
 }
 
 void HostWindow::loadAppConf() {
@@ -1143,6 +1145,7 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("flat_distance"),
        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
       {QStringLiteral("milkyway_gain"), QStringLiteral("1.00")},
+      {QStringLiteral("surround_gain"), QStringLiteral("0.55")},
   };
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   ensureMonasphereConfKeys(defaults);
@@ -1224,6 +1227,10 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
       if (ok && v >= 0.2f && v <= 2.5f) milkyway_gain_ = v;
+    } else if (line.startsWith(QStringLiteral("surround_gain="))) {
+      bool ok = false;
+      const float v = line.mid(14).toFloat(&ok);
+      if (ok && v >= 0.f && v <= 2.f) surround_gain_ = v;
     }
   }
   user.close();
@@ -2911,6 +2918,7 @@ void HostWindow::xrThreadMain() {
 
     vrp::VideoDecoder decoder;
     vrp::AudioPlayer audio;
+    audio.set_surround_gain(surround_gain_);
     // Keep miniaudio up for the whole HMD session (silence when idle / switching).
     if (!opt_.mute) {
       std::string adev;
@@ -4422,6 +4430,17 @@ void HostWindow::xrThreadMain() {
       else if (look_yaw < -kPi) look_yaw += 2.f * kPi;
       scene.set_view_offset(look_yaw, look_pitch);
       scene.set_comfort_grid(look_x != 0.f || look_y != 0.f);
+
+      if (audio.spatial_active()) {
+        const auto& q = fi.views[0].pose.orientation;
+        const float lx = -2.f * (q.x * q.z + q.w * q.y);
+        const float ly = -2.f * (q.y * q.z - q.w * q.x);
+        const float lz = -(1.f - 2.f * (q.x * q.x + q.y * q.y));
+        const float hmd_yaw = std::atan2(lx, -lz);
+        const float hmd_pitch = std::atan2(ly, std::sqrt(lx * lx + lz * lz));
+        // Stick look rotates content opposite the OpenAL yaw/pitch sense used for HMD.
+        audio.set_listener_orientation(hmd_yaw - look_yaw, hmd_pitch - look_pitch);
+      }
 
       scene.render_frame(xr, fi, proj_views, layer);
       std::vector<XrCompositionLayerBaseHeader*> layers = {

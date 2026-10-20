@@ -298,6 +298,8 @@ class HostWindow : public QMainWindow {
   bool thumb_jpeg_ = true;
   /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */
   float milkyway_gain_ = 1.f;
+  /** monasphere.conf `surround_gain`. Stereo→4.0 rear upmix (default 0.55; no UI). */
+  float surround_gain_ = 0.55f;
   vrp::FsrMode preferred_fsr_ = vrp::FsrMode::Quality;
   std::atomic<int> fsr_req_{-1};       // -1 none; else FsrMode
   int monado_desired_mode_ = -1;       // cached XRT_COMPOSITOR_DESIRED_MODE

@@ -35,6 +35,7 @@ monaSphere の**ソースコード**は [MIT](LICENSE) です。コマンド名�
 | Wayland client (`libwayland-client`) | MIT | DRM リース一覧の確認。プロトコル定義は `third_party/wayland/drm-lease-v1.xml` |
 | XCB / XCB RandR | MIT | X11 の non-desktop 出力の確認 |
 | miniaudio（vendored） | Public Domain または MIT-0 | `third_party/miniaudio/` |
+| OpenAL Soft（runtime `libopenal.so.1`；headers vendored） | LGPL-2.1-or-later | HRTF（2ch はアプリ側で 4.0 側差アップミックス）。ヘッダは `third_party/openal/` |
 | AMD FidelityFX FSR1（vendored headers） | MIT | `third_party/fsr1/` |
 
 nonfree を有効にした FFmpeg **でビルドした**バイナリを「MIT のみ」「openSUSE OSS」として再配布しないでください。

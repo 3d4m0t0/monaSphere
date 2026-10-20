@@ -1,5 +1,7 @@
 #include "audio/audio_player.hpp"
 
+#include "audio/openal_spatial.hpp"
+#include "audio/stereo_surround.hpp"
 #include "common.hpp"
 
 #include <algorithm>
@@ -419,6 +421,11 @@ struct AudioPlayer::State {
   std::atomic<int> fade_in_total{0};
   std::atomic<float> volume{1.f};
   std::atomic<float> rate{1.f};
+  OpenAlSpatial spatial;
+  bool use_spatial = false;
+  /** 2ch → 4.0 side-diff rear upmix (OpenAL path only). */
+  bool use_stereo_upmix = false;
+  StereoSurround stereo_upmix;
 };
 
 AudioPlayer::AudioPlayer() = default;
@@ -801,7 +808,12 @@ void AudioPlayer::clear_file() {
   free_demux();
   has_audio_ = false;
   playing_ = false;
+  spatial_active_ = false;
   if (st_) {
+    st_->use_spatial = false;
+    st_->use_stereo_upmix = false;
+    st_->stereo_upmix.clear();
+    st_->spatial.flush();
     st_->playing.store(false, std::memory_order_release);
     st_->stop.store(false);
     flush_output();
@@ -822,7 +834,10 @@ void AudioPlayer::free_demux() {
   if (st_->codec) avcodec_free_context(&st_->codec);
   if (st_->fmt) avformat_close_input(&st_->fmt);
   st_->stream_index = -1;
+  st_->use_spatial = false;
+  st_->use_stereo_upmix = false;
 #endif
+  spatial_active_ = false;
 }
 
 bool AudioPlayer::setup_demux(const std::string& path) {
@@ -870,9 +885,52 @@ bool AudioPlayer::setup_demux(const std::string& path) {
 
   st_->out_rate = 48000;
   st_->out_channels = 2;
+  st_->use_spatial = false;
+  st_->use_stereo_upmix = false;
+  spatial_active_ = false;
+  st_->spatial.flush();
+  st_->stereo_upmix.clear();
+
+  const int src_ch = st_->codec->ch_layout.nb_channels;
+  uint64_t ch_mask = 0;
+  if (st_->codec->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) ch_mask = st_->codec->ch_layout.u.mask;
+
+#if defined(VRP_HAS_OPENAL)
+  // FFmpeg native QUAD: FL|FR|BL|BR — used after stereo side-diff upmix.
+  constexpr uint64_t kMaskQuad = 0x00000033ull;
+  if (src_ch == 2 && OpenAlSpatial::runtime_available() &&
+      st_->spatial.configure(kMaskQuad, StereoSurround::kOutChannels, st_->out_rate)) {
+    st_->use_spatial = true;
+    st_->use_stereo_upmix = true;
+    spatial_active_ = true;
+    st_->out_channels = 2;  // swr stays stereo; upmix → 4.0 before OpenAL
+    st_->stereo_upmix.reset(st_->out_rate);
+    st_->stereo_upmix.set_rear_gain(surround_gain_);
+    VRP_LOG("Audio: OpenAL Soft HRTF 4.0 (stereo side-diff rear upmix, gain=%.2f)",
+            static_cast<double>(surround_gain_));
+  } else if (src_ch > 2 && OpenAlSpatial::runtime_available() &&
+             st_->spatial.configure(ch_mask, src_ch, st_->out_rate)) {
+    st_->use_spatial = true;
+    spatial_active_ = true;
+    st_->out_channels = src_ch;
+    VRP_LOG("Audio: OpenAL Soft HRTF (%d ch, mask=0x%llx)", src_ch,
+            static_cast<unsigned long long>(ch_mask));
+  } else if (src_ch >= 2) {
+    VRP_LOG("Audio: OpenAL HRTF unavailable — miniaudio stereo (%d ch)", src_ch);
+  }
+#else
+  (void)ch_mask;
+  if (src_ch > 2) VRP_LOG("Audio: multichannel → stereo downmix (%d ch; built without OpenAL)", src_ch);
+#endif
 
   AVChannelLayout out_ch{};
-  av_channel_layout_default(&out_ch, st_->out_channels);
+  if (st_->use_spatial && !st_->use_stereo_upmix) {
+    if (av_channel_layout_copy(&out_ch, &st_->codec->ch_layout) < 0)
+      av_channel_layout_default(&out_ch, st_->out_channels);
+  } else {
+    // Stereo upmix and non-spatial: decode/resample as stereo.
+    av_channel_layout_default(&out_ch, st_->out_channels);
+  }
   if (swr_alloc_set_opts2(&st_->swr, &out_ch, AV_SAMPLE_FMT_S16, st_->out_rate, &st_->codec->ch_layout,
                           st_->codec->sample_fmt, st_->codec->sample_rate, 0, nullptr) < 0 ||
       swr_init(st_->swr) < 0) {
@@ -957,6 +1015,11 @@ void AudioPlayer::start_thread() {
       }
       avcodec_flush_buffers(st_->codec);
       flush_swr();
+      if (st_->use_spatial) {
+        if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
+        st_->spatial.flush();
+        return true;
+      }
       const bool was_out = st_->output_live.exchange(false, std::memory_order_acq_rel);
       // Let the device callback observe output_live==false before resetting the SPSC ring.
       std::this_thread::sleep_for(std::chrono::milliseconds(25));
@@ -991,7 +1054,12 @@ void AudioPlayer::start_thread() {
         flush_swr();
         st_->discard_until_sec = sec;
         // Host already muted output before posting seek_req; reset is exclusive here.
-        if (st_->rb_ok) st_->clear_ring_exclusive();
+        if (st_->use_spatial) {
+          if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
+          st_->spatial.flush();
+        } else if (st_->rb_ok) {
+          st_->clear_ring_exclusive();
+        }
         st_->seek_done_epoch.store(st_->seek_epoch.load(std::memory_order_relaxed),
                                    std::memory_order_release);
       }
@@ -1073,7 +1141,8 @@ void AudioPlayer::start_thread() {
         const int converted =
             swr_convert(st_->swr, outs, out_samples,
                         const_cast<const uint8_t**>(st_->frame->extended_data), st_->frame->nb_samples);
-        if (converted <= 0 || !st_->rb_ok) continue;
+        if (converted <= 0) continue;
+        if (!st_->use_spatial && !st_->rb_ok) continue;
 
         int skip_out = 0;
         if (skip_in > 0 && st_->frame->sample_rate > 0 && st_->out_rate > 0) {
@@ -1102,25 +1171,47 @@ void AudioPlayer::start_thread() {
           play_frames = out_n;
         }
 
-        ma_uint32 frames_left = static_cast<ma_uint32>(play_frames);
+        int frames_left = play_frames;
         const int16_t* src = play_src;
         lock.unlock();
-        while (frames_left > 0 && !st_->stop.load() && st_->playing.load()) {
-          if (!st_->rb_ok || !st_->playing.load()) break;
-          st_->writer_in_rb.store(true, std::memory_order_release);
-          void* dst = nullptr;
-          ma_uint32 req = frames_left;
-          if (ma_pcm_rb_acquire_write(&st_->rb, &req, &dst) != MA_SUCCESS || req == 0) {
-            st_->writer_in_rb.store(false, std::memory_order_release);
-            std::this_thread::sleep_for(std::chrono::milliseconds(2));
-            continue;
+        if (st_->use_spatial) {
+          std::vector<int16_t> upmixed;
+          const int16_t* qsrc = src;
+          int q_ch = st_->out_channels;
+          if (st_->use_stereo_upmix) {
+            st_->stereo_upmix.process(src, frames_left, upmixed);
+            qsrc = upmixed.data();
+            q_ch = StereoSurround::kOutChannels;
           }
-          std::memcpy(dst, src, static_cast<size_t>(req) * static_cast<size_t>(st_->out_channels) *
-                                    sizeof(int16_t));
-          ma_pcm_rb_commit_write(&st_->rb, req);
-          st_->writer_in_rb.store(false, std::memory_order_release);
-          src += req * st_->out_channels;
-          frames_left -= req;
+          int q_left = frames_left;
+          while (q_left > 0 && !st_->stop.load() && st_->playing.load()) {
+            const int n = st_->spatial.queue_interleaved_s16(qsrc, q_left);
+            if (n <= 0) {
+              std::this_thread::sleep_for(std::chrono::milliseconds(2));
+              continue;
+            }
+            qsrc += n * q_ch;
+            q_left -= n;
+          }
+        } else {
+          while (frames_left > 0 && !st_->stop.load() && st_->playing.load()) {
+            if (!st_->rb_ok || !st_->playing.load()) break;
+            st_->writer_in_rb.store(true, std::memory_order_release);
+            void* dst = nullptr;
+            ma_uint32 req = static_cast<ma_uint32>(frames_left);
+            if (ma_pcm_rb_acquire_write(&st_->rb, &req, &dst) != MA_SUCCESS || req == 0) {
+              st_->writer_in_rb.store(false, std::memory_order_release);
+              std::this_thread::sleep_for(std::chrono::milliseconds(2));
+              continue;
+            }
+            std::memcpy(dst, src,
+                        static_cast<size_t>(req) * static_cast<size_t>(st_->out_channels) *
+                            sizeof(int16_t));
+            ma_pcm_rb_commit_write(&st_->rb, req);
+            st_->writer_in_rb.store(false, std::memory_order_release);
+            src += static_cast<int>(req) * st_->out_channels;
+            frames_left -= static_cast<int>(req);
+          }
         }
         lock.lock();
       }
@@ -1141,17 +1232,27 @@ void AudioPlayer::close() {
   mute_output();
   stop_thread();
   free_demux();
+  if (st_) st_->spatial.shutdown();
   shutdown_device();
   st_.reset();
   open_ = false;
   has_audio_ = false;
   playing_ = false;
+  spatial_active_ = false;
   device_name_.clear();
 }
 
 void AudioPlayer::quiesce_and_flush() {
 #if defined(VRP_HAS_MINIAUDIO)
   if (!st_) return;
+  if (st_->use_spatial) {
+    st_->playing.store(false, std::memory_order_release);
+    st_->output_live.store(false, std::memory_order_release);
+    st_->spatial.pause();
+    if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
+    st_->spatial.flush();
+    return;
+  }
   // Already muted and idle — just ensure the ring is empty (no sleeps).
   if (!st_->output_live.load(std::memory_order_acquire) &&
       !st_->playing.load(std::memory_order_acquire) &&
@@ -1182,7 +1283,12 @@ void AudioPlayer::seek_demux_wait(double sec) {
     if (st_->seek_done_epoch.load(std::memory_order_acquire) >= ep) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
-  if (st_->rb_ok) st_->clear_ring_exclusive();
+  if (st_->use_spatial) {
+    if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
+    st_->spatial.flush();
+  } else if (st_->rb_ok) {
+    st_->clear_ring_exclusive();
+  }
 }
 
 bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
@@ -1190,7 +1296,24 @@ bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
   (void)wait_for_prefill;
   return false;
 #else
-  if (!st_ || !st_->rb_ok || !has_audio_) return false;
+  if (!st_ || !has_audio_) return false;
+  if (st_->use_spatial) {
+    st_->output_live.store(false, std::memory_order_release);  // keep miniaudio silent
+    st_->playing.store(true, std::memory_order_release);
+    st_->spatial.set_gain(volume_);
+    if (wait_for_prefill) {
+      const int want = st_->out_rate / 10;
+      for (int i = 0; i < 50; ++i) {
+        if (st_->spatial.min_queued_frames() >= want) break;
+        if (st_->stop.load(std::memory_order_relaxed)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    }
+    st_->spatial.play();
+    playing_ = true;
+    return true;
+  }
+  if (!st_->rb_ok) return false;
   st_->playing.store(true, std::memory_order_release);  // decode fills ring; callback still muted
   if (wait_for_prefill) {
     constexpr ma_uint32 kPrefillFrames = 48000 / 10;  // ~100ms
@@ -1275,7 +1398,17 @@ void AudioPlayer::seek_to(double sec) {
 
 void AudioPlayer::flush_output() {
 #if defined(VRP_HAS_MINIAUDIO)
-  if (!st_ || !st_->rb_ok) return;
+  if (!st_) return;
+  if (st_->use_spatial) {
+    if (st_->playing.load(std::memory_order_acquire)) {
+      quiesce_and_flush();
+      return;
+    }
+    if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
+    st_->spatial.flush();
+    return;
+  }
+  if (!st_->rb_ok) return;
   if (st_->output_live.load(std::memory_order_acquire) ||
       st_->playing.load(std::memory_order_acquire)) {
     quiesce_and_flush();
@@ -1291,7 +1424,10 @@ void AudioPlayer::flush_output() {
 
 void AudioPlayer::set_volume(float v) {
   volume_ = std::clamp(v, 0.f, 1.f);
-  if (st_) st_->volume.store(volume_, std::memory_order_relaxed);
+  if (st_) {
+    st_->volume.store(volume_, std::memory_order_relaxed);
+    if (st_->use_spatial) st_->spatial.set_gain(volume_);
+  }
 }
 
 void AudioPlayer::set_rate(float rate) {
@@ -1299,6 +1435,16 @@ void AudioPlayer::set_rate(float rate) {
   if (st_) st_->rate.store(rate_, std::memory_order_relaxed);
   // Do not flush here alone — that drops buffered PCM while the demuxer stays ahead
   // and desyncs from video. Host must seek_to(video_pos) after rate changes.
+}
+
+void AudioPlayer::set_listener_orientation(float yaw_rad, float pitch_rad) {
+  if (!st_ || !st_->use_spatial) return;
+  st_->spatial.set_listener_orientation(yaw_rad, pitch_rad);
+}
+
+void AudioPlayer::set_surround_gain(float g) {
+  surround_gain_ = std::clamp(g, 0.f, 2.f);
+  if (st_) st_->stereo_upmix.set_rear_gain(surround_gain_);
 }
 
 }  // namespace vrp

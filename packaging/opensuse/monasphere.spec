@@ -30,6 +30,7 @@ BuildRequires:  glslang-devel
 BuildRequires:  ffmpeg-8-mini-devel
 BuildRequires:  pkgconfig(libpulse)
 BuildRequires:  pkgconfig(libpulse-simple)
+BuildRequires:  openal-soft-devel
 BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  pkgconfig(wayland-scanner)
 BuildRequires:  pkgconfig(xcb)
@@ -41,6 +42,7 @@ Requires:       libavformat.so.62()(64bit)
 Requires:       libavutil.so.60()(64bit)
 Requires:       libswscale.so.9()(64bit)
 Requires:       libswresample.so.6()(64bit)
+Requires:       libopenal1
 
 %description
 monaSphere (command: monasphere) is a Linux-native VR video player using

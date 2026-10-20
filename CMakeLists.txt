@@ -76,6 +76,17 @@ endif()
 set(VRP_HAS_MINIAUDIO ON)
 message(STATUS "miniaudio playback enabled (third_party/miniaudio)")
 
+# OpenAL Soft — multichannel → HRTF binaural (headers vendored; runtime .so.1)
+set(VRP_HAS_OPENAL OFF)
+find_library(OPENAL_LIBRARY NAMES openal openal.so.1 libopenal.so.1
+  PATHS /usr/lib64 /usr/lib /usr/local/lib64 /usr/local/lib)
+if(OPENAL_LIBRARY)
+  set(VRP_HAS_OPENAL ON)
+  message(STATUS "OpenAL Soft HRTF enabled (${OPENAL_LIBRARY})")
+else()
+  message(WARNING "libopenal.so.1 not found — multichannel stays stereo downmix")
+endif()
+
 set(VRP_SHADERS
   ${CMAKE_SOURCE_DIR}/shaders/scene.vert
   ${CMAKE_SOURCE_DIR}/shaders/scene.frag
@@ -178,6 +189,8 @@ add_library(vrp_core STATIC
   src/video/bc7_thumbs.cpp
   src/video/vaapi_nv12_texture.cpp
   src/audio/audio_player.cpp
+  src/audio/openal_spatial.cpp
+  src/audio/stereo_surround.cpp
   src/scene/scene_renderer.cpp
   src/scene/fsr1_upscaler.cpp
   src/ui/vr_menu.cpp
@@ -188,6 +201,7 @@ add_dependencies(vrp_core vrp_shaders)
 target_include_directories(vrp_core PUBLIC
   ${CMAKE_SOURCE_DIR}/src
   ${CMAKE_SOURCE_DIR}/third_party/miniaudio
+  ${CMAKE_SOURCE_DIR}/third_party/openal
   ${CMAKE_SOURCE_DIR}/third_party/fsr1
   ${OPENXR_INCLUDE_DIRS}
   ${VULKAN_INCLUDE_DIRS}
@@ -226,6 +240,11 @@ if(VRP_HAS_MINIAUDIO)
   # miniaudio on Linux needs pthread; Pulse/ALSA backends come via dlopen.
   find_package(Threads REQUIRED)
   target_link_libraries(vrp_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS} m)
+endif()
+
+if(VRP_HAS_OPENAL)
+  target_compile_definitions(vrp_core PUBLIC VRP_HAS_OPENAL=1)
+  target_link_libraries(vrp_core PUBLIC ${OPENAL_LIBRARY})
 endif()
 
 set(DRM_LEASE_XML ${CMAKE_SOURCE_DIR}/third_party/wayland/drm-lease-v1.xml)

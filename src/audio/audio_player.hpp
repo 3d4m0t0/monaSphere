@@ -23,7 +23,7 @@ struct AudioDeviceInfo {
   int hmd_score = 0;
 };
 
-// FFmpeg decode + miniaudio playback (Pulse used only for sink/HMD routing when available).
+// FFmpeg decode + OpenAL Soft HRTF (≥2 ch) or miniaudio (mono / OpenAL missing). Pulse for sink/HMD.
 class AudioPlayer {
  public:
   AudioPlayer();
@@ -99,12 +99,26 @@ class AudioPlayer {
   void set_rate(float rate);
   float rate() const { return rate_; }
 
+  /**
+   * Head orientation for OpenAL Soft HRTF (radians).
+   * Speakers stay world-locked; turning toward a side speaker brings it forward.
+   */
+  void set_listener_orientation(float yaw_rad, float pitch_rad);
+  /** True when the current file is playing through OpenAL Soft HRTF (≥2 ch). */
+  bool spatial_active() const { return spatial_active_; }
+
+  /** Stereo→4.0 rear upmix gain (0..2, default 0.55). Ignored for discrete multichannel. */
+  void set_surround_gain(float g);
+  float surround_gain() const { return surround_gain_; }
+
  private:
   bool open_ = false;
   bool has_audio_ = false;
   bool playing_ = false;
+  bool spatial_active_ = false;
   float volume_ = 0.2f;
   float rate_ = 1.f;
+  float surround_gain_ = 0.55f;
   std::string device_name_;
   std::string last_error_;
 
