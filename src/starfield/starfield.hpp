@@ -7,7 +7,8 @@
  * 2. Build soft-disc quads with build_mesh()
  * 3. Optional sky sphere mesh: build_sky_sphere() (app samples Gaia equirect)
  *
- * Coordinate system: Y up, RA=0 toward −Z (same as monaSphere video sphere).
+ * Catalog / ephemeris space: Y up, RA=0 toward −Z.
+ * Use earth_sky_matrix() for an Earth observer (−Z = north, LST rotation).
  */
 
 #include <cstdint>
@@ -93,5 +94,16 @@ struct MoonState {
 
 /** Low-precision ephemeris (~1°) suitable for a sky backdrop. */
 MoonState moon_at_unix(std::int64_t unix_utc_sec);
+
+/**
+ * Equatorial app-space → local horizon app-space (column-major 4×4, no translation).
+ *
+ * - Directions are geocentric (Earth radius ignored — parallel rays).
+ * - Y = local up (sin altitude), −Z = true north, +X = east.
+ * - NCP lands at (0, sin lat, −cos lat); altitude matches the HA formula
+ *   sin(alt) = sinδ sinφ + cosδ cosφ cos(LST − RA).
+ * - Local sidereal time from lon + UTC rotates the sky once per sidereal day.
+ */
+void earth_sky_matrix(std::int64_t unix_utc_sec, float lat_deg, float lon_deg, float out_m4[16]);
 
 }  // namespace vrp::starfield

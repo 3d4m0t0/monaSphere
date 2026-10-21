@@ -171,6 +171,36 @@ void ecliptic_to_app(double lon_deg, double lat_deg, double obl_deg, float& x, f
 
 }  // namespace
 
+void earth_sky_matrix(std::int64_t unix_utc_sec, float lat_deg, float lon_deg, float out_m4[16]) {
+  const double jd = static_cast<double>(unix_utc_sec) / 86400.0 + 2440587.5;
+  const double D = jd - 2451545.0;
+  // Greenwich mean sidereal time (degrees), then local.
+  const double gmst = wrap360(280.46061837 + 360.98564736629 * D);
+  const double lst = wrap360(gmst + static_cast<double>(lon_deg));
+  const double L = lst * kDeg;
+  const double P = static_cast<double>(lat_deg) * kDeg;
+  const double cL = std::cos(L);
+  const double sL = std::sin(L);
+  const double sP = std::sin(P);
+  const double cP = std::cos(P);
+
+  // Equatorial app (Y up, RA=0 → −Z) → local horizon app (Y up, −Z = north).
+  // Hour angle H = LST − RA; local up matches sin(alt) = sinδ sinφ + cosδ cosφ cos H.
+  // Column-major 3×3 in the upper-left of out_m4.
+  auto set_col = [&](int c, double x, double y, double z) {
+    out_m4[c * 4 + 0] = static_cast<float>(x);
+    out_m4[c * 4 + 1] = static_cast<float>(y);
+    out_m4[c * 4 + 2] = static_cast<float>(z);
+    out_m4[c * 4 + 3] = 0.f;
+  };
+  set_col(0, -cL, sL * cP, sL * sP);
+  set_col(1, 0.0, sP, -cP);
+  set_col(2, -sL, -cL * cP, -cL * sP);
+  out_m4[12] = out_m4[13] = out_m4[14] = 0.f;
+  out_m4[3] = out_m4[7] = out_m4[11] = 0.f;
+  out_m4[15] = 1.f;
+}
+
 MoonState moon_at_unix(std::int64_t unix_utc_sec) {
   // Julian Day / centuries from J2000.0 (Meeus-style low-precision).
   const double jd = static_cast<double>(unix_utc_sec) / 86400.0 + 2440587.5;

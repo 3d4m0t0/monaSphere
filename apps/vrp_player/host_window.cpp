@@ -45,7 +45,9 @@
 #include <QSplitter>
 #include <QStandardPaths>
 #include <QThread>
+#include <QDateTime>
 #include <QTimer>
+#include <QTimeZone>
 #include <QWindow>
 #if defined(VRP_HAS_QT_GUI_PRIVATE)
 #include <QtGui/qpa/qplatformwindow_p.h>
@@ -993,6 +995,98 @@ QString monasphereConfPath() {
   return QDir::homePath() + QStringLiteral("/.config/monasphere/monasphere.conf");
 }
 
+/** Parse zone.tab ISO-6709 coords: ±DDMMSS±DDDMMSS or ±DDMM±DDDMM. */
+bool parseZoneTabCoords(const QByteArray& coord, float& lat_deg, float& lon_deg) {
+  if (coord.size() < 5) return false;
+  int i = 0;
+  auto read_hem = [&](int& sign) -> bool {
+    if (i >= coord.size()) return false;
+    if (coord[i] == '+') {
+      sign = 1;
+      ++i;
+      return true;
+    }
+    if (coord[i] == '-') {
+      sign = -1;
+      ++i;
+      return true;
+    }
+    return false;
+  };
+  auto read_digits = [&](int n, int& out) -> bool {
+    if (i + n > coord.size()) return false;
+    int v = 0;
+    for (int k = 0; k < n; ++k) {
+      const char c = coord[i + k];
+      if (c < '0' || c > '9') return false;
+      v = v * 10 + (c - '0');
+    }
+    i += n;
+    out = v;
+    return true;
+  };
+  int lat_sign = 1, lon_sign = 1;
+  if (!read_hem(lat_sign)) return false;
+  const int lat_start = i;
+  while (i < coord.size() && coord[i] >= '0' && coord[i] <= '9') ++i;
+  const int lat_digits = i - lat_start;
+  i = lat_start;
+  int lat_d = 0, lat_m = 0, lat_s = 0;
+  if (lat_digits == 4) {
+    if (!read_digits(2, lat_d) || !read_digits(2, lat_m)) return false;
+  } else if (lat_digits == 6) {
+    if (!read_digits(2, lat_d) || !read_digits(2, lat_m) || !read_digits(2, lat_s)) return false;
+  } else {
+    return false;
+  }
+  if (!read_hem(lon_sign)) return false;
+  const int lon_start = i;
+  while (i < coord.size() && coord[i] >= '0' && coord[i] <= '9') ++i;
+  const int lon_digits = i - lon_start;
+  i = lon_start;
+  int lon_d = 0, lon_m = 0, lon_s = 0;
+  if (lon_digits == 5) {
+    if (!read_digits(3, lon_d) || !read_digits(2, lon_m)) return false;
+  } else if (lon_digits == 7) {
+    if (!read_digits(3, lon_d) || !read_digits(2, lon_m) || !read_digits(2, lon_s)) return false;
+  } else {
+    return false;
+  }
+  lat_deg = lat_sign * (lat_d + lat_m / 60.f + lat_s / 3600.f);
+  lon_deg = lon_sign * (lon_d + lon_m / 60.f + lon_s / 3600.f);
+  return lat_deg >= -90.f && lat_deg <= 90.f && lon_deg >= -180.f && lon_deg <= 180.f;
+}
+
+/**
+ * Observer on Earth from the host timezone (zone.tab reference city).
+ * Celestial directions stay geocentric; only horizon tip uses latitude (sphere).
+ */
+bool observerFromHostTimezone(float& lat_deg, float& lon_deg, QString* zone_id_out = nullptr) {
+  const QByteArray zid = QTimeZone::systemTimeZoneId();
+  if (zone_id_out) *zone_id_out = QString::fromUtf8(zid);
+  const QStringList tabs = {QStringLiteral("/usr/share/zoneinfo/zone1970.tab"),
+                            QStringLiteral("/usr/share/zoneinfo/zone.tab")};
+  for (const QString& path : tabs) {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) continue;
+    while (!f.atEnd()) {
+      const QByteArray line = f.readLine().trimmed();
+      if (line.isEmpty() || line.startsWith('#')) continue;
+      const QList<QByteArray> cols = line.split('\t');
+      if (cols.size() < 3) continue;
+      if (cols[2] != zid) continue;
+      if (parseZoneTabCoords(cols[1], lat_deg, lon_deg)) return true;
+    }
+  }
+  // Fallback: longitude from current UTC offset; latitude unknown → equator.
+  const QTimeZone tz = QTimeZone::systemTimeZone();
+  if (!tz.isValid()) return false;
+  const int off = tz.offsetFromUtc(QDateTime::currentDateTimeUtc());
+  lon_deg = std::clamp(off / 240.f, -180.f, 180.f);  // 15°/h
+  lat_deg = 0.f;
+  return true;
+}
+
 // Insert keys that are absent. Existing lines stay as they are.
 void ensureMonasphereConfKeys(const QHash<QString, QString>& defaults) {
   const QString path = monasphereConfPath();
@@ -1103,6 +1197,9 @@ void HostWindow::saveAppConf() const {
                        QString::number(static_cast<double>(milkyway_gain_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("surround_gain"),
                        QString::number(static_cast<double>(surround_gain_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("sky_from_timezone"), sky_from_timezone_ ? QStringLiteral("1") : QStringLiteral("0"));
+  setMonasphereConfKey(QStringLiteral("sky_lat"), QString::number(static_cast<double>(sky_lat_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("sky_lon"), QString::number(static_cast<double>(sky_lon_), 'f', 2));
 }
 
 void HostWindow::loadAppConf() {
@@ -1146,6 +1243,9 @@ void HostWindow::loadAppConf() {
        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
       {QStringLiteral("milkyway_gain"), QStringLiteral("1.00")},
       {QStringLiteral("surround_gain"), QStringLiteral("0.55")},
+      {QStringLiteral("sky_from_timezone"), QStringLiteral("1")},
+      {QStringLiteral("sky_lat"), QStringLiteral("35.68")},
+      {QStringLiteral("sky_lon"), QStringLiteral("139.65")},
   };
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   ensureMonasphereConfKeys(defaults);
@@ -1231,9 +1331,33 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
       if (ok && v >= 0.f && v <= 2.f) surround_gain_ = v;
+    } else if (line.startsWith(QStringLiteral("sky_from_timezone="))) {
+      bool ok = false;
+      const int v = line.mid(18).toInt(&ok);
+      if (ok) sky_from_timezone_ = v != 0;
+    } else if (line.startsWith(QStringLiteral("sky_lat="))) {
+      bool ok = false;
+      const float v = line.mid(8).toFloat(&ok);
+      if (ok && v >= -90.f && v <= 90.f) sky_lat_ = v;
+    } else if (line.startsWith(QStringLiteral("sky_lon="))) {
+      bool ok = false;
+      const float v = line.mid(8).toFloat(&ok);
+      if (ok && v >= -180.f && v <= 180.f) sky_lon_ = v;
     }
   }
   user.close();
+  if (sky_from_timezone_) {
+    float lat = sky_lat_, lon = sky_lon_;
+    QString zid;
+    if (observerFromHostTimezone(lat, lon, &zid)) {
+      sky_lat_ = lat;
+      sky_lon_ = lon;
+      setMonasphereConfKey(QStringLiteral("sky_lat"), QString::number(static_cast<double>(sky_lat_), 'f', 4));
+      setMonasphereConfKey(QStringLiteral("sky_lon"), QString::number(static_cast<double>(sky_lon_), 'f', 4));
+      VRP_LOG("sky observer from timezone %s → lat=%.4f lon=%.4f (geocentric dirs, horizon tip only)",
+              zid.toUtf8().constData(), static_cast<double>(sky_lat_), static_cast<double>(sky_lon_));
+    }
+  }
   if (legacy_pad_gamepad) {
     if (!saw_gamepad_key) gamepad_enabled_.store(true);
     setMonasphereConfKey(QStringLiteral("pad"), QStringLiteral("auto"));
@@ -2910,6 +3034,7 @@ void HostWindow::xrThreadMain() {
     scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
     scene.set_content_aspect(16.f / 9.f);
     scene.set_milkyway_gain(milkyway_gain_);
+    scene.set_sky_observer(sky_lat_, sky_lon_);
 
     vrp::Fsr1Upscaler fsr;
     fsr.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),

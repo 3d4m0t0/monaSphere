@@ -318,127 +318,10 @@ bool load_jpeg_rgba(const std::string&, std::vector<uint8_t>& rgba, int& w, int&
 }
 #endif
 
-/**
- * Gaia EDR3 colour equirect is a star-density photograph (1.8B stars), not a
- * painted nebula — the “particles” are real density speckles. For a VR backdrop
- * we collapse that grain into a continuous glow while keeping large dust lanes.
- *
- * Pipeline: wide low-pass base + residual shrink (kill bright speckles harder
- * than dark dust). Then seal ℓ=±180° for REPEAT sampling.
- */
-void denoise_equirect_rgba(std::vector<uint8_t>& rgba, int w, int h) {
+/** Seal ℓ=±180° for REPEAT sampling (no denoise — plate is pre-cleaned). */
+void seal_equirect_seam(std::vector<uint8_t>& rgba, int w, int h) {
   if (w < 16 || h < 8 || rgba.size() < static_cast<size_t>(w) * static_cast<size_t>(h) * 4u) return;
   const int row = w * 4;
-  const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
-  std::vector<float> src(n * 3u), blur(n * 3u), tmp(n * 3u), wide(n * 3u);
-
-  for (size_t i = 0; i < n; ++i) {
-    src[i * 3u + 0] = rgba[i * 4u + 0];
-    src[i * 3u + 1] = rgba[i * 4u + 1];
-    src[i * 3u + 2] = rgba[i * 4u + 2];
-  }
-
-  auto idx = [&](int x, int y) -> size_t {
-    x = ((x % w) + w) % w;
-    y = std::clamp(y, 0, h - 1);
-    return static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x);
-  };
-
-  constexpr float kW[5] = {1.f, 4.f, 6.f, 4.f, 1.f};
-  constexpr float kWsum = 16.f;
-  auto sep_blur = [&](const std::vector<float>& in, std::vector<float>& out) {
-    for (int y = 0; y < h; ++y) {
-      for (int x = 0; x < w; ++x) {
-        float acc[3] = {0.f, 0.f, 0.f};
-        for (int k = -2; k <= 2; ++k) {
-          const size_t i = idx(x + k, y);
-          const float ww = kW[k + 2];
-          acc[0] += in[i * 3u + 0] * ww;
-          acc[1] += in[i * 3u + 1] * ww;
-          acc[2] += in[i * 3u + 2] * ww;
-        }
-        const size_t o = idx(x, y);
-        tmp[o * 3u + 0] = acc[0] / kWsum;
-        tmp[o * 3u + 1] = acc[1] / kWsum;
-        tmp[o * 3u + 2] = acc[2] / kWsum;
-      }
-    }
-    for (int y = 0; y < h; ++y) {
-      for (int x = 0; x < w; ++x) {
-        float acc[3] = {0.f, 0.f, 0.f};
-        for (int k = -2; k <= 2; ++k) {
-          const size_t i = idx(x, y + k);
-          const float ww = kW[k + 2];
-          acc[0] += tmp[i * 3u + 0] * ww;
-          acc[1] += tmp[i * 3u + 1] * ww;
-          acc[2] += tmp[i * 3u + 2] * ww;
-        }
-        const size_t o = idx(x, y);
-        out[o * 3u + 0] = acc[0] / kWsum;
-        out[o * 3u + 1] = acc[1] / kWsum;
-        out[o * 3u + 2] = acc[2] / kWsum;
-      }
-    }
-  };
-
-  // Asymmetric residual: bright speckles (stars) die; dark residuals (dust) stay.
-  auto residual_shrink = [&](float grain_lo, float grain_hi, float keep_bright, float keep_dark) {
-    sep_blur(src, blur);
-    for (size_t i = 0; i < n; ++i) {
-      const float ol =
-          0.2126f * src[i * 3u] + 0.7152f * src[i * 3u + 1] + 0.0722f * src[i * 3u + 2];
-      const float bl =
-          0.2126f * blur[i * 3u] + 0.7152f * blur[i * 3u + 1] + 0.0722f * blur[i * 3u + 2];
-      const float d_luma = ol - bl;
-      const float ad = std::fabs(d_luma);
-      float t = (ad - grain_lo) / (grain_hi - grain_lo);
-      t = std::clamp(t, 0.f, 1.f);
-      t = t * t * (3.f - 2.f * t);
-      const float keep_base = (d_luma >= 0.f) ? keep_bright : keep_dark;
-      const float keep = keep_base + (1.f - keep_base) * t;
-      for (int c = 0; c < 3; ++c) {
-        const float d = src[i * 3u + static_cast<size_t>(c)] - blur[i * 3u + static_cast<size_t>(c)];
-        src[i * 3u + static_cast<size_t>(c)] = blur[i * 3u + static_cast<size_t>(c)] + d * keep;
-      }
-    }
-  };
-  // Pass 1–2: strip star density grain. Pass 3: gentle mop-up.
-  residual_shrink(2.f, 40.f, 0.015f, 0.55f);
-  residual_shrink(1.5f, 28.f, 0.02f, 0.45f);
-  residual_shrink(1.f, 18.f, 0.04f, 0.35f);
-
-  // Anchor to a wide low-pass so gaps between speckles fill into continuous glow,
-  // while still allowing the residual-shrunk dust structure through.
-  wide = src;
-  for (int pass = 0; pass < 3; ++pass) {
-    sep_blur(wide, blur);
-    wide.swap(blur);
-  }
-  for (size_t i = 0; i < n; ++i) {
-    const float sl =
-        0.2126f * src[i * 3u] + 0.7152f * src[i * 3u + 1] + 0.0722f * src[i * 3u + 2];
-    const float wl =
-        0.2126f * wide[i * 3u] + 0.7152f * wide[i * 3u + 1] + 0.0722f * wide[i * 3u + 2];
-    // Mostly wide fill (closes star-density holes). If structured src is darker,
-    // keep more of it so dust lanes are not washed out.
-    const float w_src = (sl < wl) ? 0.55f : 0.28f;
-    for (int c = 0; c < 3; ++c) {
-      const float s = src[i * 3u + static_cast<size_t>(c)];
-      const float wde = wide[i * 3u + static_cast<size_t>(c)];
-      src[i * 3u + static_cast<size_t>(c)] = w_src * s + (1.f - w_src) * wde;
-    }
-  }
-
-  for (size_t i = 0; i < n; ++i) {
-    for (int c = 0; c < 3; ++c) {
-      rgba[i * 4u + static_cast<size_t>(c)] =
-          static_cast<uint8_t>(std::clamp(src[i * 3u + static_cast<size_t>(c)] + 0.5f, 0.f, 255.f));
-    }
-    rgba[i * 4u + 3] = 255;
-  }
-
-  // Seal longitude join from a snapshot so L/R do not chase each other, then
-  // force several edge columns equal for REPEAT bilinear.
   constexpr int kSeam = 48;
   std::vector<uint8_t> seam_snap(static_cast<size_t>(kSeam) * 2u * 3u);
   for (int y = 0; y < h; ++y) {
@@ -454,7 +337,6 @@ void denoise_equirect_rgba(std::vector<uint8_t>& rgba, int w, int h) {
     }
     for (int i = 0; i < kSeam; ++i) {
       const float t = (static_cast<float>(i) + 0.5f) / static_cast<float>(kSeam);
-      // Stay near 50/50 longer across the band, then ease out.
       const float a = std::pow(0.5f * (1.f + std::cos(t * static_cast<float>(M_PI))), 0.65f);
       uint8_t* Lp =
           rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row) + static_cast<size_t>(i) * 4u;
@@ -468,7 +350,6 @@ void denoise_equirect_rgba(std::vector<uint8_t>& rgba, int w, int h) {
         Rp[c] = static_cast<uint8_t>(std::clamp(R0 * (1.f - a) + mid * a + 0.5f, 0.f, 255.f));
       }
     }
-    // Identical wrap columns (and next inward) so bilinear across u=0 has no step.
     for (int i = 0; i < 3; ++i) {
       uint8_t* L = rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(row) +
                    static_cast<size_t>(i) * 4u;
@@ -520,6 +401,7 @@ void SceneRenderer::shutdown() {
   if (star_pipeline_) vkDestroyPipeline(device_, star_pipeline_, nullptr);
   if (nebula_pipeline_) vkDestroyPipeline(device_, nebula_pipeline_, nullptr);
   if (moon_pipeline_) vkDestroyPipeline(device_, moon_pipeline_, nullptr);
+  if (sun_pipeline_) vkDestroyPipeline(device_, sun_pipeline_, nullptr);
   if (milkyway_pipeline_) vkDestroyPipeline(device_, milkyway_pipeline_, nullptr);
   if (layout_) vkDestroyPipelineLayout(device_, layout_, nullptr);
   if (grid_layout_) vkDestroyPipelineLayout(device_, grid_layout_, nullptr);
@@ -561,6 +443,8 @@ void SceneRenderer::shutdown() {
   if (nebula_frag_) vkDestroyShaderModule(device_, nebula_frag_, nullptr);
   if (moon_vert_) vkDestroyShaderModule(device_, moon_vert_, nullptr);
   if (moon_frag_) vkDestroyShaderModule(device_, moon_frag_, nullptr);
+  if (sun_vert_) vkDestroyShaderModule(device_, sun_vert_, nullptr);
+  if (sun_frag_) vkDestroyShaderModule(device_, sun_frag_, nullptr);
   if (milkyway_vert_) vkDestroyShaderModule(device_, milkyway_vert_, nullptr);
   if (milkyway_frag_) vkDestroyShaderModule(device_, milkyway_frag_, nullptr);
   if (dset_) {
@@ -593,6 +477,7 @@ void SceneRenderer::shutdown() {
   star_pipeline_ = VK_NULL_HANDLE;
   nebula_pipeline_ = VK_NULL_HANDLE;
   moon_pipeline_ = VK_NULL_HANDLE;
+  sun_pipeline_ = VK_NULL_HANDLE;
   milkyway_pipeline_ = VK_NULL_HANDLE;
   layout_ = VK_NULL_HANDLE;
   grid_layout_ = VK_NULL_HANDLE;
@@ -606,6 +491,13 @@ void SceneRenderer::set_milkyway_gain(float gain_mul) {
 
 float SceneRenderer::milkyway_gain() const { return milkyway_gain_mul_; }
 
+void SceneRenderer::set_sky_observer(float lat_deg, float lon_deg) {
+  sky_lat_deg_ = std::clamp(lat_deg, -90.f, 90.f);
+  sky_lon_deg_ = lon_deg;
+  while (sky_lon_deg_ > 180.f) sky_lon_deg_ -= 360.f;
+  while (sky_lon_deg_ < -180.f) sky_lon_deg_ += 360.f;
+}
+
 void SceneRenderer::load_milkyway_sky_texture() {
   milkyway_sky_ok_ = false;
   if (!device_ || !milkyway_dset_ || !app_) return;
@@ -616,8 +508,8 @@ void SceneRenderer::load_milkyway_sky_texture() {
     VRP_LOG("milkyway: Gaia sky texture missing (%s)", path.c_str());
     return;
   }
-  // Kill JPEG grain + blend the longitude join before upload (U wraps, V clamps).
-  denoise_equirect_rgba(rgba, w, h);
+  // Blend the longitude join before upload (U wraps). No CPU denoise.
+  seal_equirect_seam(rgba, w, h);
 
   const uint32_t uw = static_cast<uint32_t>(w);
   const uint32_t uh = static_cast<uint32_t>(h);
@@ -790,7 +682,7 @@ void SceneRenderer::load_milkyway_sky_texture() {
   write.pImageInfo = &ii;
   vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
   milkyway_sky_ok_ = true;
-  VRP_LOG("milkyway: Gaia sky %dx%d (%u mips, edge-preserve denoise)", w, h, mip_levels);
+  VRP_LOG("milkyway: Gaia sky %dx%d (%u mips, seam seal)", w, h, mip_levels);
 }
 
 void SceneRenderer::set_projection(ProjectionMode mode, StereoLayout stereo, float flat_fov_deg,
@@ -1605,6 +1497,23 @@ void SceneRenderer::create_pipelines(VkFormat /*format*/) {
   moon_gp.subpass = 0;
   VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &moon_gp, nullptr, &moon_pipeline_) == VK_SUCCESS,
             "moon pipeline");
+
+  sun_vert_ = load_shader(shader_dir_ + "/sun.vert.spv");
+  sun_frag_ = load_shader(shader_dir_ + "/sun.frag.spv");
+  VkPipelineShaderStageCreateInfo sun_stages[2]{};
+  sun_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  sun_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+  sun_stages[0].module = sun_vert_;
+  sun_stages[0].pName = "main";
+  sun_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  sun_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+  sun_stages[1].module = sun_frag_;
+  sun_stages[1].pName = "main";
+  VkGraphicsPipelineCreateInfo sun_gp = moon_gp;
+  sun_gp.pStages = sun_stages;
+  sun_gp.pColorBlendState = &star_cb;  // additive glow
+  VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &sun_gp, nullptr, &sun_pipeline_) == VK_SUCCESS,
+            "sun pipeline");
 }
 
 void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapchain& sc,
@@ -1647,11 +1556,17 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   }
   Mat4 proj = projection_fov(view.fov, 0.05f, 100.f);
 
-  // Celestial background: galactic band, then stars. Turns with content look.
-  Mat4 sky_model = Mat4::identity();
-  sky_model.m[12] = head.m[12];
-  sky_model.m[13] = head.m[13];
-  sky_model.m[14] = head.m[14];
+  // Celestial background: Earth-horizon frame (LST + latitude), then content look.
+  const auto unix_sec =
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  Mat4 sky_rot = Mat4::identity();
+  starfield::earth_sky_matrix(static_cast<std::int64_t>(unix_sec), sky_lat_deg_, sky_lon_deg_, sky_rot.m);
+  Mat4 sky_trans = Mat4::identity();
+  sky_trans.m[12] = head.m[12];
+  sky_trans.m[13] = head.m[13];
+  sky_trans.m[14] = head.m[14];
+  const Mat4 sky_model = Mat4::mul(sky_trans, sky_rot);
   const Mat4 sky_mvp = Mat4::mul(proj, Mat4::mul(content_view, sky_model));
   if (milkyway_sky_ok_ && milkyway_pipeline_ && milkyway_layout_ && milkyway_dset_ && vbo_milkyway_ &&
       ibo_milkyway_ && milkyway_index_count_ >= 3) {
@@ -1688,34 +1603,54 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_stars_, &star_off);
     vkCmdDraw(cmd, star_vert_count_, 1, 0, 0);
   }
-  if (moon_pipeline_ && moon_layout_ && vbo_moon_) {
-    const auto now = std::chrono::system_clock::now();
-    const auto unix_sec =
-        std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+  if ((moon_pipeline_ || sun_pipeline_) && moon_layout_ && vbo_moon_) {
     const starfield::MoonState moon = starfield::moon_at_unix(static_cast<std::int64_t>(unix_sec));
-    // Slightly larger than true angular diameter so it reads at sky-backdrop distance.
-    const float half_ang = 0.5f * moon.ang_diam_deg * 1.55f * static_cast<float>(M_PI) / 180.f;
-    const float half_size = 92.f * std::tan(half_ang);
     struct MoonPush {
       float mvp[16];
-      float moon_dir[4];
+      float body_dir[4];
       float sun_dir[4];
-    } moon_pc{};
-    std::memcpy(moon_pc.mvp, &sky_mvp, sizeof(moon_pc.mvp));
-    moon_pc.moon_dir[0] = moon.x;
-    moon_pc.moon_dir[1] = moon.y;
-    moon_pc.moon_dir[2] = moon.z;
-    moon_pc.moon_dir[3] = half_size;
-    moon_pc.sun_dir[0] = moon.sun_x;
-    moon_pc.sun_dir[1] = moon.sun_y;
-    moon_pc.sun_dir[2] = moon.sun_z;
-    moon_pc.sun_dir[3] = 0.f;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, moon_pipeline_);
-    vkCmdPushConstants(cmd, moon_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(moon_pc), &moon_pc);
-    VkDeviceSize moon_off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_moon_, &moon_off);
-    vkCmdDraw(cmd, 6, 1, 0, 0);
+    };
+
+    // Always draw (including below local horizon) so ephemeris / polarity can be checked.
+    if (sun_pipeline_) {
+      constexpr float kSunAngDeg = 0.53f;
+      const float half_ang = 0.5f * kSunAngDeg * 2.8f * static_cast<float>(M_PI) / 180.f;  // room for soft halo
+      const float half_size = 93.f * std::tan(half_ang);
+      MoonPush sun_pc{};
+      std::memcpy(sun_pc.mvp, &sky_mvp, sizeof(sun_pc.mvp));
+      sun_pc.body_dir[0] = moon.sun_x;
+      sun_pc.body_dir[1] = moon.sun_y;
+      sun_pc.body_dir[2] = moon.sun_z;
+      sun_pc.body_dir[3] = half_size;
+      sun_pc.sun_dir[0] = sun_pc.sun_dir[1] = sun_pc.sun_dir[2] = sun_pc.sun_dir[3] = 0.f;
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sun_pipeline_);
+      vkCmdPushConstants(cmd, moon_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                         sizeof(sun_pc), &sun_pc);
+      VkDeviceSize sun_off = 0;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_moon_, &sun_off);
+      vkCmdDraw(cmd, 6, 1, 0, 0);
+    }
+
+    if (moon_pipeline_) {
+      const float half_ang = 0.5f * moon.ang_diam_deg * 1.55f * static_cast<float>(M_PI) / 180.f;
+      const float half_size = 92.f * std::tan(half_ang);
+      MoonPush moon_pc{};
+      std::memcpy(moon_pc.mvp, &sky_mvp, sizeof(moon_pc.mvp));
+      moon_pc.body_dir[0] = moon.x;
+      moon_pc.body_dir[1] = moon.y;
+      moon_pc.body_dir[2] = moon.z;
+      moon_pc.body_dir[3] = half_size;
+      moon_pc.sun_dir[0] = moon.sun_x;
+      moon_pc.sun_dir[1] = moon.sun_y;
+      moon_pc.sun_dir[2] = moon.sun_z;
+      moon_pc.sun_dir[3] = 0.f;
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, moon_pipeline_);
+      vkCmdPushConstants(cmd, moon_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                         sizeof(moon_pc), &moon_pc);
+      VkDeviceSize moon_off = 0;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_moon_, &moon_off);
+      vkCmdDraw(cmd, 6, 1, 0, 0);
+    }
   }
 
   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
@@ -1734,6 +1669,7 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     constexpr float mesh_half_h = 1.f;
     model.m[0] = half_w / mesh_half_w;
     model.m[5] = half_h / mesh_half_h;
+    // −Z = true north after facing-north recenter (sky earth_sky_matrix).
     model.m[14] = -distance_;
   }
 

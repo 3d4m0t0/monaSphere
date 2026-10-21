@@ -300,6 +300,13 @@ class HostWindow : public QMainWindow {
   float milkyway_gain_ = 1.f;
   /** monasphere.conf `surround_gain`. Stereo→4.0 rear upmix (default 0.55; no UI). */
   float surround_gain_ = 0.55f;
+  /**
+   * Earth-horizon sky observer. When `sky_from_timezone=1` (default), filled from the
+   * host IANA zone (zone.tab). Manual `sky_lat` / `sky_lon` apply only if that flag is 0.
+   */
+  bool sky_from_timezone_ = true;
+  float sky_lat_ = 35.68f;
+  float sky_lon_ = 139.65f;
   vrp::FsrMode preferred_fsr_ = vrp::FsrMode::Quality;
   std::atomic<int> fsr_req_{-1};       // -1 none; else FsrMode
   int monado_desired_mode_ = -1;       // cached XRT_COMPOSITOR_DESIRED_MODE

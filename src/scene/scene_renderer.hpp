@@ -60,6 +60,11 @@ class SceneRenderer {
   void set_milkyway_gain(float gain_mul);
   float milkyway_gain() const;
 
+  /** Observer geodetic position for Earth-horizon sky (degrees). Default Tokyo. */
+  void set_sky_observer(float lat_deg, float lon_deg);
+  float sky_lat_deg() const { return sky_lat_deg_; }
+  float sky_lon_deg() const { return sky_lon_deg_; }
+
   // Render both eye swapchains for the current frame; fills projection layers.
   void render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo& frame,
                     std::vector<XrCompositionLayerProjectionView>& proj_views,
@@ -116,9 +121,12 @@ class SceneRenderer {
   uint32_t nebula_vert_count_ = 0;
 
   VkPipeline moon_pipeline_ = VK_NULL_HANDLE;
+  VkPipeline sun_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout moon_layout_ = VK_NULL_HANDLE;
   VkShaderModule moon_vert_ = VK_NULL_HANDLE;
   VkShaderModule moon_frag_ = VK_NULL_HANDLE;
+  VkShaderModule sun_vert_ = VK_NULL_HANDLE;
+  VkShaderModule sun_frag_ = VK_NULL_HANDLE;
   VkBuffer vbo_moon_ = VK_NULL_HANDLE;
   VkDeviceMemory vbo_moon_mem_ = VK_NULL_HANDLE;
 
@@ -132,6 +140,8 @@ class SceneRenderer {
   VkDeviceMemory ibo_milkyway_mem_ = VK_NULL_HANDLE;
   uint32_t milkyway_index_count_ = 0;
   float milkyway_gain_mul_ = 1.f;
+  float sky_lat_deg_ = 35.68f;   // Tokyo default
+  float sky_lon_deg_ = 139.65f;
   bool milkyway_sky_ok_ = false;
   VkDescriptorSetLayout milkyway_dsl_ = VK_NULL_HANDLE;
   VkDescriptorPool milkyway_pool_ = VK_NULL_HANDLE;

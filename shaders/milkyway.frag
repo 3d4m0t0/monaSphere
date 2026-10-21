@@ -60,7 +60,7 @@ void main() {
   vec3 dd_x = dFdx(d);
   vec3 dd_y = dFdy(d);
   float ang = max(length(dd_x), length(dd_y));
-  const float tex_w = 4000.0;
+  float tex_w = float(textureSize(skyTex, 0).x);
   float lod = max(0.0, log2(max(ang * (tex_w / 6.2831853), 1e-4)));
   vec3 c = textureLod(skyTex, vec2(u, v), lod).rgb;
 

@@ -21,15 +21,22 @@ them as lon/lat puts the left/right tips at the poles and opens black gaps.
 
 ## Runtime processing
 
-1. Load JPEG → RGBA (FFmpeg).
-2. Edge-preserving denoise (asymmetric residual shrink + wide low-pass fill) so
-   star-density grain collapses into a continuous glow while dark dust lanes stay.
-3. Seal ℓ=±180° (cosine band + identical wrap columns) for `REPEAT` sampling.
-4. Upload with a full mip chain; fragment shader uses direction-based `textureLod`
-   so the longitude cut does not spike automatic mip derivatives.
-5. Gain defaults to `1.0` via `monasphere.conf` `milkyway_gain` (no in-app control).
+1. Load JPEG → RGBA (FFmpeg). No CPU denoise (plate is pre-cleaned).
+2. Seal ℓ=±180° (cosine band + identical wrap columns) for `REPEAT` sampling.
+3. Upload with a full mip chain; fragment shader uses direction-based `textureLod`
+   so the longitude cut does not spike automatic mip derivatives, then applies
+   shade / soft additive glow scaled by `milkyway_gain`.
+4. Gain defaults to `1.0` via `monasphere.conf` `milkyway_gain` (no in-app control).
+5. Earth-horizon orientation from the **host timezone** (`sky_from_timezone=1`, default):
+   lat/lon from `/usr/share/zoneinfo/zone*.tab` for the system IANA zone.
+   Set `sky_from_timezone=0` to keep manual `sky_lat` / `sky_lon`.
+   Recenter facing **true north**: local up = +Y, north = −Z (flat screen on −Z).
+   Sky directions ignore Earth radius; only the horizon tip uses latitude (sphere).
+   LST from lon + UTC rotates the sky.
 
 Point stars remain `stars_wikidata.bin`; this texture is the soft density backdrop only.
+The Sun and Moon are drawn from a low-precision ephemeris on the host clock (LST +
+body motion); both are hidden below the local horizon.
 
 ## Attribution
 

@@ -100,6 +100,8 @@ set(VRP_SHADERS
   ${CMAKE_SOURCE_DIR}/shaders/milkyway.frag
   ${CMAKE_SOURCE_DIR}/shaders/moon.vert
   ${CMAKE_SOURCE_DIR}/shaders/moon.frag
+  ${CMAKE_SOURCE_DIR}/shaders/sun.vert
+  ${CMAKE_SOURCE_DIR}/shaders/sun.frag
 )
 set(VRP_SPV_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${VRP_SPV_DIR})
@@ -322,6 +324,8 @@ install(FILES
   ${CMAKE_SOURCE_DIR}/shaders/milkyway.frag
   ${CMAKE_SOURCE_DIR}/shaders/moon.vert
   ${CMAKE_SOURCE_DIR}/shaders/moon.frag
+  ${CMAKE_SOURCE_DIR}/shaders/sun.vert
+  ${CMAKE_SOURCE_DIR}/shaders/sun.frag
   ${CMAKE_SOURCE_DIR}/data/LICENSE
   ${CMAKE_SOURCE_DIR}/data/README_stars.md
   ${CMAKE_SOURCE_DIR}/data/README_nebulae.md

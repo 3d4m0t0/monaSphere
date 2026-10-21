@@ -30,7 +30,9 @@ target_link_libraries(your_app PRIVATE vrp_starfield)
 auto stars = vrp::starfield::load_catalog("stars_wikidata.bin");
 auto mesh = vrp::starfield::build_mesh(stars);
 auto [sky_v, sky_i] = vrp::starfield::build_sky_sphere(98.f);
-// App: sample Gaia equirect on sky_v (additive), then draw star discs.
+float R[16];
+earth_sky_matrix(unix_utc, /*lat*/35.68f, /*lon*/139.65f, R);
+// App: multiply sky model by R (−Z = north, NCP altitude = lat, LST rotates sky).
 ```
 
 ## License
