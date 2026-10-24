@@ -9,6 +9,8 @@
 #include <pwd.h>
 #include <unistd.h>
 
+#include <utility>
+
 namespace fs = std::filesystem;
 
 namespace vrp {
@@ -94,9 +96,22 @@ void VrMenu::init(const fs::path& start_dir) {
   bump();
 }
 
+std::string VrMenu::entry_open_path(const Entry& e) const {
+  if (!e.url.empty()) return e.url;
+  return e.path.string();
+}
+
 void VrMenu::set_media(const std::string& path, double duration_sec) {
   media_path_ = path;
-  media_name_ = fs::path(path).filename().string();
+  if (path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0) {
+    const size_t q = path.find('?');
+    const std::string noq = q == std::string::npos ? path : path.substr(0, q);
+    const size_t slash = noq.find_last_of('/');
+    media_name_ = (slash == std::string::npos) ? noq : noq.substr(slash + 1);
+    if (media_name_.empty()) media_name_ = "DLNA";
+  } else {
+    media_name_ = fs::path(path).filename().string();
+  }
   duration_sec_ = duration_sec;
   rate_ = 1.f;
   seek_bar_sec_ = 0;
@@ -370,6 +385,189 @@ void VrMenu::list_directory(const fs::path& dir, bool add_up, const fs::path& up
   entries_.insert(entries_.end(), files.begin(), files.end());
 }
 
+VrMenu::~VrMenu() {
+  if (dlna_mail_) dlna_mail_->job_id.fetch_add(1, std::memory_order_acq_rel);
+  dlna_loading_.store(false, std::memory_order_release);
+  if (dlna_thread_.joinable()) dlna_thread_.join();
+}
+
+void VrMenu::cancel_dlna_job() {
+  if (dlna_mail_) dlna_mail_->job_id.fetch_add(1, std::memory_order_acq_rel);
+  dlna_loading_.store(false, std::memory_order_release);
+  // Detach so the XR thread never blocks on SSDP/Browse (up to several seconds).
+  if (dlna_thread_.joinable()) dlna_thread_.detach();
+  if (dlna_mail_) {
+    std::lock_guard<std::mutex> lock(dlna_mail_->mu);
+    dlna_mail_->result = {};
+  }
+}
+
+void VrMenu::apply_dlna_server_list(const std::string& select_name) {
+  entries_.clear();
+  Entry up;
+  up.name = "..";
+  up.is_dir = true;
+  up.is_special = true;
+  entries_.push_back(std::move(up));
+  if (dlna_servers_.empty()) {
+    Entry none;
+    none.name = "(サーバーなし)";
+    none.is_special = true;
+    entries_.push_back(std::move(none));
+  } else {
+    for (size_t i = 0; i < dlna_servers_.size(); ++i) {
+      Entry e;
+      e.name = dlna_servers_[i].friendly_name;
+      e.is_dir = true;
+      e.dlna_id = std::to_string(i);
+      entries_.push_back(std::move(e));
+    }
+  }
+  select_entry_named(select_name);
+  sync_list_pose();
+  bump();
+}
+
+void VrMenu::apply_dlna_browse_list(const std::vector<dlna::Item>& items, const std::string& select_name) {
+  entries_.clear();
+  dlna_folder_urls_.clear();
+  Entry up;
+  up.name = "..";
+  up.is_dir = true;
+  up.is_special = true;
+  entries_.push_back(std::move(up));
+  if (items.empty()) {
+    Entry empty;
+    empty.name = "(空)";
+    empty.is_special = true;
+    entries_.push_back(std::move(empty));
+  } else {
+    for (const auto& it : items) {
+      Entry e;
+      e.name = it.title;
+      e.dlna_id = it.id;
+      if (it.is_container) {
+        e.is_dir = true;
+      } else if (it.playable && !it.url.empty()) {
+        e.is_video = true;
+        e.url = it.url;
+        dlna_folder_urls_.push_back(it.url);
+      } else {
+        e.is_special = true;
+        if (it.dtcp_protected && e.name.find("DTCP") == std::string::npos) {
+          e.name += " [DTCP・再生不可]";
+        } else if (!it.dtcp_protected && e.name.find("再生不可") == std::string::npos) {
+          e.name += " [再生不可]";
+        }
+      }
+      entries_.push_back(std::move(e));
+    }
+  }
+  select_entry_named(select_name);
+  sync_list_pose();
+  bump();
+}
+
+void VrMenu::list_dlna_servers() {
+  cancel_dlna_job();
+  entries_.clear();
+  Entry up;
+  up.name = "..";
+  up.is_dir = true;
+  up.is_special = true;
+  entries_.push_back(std::move(up));
+  cursor_ = 0;
+  scroll_ = 0;
+  sync_list_pose();
+
+  const uint64_t job = dlna_mail_->job_id.fetch_add(1, std::memory_order_acq_rel) + 1;
+  const std::string select = dlna_pending_select_;
+  dlna_loading_.store(true, std::memory_order_release);
+  dlna_spin_phase_ = 0.f;
+  bump();
+
+  auto mail = dlna_mail_;
+  dlna_thread_ = std::thread([mail, job, select] {
+    auto servers = dlna::discover(2500);
+    if (mail->job_id.load(std::memory_order_acquire) != job) return;
+    std::lock_guard<std::mutex> lock(mail->mu);
+    if (mail->job_id.load(std::memory_order_acquire) != job) return;
+    mail->result.job_id = job;
+    mail->result.ready = true;
+    mail->result.is_discover = true;
+    mail->result.servers = std::move(servers);
+    mail->result.items.clear();
+    mail->result.select_name = select;
+  });
+}
+
+void VrMenu::list_dlna_browse() {
+  cancel_dlna_job();
+  entries_.clear();
+  dlna_folder_urls_.clear();
+  Entry up;
+  up.name = "..";
+  up.is_dir = true;
+  up.is_special = true;
+  entries_.push_back(std::move(up));
+  cursor_ = 0;
+  scroll_ = 0;
+  sync_list_pose();
+
+  if (dlna_server_index_ < 0 || dlna_server_index_ >= static_cast<int>(dlna_servers_.size())) {
+    Entry err;
+    err.name = "(サーバー無効)";
+    err.is_special = true;
+    entries_.push_back(std::move(err));
+    return;
+  }
+
+  const dlna::Server srv = dlna_servers_[static_cast<size_t>(dlna_server_index_)];
+  const std::string oid = dlna_object_id_;
+  const uint64_t job = dlna_mail_->job_id.fetch_add(1, std::memory_order_acq_rel) + 1;
+  const std::string select = dlna_pending_select_;
+  dlna_loading_.store(true, std::memory_order_release);
+  dlna_spin_phase_ = 0.f;
+  bump();
+
+  auto mail = dlna_mail_;
+  dlna_thread_ = std::thread([mail, job, srv, oid, select] {
+    auto items = dlna::browse(srv, oid, 8000);
+    if (mail->job_id.load(std::memory_order_acquire) != job) return;
+    std::lock_guard<std::mutex> lock(mail->mu);
+    if (mail->job_id.load(std::memory_order_acquire) != job) return;
+    mail->result.job_id = job;
+    mail->result.ready = true;
+    mail->result.is_discover = false;
+    mail->result.servers.clear();
+    mail->result.items = std::move(items);
+    mail->result.select_name = select;
+  });
+}
+
+void VrMenu::poll_dlna_job() {
+  if (!dlna_mail_) return;
+  DlnaResult done;
+  {
+    std::lock_guard<std::mutex> lock(dlna_mail_->mu);
+    if (!dlna_mail_->result.ready) return;
+    if (dlna_mail_->result.job_id != dlna_mail_->job_id.load(std::memory_order_acquire)) {
+      dlna_mail_->result = {};
+      return;
+    }
+    done = std::move(dlna_mail_->result);
+    dlna_mail_->result = {};
+  }
+  if (dlna_thread_.joinable()) dlna_thread_.join();
+  dlna_loading_.store(false, std::memory_order_release);
+  if (done.is_discover) {
+    dlna_servers_ = std::move(done.servers);
+    apply_dlna_server_list(done.select_name);
+  } else {
+    apply_dlna_browse_list(done.items, done.select_name);
+  }
+}
+
 void VrMenu::list_removable_mounts() {
   entries_.clear();
   Entry up;
@@ -534,7 +732,26 @@ void VrMenu::refresh_dir(const std::string& select_name) {
     rem.is_dir = true;
     rem.is_special = true;
     entries_.push_back(std::move(rem));
+
+    Entry net;
+    net.name = "[ネットワーク]";
+    net.path.clear();
+    net.is_dir = true;
+    net.is_special = true;
+    entries_.push_back(std::move(net));
     select_entry_named(select_name);
+    return;
+  }
+
+  if (place_ == Place::NetworkList) {
+    dlna_pending_select_ = select_name;
+    list_dlna_servers();
+    return;
+  }
+
+  if (place_ == Place::NetworkTree) {
+    dlna_pending_select_ = select_name;
+    list_dlna_browse();
     return;
   }
 
@@ -611,6 +828,21 @@ void VrMenu::page_cursor(int dir) {
 
 std::string VrMenu::sibling_video(int delta) const {
   if (media_path_.empty() || delta == 0) return {};
+  const std::string cur_s = media_path_.string();
+  if (cur_s.rfind("http://", 0) == 0 || cur_s.rfind("https://", 0) == 0) {
+    if (dlna_folder_urls_.empty()) return {};
+    int idx = -1;
+    for (int i = 0; i < static_cast<int>(dlna_folder_urls_.size()); ++i) {
+      if (dlna_folder_urls_[static_cast<size_t>(i)] == cur_s) {
+        idx = i;
+        break;
+      }
+    }
+    if (idx < 0) return {};
+    const int ni = idx + delta;
+    if (ni < 0 || ni >= static_cast<int>(dlna_folder_urls_.size())) return {};
+    return dlna_folder_urls_[static_cast<size_t>(ni)];
+  }
   const fs::path dir = media_path_.parent_path();
   if (dir.empty()) return {};
 
@@ -733,6 +965,10 @@ void VrMenu::activate() {
     return;
   }
   if (entries_.empty() || cursor_ < 0 || cursor_ >= static_cast<int>(entries_.size())) return;
+  if (network_busy()) {
+    if (entries_[static_cast<size_t>(cursor_)].name == "..") go_back();
+    return;
+  }
   const Entry& e = entries_[static_cast<size_t>(cursor_)];
 
   if (place_ == Place::Roots) {
@@ -749,6 +985,47 @@ void VrMenu::activate() {
       refresh_dir();
       bump();
       return;
+    }
+    if (e.name == "[ネットワーク]") {
+      place_ = Place::NetworkList;
+      refresh_dir();
+      bump();
+      return;
+    }
+  }
+
+  if (place_ == Place::NetworkList) {
+    if (e.name == "..") {
+      place_ = Place::Roots;
+      refresh_dir("[ネットワーク]");
+      bump();
+      return;
+    }
+    if (e.is_dir && !e.dlna_id.empty()) {
+      dlna_server_index_ = std::atoi(e.dlna_id.c_str());
+      dlna_object_id_ = "0";
+      dlna_id_stack_.clear();
+      place_ = Place::NetworkTree;
+      refresh_dir();
+      bump();
+      return;
+    }
+  }
+
+  if (place_ == Place::NetworkTree) {
+    if (e.name == ".." || (e.is_special && e.name == "..")) {
+      go_back();
+      return;
+    }
+    if (e.is_dir && !e.dlna_id.empty()) {
+      dlna_id_stack_.push_back(dlna_object_id_);
+      dlna_object_id_ = e.dlna_id;
+      refresh_dir();
+      bump();
+      return;
+    }
+    if (e.is_video) {
+      return;  // open handled by update()
     }
   }
 
@@ -811,6 +1088,11 @@ void VrMenu::go_back() {
     return;
   }
 
+  if (network_busy()) {
+    cancel_dlna_job();
+    // Fall through to leave the loading place.
+  }
+
   if (place_ == Place::Roots) {
     visible_ = false;
     bump();
@@ -820,6 +1102,33 @@ void VrMenu::go_back() {
   if (place_ == Place::RemovableList) {
     place_ = Place::Roots;
     refresh_dir("[リムーバブル]");
+    bump();
+    return;
+  }
+
+  if (place_ == Place::NetworkList) {
+    place_ = Place::Roots;
+    refresh_dir("[ネットワーク]");
+    bump();
+    return;
+  }
+
+  if (place_ == Place::NetworkTree) {
+    if (!dlna_id_stack_.empty()) {
+      dlna_object_id_ = dlna_id_stack_.back();
+      dlna_id_stack_.pop_back();
+      refresh_dir();
+      bump();
+      return;
+    }
+    const std::string left =
+        (dlna_server_index_ >= 0 && dlna_server_index_ < static_cast<int>(dlna_servers_.size()))
+            ? dlna_servers_[static_cast<size_t>(dlna_server_index_)].friendly_name
+            : std::string{};
+    place_ = Place::NetworkList;
+    dlna_server_index_ = -1;
+    dlna_object_id_ = "0";
+    refresh_dir(left);
     bump();
     return;
   }
@@ -876,6 +1185,12 @@ void VrMenu::bump() { ++gen_; }
 
 VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   Output out;
+  poll_dlna_job();
+  if (dlna_loading_.load(std::memory_order_acquire)) {
+    // ~1.5 rev/s; host paints ~60 Hz while loading so motion stays smooth.
+    dlna_spin_phase_ += dt * 9.5f;
+    if (dlna_spin_phase_ > 6.2831853f) dlna_spin_phase_ = std::fmod(dlna_spin_phase_, 6.2831853f);
+  }
   nav_cooldown_ = std::max(0.f, nav_cooldown_ - dt);
 
   const bool confirm = in.confirm && !prev_confirm_;
@@ -1337,9 +1652,11 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     if (screen_ == Screen::Browser) {
       if (!entries_.empty() && cursor_ >= 0 && cursor_ < static_cast<int>(entries_.size())) {
         const Entry& e = entries_[static_cast<size_t>(cursor_)];
-        if (e.is_video) {
+        if (network_busy()) {
+          if (e.name == "..") activate();
+        } else if (e.is_video) {
           out.open_video = true;
-          out.video_path = e.path.string();
+          out.video_path = entry_open_path(e);
           visible_ = false;
           bump();
         } else {
@@ -1392,6 +1709,16 @@ void VrMenu::publish_hud_snapshot() {
   } else if (place_ == Place::Roots) {
     s.title = "Files";
     s.hint = "A: open  B: back";
+  } else if (place_ == Place::NetworkList) {
+    s.title = "DLNA";
+    s.hint = network_busy() ? "読み込み中…  B: キャンセル" : "A: open  B: back  (再入で再検索)";
+  } else if (place_ == Place::NetworkTree) {
+    if (dlna_server_index_ >= 0 && dlna_server_index_ < static_cast<int>(dlna_servers_.size())) {
+      s.title = dlna_servers_[static_cast<size_t>(dlna_server_index_)].friendly_name;
+    } else {
+      s.title = "DLNA";
+    }
+    s.hint = network_busy() ? "読み込み中…  B: キャンセル" : "A: open  B: back";
   } else if (place_ == Place::RemovableList) {
     s.title = "USB";
     s.hint = "A: open  B: back";
@@ -1435,6 +1762,8 @@ void VrMenu::publish_hud_snapshot() {
   s.preview_w = preview_w_;
   s.preview_h = preview_h_;
   s.preview_rgba = preview_rgba_;
+  s.network_loading = network_busy();
+  s.network_spin_phase = dlna_spin_phase_;
   std::lock_guard lock(mu_);
   published_ = std::move(s);
 }
@@ -1448,7 +1777,8 @@ std::string VrMenu::highlighted_row_id() const {
   if (screen_ != Screen::Browser || entries_.empty()) return {};
   if (cursor_ < 0 || cursor_ >= static_cast<int>(entries_.size())) return {};
   const Entry& e = entries_[static_cast<size_t>(cursor_)];
-  return std::to_string(cursor_) + '\n' + e.path.string();
+  const std::string key = !e.url.empty() ? e.url : (!e.dlna_id.empty() ? e.dlna_id : e.path.string());
+  return std::to_string(cursor_) + '\n' + key;
 }
 
 std::string VrMenu::highlighted_video_path() const {
@@ -1456,7 +1786,7 @@ std::string VrMenu::highlighted_video_path() const {
   if (cursor_ < 0 || cursor_ >= static_cast<int>(entries_.size())) return {};
   const Entry& e = entries_[static_cast<size_t>(cursor_)];
   if (!e.is_video) return {};
-  return e.path.string();
+  return entry_open_path(e);
 }
 
 }  // namespace vrp

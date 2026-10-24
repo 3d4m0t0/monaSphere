@@ -1,13 +1,16 @@
 #pragma once
 
+#include "net/dlna_client.hpp"
 #include "options.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace vrp {
@@ -46,6 +49,11 @@ inline FormatChoice format_menu_at(ProjectionMode projection, int index) {
  */
 class VrMenu {
  public:
+  VrMenu() = default;
+  ~VrMenu();
+  VrMenu(const VrMenu&) = delete;
+  VrMenu& operator=(const VrMenu&) = delete;
+
   enum class Screen : uint8_t { Browser = 0, Format = 1, Player = 2 };
 
   /** Sub-UI while playback controls are open. */
@@ -61,6 +69,10 @@ class VrMenu {
   struct Entry {
     std::string name;
     std::filesystem::path path;
+    /** Non-empty for DLNA / HTTP stream items (takes precedence over path for open). */
+    std::string url;
+    /** DLNA ContentDirectory object id (containers / items). */
+    std::string dlna_id;
     bool is_dir = false;
     bool is_video = false;
     bool is_special = false;
@@ -113,6 +125,10 @@ class VrMenu {
     int preview_h = 0;
     /** Shared with the live menu buffer so HUD paints do not deep-copy megabytes. */
     std::shared_ptr<const std::vector<uint8_t>> preview_rgba;
+    /** DLNA discover/browse running on a worker thread. */
+    bool network_loading = false;
+    /** Radians; HUD draws three chasing dots from this. */
+    float network_spin_phase = 0.f;
   };
 
   struct Output {
@@ -232,12 +248,21 @@ class VrMenu {
   bool list_gliding() const { return list_glide_paint_; }
   /** The seek bar is sliding between stick-seek targets. */
   bool seek_gliding() const { return seek_glide_paint_; }
+  /** DLNA discover/browse worker is running (HUD spins at higher fps). */
+  bool network_busy() const { return dlna_loading_.load(std::memory_order_acquire); }
 
   /** Rows shown in the file list. Page left/right moves by this many. */
   static constexpr int kVisibleRows = 17;
 
  private:
-  enum class Place : uint8_t { Roots = 0, HomeTree = 1, RemovableList = 2, RemovableTree = 3 };
+  enum class Place : uint8_t {
+    Roots = 0,
+    HomeTree = 1,
+    RemovableList = 2,
+    RemovableTree = 3,
+    NetworkList = 4,  // DLNA MediaServer discovery
+    NetworkTree = 5,  // ContentDirectory browse
+  };
 
   /** [|<][<][>/||][□][>][>|] [Vol] [Fmt] [FSR] [Hz] */
   enum Transport : int {
@@ -271,7 +296,14 @@ class VrMenu {
   void list_directory(const std::filesystem::path& dir, bool add_up, const std::filesystem::path& up_path,
                       bool up_is_special);
   void list_removable_mounts();
+  void list_dlna_servers();
+  void list_dlna_browse();
+  void cancel_dlna_job();
+  void poll_dlna_job();
+  void apply_dlna_server_list(const std::string& select_name);
+  void apply_dlna_browse_list(const std::vector<dlna::Item>& items, const std::string& select_name);
   std::string sibling_video(int delta) const;
+  std::string entry_open_path(const Entry& e) const;
   float step_rate(float cur, int dir) const;
   /** Playback-controls rate: 0.5 … 2.0 */
   float step_playback_rate(float cur, int dir) const;
@@ -296,6 +328,32 @@ class VrMenu {
   std::filesystem::path home_;
   std::filesystem::path cwd_;
   std::filesystem::path removable_root_;
+  /** Cached DLNA servers from the last discovery. */
+  std::vector<dlna::Server> dlna_servers_;
+  int dlna_server_index_ = -1;
+  std::string dlna_object_id_ = "0";
+  std::vector<std::string> dlna_id_stack_;  // parent chain for go_back
+  /** Playable siblings in the current DLNA folder (urls), for next/prev. */
+  std::vector<std::string> dlna_folder_urls_;
+  std::atomic<bool> dlna_loading_{false};
+  std::thread dlna_thread_;
+  struct DlnaResult {
+    uint64_t job_id = 0;
+    bool ready = false;
+    bool is_discover = false;
+    std::vector<dlna::Server> servers;
+    std::vector<dlna::Item> items;
+    std::string select_name;
+  };
+  /** Shared with worker so cancel can detach without touching destroyed `this`. */
+  struct DlnaMailbox {
+    std::atomic<uint64_t> job_id{0};
+    std::mutex mu;
+    DlnaResult result;
+  };
+  std::shared_ptr<DlnaMailbox> dlna_mail_ = std::make_shared<DlnaMailbox>();
+  float dlna_spin_phase_ = 0.f;
+  std::string dlna_pending_select_;
   std::vector<Entry> entries_;
   int cursor_ = 0;
   int scroll_ = 0;

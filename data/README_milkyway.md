@@ -36,7 +36,7 @@ them as lon/lat puts the left/right tips at the poles and opens black gaps.
 
 Point stars remain `stars_wikidata.bin`; this texture is the soft density backdrop only.
 The Sun and Moon are drawn from a low-precision ephemeris on the host clock (LST +
-body motion); both are hidden below the local horizon.
+body motion).
 
 ## Attribution
 

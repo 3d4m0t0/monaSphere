@@ -1320,6 +1320,15 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
     AVDictionary* open_opts = nullptr;
     av_dict_set(&open_opts, "probesize", "262144", 0);            // 256 KiB
     av_dict_set(&open_opts, "analyzeduration", "500000", 0);      // 0.5s
+    if (path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0) {
+      av_dict_set(&open_opts, "rw_timeout", "8000000", 0);  // 8s µs
+      av_dict_set(&open_opts, "reconnect", "1", 0);
+      av_dict_set(&open_opts, "reconnect_streamed", "1", 0);
+      av_dict_set(&open_opts, "user_agent", "monaSphere/1.0", 0);
+      // Recorders often need a longer analyze window for MPEG-TS.
+      av_dict_set(&open_opts, "analyzeduration", "2000000", 0);
+      av_dict_set(&open_opts, "probesize", "1048576", 0);
+    }
     err = avformat_open_input(&ff_->fmt, path.c_str(), nullptr, &open_opts);
     av_dict_free(&open_opts);
   }

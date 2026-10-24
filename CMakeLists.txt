@@ -196,6 +196,7 @@ add_library(vrp_core STATIC
   src/scene/scene_renderer.cpp
   src/scene/fsr1_upscaler.cpp
   src/ui/vr_menu.cpp
+  src/net/dlna_client.cpp
   src/input/gamepad.cpp
   third_party/miniaudio/miniaudio_impl.cpp
 )

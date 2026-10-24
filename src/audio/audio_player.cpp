@@ -851,9 +851,20 @@ bool AudioPlayer::setup_demux(const std::string& path) {
     return false;
   }
   free_demux();
-  if (avformat_open_input(&st_->fmt, path.c_str(), nullptr, nullptr) < 0) {
-    fail("音声ファイルを開けません: " + path);
-    return false;
+  {
+    AVDictionary* open_opts = nullptr;
+    if (path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0) {
+      av_dict_set(&open_opts, "rw_timeout", "8000000", 0);
+      av_dict_set(&open_opts, "reconnect", "1", 0);
+      av_dict_set(&open_opts, "reconnect_streamed", "1", 0);
+      av_dict_set(&open_opts, "user_agent", "monaSphere/1.0", 0);
+    }
+    const int err = avformat_open_input(&st_->fmt, path.c_str(), nullptr, &open_opts);
+    av_dict_free(&open_opts);
+    if (err < 0) {
+      fail("音声ファイルを開けません: " + path);
+      return false;
+    }
   }
   if (avformat_find_stream_info(st_->fmt, nullptr) < 0) {
     fail("ストリーム情報を取得できません");

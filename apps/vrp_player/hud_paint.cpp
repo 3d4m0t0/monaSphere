@@ -12,6 +12,7 @@
 #include <QImage>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <initializer_list>
 
@@ -912,7 +913,7 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
     if (show_scroll) list_w -= kScrollW + kScrollGap;
     const QRect view(list_x, list_top, list_w, max_rows * row_h);
     canvas.set_clip(view);
-    if (count > 0) {
+    if (count > 0 && !snap.network_loading) {
       const float hy =
           static_cast<float>(list_top) + (snap.focus - snap.scroll_f) * static_cast<float>(row_h);
       canvas.fill(QRect(list_x + 8, static_cast<int>(std::lround(hy)) + 2, list_w - 16, row_h - 4),
@@ -930,6 +931,30 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
       else draw_row(canvas, row, name, body_font);
     }
     canvas.set_clip({});
+
+    if (snap.network_loading) {
+      const int cx = list_x + list_w / 2;
+      const int cy = list_top + (max_rows * row_h) / 2;
+      constexpr float kOrbit = 22.f;
+      constexpr int kDot = 11;
+      for (int i = 0; i < 3; ++i) {
+        const float a = snap.network_spin_phase + static_cast<float>(i) * (2.f * 3.14159265f / 3.f);
+        const int dx = static_cast<int>(std::lround(kOrbit * std::cos(static_cast<double>(a))));
+        const int dy = static_cast<int>(std::lround(kOrbit * std::sin(static_cast<double>(a))));
+        const float pulse = 0.45f + 0.55f * (0.5f + 0.5f * std::sin(static_cast<double>(
+                                                   snap.network_spin_phase * 1.7f + static_cast<float>(i))));
+        const int alpha = std::clamp(static_cast<int>(70.f + 185.f * pulse), 40, 255);
+        const QRect dot(cx + dx - kDot / 2, cy + dy - kDot / 2, kDot, kDot);
+        canvas.paint_cached(
+            hud_key({90, static_cast<uint64_t>(kDot), static_cast<uint64_t>(alpha)}), dot, kDot, kDot,
+            [alpha](QPainter& p) {
+              p.setRenderHint(QPainter::Antialiasing, true);
+              p.setPen(Qt::NoPen);
+              p.setBrush(QColor(230, 240, 255, alpha));
+              p.drawEllipse(QRectF(0.5, 0.5, kDot - 1.0, kDot - 1.0));
+            });
+      }
+    }
 
     if (show_scroll) {
       const QRect track(list_x + list_w + kScrollGap, list_top + 2, kScrollW, max_rows * row_h - 4);

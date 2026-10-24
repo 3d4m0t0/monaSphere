@@ -3175,7 +3175,7 @@ void HostWindow::xrThreadMain() {
       preview_result = {};
     };
     auto request_preview = [&](const std::string& path) {
-      if (path.empty()) {
+      if (path.empty() || path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0) {
         if (!preview_path_done.empty() || preview_busy.load(std::memory_order_acquire)) {
           preview_gen.fetch_add(1, std::memory_order_acq_rel);
           preview_path_done.clear();
@@ -3317,7 +3317,9 @@ void HostWindow::xrThreadMain() {
       decoder.close();
 
       const bool ok = decoder.open(path, hwaccel_);
-      if (ok) {
+      const bool network_url =
+          path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
+      if (ok && !network_url) {
         vrp::SeekThumbRawStep raw;
         if (nvidia_bc7) {
           raw = [&bc7, bc7_build](int index, double /*time_sec*/, int /*planned*/, double interval, int w, int h,
@@ -4100,7 +4102,10 @@ void HostWindow::xrThreadMain() {
           request_preview(preview_hi);
         }
         static auto last_hud_paint = std::chrono::steady_clock::time_point{};
-        if (hud_dirty || now - last_hud_paint > std::chrono::milliseconds(100)) {
+        // DLNA spinner needs ~60 fps; idle browser can stay at 10 fps.
+        const auto hud_interval =
+            menu.network_busy() ? std::chrono::milliseconds(16) : std::chrono::milliseconds(100);
+        if (hud_dirty || now - last_hud_paint > hud_interval) {
           last_hud_paint = now;
           hud_paint();
         }
