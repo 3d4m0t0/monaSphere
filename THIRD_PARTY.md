@@ -37,6 +37,10 @@ monaSphere の**ソースコード**は [MIT](LICENSE) です。コマンド名�
 | miniaudio（vendored） | Public Domain または MIT-0 | `third_party/miniaudio/` |
 | OpenAL Soft（runtime `libopenal.so.1`；headers vendored） | LGPL-2.1-or-later | HRTF（2ch はアプリ側で 4.0 側差アップミックス）。ヘッダは `third_party/openal/` |
 | AMD FidelityFX FSR1（vendored headers） | MIT | `third_party/fsr1/` |
+| PipeWire (`libpipewire-0.3`) | MIT / LGPL-2.1+（ライブラリ） | live：xdg-desktop-portal ScreenCast → DMA-BUF／RGBA。Chromium 本体は同梱しない |
+| xdg-desktop-portal ScreenCast / RemoteDesktop | （デスクトップ実装依存） | KDE: ScreenCast 単独で MONITOR 選択。GNOME: RemoteDesktop+ScreenCast + `ConnectToEIS`。`restore_token` を `monasphere.conf` に保存 |
+| libei (`libei1`) | MIT | Wayland seat pointer inject（KWin EIS または portal `RemoteDesktop.ConnectToEIS`）。ヘッダは `third_party/libei/` |
+| KRFB `krfb-virtualmonitor`（任意・実行時） | GPL-2.0-or-later（KDE） | Plasma Wayland 仮想出力。同梱せず `PATH` 上のバイナリを起動／終了。`live_virtual=0` で無効 |
 
 nonfree を有効にした FFmpeg **でビルドした**バイナリを「MIT のみ」「openSUSE OSS」として再配布しないでください。
 

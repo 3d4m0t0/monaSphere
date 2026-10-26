@@ -109,6 +109,7 @@ cp "$root/LICENSE" "$root/THIRD_PARTY.md" "$doc/"
 cp "$root/data/LICENSE" "$doc/stars-CC0-LICENSE"
 cp "$root/data/README_stars.md" "$doc/"
 cp "$root/data/README_nebulae.md" "$doc/"
+cp "$root/data/README_live.md" "$doc/"
 cp "$deps/ffmpeg-$ffmpeg_version/COPYING.LGPLv2.1" "$doc/ffmpeg-COPYING.LGPLv2.1"
 if [ -f /usr/share/doc/qt6-base-dev/copyright ]; then
   cp /usr/share/doc/qt6-base-dev/copyright "$doc/Qt-copyright"

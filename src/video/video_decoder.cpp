@@ -1965,11 +1965,25 @@ void VideoTexture::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue, u
 
 bool VideoTexture::upload_idle_screen() {
   // Soft slate panel — alpha ~0.35 so the sky shows through until a video binds.
+  // Prefer the current size when already allocated so we do not destroy images the
+  // XR compositor may still reference (live → idle used to force a 2×2 resize).
   VideoFrame ph;
-  ph.width = 2;
-  ph.height = 2;
   constexpr uint8_t r = 36, g = 42, b = 56, a = 90;
-  ph.rgba = {r, g, b, a, r, g, b, a, r, g, b, a, r, g, b, a};
+  if (width_ >= 2 && height_ >= 2 && slots_[0].image && slots_[1].image) {
+    ph.width = width_;
+    ph.height = height_;
+    ph.rgba.assign(static_cast<size_t>(ph.width) * static_cast<size_t>(ph.height) * 4u, 0);
+    for (size_t i = 0; i + 3 < ph.rgba.size(); i += 4) {
+      ph.rgba[i] = r;
+      ph.rgba[i + 1] = g;
+      ph.rgba[i + 2] = b;
+      ph.rgba[i + 3] = a;
+    }
+  } else {
+    ph.width = 2;
+    ph.height = 2;
+    ph.rgba = {r, g, b, a, r, g, b, a, r, g, b, a, r, g, b, a};
+  }
   for (int i = 0; i < 64; ++i) {
     if (try_upload(ph)) break;
     wait_fence();
@@ -1979,6 +1993,52 @@ bool VideoTexture::upload_idle_screen() {
     wait_fence();
   }
   return view() != VK_NULL_HANDLE;
+}
+
+bool VideoTexture::try_upload_spinner(int width, int height, float phase) {
+  const int w = std::clamp(width > 0 ? width : 640, 64, 1920);
+  const int h = std::clamp(height > 0 ? height : 360, 64, 1080);
+  VideoFrame ph;
+  ph.width = w;
+  ph.height = h;
+  ph.rgba.assign(static_cast<size_t>(w) * static_cast<size_t>(h) * 4u, 0);
+  constexpr uint8_t br = 28, bg = 32, bb = 44, ba = 200;
+  for (size_t i = 0; i + 3 < ph.rgba.size(); i += 4) {
+    ph.rgba[i] = br;
+    ph.rgba[i + 1] = bg;
+    ph.rgba[i + 2] = bb;
+    ph.rgba[i + 3] = ba;
+  }
+  const float cx = 0.5f * static_cast<float>(w);
+  const float cy = 0.5f * static_cast<float>(h);
+  const float orbit = 0.045f * static_cast<float>(std::min(w, h));
+  const float rad = std::max(3.f, 0.012f * static_cast<float>(std::min(w, h)));
+  const float r2 = rad * rad;
+  for (int di = 0; di < 3; ++di) {
+    const float a = phase + static_cast<float>(di) * (2.f * 3.14159265f / 3.f);
+    const float dx = orbit * std::cos(a);
+    const float dy = orbit * std::sin(a);
+    const float pulse =
+        0.45f + 0.55f * (0.5f + 0.5f * std::sin(phase * 1.7f + static_cast<float>(di)));
+    const int alpha = std::clamp(static_cast<int>(70.f + 185.f * pulse), 40, 255);
+    const int x0 = std::max(0, static_cast<int>(cx + dx - rad - 1.f));
+    const int y0 = std::max(0, static_cast<int>(cy + dy - rad - 1.f));
+    const int x1 = std::min(w - 1, static_cast<int>(cx + dx + rad + 1.f));
+    const int y1 = std::min(h - 1, static_cast<int>(cy + dy + rad + 1.f));
+    for (int y = y0; y <= y1; ++y) {
+      for (int x = x0; x <= x1; ++x) {
+        const float fx = static_cast<float>(x) + 0.5f - (cx + dx);
+        const float fy = static_cast<float>(y) + 0.5f - (cy + dy);
+        if (fx * fx + fy * fy > r2) continue;
+        const size_t o = (static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)) * 4u;
+        ph.rgba[o] = 230;
+        ph.rgba[o + 1] = 240;
+        ph.rgba[o + 2] = 255;
+        ph.rgba[o + 3] = static_cast<uint8_t>(alpha);
+      }
+    }
+  }
+  return try_upload(ph);
 }
 
 void VideoTexture::shutdown() {
@@ -2083,6 +2143,9 @@ void VideoTexture::ensure_size(int width, int height) {
   if (width == width_ && height == height_ && slots_[0].image && slots_[1].image) return;
   wait_fence();
   in_flight_ = false;
+  // Recreated images are UNDEFINED until the next upload finishes — force the sync path.
+  valid_ = false;
+  rebind_ = false;
   destroy_slots();
   width_ = width;
   height_ = height;

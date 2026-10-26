@@ -25,3 +25,5 @@ Categories=AudioVideo;Video;Player;
 Keywords=VR;OpenXR;video;player;monasphere;
 MimeType=video/mp4;video/x-matroska;video/webm;video/quicktime;
 StartupNotify=true
+StartupWMClass=monaSphere
+# Required so xdg-desktop-portal can resolve app id "monasphere" for ScreenCast restore_token.

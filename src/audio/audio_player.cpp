@@ -1,6 +1,7 @@
 #include "audio/audio_player.hpp"
 
 #include "audio/openal_spatial.hpp"
+#include "audio/pulse_monitor.hpp"
 #include "audio/stereo_surround.hpp"
 #include "common.hpp"
 
@@ -426,6 +427,12 @@ struct AudioPlayer::State {
   /** 2ch → 4.0 side-diff rear upmix (OpenAL path only). */
   bool use_stereo_upmix = false;
   StereoSurround stereo_upmix;
+  /** Pulse monitor → Flat surround (live). Separate from file demux thread. */
+  std::thread live_thread;
+  std::atomic<bool> live_stop{false};
+  PulseMonitor live_mon;
+  /** Filled by request_start before taking live_ops_mu_ (Pulse outside lock). */
+  std::string pending_yt_monitor;
 };
 
 AudioPlayer::AudioPlayer() = default;
@@ -435,6 +442,24 @@ AudioPlayer::~AudioPlayer() { close(); }
 void AudioPlayer::fail(const std::string& msg) {
   last_error_ = msg;
   VRP_ERR("audio: %s", msg.c_str());
+  push_audio_status(std::string("audio error: ") + msg);
+}
+
+void AudioPlayer::push_audio_status(std::string line) {
+  VRP_LOG("%s", line.c_str());
+  std::lock_guard<std::mutex> lock(status_mu_);
+  status_lines_.push_back(std::move(line));
+  if (status_lines_.size() > 64) {
+    status_lines_.erase(status_lines_.begin(),
+                        status_lines_.begin() + static_cast<std::ptrdiff_t>(status_lines_.size() - 48));
+  }
+}
+
+std::vector<std::string> AudioPlayer::drain_audio_status() {
+  std::lock_guard<std::mutex> lock(status_mu_);
+  std::vector<std::string> out;
+  out.swap(status_lines_);
+  return out;
 }
 
 std::vector<AudioDeviceInfo> AudioPlayer::list_devices() {
@@ -803,6 +828,12 @@ bool AudioPlayer::ensure_output(const std::string& device_name) {
 }
 
 void AudioPlayer::clear_file() {
+  if (live_monitor_) {
+    // Live capture owns the spatial path — don't tear it down via clear_file.
+    stop_thread();
+    free_demux();
+    return;
+  }
   mute_output();
   stop_thread();
   free_demux();
@@ -1240,6 +1271,7 @@ void AudioPlayer::stop_thread() {
 
 void AudioPlayer::close() {
   // Full teardown (HMD disconnect / app exit). Prefer clear_file() while the session is live.
+  stop_live_monitor();
   mute_output();
   stop_thread();
   free_demux();
@@ -1250,6 +1282,7 @@ void AudioPlayer::close() {
   has_audio_ = false;
   playing_ = false;
   spatial_active_ = false;
+  live_monitor_ = false;
   device_name_.clear();
 }
 
@@ -1358,12 +1391,15 @@ void AudioPlayer::play() {
 }
 
 void AudioPlayer::mute_output() {
+  // Live capture owns OpenAL — file mute/pause must not stop HRTF playback.
+  if (live_monitor_.load(std::memory_order_acquire)) return;
   playing_ = false;
   if (!st_) return;
   quiesce_and_flush();
 }
 
 void AudioPlayer::park_at(double sec) {
+  if (live_monitor_.load(std::memory_order_acquire)) return;
   if (!st_ || !has_audio_) return;
   playing_ = false;
   quiesce_and_flush();
@@ -1371,6 +1407,7 @@ void AudioPlayer::park_at(double sec) {
 }
 
 void AudioPlayer::arm_at(double sec) {
+  if (live_monitor_.load(std::memory_order_acquire)) return;
   if (!st_ || !has_audio_) return;
   playing_ = false;
   quiesce_and_flush();
@@ -1383,6 +1420,7 @@ void AudioPlayer::pause() {
 }
 
 void AudioPlayer::stop() {
+  if (live_monitor_.load(std::memory_order_acquire)) return;
   if (!st_ || !open_) {
     playing_ = false;
     return;
@@ -1450,12 +1488,329 @@ void AudioPlayer::set_rate(float rate) {
 
 void AudioPlayer::set_listener_orientation(float yaw_rad, float pitch_rad) {
   if (!st_ || !st_->use_spatial) return;
+  // Never gate on live_op_busy_ — a wedged live Pulse start used to freeze
+  // Flat HRTF head-tracking for the rest of the session.
   st_->spatial.set_listener_orientation(yaw_rad, pitch_rad);
 }
 
 void AudioPlayer::set_surround_gain(float g) {
   surround_gain_ = std::clamp(g, 0.f, 2.f);
   if (st_) st_->stereo_upmix.set_rear_gain(surround_gain_);
+}
+
+void AudioPlayer::stop_live_thread() {
+  if (!st_) return;
+  st_->live_stop.store(true, std::memory_order_release);
+  st_->playing.store(false, std::memory_order_release);
+  // Unblock pa_simple_read without freeing — free after join (avoids ABRT in
+  // pa_stream_get_state when close races with read).
+  st_->live_mon.interrupt();
+  if (st_->live_thread.joinable()) st_->live_thread.join();
+  st_->live_mon.close();
+  st_->live_stop.store(false, std::memory_order_release);
+}
+
+void AudioPlayer::start_live_thread(const std::string& monitor_source) {
+  if (!st_) return;
+  stop_live_thread();
+  st_->live_stop.store(false, std::memory_order_release);
+  if (!st_->live_mon.open(monitor_source)) {
+    fail(st_->live_mon.last_error().empty() ? "Pulse monitor open failed"
+                                            : st_->live_mon.last_error());
+    return;
+  }
+  st_->live_thread = std::thread([this] {
+    if (!st_) return;
+    std::vector<int16_t> buf(static_cast<size_t>(PulseMonitor::kRate / 50 * PulseMonitor::kChannels));
+    std::vector<int16_t> upmixed;
+    auto last_route = std::chrono::steady_clock::now();
+    auto last_dbg = last_route;
+    uint64_t frames_in = 0;
+    uint64_t frames_queued = 0;
+    double peak = 0.0;
+    while (!st_->live_stop.load(std::memory_order_relaxed)) {
+      const auto now = std::chrono::steady_clock::now();
+      // Chrome can spawn new sink-inputs while a video plays — keep isolating.
+      if (now - last_route >= std::chrono::seconds(1)) {
+        const int n = PulseMonitor::route_browser_to_yt_sink();
+        if (n > 0) {
+          push_audio_status("live audio: re-routed/muted " + std::to_string(n) + " stream(s)");
+        }
+        last_route = now;
+      }
+      if (!st_->playing.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+      const int max_frames = static_cast<int>(buf.size() / PulseMonitor::kChannels);
+      const int got = st_->live_mon.read_s16_stereo(buf.data(), max_frames);
+      if (got < 0) {
+        push_audio_status(std::string("live audio: monitor read error: ") + st_->live_mon.last_error());
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
+      if (got == 0) continue;
+      frames_in += static_cast<uint64_t>(got);
+      for (int i = 0; i < got * PulseMonitor::kChannels; ++i) {
+        const double a = std::fabs(static_cast<double>(buf[static_cast<size_t>(i)]) / 32768.0);
+        if (a > peak) peak = a;
+      }
+      if (!st_->use_spatial) {
+        push_audio_status("live audio: WARNING use_spatial=0 — dropping monitor PCM");
+        continue;
+      }
+      const int16_t* qsrc = buf.data();
+      int q_ch = PulseMonitor::kChannels;
+      int q_left = got;
+      if (st_->use_stereo_upmix) {
+        st_->stereo_upmix.process(buf.data(), got, upmixed);
+        qsrc = upmixed.data();
+        q_ch = StereoSurround::kOutChannels;
+      }
+      while (q_left > 0 && !st_->live_stop.load() && st_->playing.load()) {
+        const int n = st_->spatial.queue_interleaved_s16(qsrc, q_left);
+        if (n <= 0) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          continue;
+        }
+        frames_queued += static_cast<uint64_t>(n);
+        qsrc += n * q_ch;
+        q_left -= n;
+      }
+      if (now - last_dbg >= std::chrono::seconds(2)) {
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "live audio: Flat surround feed peak=%.3f in=%llu q=%llu upmix=%d spatial=%d src=%s",
+                      peak, static_cast<unsigned long long>(frames_in),
+                      static_cast<unsigned long long>(frames_queued),
+                      st_->use_stereo_upmix ? 1 : 0, st_->use_spatial ? 1 : 0,
+                      st_->live_mon.source().c_str());  // copy under mutex
+        push_audio_status(line);
+        peak = 0.0;
+        frames_in = 0;
+        frames_queued = 0;
+        last_dbg = now;
+      }
+    }
+  });
+}
+
+bool AudioPlayer::start_live_monitor() {
+  return start_live_monitor_with_gen(live_op_gen_.load(std::memory_order_acquire));
+}
+
+bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
+#if !defined(VRP_HAS_PULSE) || !defined(VRP_HAS_OPENAL)
+  (void)gen;
+  fail("Live Flat audio needs PulseAudio + OpenAL");
+  return false;
+#else
+  // Assumes live_ops_mu_ is held. Pulse setup must run *outside* that lock
+  // (see request_start_live_monitor) so Stop never wedges the XR thread.
+  auto cancelled = [&] {
+    return live_op_gen_.load(std::memory_order_acquire) != gen;
+  };
+  if (cancelled()) return false;
+  if (!st_) return false;
+
+  spatial_active_.store(false, std::memory_order_release);
+  live_monitor_.store(false, std::memory_order_release);
+  stop_live_thread();
+  if (st_) {
+    st_->use_spatial = false;
+    st_->use_stereo_upmix = false;
+    st_->stereo_upmix.clear();
+    st_->spatial.flush();
+    st_->spatial.pause();
+  }
+  has_audio_ = false;
+  playing_ = false;
+  stop_thread();
+  free_demux();
+  st_->output_live.store(false, std::memory_order_release);
+  st_->playing.store(false, std::memory_order_release);
+  if (cancelled()) return false;
+
+  const std::string monitor = st_->pending_yt_monitor;
+  if (monitor.empty()) {
+    fail("live monitor source empty");
+    return false;
+  }
+
+  constexpr uint64_t kMaskQuad = 0x00000033ull;
+  if (!st_->spatial.configure(kMaskQuad, StereoSurround::kOutChannels, 48000, device_name_)) {
+    fail("OpenAL configure failed for live monitor");
+    return false;
+  }
+  if (cancelled()) {
+    st_->spatial.flush();
+    st_->spatial.pause();
+    return false;
+  }
+  st_->use_spatial = true;
+  st_->use_stereo_upmix = true;
+  st_->out_rate = 48000;
+  st_->out_channels = 2;
+  st_->stereo_upmix.reset(st_->out_rate);
+  st_->stereo_upmix.set_rear_gain(surround_gain_);
+  spatial_active_.store(true, std::memory_order_release);
+  has_audio_ = true;
+  live_monitor_.store(true, std::memory_order_release);
+
+  st_->spatial.set_gain(volume_);
+  st_->spatial.flush();
+  start_live_thread(monitor);
+  if (!st_->live_mon.ok()) {
+    live_monitor_.store(false, std::memory_order_release);
+    spatial_active_.store(false, std::memory_order_release);
+    has_audio_ = false;
+    playing_ = false;
+    return false;
+  }
+  if (cancelled()) {
+    stop_live_thread();
+    st_->spatial.flush();
+    st_->spatial.pause();
+    spatial_active_.store(false, std::memory_order_release);
+    has_audio_ = false;
+    playing_ = false;
+    live_monitor_.store(false, std::memory_order_release);
+    return false;
+  }
+  st_->playing.store(true, std::memory_order_release);
+  st_->spatial.play();
+  playing_ = true;
+
+  const uint64_t route_gen = gen;
+  std::thread([this, route_gen] {
+    for (int i = 0; i < 120; ++i) {
+      if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
+      if (!live_monitor_.load(std::memory_order_acquire)) return;
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
+      if (!live_monitor_.load(std::memory_order_acquire)) return;
+      (void)PulseMonitor::route_browser_to_yt_sink();
+    }
+  }).detach();
+
+  {
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "live audio: Chrome PCM → stereo side-diff 4.0 → OpenAL Soft HRTF "
+                  "(gain=%.2f vol=%.2f) monitor=%s module=%u",
+                  static_cast<double>(surround_gain_), static_cast<double>(volume_), monitor.c_str(),
+                  PulseMonitor::last_module_index());
+    push_audio_status(line);
+  }
+  return true;
+#endif
+}
+
+void AudioPlayer::request_start_live_monitor() {
+  if (live_monitor_.load(std::memory_order_acquire) ||
+      live_op_busy_.exchange(true, std::memory_order_acq_rel))
+    return;
+  const uint64_t gen = live_op_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  std::thread([this, gen] {
+    struct BusyClear {
+      AudioPlayer* self = nullptr;
+      ~BusyClear() {
+        if (self) self->live_op_busy_.store(false, std::memory_order_release);
+      }
+    } clear{this};
+    auto cancelled = [&] {
+      return live_op_gen_.load(std::memory_order_acquire) != gen;
+    };
+#if !defined(VRP_HAS_PULSE) || !defined(VRP_HAS_OPENAL)
+    fail("Live Flat audio needs PulseAudio + OpenAL");
+    return;
+#else
+    if (cancelled()) return;
+    if (!OpenAlSpatial::runtime_available()) {
+      fail("OpenAL Soft HRTF unavailable for live monitor");
+      return;
+    }
+    if (!is_output_ready() && !ensure_output(device_name_)) return;
+    if (cancelled()) return;
+
+    // Pulse can take seconds — never hold live_ops_mu_ here (XR Stop must not wedge).
+    const std::string monitor = PulseMonitor::ensure_yt_null_sink();
+    if (cancelled()) return;
+    if (monitor.empty()) {
+      fail("could not create monaSphereYt null sink");
+      return;
+    }
+    (void)PulseMonitor::route_browser_to_yt_sink();
+    if (cancelled()) return;
+
+    std::lock_guard<std::mutex> lock(live_ops_mu_);
+    if (cancelled()) return;
+    if (st_) st_->pending_yt_monitor = monitor;
+    const bool ok = start_live_monitor_with_gen(gen);
+    if (st_) st_->pending_yt_monitor.clear();
+    if (cancelled()) {
+      if (ok) stop_live_monitor();
+      return;
+    }
+    if (!ok) VRP_LOG("Audio: live start failed: %s", last_error_.c_str());
+#endif
+  }).detach();
+}
+
+void AudioPlayer::request_stop_live_monitor() {
+  // Invalidate in-flight start (aborts between Pulse and OpenAL).
+  const uint64_t gen = live_op_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  // Drop listener updates immediately so XR does not touch Soft during stop.
+  spatial_active_.store(false, std::memory_order_release);
+  std::thread([this, gen] {
+    std::lock_guard<std::mutex> lock(live_ops_mu_);
+    if (live_op_gen_.load(std::memory_order_acquire) != gen) return;
+    live_op_busy_.store(true, std::memory_order_release);
+    struct BusyClear {
+      AudioPlayer* self = nullptr;
+      ~BusyClear() {
+        if (self) self->live_op_busy_.store(false, std::memory_order_release);
+      }
+    } clear{this};
+    stop_live_monitor();
+  }).detach();
+}
+
+void AudioPlayer::wait_live_monitor_idle(int timeout_ms) {
+  // Poll only — never lock live_ops_mu_ on the XR thread (that deadlocked Stop
+  // while start held the mutex inside Pulse route).
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(0, timeout_ms));
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (!live_op_busy_.load(std::memory_order_acquire) &&
+        !live_monitor_.load(std::memory_order_acquire)) {
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  VRP_LOG("Audio: wait_live_monitor_idle timeout (busy=%d live=%d) — continuing teardown",
+          live_op_busy_.load(std::memory_order_relaxed) ? 1 : 0,
+          live_monitor_.load(std::memory_order_relaxed) ? 1 : 0);
+}
+
+void AudioPlayer::stop_live_monitor() {
+  if (!live_monitor_.load(std::memory_order_acquire) && !(st_ && st_->live_thread.joinable()))
+    return;
+  // XR must not call set_listener while we pause Soft.
+  spatial_active_.store(false, std::memory_order_release);
+  live_monitor_.store(false, std::memory_order_release);
+  stop_live_thread();
+  if (st_) {
+    st_->use_spatial = false;
+    st_->use_stereo_upmix = false;
+    st_->stereo_upmix.clear();
+    st_->spatial.flush();
+    st_->spatial.pause();
+  }
+  has_audio_ = false;
+  playing_ = false;
+  push_audio_status("live audio: live monitor stopping — restore + destroy monaSphereYt");
+  std::thread([] { (void)PulseMonitor::restore_browser_routing(); }).detach();
 }
 
 }  // namespace vrp

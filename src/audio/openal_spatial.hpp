@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>  // recursive_mutex
 #include <string>
 
 namespace vrp {
@@ -21,7 +22,8 @@ class OpenAlSpatial {
 
   static bool runtime_available();
 
-  bool init();
+  /** @param pulse_sink  Pulse/PipeWire sink name (e.g. jamesdsp_sink); empty = default. */
+  bool init(const std::string& pulse_sink = {});
   void shutdown();
   bool ready() const;
 
@@ -29,7 +31,8 @@ class OpenAlSpatial {
    * Map FFmpeg native channel layout mask to virtual speakers.
    * @return false if OpenAL unavailable / layout empty.
    */
-  bool configure(uint64_t channel_mask, int channels, int sample_rate);
+  bool configure(uint64_t channel_mask, int channels, int sample_rate,
+                 const std::string& pulse_sink = {});
 
   void set_listener_orientation(float yaw_rad, float pitch_rad);
   void set_gain(float linear_0_1);
@@ -49,6 +52,10 @@ class OpenAlSpatial {
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;
+  /** recursive: queue_interleaved_s16 calls play() while holding the lock. */
+  mutable std::recursive_mutex mu_;
+  /** Caller must hold mu_. */
+  void shutdown_unlocked();
 };
 
 }  // namespace vrp

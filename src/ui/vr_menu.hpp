@@ -156,6 +156,10 @@ class VrMenu {
     /** User confirmed HMD refresh-rate change (may restart Monado / XR). */
     bool refresh_hz_restart = false;
     int preferred_hz = 0;  // 0 = auto
+    /** Start Chromium --app on Virtual MONITOR (ScreenCast live). */
+    bool open_live = false;
+    /** Target URL when open_live (from conf live_app[N]=Name|URL). */
+    std::string live_url;
   };
 
   struct PadInput {
@@ -179,7 +183,14 @@ class VrMenu {
     bool r2_held = false;
   };
 
+  struct LiveApp {
+    std::string name;
+    std::string url;
+  };
+
   void init(const std::filesystem::path& start_dir);
+  /** HMD Roots entries [Name] → ScreenCast live browser (conf live_app[N]=). */
+  void set_live_apps(std::vector<LiveApp> apps);
   void set_media(const std::string& path, double duration_sec);
   void set_media_info(const std::string& video_codec, const std::string& res, const std::string& fps,
                        const std::string& bitrate, const std::string& audio_codec,
@@ -211,6 +222,8 @@ class VrMenu {
 
   bool visible() const { return visible_; }
   bool controls_visible() const { return controls_visible_; }
+  /** Show the file browser at Roots (e.g. after closing live capture). */
+  void show_file_browser();
   bool seek_bar_only() const { return seek_bar_only_; }
   /** While thumbs are still building, keep a seek bar up (unless playback controls are open). */
   void set_thumb_bar_force(bool on);
@@ -354,6 +367,7 @@ class VrMenu {
   std::shared_ptr<DlnaMailbox> dlna_mail_ = std::make_shared<DlnaMailbox>();
   float dlna_spin_phase_ = 0.f;
   std::string dlna_pending_select_;
+  std::vector<LiveApp> live_apps_;
   std::vector<Entry> entries_;
   int cursor_ = 0;
   int scroll_ = 0;

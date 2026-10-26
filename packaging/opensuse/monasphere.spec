@@ -35,6 +35,9 @@ BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  pkgconfig(wayland-scanner)
 BuildRequires:  pkgconfig(xcb)
 BuildRequires:  pkgconfig(xcb-randr)
+BuildRequires:  pkgconfig(libpipewire-0.3)
+BuildRequires:  libX11-devel
+BuildRequires:  libXtst-devel
 
 # SONAME caps. Any libav* build that provides these SONAMEs can satisfy them.
 Requires:       libavcodec.so.62()(64bit)
@@ -43,6 +46,8 @@ Requires:       libavutil.so.60()(64bit)
 Requires:       libswscale.so.9()(64bit)
 Requires:       libswresample.so.6()(64bit)
 Requires:       libopenal1
+Requires:       libpipewire-0_3-0
+Recommends:     krfb
 
 %description
 monaSphere (command: monasphere) is a Linux-native VR video player using
@@ -68,7 +73,7 @@ a codec set.
 
 %files
 %license LICENSE data/LICENSE
-%doc README.md THIRD_PARTY.md data/README_stars.md
+%doc README.md THIRD_PARTY.md data/README_stars.md data/README_live.md
 # CMake installs these under /usr/share/doc, not %%{_docdir} (/usr/share/doc/packages).
 %{_datadir}/doc/monasphere/
 %{_bindir}/monasphere

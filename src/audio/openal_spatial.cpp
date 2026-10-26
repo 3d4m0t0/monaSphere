@@ -3,8 +3,11 @@
 #include "common.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 #if defined(VRP_HAS_OPENAL)
@@ -104,6 +107,8 @@ struct OpenAlSpatial::Impl {
   int channels = 0;
   float gain = 1.f;
   std::string last_error;
+  /** Pulse sink passed to the last successful init (empty = default device). */
+  std::string pulse_sink;
 };
 
 OpenAlSpatial::OpenAlSpatial() : impl_(std::make_unique<Impl>()) {}
@@ -123,13 +128,23 @@ bool OpenAlSpatial::runtime_available() {
 bool OpenAlSpatial::ready() const { return impl_ && impl_->ready; }
 const std::string& OpenAlSpatial::last_error() const { return impl_->last_error; }
 
-bool OpenAlSpatial::init() {
+bool OpenAlSpatial::init(const std::string& pulse_sink) {
 #if !defined(VRP_HAS_OPENAL)
+  (void)pulse_sink;
   impl_->last_error = "OpenAL Soft がビルドに含まれていません";
   return false;
 #else
-  shutdown();
-  impl_->device = alcOpenDevice(nullptr);
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  shutdown_unlocked();
+  // Prefer the same Pulse sink miniaudio uses (e.g. jamesdsp → HMD). Default
+  // OpenAL Soft otherwise follows the Pulse default (often HDMI/TV).
+  const std::string want =
+      (!pulse_sink.empty() && pulse_sink != "default") ? pulse_sink : std::string{};
+  if (!want.empty()) {
+    ::setenv("PULSE_SINK", want.c_str(), 1);
+    impl_->device = alcOpenDevice(want.c_str());
+  }
+  if (!impl_->device) impl_->device = alcOpenDevice(nullptr);
   if (!impl_->device) {
     impl_->last_error = "OpenAL デバイスを開けません";
     VRP_ERR("openal: %s", impl_->last_error.c_str());
@@ -139,7 +154,7 @@ bool OpenAlSpatial::init() {
   if (!impl_->context || !alcMakeContextCurrent(impl_->context)) {
     impl_->last_error = "OpenAL コンテキストを作成できません";
     VRP_ERR("openal: %s", impl_->last_error.c_str());
-    shutdown();
+    shutdown_unlocked();
     return false;
   }
   (void)enable_hrtf(impl_->device);
@@ -149,11 +164,15 @@ bool OpenAlSpatial::init() {
   const ALfloat orient[6] = {0.f, 0.f, -1.f, 0.f, 1.f, 0.f};
   alListenerfv(AL_ORIENTATION, orient);
   impl_->ready = true;
+  impl_->pulse_sink = want;
+  if (!want.empty()) {
+    VRP_LOG("OpenAL: opened (pulse_sink=%s)", want.c_str());
+  }
   return true;
 #endif
 }
 
-void OpenAlSpatial::shutdown() {
+void OpenAlSpatial::shutdown_unlocked() {
 #if defined(VRP_HAS_OPENAL)
   if (!impl_) return;
   if (impl_->context) {
@@ -167,11 +186,19 @@ void OpenAlSpatial::shutdown() {
       alDeleteBuffers(kBuffersPerSource, sp.buffers);
     }
     impl_->speakers.clear();
+    // Soft's mixer can still run HRTF JIT after DestroyContext if we race — suspend
+    // and give the backend a beat before freeing (SEGV_MAPERR in unmapped Soft code).
+    if (alcIsExtensionPresent(impl_->device, "ALC_SOFT_pause_device")) {
+      auto pause = reinterpret_cast<LPALCDEVICEPAUSESOFT>(
+          alcGetProcAddress(impl_->device, "alcDevicePauseSOFT"));
+      if (pause) pause(impl_->device);
+    }
     alcMakeContextCurrent(nullptr);
     alcDestroyContext(impl_->context);
     impl_->context = nullptr;
   }
   if (impl_->device) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(15));
     alcCloseDevice(impl_->device);
     impl_->device = nullptr;
   }
@@ -179,17 +206,38 @@ void OpenAlSpatial::shutdown() {
   if (impl_) {
     impl_->ready = false;
     impl_->channels = 0;
+    impl_->pulse_sink.clear();
   }
 }
 
-bool OpenAlSpatial::configure(uint64_t channel_mask, int channels, int sample_rate) {
+void OpenAlSpatial::shutdown() {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  shutdown_unlocked();
+}
+
+bool OpenAlSpatial::configure(uint64_t channel_mask, int channels, int sample_rate,
+                              const std::string& pulse_sink) {
 #if !defined(VRP_HAS_OPENAL)
   (void)channel_mask;
   (void)channels;
   (void)sample_rate;
+  (void)pulse_sink;
   return false;
 #else
-  if (!impl_->ready && !init()) return false;
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  const std::string want =
+      (!pulse_sink.empty() && pulse_sink != "default") ? pulse_sink : std::string{};
+  // Only reopen when the Pulse sink actually changes. Destroying an active Soft
+  // device while the mixer thread still runs the HRTF JIT → SEGV_MAPERR.
+  const bool sink_changed = !want.empty() && want != impl_->pulse_sink;
+  if (!impl_->ready) {
+    // init() takes mu_ (recursive).
+    if (!init(want)) return false;
+  } else if (sink_changed) {
+    VRP_LOG("OpenAL: reopening for pulse_sink %s → %s", impl_->pulse_sink.c_str(), want.c_str());
+    shutdown_unlocked();
+    if (!init(want)) return false;
+  }
   alcMakeContextCurrent(impl_->context);
   for (Speaker& sp : impl_->speakers) {
     if (sp.source) {
@@ -266,6 +314,7 @@ bool OpenAlSpatial::configure(uint64_t channel_mask, int channels, int sample_ra
 
 void OpenAlSpatial::set_listener_orientation(float yaw_rad, float pitch_rad) {
 #if defined(VRP_HAS_OPENAL)
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || !impl_->context) return;
   alcMakeContextCurrent(impl_->context);
   const float cp = std::cos(pitch_rad);
@@ -283,6 +332,7 @@ void OpenAlSpatial::set_listener_orientation(float yaw_rad, float pitch_rad) {
 void OpenAlSpatial::set_gain(float linear_0_1) {
   impl_->gain = std::clamp(linear_0_1, 0.f, 1.f);
 #if defined(VRP_HAS_OPENAL)
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || !impl_->context) return;
   alcMakeContextCurrent(impl_->context);
   alListenerf(AL_GAIN, impl_->gain);
@@ -291,6 +341,7 @@ void OpenAlSpatial::set_gain(float linear_0_1) {
 
 void OpenAlSpatial::play() {
 #if defined(VRP_HAS_OPENAL)
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || !impl_->context) return;
   alcMakeContextCurrent(impl_->context);
   for (Speaker& sp : impl_->speakers) {
@@ -303,6 +354,7 @@ void OpenAlSpatial::play() {
 
 void OpenAlSpatial::pause() {
 #if defined(VRP_HAS_OPENAL)
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || !impl_->context) return;
   alcMakeContextCurrent(impl_->context);
   for (Speaker& sp : impl_->speakers) alSourcePause(sp.source);
@@ -311,6 +363,7 @@ void OpenAlSpatial::pause() {
 
 void OpenAlSpatial::flush() {
 #if defined(VRP_HAS_OPENAL)
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || !impl_->context) return;
   alcMakeContextCurrent(impl_->context);
   for (Speaker& sp : impl_->speakers) {
@@ -329,6 +382,7 @@ void OpenAlSpatial::flush() {
 
 int OpenAlSpatial::min_queued_frames() const {
 #if defined(VRP_HAS_OPENAL)
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || impl_->speakers.empty()) return 0;
   int min_free = kBuffersPerSource;
   for (const Speaker& sp : impl_->speakers) min_free = std::min(min_free, sp.free_count);
@@ -344,6 +398,7 @@ int OpenAlSpatial::queue_interleaved_s16(const int16_t* frames, int frame_count)
   (void)frame_count;
   return 0;
 #else
+  std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || !impl_->context || !frames || frame_count <= 0 || impl_->speakers.empty())
     return 0;
   alcMakeContextCurrent(impl_->context);

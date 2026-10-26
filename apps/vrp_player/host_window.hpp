@@ -4,14 +4,20 @@
 #include "options.hpp"
 #include "ui/hud_mesh.hpp"
 #include "video/video_decoder.hpp"
+#include "youtube_session.hpp"
+#if defined(VRP_HAS_PIPEWIRE)
+#include "capture/pipewire_capture.hpp"
+#endif
 
 #include <QMainWindow>
 #include <QProcess>
 #include <QMap>
 #include <QString>
+#include <QVector>
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -22,6 +28,7 @@ class QPlainTextEdit;
 class QMenu;
 class QAction;
 class QActionGroup;
+class QScreen;
 class QRadioButton;
 
 namespace vrp {
@@ -72,6 +79,14 @@ class HostWindow : public QMainWindow {
   void onFsrAction(QAction* action);
   void onHzAction(QAction* action);
   void showAboutDialog();
+  /** Host Tools → Set up live capture… (portal auth / token). */
+  void setupYouTubeCapture();
+  /** HMD live_app entry: start (or restart) ScreenCast + Chromium --app. */
+  void startLiveFromHmd(const QString& url);
+  /** Stop live capture (HMD Options / ○ long; not exposed in Tools). */
+  void stopYouTubeCapture();
+  void ensureYouTubeSession();
+  void beginYouTubeCapture(bool host_setup, const QString& url_override = {});
   void onRuntimeChosen(bool wivrn);
   /** Auto (preferred_hz_==0) maps to 90 Hz; explicit 90/120 unchanged. */
   int effectivePreferredHz() const { return preferred_hz_ <= 0 ? 90 : preferred_hz_; }
@@ -198,8 +213,10 @@ class HostWindow : public QMainWindow {
   QString hud_toast_;
   std::chrono::steady_clock::time_point hud_toast_until_{};
   std::atomic<bool> hud_toast_active_{false};
-  /** B that closed the help card is still down. Do not treat its release as a controls toggle. */
+  /** Buttons that dismissed the help card — ignore until released so they do not open menus. */
   bool help_swallow_back_ = false;
+  bool help_swallow_confirm_ = false;
+  bool help_swallow_menu_ = false;
   std::atomic<uint64_t> hud_paint_req_{0};
   std::atomic<uint64_t> hud_paint_done_{0};
   /** A paint is queued or running. Further requests coalesce into one follow-up. */
@@ -338,4 +355,46 @@ class HostWindow : public QMainWindow {
   qint64 monado_auto_connect_cooldown_ms_ = 0;
   bool logged_session_refresh_hz_ = false;
   qint64 sync_lag_hold_until_ms_ = 0;  // keep 「フレーム遅れ」 visible briefly
+
+  /** Persisted ScreenCast restore token (also held by the live session). */
+  QString live_restore_token_;
+  struct LiveAppEntry {
+    QString name;
+    QString url;
+  };
+  /** From conf live_app[N]=Name|URL (empty slots skipped). */
+  QVector<LiveAppEntry> live_apps_;
+  QString firstLiveAppUrl() const;
+  bool live_capture_monitor_ = true;
+  bool live_virtual_ = true;
+  int live_virtual_w_ = 1280;
+  int live_virtual_h_ = 720;
+  /** krfb-virtualmonitor --scale (2 = 200%). */
+  float live_virtual_scale_ = 2.f;
+  /** Chromium --force-device-scale-factor (keep 1 when Virtual is already scaled). */
+  float live_chrome_scale_ = 1.f;
+  int live_cursor_scale_ = 1;
+  QString live_output_;
+  bool live_chrome_default_profile_ = true;
+
+  vrp::YouTubeSession* yt_session_ = nullptr;
+  /** Tools → Set up phases: Capture (interactive) → Refresh (silent restore) → Done. */
+  enum class YtSetupPhase { None, Capture, Refresh };
+  YtSetupPhase yt_setup_phase_ = YtSetupPhase::None;
+  /** Tools → Set up: after Streaming, auto-stop (keep vdisp + token). */
+  bool yt_host_setup_stop_after_stream_ = false;
+  /** Host setup / post-setup: do not bind live frames on the HMD Flat panel. */
+  std::atomic<bool> yt_hmd_suppress_live_{false};
+  /** HMD open: wait for prior session Idle before restore (cap retries). */
+  int yt_hmd_start_waits_ = 0;
+  /** Earliest wall-clock ms when HMD restore may call portal Start (after stop settle). */
+  qint64 yt_restore_ready_ms_ = 0;
+  /**
+   * UI/Tools or portal Closed → XR thread tears down DMA before PipeWire stop
+   * (otherwise VkImage + revoked dmabuf → SEGV).
+   */
+  std::atomic<bool> yt_stop_requested_{false};
+  /** XR thread only: log once when async live-monitor start settles. */
+  bool yt_audio_pending_log_ = false;
+  int yt_audio_fail_retries_ = 0;
 };

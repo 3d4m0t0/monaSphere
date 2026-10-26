@@ -96,6 +96,12 @@ void VrMenu::init(const fs::path& start_dir) {
   bump();
 }
 
+void VrMenu::set_live_apps(std::vector<LiveApp> apps) {
+  live_apps_ = std::move(apps);
+  if (place_ == Place::Roots) refresh_dir();
+  bump();
+}
+
 std::string VrMenu::entry_open_path(const Entry& e) const {
   if (!e.url.empty()) return e.url;
   return e.path.string();
@@ -739,6 +745,16 @@ void VrMenu::refresh_dir(const std::string& select_name) {
     net.is_dir = true;
     net.is_special = true;
     entries_.push_back(std::move(net));
+
+    for (const LiveApp& app : live_apps_) {
+      if (app.name.empty() || app.url.empty()) continue;
+      Entry la;
+      la.name = "[" + app.name + "]";
+      la.url = app.url;
+      la.path.clear();
+      la.is_special = true;
+      entries_.push_back(std::move(la));
+    }
     select_entry_named(select_name);
     return;
   }
@@ -1074,6 +1090,16 @@ void VrMenu::activate() {
   if (e.is_video) {
     // Open handled by update output
   }
+}
+
+void VrMenu::show_file_browser() {
+  visible_ = true;
+  controls_visible_ = false;
+  close_controls_edit();
+  screen_ = Screen::Browser;
+  place_ = Place::Roots;
+  refresh_dir({});
+  bump();
 }
 
 void VrMenu::go_back() {
@@ -1654,6 +1680,11 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         const Entry& e = entries_[static_cast<size_t>(cursor_)];
         if (network_busy()) {
           if (e.name == "..") activate();
+        } else if (e.is_special && !e.url.empty()) {
+          out.open_live = true;
+          out.live_url = e.url;
+          visible_ = false;
+          bump();
         } else if (e.is_video) {
           out.open_video = true;
           out.video_path = entry_open_path(e);

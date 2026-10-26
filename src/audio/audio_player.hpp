@@ -1,7 +1,9 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -104,23 +106,58 @@ class AudioPlayer {
    * Speakers stay world-locked; turning toward a side speaker brings it forward.
    */
   void set_listener_orientation(float yaw_rad, float pitch_rad);
-  /** True when the current file is playing through OpenAL Soft HRTF (≥2 ch). */
-  bool spatial_active() const { return spatial_active_; }
+  /** True when OpenAL Soft HRTF is active (file or live Flat path). */
+  bool spatial_active() const { return spatial_active_.load(std::memory_order_acquire); }
 
   /** Stereo→4.0 rear upmix gain (0..2, default 0.55). Ignored for discrete multichannel. */
   void set_surround_gain(float g);
   float surround_gain() const { return surround_gain_; }
 
+  /**
+   * Live stereo from a Pulse monitor (browser) → same Flat path
+   * (stereo side-diff upmix → OpenAL Soft HRTF). Diverts browser streams to a
+   * null sink so the HMD does not double-play system audio.
+   *
+   * Prefer request_* from the XR thread — Pulse/OpenAL setup can take hundreds of
+   * ms and must not block xrWaitFrame.
+   */
+  bool start_live_monitor();
+  void stop_live_monitor();
+  /** Non-blocking: runs start_live_monitor on a worker. */
+  void request_start_live_monitor();
+  /** Non-blocking: runs stop_live_monitor on a worker. */
+  void request_stop_live_monitor();
+  /**
+   * Block until live start/stop workers finish (and monitor is down).
+   * Call from XR before tearing down capture — avoids OpenAL Soft HRTF JIT UAF.
+   */
+  void wait_live_monitor_idle(int timeout_ms = 8000);
+  bool live_monitor_active() const { return live_monitor_.load(std::memory_order_acquire); }
+  bool live_monitor_busy() const { return live_op_busy_.load(std::memory_order_acquire); }
+
+  /** Drain live/Flat audio debug lines for the host log (XR or UI thread). */
+  std::vector<std::string> drain_audio_status();
+
  private:
+  void push_audio_status(std::string line);
   bool open_ = false;
   bool has_audio_ = false;
   bool playing_ = false;
-  bool spatial_active_ = false;
+  std::atomic<bool> spatial_active_{false};
+  std::atomic<bool> live_monitor_{false};
+  std::atomic<bool> live_op_busy_{false};
+  /** Bumped on each live start/stop request so a wedged start cannot stick busy. */
+  std::atomic<uint64_t> live_op_gen_{0};
+  /** Serializes start_live_monitor / stop_live_monitor bodies (OpenAL must not overlap). */
+  std::mutex live_ops_mu_;
+  bool start_live_monitor_with_gen(uint64_t gen);
   float volume_ = 0.2f;
   float rate_ = 1.f;
   float surround_gain_ = 0.55f;
   std::string device_name_;
   std::string last_error_;
+  std::mutex status_mu_;
+  std::vector<std::string> status_lines_;
 
   struct State;
   std::unique_ptr<State> st_;
@@ -128,6 +165,8 @@ class AudioPlayer {
   void fail(const std::string& msg);
   void start_thread();
   void stop_thread();
+  void start_live_thread(const std::string& monitor_source);
+  void stop_live_thread();
   /** Free FFmpeg demux/codec/swr (device/ring untouched). */
   void free_demux();
   /** Open path into existing State demux slots. */

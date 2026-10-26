@@ -72,6 +72,19 @@ else()
   message(WARNING "PulseAudio not found — audio device list limited to default")
 endif()
 
+set(VRP_HAS_PIPEWIRE OFF)
+pkg_check_modules(PIPEWIRE libpipewire-0.3)
+pkg_check_modules(LIBDRM libdrm)
+if(PIPEWIRE_FOUND)
+  set(VRP_HAS_PIPEWIRE ON)
+  message(STATUS "PipeWire found — live ScreenCast capture enabled")
+  if(NOT LIBDRM_FOUND)
+    message(WARNING "libdrm not found — DMA-BUF fourcc headers may be missing")
+  endif()
+else()
+  message(WARNING "PipeWire not found — live capture disabled")
+endif()
+
 # Vendored miniaudio (playback backend)
 set(VRP_HAS_MINIAUDIO ON)
 message(STATUS "miniaudio playback enabled (third_party/miniaudio)")
@@ -193,6 +206,7 @@ add_library(vrp_core STATIC
   src/audio/audio_player.cpp
   src/audio/openal_spatial.cpp
   src/audio/stereo_surround.cpp
+  src/audio/pulse_monitor.cpp
   src/scene/scene_renderer.cpp
   src/scene/fsr1_upscaler.cpp
   src/ui/vr_menu.cpp
@@ -200,6 +214,12 @@ add_library(vrp_core STATIC
   src/input/gamepad.cpp
   third_party/miniaudio/miniaudio_impl.cpp
 )
+if(VRP_HAS_PIPEWIRE)
+  target_sources(vrp_core PRIVATE
+    src/capture/pipewire_capture.cpp
+    src/video/pipewire_dma_texture.cpp
+  )
+endif()
 add_dependencies(vrp_core vrp_shaders)
 target_include_directories(vrp_core PUBLIC
   ${CMAKE_SOURCE_DIR}/src
@@ -250,6 +270,13 @@ if(VRP_HAS_OPENAL)
   target_link_libraries(vrp_core PUBLIC ${OPENAL_LIBRARY})
 endif()
 
+if(VRP_HAS_PIPEWIRE)
+  target_compile_definitions(vrp_core PUBLIC VRP_HAS_PIPEWIRE=1)
+  target_include_directories(vrp_core PUBLIC ${PIPEWIRE_INCLUDE_DIRS} ${LIBDRM_INCLUDE_DIRS})
+  target_link_libraries(vrp_core PUBLIC ${PIPEWIRE_LIBRARIES} ${LIBDRM_LIBRARIES})
+  target_compile_options(vrp_core PUBLIC ${PIPEWIRE_CFLAGS_OTHER} ${LIBDRM_CFLAGS_OTHER})
+endif()
+
 set(DRM_LEASE_XML ${CMAKE_SOURCE_DIR}/third_party/wayland/drm-lease-v1.xml)
 set(DRM_LEASE_HEADER ${CMAKE_BINARY_DIR}/drm-lease-v1-client-protocol.h)
 set(DRM_LEASE_CODE ${CMAKE_BINARY_DIR}/drm-lease-v1-protocol.c)
@@ -274,6 +301,8 @@ add_executable(vrp_player
   apps/vrp_player/i18n.qrc
   apps/vrp_player/host_window.cpp
   apps/vrp_player/host_window.hpp
+  apps/vrp_player/youtube_session.cpp
+  apps/vrp_player/youtube_session.hpp
   apps/vrp_player/drm_lease_probe.cpp
   apps/vrp_player/drm_lease_probe.hpp
   apps/vrp_player/x11_direct_probe.cpp
@@ -282,14 +311,40 @@ add_executable(vrp_player
   apps/vrp_player/hud_paint.hpp
   apps/vrp_player/hud_cache.cpp
   apps/vrp_player/hud_cache.hpp
+  src/capture/screencast_portal.cpp
+  src/capture/screencast_portal.hpp
+  src/capture/portal_request.hpp
+  src/capture/chromium_yt.cpp
+  src/capture/chromium_yt.hpp
+  src/capture/chromium_yt_x11.cpp
+  src/capture/chromium_yt_x11.hpp
+  src/capture/eis_pointer.cpp
+  src/capture/eis_pointer.hpp
+  src/capture/kde_eis_pointer.cpp
+  src/capture/kde_eis_pointer.hpp
+  src/capture/desktop_env.hpp
+  src/capture/kde_virtual_display.cpp
+  src/capture/kde_virtual_display.hpp
+  src/capture/kwin_window_placer.cpp
+  src/capture/kwin_window_placer.hpp
   ${DRM_LEASE_HEADER}
   ${DRM_LEASE_CODE}
 )
 set_target_properties(vrp_player PROPERTIES OUTPUT_NAME monasphere)
+find_package(X11 REQUIRED)
+find_library(XTST_LIBRARY Xtst REQUIRED)
+find_library(XRANDR_LIBRARY Xrandr REQUIRED)
+# libei-devel optional; fall back to SONAME when only the runtime package is present.
+find_library(LIBEI_LIBRARY NAMES ei ei.so.1 PATHS /usr/lib64 /usr/lib)
+if(NOT LIBEI_LIBRARY)
+  set(LIBEI_LIBRARY /usr/lib64/libei.so.1)
+endif()
 target_link_libraries(vrp_player PRIVATE vrp_core vrp_gamepad_icons Qt6::Widgets Qt6::Network Qt6::DBus
-                      ${WAYLAND_CLIENT_LIBRARIES} ${XCB_RANDR_LIBRARIES} ${CMAKE_DL_LIBS})
+                      ${WAYLAND_CLIENT_LIBRARIES} ${XCB_RANDR_LIBRARIES} ${CMAKE_DL_LIBS}
+                      X11::X11 ${XTST_LIBRARY} ${XRANDR_LIBRARY} ${LIBEI_LIBRARY})
 target_include_directories(vrp_player PRIVATE ${CMAKE_BINARY_DIR} ${WAYLAND_CLIENT_INCLUDE_DIRS}
-                           ${XCB_RANDR_INCLUDE_DIRS})
+                           ${XCB_RANDR_INCLUDE_DIRS} ${X11_INCLUDE_DIR}
+                           ${CMAKE_SOURCE_DIR}/third_party/libei)
 target_compile_options(vrp_player PRIVATE ${WAYLAND_CLIENT_CFLAGS_OTHER} ${XCB_RANDR_CFLAGS_OTHER})
 if(VRP_HAS_QT_GUI_PRIVATE)
   target_compile_definitions(vrp_player PRIVATE VRP_HAS_QT_GUI_PRIVATE=1)
@@ -331,6 +386,7 @@ install(FILES
   ${CMAKE_SOURCE_DIR}/data/README_stars.md
   ${CMAKE_SOURCE_DIR}/data/README_nebulae.md
   ${CMAKE_SOURCE_DIR}/data/README_milkyway.md
+  ${CMAKE_SOURCE_DIR}/data/README_live.md
   DESTINATION share/vrp/starfield)
 install(FILES ${CMAKE_SOURCE_DIR}/src/starfield/README.md DESTINATION share/doc/vrp_starfield)
 install(FILES ${CMAKE_SOURCE_DIR}/icons/hicolor/256x256/apps/monasphere.png
@@ -349,8 +405,10 @@ install(FILES
   ${CMAKE_SOURCE_DIR}/data/README_stars.md
   ${CMAKE_SOURCE_DIR}/data/README_nebulae.md
   ${CMAKE_SOURCE_DIR}/data/README_milkyway.md
+  ${CMAKE_SOURCE_DIR}/data/README_live.md
   DESTINATION share/monasphere/shaders)
 install(FILES ${CMAKE_SOURCE_DIR}/THIRD_PARTY.md
+              ${CMAKE_SOURCE_DIR}/data/README_live.md
   DESTINATION share/doc/monasphere
 )
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/translations/

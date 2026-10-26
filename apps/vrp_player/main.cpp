@@ -6,12 +6,16 @@
 
 #include <QApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QGuiApplication>
+#include <QStandardPaths>
 #include <QStringList>
 #include <QIcon>
 #include <QLocalServer>
 #include <QLocalSocket>
+
+#include <X11/Xlib.h>
 
 #include <cstdlib>
 #include <iostream>
@@ -156,6 +160,10 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  // Live X11 inject (XR thread) + place poll (Qt thread) share Display*.
+  // Without this, concurrent XOpenDisplay deadlocks (_XConnectXCB / ABRT).
+  XInitThreads();
+
   const QByteArray activation_token = startupActivationToken();
 
   QApplication app(argc, argv);
@@ -168,6 +176,37 @@ int main(int argc, char** argv) {
   QApplication::setApplicationName(QStringLiteral("monaSphere"));
   QApplication::setApplicationDisplayName(QStringLiteral("monaSphere"));
   QGuiApplication::setDesktopFileName(QStringLiteral("monasphere"));
+  // Portal ScreenCast restore_token is keyed by app id from the .desktop file.
+  // Dev builds often lack an installed entry → "App info not found for 'monasphere'".
+  {
+    const QString apps =
+        QStandardPaths::writableLocation(QStandardPaths::ApplicationsLocation);
+    const QString dest = apps + QStringLiteral("/monasphere.desktop");
+    if (!QFileInfo::exists(dest)) {
+      QDir().mkpath(apps);
+      const QDir app_dir(QCoreApplication::applicationDirPath());
+      const QStringList candidates{
+          app_dir.absoluteFilePath(QStringLiteral("../share/applications/monasphere.desktop")),
+          app_dir.absoluteFilePath(QStringLiteral("../../data/monasphere.desktop")),
+          app_dir.absoluteFilePath(QStringLiteral("data/monasphere.desktop")),
+      };
+      bool copied = false;
+      for (const QString& src : candidates) {
+        if (QFileInfo::exists(src) && QFile::copy(src, dest)) {
+          copied = true;
+          break;
+        }
+      }
+      if (!copied) {
+        QFile out(dest);
+        if (out.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+          out.write(
+              "[Desktop Entry]\nType=Application\nName=monaSphere\nExec=monasphere\n"
+              "Icon=monasphere\nStartupWMClass=monaSphere\nCategories=AudioVideo;Video;Player;\n");
+        }
+      }
+    }
+  }
   if (!show_ui) {
     // Still use the host window but auto-connect; window remains the control surface.
     show_ui = true;

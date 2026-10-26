@@ -297,6 +297,11 @@ class VideoTexture {
    * Blocks briefly if a previous upload is in flight. Returns true when presentable.
    */
   bool upload_idle_screen();
+  /**
+   * Dark slate + orbiting dots (same motif as DLNA loading). Non-blocking via try_upload.
+   * @param phase radians; advance ~9.5 rad/s for ~1.5 rev/s.
+   */
+  bool try_upload_spinner(int width, int height, float phase);
 
   VkImageView view() const { return slots_[display_].view; }
   VkSampler sampler() const { return sampler_; }
