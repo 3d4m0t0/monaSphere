@@ -1909,7 +1909,12 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   // (cores after live_ops_mu_ serialization). Chrome stays on the system sink.
   // Re-enable only after OpenAL lifetime is proven safe on Stop.
   cfg.enable_audio = false;
+  cfg.drm_modifiers = live_drm_modifiers_;
   appendLog(tr("Live audio: system sink only (Flat OpenAL deferred)"));
+  if (!live_drm_modifiers_.empty()) {
+    appendLog(tr("ScreenCast: announcing %1 Vulkan-sampleable DRM modifier(s)")
+                  .arg(live_drm_modifiers_.size()));
+  }
   if (live_chrome_default_profile_) {
     appendLog(tr("Chrome: using default profile (logins/cookies)"));
   }
@@ -3541,18 +3546,29 @@ void HostWindow::xrThreadMain() {
     const bool pw_dma =
         pw_dma_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
                         xr.dma_buf_import());
+    const bool pw_dma_nvidia = pw_dma && pw_dma_tex.nvidia();
+    if (pw_dma) {
+      live_drm_modifiers_ = pw_dma_tex.sampleable_modifiers();
+    } else {
+      live_drm_modifiers_ =
+          vrp::PipewireDmaTexture::query_sampleable_modifiers(xr.physical_device());
+    }
 #else
     const bool pw_dma = false;
+    const bool pw_dma_nvidia = false;
 #endif
     decoder.set_cuda_texture(gpu_nv12 ? &cuda_tex : nullptr);
     decoder.set_vaapi_texture(vaapi_nv12 ? &vaapi_tex : nullptr);
     QMetaObject::invokeMethod(
         this,
-        [this, gpu_nv12, vaapi_nv12, pw_dma] {
+        [this, gpu_nv12, vaapi_nv12, pw_dma, pw_dma_nvidia] {
           if (gpu_nv12) appendLog(tr("Video: GPU NV12"));
           else if (vaapi_nv12) appendLog(tr("Video: VA-API dma-buf"));
           else appendLog(tr("Video: CPU RGBA"));
-          if (pw_dma) appendLog(tr("ScreenCast: DMA-BUF import armed"));
+          if (pw_dma_nvidia)
+            appendLog(tr("ScreenCast: DMA-BUF import armed (NVIDIA experimental)"));
+          else if (pw_dma)
+            appendLog(tr("ScreenCast: DMA-BUF import armed"));
         },
         Qt::QueuedConnection);
     scene.set_texture(texture.view(), texture.sampler());
@@ -5022,7 +5038,35 @@ void HostWindow::xrThreadMain() {
       if (!yt_suppress) yt_suppress_idle_uploaded = false;
       if (yt_suppress) {
         show_idle_screen = true;
-        pw_dma_tex.reset();
+        // Still exercise DMA-BUF → Vulkan import (NVIDIA experiment) without painting.
+        // Do not reset the texture every frame — that aborted arming/import.
+        if (pw_dma && yt_session_ && yt_cap && yt_cap->running() &&
+            !yt_session_->dma_disabled() && !pw_dma_tex.import_abandoned()) {
+          vrp::PipewireDmaFrame dma;
+          if (yt_cap->take_latest_dma(dma, yt_session_->dma_seq())) {
+            if (pw_dma_tex.try_import(dma)) {
+              if (!yt_session_->dma_logged()) {
+                yt_session_->dma_logged() = true;
+                const QString note =
+                    tr("display path: PipeWire DMA-BUF zero-copy %1x%2 modifier=0x%3 (setup/no paint)")
+                        .arg(dma.width)
+                        .arg(dma.height)
+                        .arg(dma.modifier, 0, 16);
+                QMetaObject::invokeMethod(
+                    this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
+              }
+            } else if (pw_dma_tex.import_abandoned()) {
+              yt_session_->dma_disabled() = true;
+              const QString err = QString::fromStdString(pw_dma_tex.last_error());
+              const QString note =
+                  tr("ScreenCast: DMA-BUF import failed (%1, modifier=0x%2) — CPU RGBA fallback")
+                      .arg(err.isEmpty() ? tr("unknown") : err)
+                      .arg(dma.modifier, 0, 16);
+              QMetaObject::invokeMethod(
+                  this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
+            }
+          }
+        }
         if (!seek_visual) {
           if (!yt_suppress_idle_uploaded) {
             (void)texture.upload_idle_screen();
@@ -5049,15 +5093,16 @@ void HostWindow::xrThreadMain() {
                                      static_cast<float>(std::max(1, th)));
           }
         };
+        // Desktop capture is sRGB/gamma; Flat shader expects linear unless rgba_gamma.
         auto bind_last_yt = [&] {
           if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.view()) {
-            scene.set_texture(pw_dma_tex.view(), pw_dma_tex.sampler());
+            scene.set_texture_gamma(pw_dma_tex.view(), pw_dma_tex.sampler());
             set_yt_aspect(pw_dma_tex.width(), pw_dma_tex.height());
             fsr_need_process = false;
             return true;
           }
           if (texture.view() && texture.width() > 8 && texture.height() > 8) {
-            scene.set_texture(texture.view(), texture.sampler());
+            scene.set_texture_gamma(texture.view(), texture.sampler());
             set_yt_aspect(texture.width(), texture.height());
             fsr_need_process = false;
             return true;
@@ -5075,7 +5120,8 @@ void HostWindow::xrThreadMain() {
             }
           }
           bool imported_dma = false;
-          if (pw_dma && !(yt_session_ && yt_session_->dma_disabled())) {
+          if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) &&
+              !pw_dma_tex.import_abandoned()) {
             vrp::PipewireDmaFrame dma;
             if (yt_cap->take_latest_dma(dma, yt_session_->dma_seq())) {
               if (pw_dma_tex.try_import(dma)) {
@@ -5090,7 +5136,8 @@ void HostWindow::xrThreadMain() {
                   QMetaObject::invokeMethod(
                       this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
                 }
-              } else {
+              } else if (pw_dma_tex.import_abandoned()) {
+                // Hard fail only — soft skips (arming / missing modifier) keep CPU path.
                 if (yt_session_) yt_session_->dma_disabled() = true;
                 const QString err = QString::fromStdString(pw_dma_tex.last_error());
                 const QString note =
@@ -5113,18 +5160,18 @@ void HostWindow::xrThreadMain() {
             }
           }
           if (imported_dma && pw_dma_tex.poll_present() && pw_dma_tex.view()) {
-            scene.set_texture(pw_dma_tex.view(), pw_dma_tex.sampler());
+            scene.set_texture_gamma(pw_dma_tex.view(), pw_dma_tex.sampler());
             set_yt_aspect(pw_dma_tex.width(), pw_dma_tex.height());
             fsr_need_process = false;
             yt_picture = true;
           } else if (dma_live && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.view()) {
-            scene.set_texture(pw_dma_tex.view(), pw_dma_tex.sampler());
+            scene.set_texture_gamma(pw_dma_tex.view(), pw_dma_tex.sampler());
             set_yt_aspect(pw_dma_tex.width(), pw_dma_tex.height());
             fsr_need_process = false;
             yt_picture = true;
           } else if (got_cpu) {
             if (texture.poll_present() && texture.view()) {
-              scene.set_texture(texture.view(), texture.sampler());
+              scene.set_texture_gamma(texture.view(), texture.sampler());
               set_yt_aspect(texture.width(), texture.height());
               fsr_need_process = false;
               yt_picture = true;

@@ -15,7 +15,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <sys/mman.h>
+#include <vector>
 
 namespace vrp {
 namespace {
@@ -111,7 +113,10 @@ struct PwState {
   bool have_modifier = false;
   bool logged_dma = false;
   bool logged_cpu = false;
+  bool logged_demote = false;
   int sync_seq = 0;
+  /** Consumer-sampleable DRM modifiers (LINEAR at minimum). Copied from PipewireCapture. */
+  std::vector<uint64_t> consumer_modifiers;
 };
 
 void on_core_done(void* data, uint32_t /*id*/, int seq) {
@@ -159,10 +164,14 @@ spa_pod* build_format_plain(spa_pod_builder* b) {
 }
 
 /**
- * Modifier-aware EnumFormat. LINEAR first so KWin can emit sampleable DMA-BUF.
- * DONT_FIXATE + MANDATORY is the PipeWire-recommended consumer pattern.
+ * Modifier-aware EnumFormat (DMA-BUF). Must be announced *before* the plain
+ * MemFd EnumFormat so PipeWire prioritises DMA-BUF
+ * (https://docs.pipewire.org/page_dma_buf.html).
+ *
+ * Announce Vulkan-sampleable modifiers (no MOD_INVALID — that made KWin pick
+ * modifier-less, fail on NVIDIA, and demote to MemFd).
  */
-spa_pod* build_format_modifier(spa_pod_builder* b) {
+spa_pod* build_format_modifier(spa_pod_builder* b, const std::vector<uint64_t>& mods) {
   spa_pod_frame f[2];
   spa_rectangle def_size{1920, 1080};
   spa_rectangle min_size{64, 64};
@@ -170,6 +179,11 @@ spa_pod* build_format_modifier(spa_pod_builder* b) {
   spa_fraction def_fps{60, 1};
   spa_fraction min_fps{0, 1};
   spa_fraction max_fps{240, 1};
+
+  std::vector<uint64_t> list = mods;
+  if (list.empty()) list.push_back(DRM_FORMAT_MOD_LINEAR);
+  // Cap POD size — PipeWire enum choice with dozens of NVIDIA mods is fine; keep a lid.
+  if (list.size() > 64) list.resize(64);
 
   spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
   spa_pod_builder_add(b, SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video), 0);
@@ -186,9 +200,9 @@ spa_pod* build_format_modifier(spa_pod_builder* b) {
   spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier,
                        SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
   spa_pod_builder_push_choice(b, &f[1], SPA_CHOICE_Enum, 0);
-  spa_pod_builder_long(b, static_cast<int64_t>(DRM_FORMAT_MOD_LINEAR));
-  spa_pod_builder_long(b, static_cast<int64_t>(DRM_FORMAT_MOD_LINEAR));
-  spa_pod_builder_long(b, static_cast<int64_t>(kDrmModInvalid));
+  // Default = first entry (LINEAR when query put it first).
+  spa_pod_builder_long(b, static_cast<int64_t>(list.front()));
+  for (uint64_t m : list) spa_pod_builder_long(b, static_cast<int64_t>(m));
   spa_pod_builder_pop(b, &f[1]);
   return static_cast<spa_pod*>(spa_pod_builder_pop(b, &f[0]));
 }
@@ -202,34 +216,46 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
   if (info.media_type != SPA_MEDIA_TYPE_video || info.media_subtype != SPA_MEDIA_SUBTYPE_raw) return;
   if (spa_format_video_raw_parse(param, &info.info.raw) < 0) return;
 
+  // Docs: use spa_pod_find_prop — presence means DMA-BUF path, absence means SHM.
+  const spa_pod_prop* mod_prop = spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_modifier);
+  const bool negotiated_mod = mod_prop != nullptr;
+  const bool was_mod = st->have_modifier;
+
   st->info = info.info.raw;
   st->format = info.info.raw.format;
   st->drm_fourcc = spa_to_drm_fourcc(st->format);
-  st->have_modifier = (info.info.raw.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
+  st->have_modifier = negotiated_mod && (info.info.raw.flags & SPA_VIDEO_FLAG_MODIFIER) != 0;
   st->modifier = info.info.raw.modifier;
-  if (!st->have_modifier || st->modifier == kDrmModInvalid) {
-    st->modifier = DRM_FORMAT_MOD_LINEAR;
+  if (!negotiated_mod) {
+    st->have_modifier = false;
+    st->modifier = kDrmModInvalid;
   }
 
   const uint32_t w = st->info.size.width;
   const uint32_t h = st->info.size.height;
-  VRP_LOG("pipewire: format %s %ux%u modifier=0x%llx drm=0x%x", spa_fmt_name(st->format), w, h,
-          static_cast<unsigned long long>(st->modifier), st->drm_fourcc);
+  if (was_mod && !negotiated_mod && !st->logged_demote) {
+    st->logged_demote = true;
+    VRP_LOG("pipewire: producer demoted DMA-BUF → SHM (modifier alloc failed?)");
+  }
+  VRP_LOG("pipewire: format %s %ux%u modifier=0x%llx drm=0x%x negotiated_mod=%d",
+          spa_fmt_name(st->format), w, h, static_cast<unsigned long long>(st->modifier),
+          st->drm_fourcc, negotiated_mod ? 1 : 0);
   if (st->self) {
     char line[192];
-    std::snprintf(line, sizeof(line), "pipewire: format %s %ux%u modifier=0x%llx",
-                  spa_fmt_name(st->format), w, h, static_cast<unsigned long long>(st->modifier));
+    std::snprintf(line, sizeof(line), "pipewire: format %s %ux%u modifier=0x%llx%s",
+                  spa_fmt_name(st->format), w, h, static_cast<unsigned long long>(st->modifier),
+                  negotiated_mod ? " (dmabuf)" : " (shm)");
     st->self->push_status(line);
   }
 
-  // Prefer DmaBuf when the producer can provide it; MemFd/MemPtr keep CPU fallback alive.
-  // Include size/stride so update_params does not wipe producer defaults incompletely.
+  // Docs: modifiers negotiated → DmaBuf only; else MemFd/MemPtr.
   const uint32_t stride = w * 4u;
   const uint32_t size = stride * h;
   uint8_t buffer[1024];
   spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
   const uint32_t data_types =
-      (1u << SPA_DATA_DmaBuf) | (1u << SPA_DATA_MemFd) | (1u << SPA_DATA_MemPtr);
+      negotiated_mod ? (1u << SPA_DATA_DmaBuf)
+                     : ((1u << SPA_DATA_MemFd) | (1u << SPA_DATA_MemPtr));
   const spa_pod* params[] = {static_cast<spa_pod*>(spa_pod_builder_add_object(
       &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers, SPA_PARAM_BUFFERS_buffers,
       SPA_POD_CHOICE_RANGE_Int(8, 2, 16), SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
@@ -238,11 +264,13 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
       SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_types)))};
   if (pw_stream_update_params(st->stream, params, 1) < 0) {
     VRP_LOG("pipewire: update_params(Buffers) failed — using stream defaults");
+  } else {
+    VRP_LOG("pipewire: buffers dataType=%s", negotiated_mod ? "DmaBuf" : "MemFd/MemPtr");
   }
 
   if (st->self) {
     st->self->set_negotiated(static_cast<uint32_t>(st->format), st->drm_fourcc, st->modifier,
-                             st->have_modifier);
+                             negotiated_mod);
   }
 }
 
@@ -297,6 +325,15 @@ void on_process(void* data) {
     return;
   }
 
+  if (!st->logged_dma && !st->logged_cpu) {
+    const char* t = d->type == SPA_DATA_DmaBuf   ? "DmaBuf"
+                    : d->type == SPA_DATA_MemFd  ? "MemFd"
+                    : d->type == SPA_DATA_MemPtr ? "MemPtr"
+                                                 : "other";
+    VRP_LOG("pipewire: first buffer type=%s fd=%d n_datas=%u modifier=0x%llx", t, d->fd, buf->n_datas,
+            static_cast<unsigned long long>(st->modifier));
+  }
+
   const uint32_t stride =
       d->chunk && d->chunk->stride > 0 ? static_cast<uint32_t>(d->chunk->stride)
                                       : static_cast<uint32_t>(w) * 4u;
@@ -305,7 +342,9 @@ void on_process(void* data) {
       d->chunk && d->chunk->size > 0 ? static_cast<uint32_t>(d->chunk->size) : stride * static_cast<uint32_t>(h);
   if (size == 0) size = stride * static_cast<uint32_t>(h);
 
-  // DMA-BUF: dup fd for Vulkan import (zero-copy). Always also try CPU below.
+  // DMA-BUF: dup fd for Vulkan import (zero-copy). Skip CPU when DMA is used —
+  // mmap/convert of tiled NVIDIA buffers is slow and caused stutter + false CPU logs.
+  bool published_dma = false;
   if (d->type == SPA_DATA_DmaBuf && d->fd >= 0 && st->drm_fourcc != 0) {
     const int dupfd = ::dup(d->fd);
     if (dupfd >= 0) {
@@ -315,6 +354,8 @@ void on_process(void* data) {
       dma.height = h;
       dma.drm_fourcc = st->drm_fourcc;
       dma.modifier = st->modifier;
+      // LINEAR (0) is a real modifier; INVALID is the modifier-less token.
+      dma.has_modifier = st->modifier != kDrmModInvalid;
       dma.stride = stride;
       dma.offset = offset;
       dma.size = size;
@@ -330,25 +371,28 @@ void on_process(void* data) {
       }
       st->self->set_negotiated(static_cast<uint32_t>(st->format), st->drm_fourcc, st->modifier, true);
       st->self->publish_dma(std::move(dma));
+      published_dma = true;
     }
   }
 
-  // CPU RGBA: MAP_BUFFERS fills d->data for MemFd/linear DmaBuf; otherwise mmap (SHARED).
-  const uint8_t* src = nullptr;
-  void* map = MAP_FAILED;
-  size_t map_len = 0;
-  if (d->data) {
-    src = static_cast<const uint8_t*>(d->data) + offset;
-  } else if ((d->type == SPA_DATA_MemFd || d->type == SPA_DATA_DmaBuf) && d->fd >= 0) {
-    map_len = d->maxsize > 0 ? d->maxsize : (offset + size);
-    if (map_len == 0) map_len = static_cast<size_t>(stride) * static_cast<size_t>(h) + offset;
-    map = ::mmap(nullptr, map_len, PROT_READ, MAP_SHARED, d->fd, static_cast<off_t>(d->mapoffset));
-    if (map != MAP_FAILED) {
-      src = static_cast<const uint8_t*>(map) + offset;
+  if (!published_dma) {
+    // CPU RGBA: MAP_BUFFERS fills d->data for MemFd; mmap for MemFd fallback.
+    const uint8_t* src = nullptr;
+    void* map = MAP_FAILED;
+    size_t map_len = 0;
+    if (d->data) {
+      src = static_cast<const uint8_t*>(d->data) + offset;
+    } else if ((d->type == SPA_DATA_MemFd || d->type == SPA_DATA_DmaBuf) && d->fd >= 0) {
+      map_len = d->maxsize > 0 ? d->maxsize : (offset + size);
+      if (map_len == 0) map_len = static_cast<size_t>(stride) * static_cast<size_t>(h) + offset;
+      map = ::mmap(nullptr, map_len, PROT_READ, MAP_SHARED, d->fd, static_cast<off_t>(d->mapoffset));
+      if (map != MAP_FAILED) {
+        src = static_cast<const uint8_t*>(map) + offset;
+      }
     }
+    if (src) publish_cpu_from_ptr(st, src, static_cast<int>(stride), w, h);
+    if (map != MAP_FAILED) ::munmap(map, map_len);
   }
-  if (src) publish_cpu_from_ptr(st, src, static_cast<int>(stride), w, h);
-  if (map != MAP_FAILED) ::munmap(map, map_len);
 
   pw_stream_queue_buffer(st->stream, b);
 }
@@ -464,12 +508,15 @@ bool PipewireCapture::take_latest_dma(PipewireDmaFrame& out, uint64_t& seen_seq)
   return true;
 }
 
-bool PipewireCapture::start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial) {
+bool PipewireCapture::start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial,
+                            std::vector<uint64_t> consumer_modifiers) {
   stop();
   if (pw_fd < 0) {
     set_error("bad pipewire fd");
     return false;
   }
+  consumer_modifiers_ = std::move(consumer_modifiers);
+  if (consumer_modifiers_.empty()) consumer_modifiers_.push_back(DRM_FORMAT_MOD_LINEAR);
   stop_.store(false);
   running_.store(true);
   thread_ = std::thread([this, pw_fd, node_id, pipewire_serial] {
@@ -548,14 +595,29 @@ void PipewireCapture::thread_main(int pw_fd, uint32_t node_id, uint64_t serial) 
   spa_hook stream_listener{};
   pw_stream_add_listener(st.stream, &stream_listener, &kStreamEvents, &st);
 
-  uint8_t pod_buf[4096];
-  spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
-  // Plain first (reliable MemFd/CPU). Modifier second (DMA-BUF when producer agrees).
-  const spa_pod* params[2];
-  params[0] = build_format_plain(&builder);
-  params[1] = build_format_modifier(&builder);
+  st.consumer_modifiers = consumer_modifiers_;
+  {
+    std::string line = "pipewire: announcing ";
+    line += std::to_string(st.consumer_modifiers.size());
+    line += " DRM modifier(s):";
+    for (size_t i = 0; i < st.consumer_modifiers.size() && i < 8; ++i) {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), " 0x%llx",
+                    static_cast<unsigned long long>(st.consumer_modifiers[i]));
+      line += buf;
+    }
+    if (st.consumer_modifiers.size() > 8) line += " …";
+    VRP_LOG("%s", line.c_str());
+  }
 
-  // MAP_BUFFERS: CPU path stays reliable (pre-DMA behavior). DmaBuf fds remain usable via dup.
+  uint8_t pod_buf[8192];
+  spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
+  // DMA-BUF (modifier) first, SHM plain second — PipeWire docs priority order.
+  const spa_pod* params[2];
+  params[0] = build_format_modifier(&builder, st.consumer_modifiers);
+  params[1] = build_format_plain(&builder);
+
+  // MAP_BUFFERS: CPU path stays reliable for MemFd / linear DmaBuf.
   const auto flags = static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT |
                                                    PW_STREAM_FLAG_INACTIVE | PW_STREAM_FLAG_MAP_BUFFERS);
   int cret = pw_stream_connect(st.stream, PW_DIRECTION_INPUT, node_id, flags, params, 2);

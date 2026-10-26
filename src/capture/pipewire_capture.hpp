@@ -22,6 +22,8 @@ struct PipewireDmaFrame {
   int height = 0;
   uint32_t drm_fourcc = 0;
   uint64_t modifier = 0;
+  /** True when SPA reported SPA_VIDEO_FLAG_MODIFIER with a non-INVALID value. */
+  bool has_modifier = false;
   uint32_t stride = 0;
   uint32_t offset = 0;
   uint32_t size = 0;
@@ -42,11 +44,13 @@ struct PipewireDmaFrame {
     height = o.height;
     drm_fourcc = o.drm_fourcc;
     modifier = o.modifier;
+    has_modifier = o.has_modifier;
     stride = o.stride;
     offset = o.offset;
     size = o.size;
     seq = o.seq;
     o.fd = -1;
+    o.has_modifier = false;
     return *this;
   }
 
@@ -72,8 +76,13 @@ class PipewireCapture {
   PipewireCapture(const PipewireCapture&) = delete;
   PipewireCapture& operator=(const PipewireCapture&) = delete;
 
-  /** Takes ownership of pw_fd. */
-  bool start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial = 0);
+  /**
+   * Takes ownership of pw_fd.
+   * @param consumer_modifiers DRM modifiers this process can sample (from Vulkan).
+   *        Empty → LINEAR only. Do not include MOD_INVALID (forces SHM demote on NVIDIA).
+   */
+  bool start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial = 0,
+             std::vector<uint64_t> consumer_modifiers = {});
   void stop();
 
   bool running() const { return running_.load(std::memory_order_acquire); }
@@ -111,6 +120,7 @@ class PipewireCapture {
   void set_error(const std::string& e);
 
   std::thread thread_;
+  std::vector<uint64_t> consumer_modifiers_;
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_{false};
   std::atomic<int> width_{0};

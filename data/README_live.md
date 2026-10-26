@@ -131,6 +131,9 @@ app-owned virtual display.
 
 ## Limits
 
+- NVIDIA DMA-BUF import is **experimental** (OPAQUE_FD fallback, explicit DRM
+  modifiers, armed frames). First hard failure permanently falls back to CPU RGBA
+  for that session (driver import-poisoning). Set nothing special to try it.
 - Capture is the **whole monitor** (or whole window). Not a single browser tab.
 - Managed virtual display needs **Plasma Wayland + krfb**. GNOME / X11 use a spare
   MONITOR or WINDOW mode (`live_virtual=0`).

@@ -376,6 +376,8 @@ class HostWindow : public QMainWindow {
   int live_cursor_scale_ = 1;
   QString live_output_;
   bool live_chrome_default_profile_ = true;
+  /** Filled on XR thread from PipewireDmaTexture::query_sampleable_modifiers. */
+  std::vector<uint64_t> live_drm_modifiers_;
 
   vrp::YouTubeSession* yt_session_ = nullptr;
   /** Tools → Set up phases: Capture (interactive) → Refresh (silent restore) → Done. */

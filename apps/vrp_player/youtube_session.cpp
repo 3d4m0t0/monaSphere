@@ -836,7 +836,7 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
     return;
   }
   if (!capture_) capture_ = std::make_unique<PipewireCapture>();
-  if (!capture_->start(r.pw_fd, r.node_id, r.pipewire_serial)) {
+  if (!capture_->start(r.pw_fd, r.node_id, r.pipewire_serial, cfg_.drm_modifiers)) {
     const QString err = QString::fromStdString(capture_->last_error());
     ::close(r.pw_fd);
     if (r.eis_fd >= 0) ::close(r.eis_fd);

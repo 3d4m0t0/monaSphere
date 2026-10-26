@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace vrp {
 
@@ -59,6 +60,8 @@ class YouTubeSession : public QObject {
     bool use_default_chrome_profile = true;
     /** When true, HostWindow may start Flat live audio after streaming. */
     bool enable_audio = false;
+    /** Vulkan-sampleable DRM modifiers for PipeWire DMA-BUF EnumFormat (LINEAR min). */
+    std::vector<uint64_t> drm_modifiers;
   };
 
   explicit YouTubeSession(QObject* parent = nullptr);
