@@ -5,9 +5,12 @@
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusReply>
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QSet>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QTemporaryDir>
@@ -18,6 +21,8 @@ namespace vrp {
 namespace {
 
 constexpr const char* kTempRuleId = "monaSphereYT";
+/** Session rule for [アプリ] — matches discovered wmclass (e.g. retroarch). */
+constexpr const char* kDeskRuleId = "monaSphereDesk";
 
 QString jsEscape(const QString& s) {
   QString o = s;
@@ -190,9 +195,16 @@ int loadAndRunScript(const QString& script, QString* error_out, bool keep_loaded
     delete heap_dir;
     return ok ? script_id : -1;
   }
+  if (!ok) {
+    // Keep-loaded arm failed after load — unload or KWin keeps the script forever.
+    (void)unloadScript(script_id, plugin_name);
+    delete heap_dir;
+    if (out_keep_dir) *out_keep_dir = nullptr;
+    return -1;
+  }
   if (out_keep_dir) *out_keep_dir = heap_dir;
   else delete heap_dir;
-  return ok ? script_id : -1;
+  return script_id;
 }
 
 bool runScript(const QString& script, QString* error_out) {
@@ -282,7 +294,7 @@ bool installTempWindowRule(int screen_index, bool session_keep, QString* error_o
   return true;
 }
 
-void removeTempWindowRule() {
+void removeTempWindowRuleById(const char* rule_id) {
   QSettings s(rulesPath(), QSettings::IniFormat);
   s.beginGroup(QStringLiteral("General"));
   QStringList order = s.value(QStringLiteral("Order")).toString().split(QLatin1Char(','),
@@ -290,7 +302,7 @@ void removeTempWindowRule() {
   QStringList rules = s.value(QStringLiteral("rules")).toString().split(QLatin1Char(','),
                                                                         Qt::SkipEmptyParts);
   s.endGroup();
-  const QString id = QString::fromUtf8(kTempRuleId);
+  const QString id = QString::fromUtf8(rule_id);
   order.removeAll(id);
   rules.removeAll(id);
   s.beginGroup(QStringLiteral("General"));
@@ -301,7 +313,64 @@ void removeTempWindowRule() {
   s.remove(id);
   s.sync();
   kwinReconfigure();
-  VRP_LOG("kwin-place: removed temporary Window Rule '%s'", kTempRuleId);
+  VRP_LOG("kwin-place: removed temporary Window Rule '%s'", rule_id);
+}
+
+void removeTempWindowRule() { removeTempWindowRuleById(kTempRuleId); }
+
+bool installDesktopWindowRuleLocked(const QString& wmclass, int screen_index, QString* error_out) {
+  if (wmclass.isEmpty() || screen_index < 0) {
+    if (error_out) *error_out = QStringLiteral("bad wmclass/screen");
+    return false;
+  }
+  QSettings s(rulesPath(), QSettings::IniFormat);
+  s.beginGroup(QStringLiteral("General"));
+  QStringList order = s.value(QStringLiteral("Order")).toString().split(QLatin1Char(','),
+                                                                        Qt::SkipEmptyParts);
+  QStringList rules = s.value(QStringLiteral("rules")).toString().split(QLatin1Char(','),
+                                                                        Qt::SkipEmptyParts);
+  s.endGroup();
+
+  auto ensure = [](QStringList& list, const QString& id) {
+    if (!list.contains(id)) list.prepend(id);
+  };
+  const QString id = QString::fromUtf8(kDeskRuleId);
+  ensure(order, id);
+  ensure(rules, id);
+
+  s.beginGroup(QStringLiteral("General"));
+  s.setValue(QStringLiteral("Order"), order.join(QLatin1Char(',')));
+  s.setValue(QStringLiteral("rules"), rules.join(QLatin1Char(',')));
+  s.setValue(QStringLiteral("count"), order.size());
+  s.endGroup();
+
+  s.beginGroup(id);
+  s.setValue(QStringLiteral("Description"),
+             QStringLiteral("monaSphere [アプリ] → Force screen on Virtual (app owns fullscreen)"));
+  // After map only (KWin Wayland ignores many pre-start Force-screen rules).
+  s.setValue(QStringLiteral("wmclass"), wmclass);
+  s.setValue(QStringLiteral("wmclasscomplete"), true);
+  s.setValue(QStringLiteral("wmclassmatch"), 1);  // ExactMatch
+  s.setValue(QStringLiteral("titlematch"), 0);
+  s.setValue(QStringLiteral("types"), 1);
+  s.setValue(QStringLiteral("screen"), screen_index);
+  s.setValue(QStringLiteral("screenrule"), 2);  // Force → Virtual-*
+  s.setValue(QStringLiteral("fullscreenrule"), 0);
+  s.setValue(QStringLiteral("noborderrule"), 0);
+  s.remove(QStringLiteral("skiptaskbar"));
+  s.remove(QStringLiteral("skiptaskbarrule"));
+  s.remove(QStringLiteral("skippager"));
+  s.remove(QStringLiteral("skippagerrule"));
+  s.endGroup();
+  s.sync();
+  if (s.status() != QSettings::NoError) {
+    if (error_out) *error_out = QStringLiteral("kwinrulesrc write failed");
+    return false;
+  }
+  kwinReconfigure();
+  VRP_LOG("kwin-place: installed Desk Window Rule complete='%s' Force screen=%d",
+          wmclass.toUtf8().constData(), screen_index);
+  return true;
 }
 
 QString jsHelpers() {
@@ -331,6 +400,19 @@ QString jsHelpers() {
       "  if (rn.indexOf('crx_') === 0) return true;\n"
       "  return false;\n"
       "}\n"
+      "function isNormalWin(w) {\n"
+      "  if (!w || w.deleted) return false;\n"
+      "  try { if (w.desktopWindow) return false; } catch (e0) {}\n"
+      "  try { if (w.dock) return false; } catch (e1) {}\n"
+      "  try { if (w.toolbar) return false; } catch (e2) {}\n"
+      "  try { if (w.menu) return false; } catch (e3) {}\n"
+      "  try { if (w.splash) return false; } catch (e4) {}\n"
+      "  try { if (w.notification) return false; } catch (e5) {}\n"
+      "  try { if (w.criticalNotification) return false; } catch (e6) {}\n"
+      "  try { if (w.appletPopup) return false; } catch (e7) {}\n"
+      "  try { if (typeof w.normalWindow === 'boolean' && !w.normalWindow) return false; } catch (e8) {}\n"
+      "  return true;\n"
+      "}\n"
       "function findOutput(needle) {\n"
       "  const screens = workspace.screens;\n"
       "  for (let i = 0; i < screens.length; ++i) {\n"
@@ -347,8 +429,7 @@ QString jsHelpers() {
       "  }\n"
       "  return -1;\n"
       "}\n"
-      // Keep minimized while moving off the main desktop, then fullscreen on the
-      // virtual output. Never activate first — that flashes a stack animation.
+      // Chrome live: minimize while moving, then force compositor fullscreen.
       "function placeOnOutput(w, targetOut) {\n"
       "  try {\n"
       "    w.fullScreen = false;\n"
@@ -375,6 +456,36 @@ QString jsHelpers() {
       "    try { w.output = targetOut; } catch (eO2) {}\n"
       "    try { w.noBorder = true; } catch (eNb2) {}\n"
       "    w.fullScreen = true;\n"
+      "    return true;\n"
+      "  } catch (e) { print(e); return false; }\n"
+      "}\n"
+      // [アプリ]: leave FS so sendClientToScreen sticks; do NOT minimize — GL apps\n"
+      // (RetroArch) go permanently black after minimize/unminimize on Virtual.\n"
+      "function desktopOnTarget(w, targetOut) {\n"
+      "  try {\n"
+      "    return !!(w.output && targetOut && String(w.output.name) === String(targetOut.name));\n"
+      "  } catch (e) { return false; }\n"
+      "}\n"
+      "function placeOnOutputDesktop(w, targetOut) {\n"
+      "  try {\n"
+      "    if (desktopOnTarget(w, targetOut)) return true;  // Window Rule already pinned\n"
+      "    const wasFs = !!w.fullScreen;\n"
+      "    try { w.fullScreen = false; } catch (eFs0) {}\n"
+      "    if (typeof workspace.setMaximize === 'function')\n"
+      "      workspace.setMaximize(w, false, false);\n"
+      "    try {\n"
+      "      if (typeof workspace.currentDesktopForScreen === 'function') {\n"
+      "        const desk = workspace.currentDesktopForScreen(targetOut);\n"
+      "        if (desk) w.desktops = [desk];\n"
+      "      }\n"
+      "    } catch (eD) {}\n"
+      "    if (typeof workspace.sendClientToScreen === 'function')\n"
+      "      workspace.sendClientToScreen(w, targetOut);\n"
+      "    try { w.output = targetOut; } catch (eO) {}\n"
+      "    if (wasFs) { try { w.fullScreen = true; } catch (eFs1) {} }\n"
+      "    if (typeof workspace.sendClientToScreen === 'function')\n"
+      "      workspace.sendClientToScreen(w, targetOut);\n"
+      "    try { w.output = targetOut; } catch (eO2) {}\n"
       "    return true;\n"
       "  } catch (e) { print(e); return false; }\n"
       "}\n");
@@ -432,6 +543,15 @@ struct ArmState {
   int rule_screen_index = -1;
   QStringList exclude_ids;
   QString output_substr;
+  ~ArmState() {
+    // Process exit while still armed — free temp dir; best-effort KWin unload.
+    if (script_id >= 0 || script_dir) {
+      (void)unloadScript(script_id, QString::fromUtf8(kScriptNamePlace));
+      script_id = -1;
+    }
+    delete script_dir;
+    script_dir = nullptr;
+  }
 };
 ArmState& arm() {
   static ArmState s;
@@ -443,6 +563,14 @@ struct PortalArmState {
   bool armed = false;
   int script_id = -1;
   QTemporaryDir* script_dir = nullptr;
+  ~PortalArmState() {
+    if (script_id >= 0 || script_dir) {
+      (void)unloadScript(script_id, QString::fromUtf8(kScriptNamePortal));
+      script_id = -1;
+    }
+    delete script_dir;
+    script_dir = nullptr;
+  }
 };
 PortalArmState& portalArm() {
   static PortalArmState s;
@@ -659,8 +787,134 @@ QStringList KwinWindowPlacer::list_candidate_ids(QString* error_out) {
   return out;
 }
 
+bool KwinWindowPlacer::query_window_wmclass(const QString& internal_id, QString* resource_class,
+                                            QString* resource_name, QString* error_out) {
+  if (internal_id.isEmpty()) {
+    if (error_out) *error_out = QStringLiteral("empty id");
+    return false;
+  }
+  BusGuard guard;
+  guard.clearLast();
+  const QString script =
+      jsHelpers() +
+      QStringLiteral(
+          "const want = '%1';\n"
+          "const wins = (typeof workspace.windowList === 'function')\n"
+          "    ? workspace.windowList() : workspace.windowList;\n"
+          "for (let i = 0; i < wins.length; ++i) {\n"
+          "  const w = wins[i];\n"
+          "  if (!w || w.deleted) continue;\n"
+          "  if (String(w.internalId) !== want) continue;\n"
+          "  const rc = String(w.resourceClass || '');\n"
+          "  const rn = String(w.resourceName || '');\n"
+          "  report('class:' + rc + '\\n' + rn);\n"
+          "  break;\n"
+          "}\n")
+          .arg(jsEscape(internal_id));
+  if (!runScript(script, error_out)) return false;
+  const QString rep = guard.last();
+  if (!rep.startsWith(QLatin1String("class:"))) {
+    if (error_out) *error_out = rep.isEmpty() ? QStringLiteral("window not found") : rep;
+    return false;
+  }
+  const QString body = rep.mid(6);
+  const int nl = body.indexOf(QLatin1Char('\n'));
+  const QString rc = (nl >= 0 ? body.left(nl) : body).trimmed();
+  const QString rn = (nl >= 0 ? body.mid(nl + 1) : QString()).trimmed();
+  if (resource_class) *resource_class = rc;
+  if (resource_name) *resource_name = rn;
+  return !rc.isEmpty() || !rn.isEmpty();
+}
+
+namespace {
+QString g_desk_rule_class;
+QString g_desk_rule_output;
+}  // namespace
+
+int KwinWindowPlacer::query_output_index(const QString& output_substr, QString* error_out) {
+  return queryOutputIndex(output_substr, error_out);
+}
+
+bool KwinWindowPlacer::install_desktop_window_rule(const QString& wmclass, int screen_index,
+                                                   QString* error_out) {
+  if (wmclass.isEmpty()) {
+    if (error_out) *error_out = QStringLiteral("empty wmclass");
+    return false;
+  }
+  if (screen_index < 0) {
+    if (error_out) *error_out = QStringLiteral("bad screen index");
+    return false;
+  }
+  const QString key = QStringLiteral("idx:%1").arg(screen_index);
+  if (g_desk_rule_class.compare(wmclass, Qt::CaseInsensitive) == 0 &&
+      g_desk_rule_output == key) {
+    VRP_LOG("kwin-place: Desk Window Rule already active class='%s' screen=%d",
+            wmclass.toUtf8().constData(), screen_index);
+    return true;
+  }
+  if (!installDesktopWindowRuleLocked(wmclass, screen_index, error_out)) return false;
+  g_desk_rule_class = wmclass;
+  g_desk_rule_output = key;
+  return true;
+}
+
+bool KwinWindowPlacer::install_desktop_window_rule(const QString& wmclass,
+                                                   const QString& output_substr,
+                                                   QString* error_out) {
+  if (wmclass.isEmpty()) {
+    if (error_out) *error_out = QStringLiteral("empty wmclass");
+    return false;
+  }
+  if (g_desk_rule_class.compare(wmclass, Qt::CaseInsensitive) == 0 &&
+      g_desk_rule_output.compare(output_substr, Qt::CaseInsensitive) == 0) {
+    VRP_LOG("kwin-place: Desk Window Rule already active class='%s'",
+            wmclass.toUtf8().constData());
+    return true;
+  }
+  QString idx_err;
+  const int screen_idx = queryOutputIndex(output_substr, &idx_err);
+  if (screen_idx < 0) {
+    if (error_out)
+      *error_out = idx_err.isEmpty() ? QStringLiteral("no output index") : idx_err;
+    return false;
+  }
+  if (!installDesktopWindowRuleLocked(wmclass, screen_idx, error_out)) return false;
+  g_desk_rule_class = wmclass;
+  g_desk_rule_output = output_substr;
+  return true;
+}
+
+void KwinWindowPlacer::remove_desktop_window_rule() {
+  removeTempWindowRuleById(kDeskRuleId);
+  g_desk_rule_class.clear();
+  g_desk_rule_output.clear();
+}
+
+QStringList KwinWindowPlacer::list_all_window_ids(QString* error_out) {
+  BusGuard guard;
+  guard.clearLast();
+  const QString script = jsHelpers() + QStringLiteral(
+      "const wins = (typeof workspace.windowList === 'function')\n"
+      "    ? workspace.windowList() : workspace.windowList;\n"
+      "const ids = [];\n"
+      "for (let i = 0; i < wins.length; ++i) {\n"
+      "  const w = wins[i];\n"
+      "  if (!isNormalWin(w)) continue;\n"
+      "  ids.push(String(w.internalId));\n"
+      "}\n"
+      "report('ids:' + ids.join(','));\n");
+  if (!runScript(script, error_out)) return {};
+  QStringList out;
+  if (guard.last().startsWith(QLatin1String("ids:"))) {
+    const QString body = guard.last().mid(4);
+    if (!body.isEmpty()) out = body.split(QLatin1Char(','), Qt::SkipEmptyParts);
+  }
+  return out;
+}
+
 bool KwinWindowPlacer::arm_place_on_open(const QString& output_substr,
-                                         const QStringList& exclude_ids, QString* error_out) {
+                                         const QStringList& exclude_ids, QString* error_out,
+                                         int screen_index) {
   if (output_substr.isEmpty()) {
     if (error_out) *error_out = QStringLiteral("empty output");
     return false;
@@ -679,7 +933,8 @@ bool KwinWindowPlacer::arm_place_on_open(const QString& output_substr,
 
   bool rule_ok = false;
   QString idx_err;
-  const int screen_idx = queryOutputIndex(output_substr, &idx_err);
+  int screen_idx = screen_index;
+  if (screen_idx < 0) screen_idx = queryOutputIndex(output_substr, &idx_err);
   if (screen_idx >= 0) {
     QString rule_err;
     if (installTempWindowRule(screen_idx, /*session_keep=*/false, &rule_err)) {
@@ -789,6 +1044,297 @@ bool KwinWindowPlacer::arm_place_on_open(const QString& output_substr,
   VRP_LOG("kwin-place: armed compositor place on '%s' (rule=%d script=%d)",
           output_substr.toUtf8().constData(), arm().rule_installed ? 1 : 0, id);
   return true;
+}
+
+QList<qint64> KwinWindowPlacer::pid_tree(qint64 root_pid) {
+  QList<qint64> out;
+  if (root_pid <= 0) return out;
+  QSet<qint64> want;
+  want.insert(root_pid);
+  // Expand a few times so short-lived wrappers / forks are covered.
+  for (int pass = 0; pass < 4; ++pass) {
+    const QFileInfoList entries =
+        QDir(QStringLiteral("/proc"))
+            .entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+    bool grew = false;
+    for (const QFileInfo& fi : entries) {
+      bool ok = false;
+      const qint64 pid = fi.fileName().toLongLong(&ok);
+      if (!ok || pid <= 1) continue;
+      QFile st(fi.absoluteFilePath() + QStringLiteral("/status"));
+      if (!st.open(QIODevice::ReadOnly | QIODevice::Text)) continue;
+      qint64 ppid = -1;
+      while (!st.atEnd()) {
+        const QByteArray line = st.readLine();
+        if (line.startsWith("PPid:")) {
+          ppid = line.mid(5).trimmed().toLongLong();
+          break;
+        }
+      }
+      if (ppid > 0 && want.contains(ppid) && !want.contains(pid)) {
+        want.insert(pid);
+        grew = true;
+      }
+    }
+    if (!grew) break;
+  }
+  out.reserve(want.size());
+  for (qint64 p : want) out.push_back(p);
+  return out;
+}
+
+namespace {
+
+QString jsPidArray(const QList<qint64>& pids) {
+  QString s = QStringLiteral("[");
+  for (int i = 0; i < pids.size(); ++i) {
+    if (i) s += QLatin1Char(',');
+    s += QString::number(pids[i]);
+  }
+  s += QLatin1Char(']');
+  return s;
+}
+
+QString jsNameArray(const QStringList& names) {
+  QString s = QStringLiteral("[");
+  for (int i = 0; i < names.size(); ++i) {
+    if (i) s += QLatin1Char(',');
+    s += QLatin1Char('\'') + jsEscape(names[i].toLower()) + QLatin1Char('\'');
+  }
+  s += QLatin1Char(']');
+  return s;
+}
+
+QString jsDesktopPlaceFns() {
+  return QStringLiteral(
+      "function excluded(id) {\n"
+      "  const s = String(id);\n"
+      "  for (let i = 0; i < exclude.length; ++i) if (exclude[i] === s) return true;\n"
+      "  return false;\n"
+      "}\n"
+      "function pidHit(w) {\n"
+      "  if (!wantPids.length) return false;\n"
+      "  let p = 0;\n"
+      "  try { p = Number(w.pid) || 0; } catch (eP) { p = 0; }\n"
+      "  if (!p) return false;\n"
+      "  for (let i = 0; i < wantPids.length; ++i) if (wantPids[i] === p) return true;\n"
+      "  return false;\n"
+      "}\n"
+      "function nameHit(w) {\n"
+      "  if (!wantNames.length) return false;\n"
+      "  const cls = (w.resourceClass || '').toLowerCase();\n"
+      "  const rn = (w.resourceName || '').toLowerCase();\n"
+      "  let desk = '';\n"
+      "  try { desk = String(w.desktopFileName || '').toLowerCase(); } catch (eDf) {}\n"
+      "  const cap = String(w.caption || '').toLowerCase();\n"
+      "  for (let i = 0; i < wantNames.length; ++i) {\n"
+      "    const n = wantNames[i];\n"
+      "    if (!n) continue;\n"
+      "    if (cls.indexOf(n) >= 0 || rn.indexOf(n) >= 0 || desk.indexOf(n) >= 0)\n"
+      "      return true;\n"
+      "    if (n.length >= 5 && cap.indexOf(n) >= 0) return true;\n"
+      "  }\n"
+      "  return false;\n"
+      "}\n"
+      "function scoreDesk(w, idx, total) {\n"
+      "  if (!isNormalWin(w)) return -1;\n"
+      "  const id = String(w.internalId);\n"
+      "  if (excluded(id)) return -1;\n"
+      "  const hit = pidHit(w);\n"
+      "  const byName = nameHit(w);\n"
+      "  if (!hit && !byName) return -1;\n"
+      "  const fg = w.frameGeometry;\n"
+      "  const a = Math.max(1, fg.width) * Math.max(1, fg.height);\n"
+      "  const mini = !!w.minimized;\n"
+      "  if (!mini && a < 4000 && !hit && !byName) return -1;\n"
+      "  let score = (total - idx) + Math.min(a / 1000, 50000);\n"
+      "  if (hit) score += 200000;\n"
+      "  if (byName) score += 150000;\n"
+      "  return score;\n"
+      "}\n");
+}
+
+}  // namespace
+
+bool KwinWindowPlacer::arm_place_new_window(const QString& output_substr,
+                                            const QStringList& exclude_ids,
+                                            const QList<qint64>& prefer_pids,
+                                            const QStringList& want_names, QString* error_out) {
+  if (output_substr.isEmpty()) {
+    if (error_out) *error_out = QStringLiteral("empty output");
+    return false;
+  }
+  {
+    QMutexLocker lock(&arm().mu);
+    disarmLocked(/*keep_fullscreen_rule=*/false);
+  }
+
+  if (!placeHub().ok) {
+    if (error_out) *error_out = QStringLiteral("D-Bus place reporter failed");
+    return false;
+  }
+
+  // No wmclass Window Rule — place script only (arbitrary desktop apps).
+  placeHub().reporter.last.clear();
+
+  const QString script =
+      jsHelpers() +
+      QStringLiteral(
+          "const outNeedle = '%1'.toLowerCase();\n"
+          "const exclude = %2;\n"
+          "const wantPids = %3;\n"
+          "const wantNames = %4;\n")
+          .arg(jsEscape(output_substr.toLower()), jsExcludeArray(exclude_ids),
+               jsPidArray(prefer_pids), jsNameArray(want_names)) +
+      jsDesktopPlaceFns() +
+      QStringLiteral(
+          "const targetOut = findOutput(outNeedle);\n"
+          "if (!targetOut) { report('fail:no-output'); }\n"
+          "else {\n"
+          "  let reported = false;\n"
+          "  let settleTimer = null;\n"
+          "  function stopSettle() {\n"
+          "    try { if (settleTimer) settleTimer.stop(); } catch (eS) {}\n"
+          "  }\n"
+          // One successful place then stop — captionChanged↔place loops froze Plasma.\n"
+          // Like Chrome arm: trust placeOnOutput* (do not require immediate output check).\n"
+          "  function tryPlace(w, why) {\n"
+          "    if (reported) return false;\n"
+          "    if (!w || w.deleted) return false;\n"
+          "    if (scoreDesk(w, 0, 1) < 0) return false;\n"
+          "    if (!placeOnOutputDesktop(w, targetOut)) return false;\n"
+          "    reported = true;\n"
+          "    stopSettle();\n"
+          "    report('ok:' + String(w.internalId) + ':' + targetOut.name + ':' + why + ':desk');\n"
+          "    return true;\n"
+          "  }\n"
+          "  function scan(why) {\n"
+          "    if (reported) return;\n"
+          "    const wins = (typeof workspace.windowList === 'function')\n"
+          "        ? workspace.windowList() : workspace.windowList;\n"
+          "    let ranked = [];\n"
+          "    for (let i = 0; i < wins.length; ++i) {\n"
+          "      const w = wins[i];\n"
+          "      const sc = scoreDesk(w, i, wins.length);\n"
+          "      if (sc >= 0) ranked.push({w:w, sc:sc});\n"
+          "    }\n"
+          "    ranked.sort(function(a,b){ return b.sc - a.sc; });\n"
+          "    for (let i = 0; i < ranked.length; ++i) {\n"
+          "      if (tryPlace(ranked[i].w, why)) break;\n"
+          "    }\n"
+          "  }\n"
+          "  function watch(w) { tryPlace(w, 'added'); }\n"
+          "  try { workspace.windowAdded.connect(watch); } catch (eA) {}\n"
+          "  try { workspace.clientAdded.connect(watch); } catch (eB) {}\n"
+          "  report('armed:' + targetOut.name + ':desktop');\n"
+          "  scan('boot');\n"
+          "  // Brief settle only — never leave a permanent hot timer in KWin.\n"
+          "  try {\n"
+          "    settleTimer = new QTimer();\n"
+          "    let ticks = 0;\n"
+          "    settleTimer.interval = 300;\n"
+          "    settleTimer.triggered.connect(function() {\n"
+          "      if (reported) { stopSettle(); return; }\n"
+          "      scan('timer');\n"
+          "      if (++ticks >= 20) stopSettle();  // ~6s\n"
+          "    });\n"
+          "    settleTimer.start();\n"
+          "  } catch (eT) { print('monaSphere timer: ' + eT); }\n"
+          "}\n");
+
+  QString err;
+  QTemporaryDir* keep = nullptr;
+  const int id = loadAndRunScript(script, &err, /*keep_loaded=*/true, &keep);
+
+  QMutexLocker lock(&arm().mu);
+  arm().rule_installed = false;
+  arm().rule_screen_index = -1;
+  arm().exclude_ids = exclude_ids;
+  arm().output_substr = output_substr;
+  if (id < 0) {
+    if (error_out) *error_out = err.isEmpty() ? QStringLiteral("arm failed") : err;
+    delete keep;
+    arm().script_id = -1;
+    arm().script_dir = nullptr;
+    arm().armed = false;
+    return false;
+  }
+  arm().armed = true;
+  arm().script_id = id;
+  arm().script_dir = keep;
+  arm().last_report = placeHub().reporter.last;
+  VRP_LOG("kwin-place: armed desktop place on '%s' (script=%d pids=%d names=%d)",
+          output_substr.toUtf8().constData(), id, prefer_pids.size(), want_names.size());
+  return true;
+}
+
+bool KwinWindowPlacer::move_new_window_to_output(const QString& output_substr,
+                                                 const QStringList& exclude_ids,
+                                                 const QList<qint64>& prefer_pids,
+                                                 const QStringList& want_names,
+                                                 QString* out_window_id, QString* error_out,
+                                                 bool* moved_ok) {
+  if (output_substr.isEmpty()) {
+    if (error_out) *error_out = QStringLiteral("empty output");
+    return false;
+  }
+  BusGuard guard;
+  const QString prior = placeHub().reporter.last;
+  if (!prior.startsWith(QLatin1String("ok:"))) guard.clearLast();
+  const QString script =
+      jsHelpers() +
+      QStringLiteral(
+          "const outNeedle = '%1'.toLowerCase();\n"
+          "const exclude = %2;\n"
+          "const wantPids = %3;\n"
+          "const wantNames = %4;\n")
+          .arg(jsEscape(output_substr.toLower()), jsExcludeArray(exclude_ids),
+               jsPidArray(prefer_pids), jsNameArray(want_names)) +
+      jsDesktopPlaceFns() +
+      QStringLiteral(
+          "const targetOut = findOutput(outNeedle);\n"
+          "if (!targetOut) { report('fail:no-output'); }\n"
+          "else {\n"
+          "  const wins = (typeof workspace.windowList === 'function')\n"
+          "      ? workspace.windowList() : workspace.windowList;\n"
+          "  let ranked = [];\n"
+          "  for (let i = 0; i < wins.length; ++i) {\n"
+          "    const w = wins[i];\n"
+          "    const sc = scoreDesk(w, i, wins.length);\n"
+          "    if (sc >= 0) ranked.push({w:w, sc:sc});\n"
+          "  }\n"
+          "  ranked.sort(function(a,b){ return b.sc - a.sc; });\n"
+          "  let placed = null;\n"
+          "  for (let i = 0; i < ranked.length; ++i) {\n"
+          "    if (placeOnOutputDesktop(ranked[i].w, targetOut)) {\n"
+          "      if (!placed) placed = ranked[i].w;\n"
+          "    }\n"
+          "  }\n"
+          "  if (!placed) { report('fail:no-window'); }\n"
+          "  else report('ok:' + String(placed.internalId) + ':' + targetOut.name);\n"
+          "}\n");
+
+  const bool ran = runScript(script, error_out);
+  QString rep = guard.last();
+  if (!rep.startsWith(QLatin1String("ok:")) && prior.startsWith(QLatin1String("ok:"))) {
+    rep = prior;
+  }
+  if (rep.startsWith(QLatin1String("ok:"))) {
+    QMutexLocker lock(&arm().mu);
+    arm().last_report = rep;
+    placeHub().reporter.last = rep;
+  }
+  const bool ok_msg = rep.startsWith(QLatin1String("ok:"));
+  if (moved_ok) *moved_ok = ok_msg;
+  if (ok_msg && out_window_id) {
+    const QString rest = rep.mid(3);
+    const int colon = rest.indexOf(QLatin1Char(':'));
+    *out_window_id = colon >= 0 ? rest.left(colon) : rest;
+  }
+  if (!ok_msg && error_out && error_out->isEmpty()) {
+    *error_out = rep.isEmpty() ? QStringLiteral("no placement report") : rep;
+  }
+  return ran;
 }
 
 bool KwinWindowPlacer::poll_armed_place(QString* out_window_id, QString* error_out) {

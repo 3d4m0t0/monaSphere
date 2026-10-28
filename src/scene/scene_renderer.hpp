@@ -27,6 +27,15 @@ class SceneRenderer {
   void set_texture(VkImageView view, VkSampler sampler);
   /** RGBA video that is still gamma-encoded (e.g. FSR1 output). Linearized like NV12. */
   void set_texture_gamma(VkImageView view, VkSampler sampler);
+  /**
+   * Flat content cursor overlay (u/v in 0..1). Used when ScreenCast cannot
+   * embed the DE cursor (AvailableCursorModes empty → Hidden).
+   */
+  void set_content_cursor(float u, float v, bool on) {
+    content_cursor_u_ = u;
+    content_cursor_v_ = v;
+    content_cursor_on_ = on;
+  }
   void set_nv12_texture(VkImageView y, VkImageView uv, VkSampler sampler, bool full_range = false);
   /**
    * Stage a video descriptor update applied after the previous eye submit finishes
@@ -97,6 +106,9 @@ class SceneRenderer {
   float look_yaw_ = 0.f;
   float look_pitch_ = 0.f;
   bool comfort_grid_ = false;
+  bool content_cursor_on_ = false;
+  float content_cursor_u_ = 0.5f;
+  float content_cursor_v_ = 0.5f;
 
   VkPipeline grid_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout grid_layout_ = VK_NULL_HANDLE;

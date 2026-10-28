@@ -78,18 +78,18 @@ void VrMenu::init(const fs::path& start_dir) {
     home_ = fs::weakly_canonical(home_, ec);
   }
 
+  // Prefer last_dir only as the HomeTree entry point; boot always opens Roots.
   fs::path start = start_dir.empty() ? home_ : start_dir;
   if (fs::is_regular_file(start, ec)) start = start.parent_path();
   if (!fs::is_directory(start, ec)) start = home_;
   start = fs::weakly_canonical(start, ec);
-
   if (path_under(start, home_) || start == home_) {
-    place_ = Place::HomeTree;
     cwd_ = start;
   } else {
-    place_ = Place::Roots;
     cwd_ = home_;
   }
+
+  place_ = Place::Roots;
   removable_root_.clear();
   load_volume();
   refresh_dir();
@@ -99,6 +99,13 @@ void VrMenu::init(const fs::path& start_dir) {
 void VrMenu::set_live_apps(std::vector<LiveApp> apps) {
   live_apps_ = std::move(apps);
   if (place_ == Place::Roots) refresh_dir();
+  bump();
+}
+
+void VrMenu::set_desktop_apps(std::vector<DesktopApp> apps) {
+  desktop_apps_ = std::move(apps);
+  if (desktop_app_focus_ >= static_cast<int>(desktop_apps_.size())) desktop_app_focus_ = -1;
+  if (place_ == Place::Roots || place_ == Place::AppsList || place_ == Place::AppTitles) refresh_dir();
   bump();
 }
 
@@ -755,6 +762,79 @@ void VrMenu::refresh_dir(const std::string& select_name) {
       la.is_special = true;
       entries_.push_back(std::move(la));
     }
+
+    Entry apps;
+    apps.name = "[アプリ]";
+    apps.path.clear();
+    apps.is_dir = true;
+    apps.is_special = true;
+    entries_.push_back(std::move(apps));
+
+    select_entry_named(select_name);
+    return;
+  }
+
+  if (place_ == Place::AppsList) {
+    Entry up;
+    up.name = "..";
+    up.is_dir = true;
+    up.is_special = true;
+    entries_.push_back(std::move(up));
+    for (size_t i = 0; i < desktop_apps_.size(); ++i) {
+      const DesktopApp& app = desktop_apps_[i];
+      if (app.name.empty() || app.exec.empty()) continue;
+      Entry e;
+      e.name = app.name;
+      e.exec = app.exec;
+      e.exec_args = app.args;
+      e.desktop_app_index = static_cast<int>(i);
+      e.is_dir = !app.titles.empty();
+      e.is_special = true;
+      entries_.push_back(std::move(e));
+    }
+    select_entry_named(select_name);
+    return;
+  }
+
+  if (place_ == Place::AppTitles) {
+    Entry up;
+    up.name = "..";
+    up.is_dir = true;
+    up.is_special = true;
+    entries_.push_back(std::move(up));
+    if (desktop_app_focus_ >= 0 && desktop_app_focus_ < static_cast<int>(desktop_apps_.size())) {
+      const DesktopApp& app = desktop_apps_[static_cast<size_t>(desktop_app_focus_)];
+      for (const DesktopTitle& t : app.titles) {
+        if (t.name.empty()) continue;
+        Entry e;
+        e.name = t.name;
+        e.exec = app.exec;
+        e.exec_args = t.args.empty() ? app.args : t.args;
+        e.monitor_span = t.monitor_span > 0 ? t.monitor_span : 1;
+        e.desktop_app_index = desktop_app_focus_;
+        e.is_special = true;
+        entries_.push_back(std::move(e));
+      }
+    }
+    select_entry_named(select_name);
+    return;
+  }
+
+  if (place_ == Place::NetworkHub) {
+    Entry up;
+    up.name = "..";
+    up.is_dir = true;
+    up.is_special = true;
+    entries_.push_back(std::move(up));
+    Entry dlna;
+    dlna.name = "DLNA";
+    dlna.is_dir = true;
+    dlna.is_special = true;
+    entries_.push_back(std::move(dlna));
+    Entry smb;
+    smb.name = "smb（todo）";
+    smb.is_special = true;
+    entries_.push_back(std::move(smb));
     select_entry_named(select_name);
     return;
   }
@@ -990,7 +1070,8 @@ void VrMenu::activate() {
   if (place_ == Place::Roots) {
     if (e.name == "[ホーム]") {
       place_ = Place::HomeTree;
-      cwd_ = home_;
+      // Prefer last remembered home path from init(); fall back to $HOME.
+      if (cwd_.empty() || (!path_under(cwd_, home_) && cwd_ != home_)) cwd_ = home_;
       refresh_dir();
       save_last_dir();
       bump();
@@ -1003,8 +1084,57 @@ void VrMenu::activate() {
       return;
     }
     if (e.name == "[ネットワーク]") {
+      place_ = Place::NetworkHub;
+      refresh_dir();
+      bump();
+      return;
+    }
+    if (e.name == "[アプリ]") {
+      place_ = Place::AppsList;
+      refresh_dir();
+      bump();
+      return;
+    }
+  }
+
+  if (place_ == Place::AppsList) {
+    if (e.name == ".." || (e.is_special && e.name == "..")) {
+      go_back();
+      return;
+    }
+    if (e.is_dir && e.desktop_app_index >= 0) {
+      desktop_app_focus_ = e.desktop_app_index;
+      place_ = Place::AppTitles;
+      refresh_dir();
+      bump();
+      return;
+    }
+    // Desktop app open is handled in update() via open_desktop_app.
+    return;
+  }
+
+  if (place_ == Place::AppTitles) {
+    if (e.name == ".." || (e.is_special && e.name == "..")) {
+      go_back();
+      return;
+    }
+    // Title open is handled in update() via open_desktop_app.
+    return;
+  }
+
+  if (place_ == Place::NetworkHub) {
+    if (e.name == ".." || (e.is_special && e.name == "..")) {
+      go_back();
+      return;
+    }
+    if (e.name == "DLNA") {
       place_ = Place::NetworkList;
       refresh_dir();
+      bump();
+      return;
+    }
+    if (e.name == "smb（todo）") {
+      // Placeholder until SMB browsing is implemented.
       bump();
       return;
     }
@@ -1012,8 +1142,8 @@ void VrMenu::activate() {
 
   if (place_ == Place::NetworkList) {
     if (e.name == "..") {
-      place_ = Place::Roots;
-      refresh_dir("[ネットワーク]");
+      place_ = Place::NetworkHub;
+      refresh_dir("DLNA");
       bump();
       return;
     }
@@ -1102,6 +1232,17 @@ void VrMenu::show_file_browser() {
   bump();
 }
 
+void VrMenu::show_apps_list() {
+  visible_ = true;
+  controls_visible_ = false;
+  close_controls_edit();
+  screen_ = Screen::Browser;
+  desktop_app_focus_ = -1;
+  place_ = Place::AppsList;
+  refresh_dir({});
+  bump();
+}
+
 void VrMenu::go_back() {
   if (screen_ == Screen::Format) {
     screen_ = Screen::Browser;
@@ -1132,9 +1273,36 @@ void VrMenu::go_back() {
     return;
   }
 
-  if (place_ == Place::NetworkList) {
+  if (place_ == Place::NetworkHub) {
     place_ = Place::Roots;
     refresh_dir("[ネットワーク]");
+    bump();
+    return;
+  }
+
+  if (place_ == Place::AppTitles) {
+    std::string focus_name;
+    if (desktop_app_focus_ >= 0 && desktop_app_focus_ < static_cast<int>(desktop_apps_.size())) {
+      focus_name = desktop_apps_[static_cast<size_t>(desktop_app_focus_)].name;
+    }
+    desktop_app_focus_ = -1;
+    place_ = Place::AppsList;
+    refresh_dir(focus_name);
+    bump();
+    return;
+  }
+
+  if (place_ == Place::AppsList) {
+    desktop_app_focus_ = -1;
+    place_ = Place::Roots;
+    refresh_dir("[アプリ]");
+    bump();
+    return;
+  }
+
+  if (place_ == Place::NetworkList) {
+    place_ = Place::NetworkHub;
+    refresh_dir("DLNA");
     bump();
     return;
   }
@@ -1685,6 +1853,14 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
           out.live_url = e.url;
           visible_ = false;
           bump();
+        } else if (e.is_special && !e.exec.empty() && !e.is_dir) {
+          out.open_desktop_app = true;
+          out.desktop_app_exec = e.exec;
+          out.desktop_app_args = e.exec_args;
+          out.desktop_monitor_span = e.monitor_span > 0 ? e.monitor_span : 1;
+          out.desktop_app_label = e.name;
+          visible_ = false;
+          bump();
         } else if (e.is_video) {
           out.open_video = true;
           out.video_path = entry_open_path(e);
@@ -1738,7 +1914,21 @@ void VrMenu::publish_hud_snapshot() {
         break;
     }
   } else if (place_ == Place::Roots) {
-    s.title = "Files";
+    s.title = "monaSphere";
+    s.hint = "A: open  B: back";
+  } else if (place_ == Place::AppsList) {
+    s.title = "アプリ";
+    s.hint = desktop_apps_.empty() ? "conf: live_desktop_app[N]=Name|exec  B: back"
+                                   : "A: open  B: back";
+  } else if (place_ == Place::AppTitles) {
+    if (desktop_app_focus_ >= 0 && desktop_app_focus_ < static_cast<int>(desktop_apps_.size())) {
+      s.title = desktop_apps_[static_cast<size_t>(desktop_app_focus_)].name;
+    } else {
+      s.title = "アプリ";
+    }
+    s.hint = "A: open  B: back";
+  } else if (place_ == Place::NetworkHub) {
+    s.title = "ネットワーク";
     s.hint = "A: open  B: back";
   } else if (place_ == Place::NetworkList) {
     s.title = "DLNA";

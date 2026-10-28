@@ -14,6 +14,11 @@ layout(push_constant) uniform Push {
   int nv12;
   // 1 = file-dialog 180/360 card. Card UV is a 90° window looking forward.
   int project;
+  // Live Flat: software cursor when ScreenCast Embedded is unavailable.
+  int cursorOn;
+  float cursorU;
+  float cursorV;
+  float cursorAspect;  // content width/height for circular mark in UV
 } pc;
 
 vec3 yuv_to_rgb_limited(float y, float u, float v) {
@@ -111,5 +116,26 @@ void main() {
     vec4 c = texture(videoTex, uv);
     if (c.a < 0.02) discard;
     outColor = c;
+  }
+
+  // Stick / EIS pointer overlay (Hidden ScreenCast has no Embedded DE cursor).
+  if (pc.cursorOn != 0 && pc.project == 0) {
+    float aspect = max(pc.cursorAspect, 0.1);
+    vec2 d = (uv - vec2(pc.cursorU, pc.cursorV)) * vec2(aspect, 1.0);
+    float r = length(d);
+    // Ring + hot-spot so the tip stays readable on bright YouTube UI.
+    float ring = smoothstep(0.022, 0.016, r) * (1.0 - smoothstep(0.012, 0.008, r));
+    float core = 1.0 - smoothstep(0.0, 0.0055, r);
+    float mark = max(ring, core * 0.95);
+    // Short stem below the tip (mouse-arrow hint).
+    vec2 stem = d - vec2(0.0, 0.018);
+    float stem_m = (1.0 - smoothstep(0.004, 0.009, abs(stem.x))) *
+                   (1.0 - smoothstep(0.0, 0.022, abs(stem.y + 0.01)));
+    mark = max(mark, stem_m * step(stem.y, 0.0));
+    vec3 tip = vec3(1.0, 0.92, 0.15);
+    vec3 outline = vec3(0.05, 0.05, 0.05);
+    float edge = smoothstep(0.024, 0.020, r) * (1.0 - smoothstep(0.020, 0.016, r));
+    outColor.rgb = mix(outColor.rgb, outline, edge * 0.85);
+    outColor.rgb = mix(outColor.rgb, tip, mark);
   }
 }

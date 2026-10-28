@@ -44,6 +44,9 @@ class EisPointer {
   bool region_local() const { return region_local_.load(std::memory_order_acquire); }
   uint32_t region_x() const { return region_x_; }
   uint32_t region_y() const { return region_y_; }
+  /** libei region size in compositor logical pixels (physical / output scale). */
+  uint32_t region_w() const { return region_w_; }
+  uint32_t region_h() const { return region_h_; }
 
  private:
   bool ensure_device();

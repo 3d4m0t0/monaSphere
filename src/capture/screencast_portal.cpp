@@ -215,7 +215,10 @@ void ScreencastPortal::fail(const QString& err) {
 void ScreencastPortal::start(const QString& parent_window, const QString& restore_token,
                              uint32_t persist_mode, SourceKind kind, SessionMode mode) {
   if (busy_) {
-    fail(QStringLiteral("ScreenCast already starting"));
+    // Do not fail() — that clears busy_ and aborts the in-flight Start (restore
+    // retry races used to emit "already starting" then tear down Virtual-*).
+    VRP_LOG("screencast: start ignored — already in progress (restore=%s)",
+            restore_token.isEmpty() ? "no" : "yes");
     return;
   }
   if (!session_path_.isEmpty()) {
@@ -474,16 +477,31 @@ void ScreencastPortal::callSelectSources() {
   opts.insert(QStringLiteral("types"), QVariant::fromValue<uint>(static_cast<uint>(kind_)));
   opts.insert(QStringLiteral("multiple"), false);
 
+  // Do not request Embedded when AvailableCursorModes=0 — portal returns
+  // "Unavailable cursor mode 2". Flat then draws a software stick cursor.
+  embedded_cursor_ = false;
   if (cursor_modes_ & kCursorEmbedded) {
     opts.insert(QStringLiteral("cursor_mode"), QVariant::fromValue<uint>(kCursorEmbedded));
+    embedded_cursor_ = true;
     VRP_LOG("screencast: cursor_mode=Embedded (DE cursor in stream)");
   } else {
-    VRP_LOG("screencast: WARNING portal has no Embedded cursor (AvailableCursorModes=0x%x)",
+    VRP_LOG("screencast: WARNING portal has no Embedded cursor (AvailableCursorModes=0x%x) — "
+            "HMD will draw a software cursor",
             cursor_modes_);
   }
 
   // Persist on ScreenCast only for VideoOnly. RD path persists via SelectDevices.
-  if (mode_ == SessionMode::VideoOnly && portal_version_ >= 4) {
+  // Spec: persist_mode since ScreenCast v4. Some hosts report version=0 (and
+  // AvailableCursorModes=0) while still implementing persist — gating on
+  // version>=4 then skips Remember/restore_token and setup looks like a failure.
+  // Unknown options are ignored by older portals, so always send when VideoOnly.
+  if (mode_ == SessionMode::VideoOnly) {
+    if (portal_version_ > 0 && portal_version_ < 4) {
+      VRP_LOG("screencast: WARNING ScreenCast v%u < 4 — persist_mode may be ignored",
+              portal_version_);
+    } else if (portal_version_ == 0) {
+      VRP_LOG("screencast: WARNING ScreenCast version=0 — still sending persist_mode");
+    }
     opts.insert(QStringLiteral("persist_mode"), QVariant::fromValue<uint>(persist_mode_));
     if (!restore_token_in_.isEmpty()) {
       opts.insert(QStringLiteral("restore_token"), restore_token_in_);

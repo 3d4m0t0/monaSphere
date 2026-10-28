@@ -150,6 +150,13 @@ class ChromiumYtX11 {
 
   /** Map MONITOR-space cursor into Chrome client pixels for XSendEvent. */
   void client_cursor(int* cx, int* cy) const;
+
+  /**
+   * Absolute EIS coords for the current cursor_. Scales configured virtual
+   * pixels (width_/height_, e.g. 3840×2160) into the libei region (logical
+   * size after live_virtual_scale, e.g. 1280×720) when region_local.
+   */
+  void eis_abs_from_cursor(double* ax, double* ay) const;
 };
 
 // Software RGBA cursor overlay intentionally omitted — live uses ScreenCast

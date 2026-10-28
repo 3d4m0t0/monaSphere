@@ -427,8 +427,13 @@
     },
     {
       "context": "monaSphere",
-      "source": "File dialog",
-      "translation": "文件窗口 显示切换"
+      "source": "Menu",
+      "translation": "菜单"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Recenter (always)",
+      "translation": "重置中心（始终）"
     },
     {
       "context": "monaSphere",

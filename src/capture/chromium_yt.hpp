@@ -47,11 +47,27 @@ class ChromiumYtLauncher : public QObject {
   float device_scale_factor() const { return device_scale_; }
 
   /**
+   * Wayland: omit --force-device-scale-factor so Chromium uses the output scale
+   * (live_virtual_scale / Plasma 200% == true 2×). When false, always pass
+   * --force-device-scale-factor (needed for X11 ozone).
+   */
+  void set_follow_output_scale(bool on) { follow_output_scale_ = on; }
+  bool follow_output_scale() const { return follow_output_scale_; }
+
+  /**
    * true (default): system Chrome profile (subscription logins).
    * false: isolated ~/.config/monasphere/chromium-yt (scale always applies).
    */
   void set_use_default_profile(bool on) { use_default_profile_ = on; }
   bool use_default_profile() const { return use_default_profile_; }
+
+  /**
+   * When true, set PULSE_SINK/PIPEWIRE_NODE=monaSphereYt for Flat live capture.
+   * Keep false while Flat OpenAL live audio is deferred — otherwise Chrome
+   * targets a missing/orphan null sink and the host mixer shows a bogus mic.
+   */
+  void set_route_audio_to_yt_sink(bool on) { route_audio_to_yt_sink_ = on; }
+  bool route_audio_to_yt_sink() const { return route_audio_to_yt_sink_; }
 
   bool running() const;
   qint64 process_id() const;
@@ -85,7 +101,9 @@ class ChromiumYtLauncher : public QObject {
   bool start_fullscreen_ = false;
   bool start_minimized_ = false;
   float device_scale_ = 1.5f;
+  bool follow_output_scale_ = false;
   bool use_default_profile_ = true;
+  bool route_audio_to_yt_sink_ = false;
   bool shared_session_ = false;
   qint64 detached_pid_ = 0;
   QProcess proc_;

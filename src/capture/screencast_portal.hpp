@@ -60,6 +60,8 @@ class ScreencastPortal : public QObject {
   SessionMode session_mode() const { return mode_; }
   /** True if the in-flight / last start used a restore_token. */
   bool used_restore_token() const { return !restore_token_in_.isEmpty(); }
+  /** True when SelectSources requested Embedded DE cursor in the stream. */
+  bool embedded_cursor() const { return embedded_cursor_; }
 
  signals:
   void started(vrp::ScreencastPortal::Result result);
@@ -99,6 +101,7 @@ class ScreencastPortal : public QObject {
   QString session_path_;
   uint32_t source_types_ = 0;
   uint32_t cursor_modes_ = 0;
+  bool embedded_cursor_ = false;
   uint32_t portal_version_ = 1;          // ScreenCast
   uint32_t remote_desktop_version_ = 1;  // RemoteDesktop
   uint32_t node_id_ = 0;

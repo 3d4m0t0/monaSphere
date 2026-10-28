@@ -2011,8 +2011,9 @@ bool VideoTexture::try_upload_spinner(int width, int height, float phase) {
   }
   const float cx = 0.5f * static_cast<float>(w);
   const float cy = 0.5f * static_cast<float>(h);
-  const float orbit = 0.045f * static_cast<float>(std::min(w, h));
-  const float rad = std::max(3.f, 0.012f * static_cast<float>(std::min(w, h)));
+  // Match HMD menu network spinner (orbit 22px, ~dot 11 → rad 5.5).
+  constexpr float orbit = 22.f;
+  constexpr float rad = 5.5f;
   const float r2 = rad * rad;
   for (int di = 0; di < 3; ++di) {
     const float a = phase + static_cast<float>(di) * (2.f * 3.14159265f / 3.f);

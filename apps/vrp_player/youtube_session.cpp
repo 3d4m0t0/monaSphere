@@ -1,12 +1,18 @@
 #include "youtube_session.hpp"
 
+#include "audio/pulse_monitor.hpp"
 #include "capture/kwin_window_placer.hpp"
 #include "common.hpp"
 
 #include <QCoreApplication>
 #include <QCursor>
+#include <QDir>
 #include <QElapsedTimer>
+#include <QEventLoop>
+#include <QFile>
+#include <QFileInfo>
 #include <QGuiApplication>
+#include <QIODevice>
 #include <QScreen>
 #include <QThread>
 #include <QWidget>
@@ -14,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <thread>
 #include <unistd.h>
 
 namespace vrp {
@@ -21,15 +28,22 @@ namespace vrp {
 YouTubeSession::YouTubeSession(QObject* parent) : QObject(parent) {
   desk_ = detect_desktop_env();
   chrome_ = new ChromiumYtLauncher(this);
+  desktop_app_ = new QProcess(this);
+  desktop_app_->setProcessChannelMode(QProcess::MergedChannels);
+  connect(desktop_app_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this,
+          &YouTubeSession::onDesktopAppFinished);
   portal_ = new ScreencastPortal(this);
   kde_eis_ = new KdeEisPointer();
   portal_eis_ = new EisPointer();
-  vdisp_ = new KdeVirtualDisplay(this);
 #if defined(VRP_HAS_PIPEWIRE)
   capture_ = std::make_unique<PipewireCapture>();
 #endif
   place_timer_.setSingleShot(true);
   connect(&place_timer_, &QTimer::timeout, this, &YouTubeSession::pollPlace);
+  desk_maintain_timer_.setSingleShot(false);
+  desk_maintain_timer_.setInterval(400);
+  // Timer kept but unused (sticky KWin arm replaces maintain poll).
+  connect(&desk_maintain_timer_, &QTimer::timeout, this, &YouTubeSession::maintainDesktopAppWindows);
 
   connect(portal_, &ScreencastPortal::started, this, &YouTubeSession::onPortalStarted);
   connect(portal_, &ScreencastPortal::failed, this, &YouTubeSession::onPortalFailed);
@@ -43,16 +57,11 @@ YouTubeSession::YouTubeSession(QObject* parent) : QObject(parent) {
     }
   });
   connect(portal_, &ScreencastPortal::status, this, [this](const QString& m) { emit logMessage(m); });
-  connect(vdisp_, &KdeVirtualDisplay::failed, this, [this](const QString& e) {
-    if (e.contains(QStringLiteral("クラッシュ"), Qt::CaseInsensitive) ||
-        e.contains(QStringLiteral("crashed"), Qt::CaseInsensitive)) {
-      return;
-    }
-    emit logMessage(tr("Virtual display: %1").arg(e));
-  });
 }
 
 YouTubeSession::~YouTubeSession() {
+  // Do not touch Host-owned VirtualDisplayManager — it may already be mid-teardown.
+  vdisp_mgr_ = nullptr;
   shutdown();
   delete kde_eis_;
   kde_eis_ = nullptr;
@@ -146,17 +155,125 @@ void YouTubeSession::fail(const QString& err) {
   KwinWindowPlacer::disarm_place_on_open();
   KwinWindowPlacer::disarm_portal_dialog_on_primary();
   cleanupStreaming();
-  destroyVirtualDisplay();
+  // Leave Virtual up — Host destroy() when leaving live; next ensure() may reuse.
   loading_.store(false, std::memory_order_release);
   active_.store(false, std::memory_order_release);
   audio_wanted_.store(false, std::memory_order_release);
+  clear_busy_status();
   setState(State::Failed);
   emit failed(err);
   emit logMessage(err);
   setState(State::Idle);
 }
 
+bool YouTubeSession::virtual_display_alive() const {
+  return vdisp_mgr_ && vdisp_mgr_->alive();
+}
+
+void YouTubeSession::stopDesktopAppProcess() {
+  if (!desktop_app_) return;
+  if (desktop_app_->state() == QProcess::NotRunning) return;
+  desktop_app_stopping_ = true;
+  desktop_app_->terminate();
+  if (!desktop_app_->waitForFinished(2000)) {
+    desktop_app_->kill();
+    desktop_app_->waitForFinished(1000);
+  }
+  desktop_app_stopping_ = false;
+}
+
+void YouTubeSession::set_busy_status(const QString& status) {
+  std::lock_guard<std::mutex> lock(busy_mu_);
+  busy_status_ = status;
+}
+
+void YouTubeSession::clear_busy_status() {
+  std::lock_guard<std::mutex> lock(busy_mu_);
+  busy_status_.clear();
+}
+
+QString YouTubeSession::busy_status() const {
+  std::lock_guard<std::mutex> lock(busy_mu_);
+  return busy_status_;
+}
+
+void YouTubeSession::onDesktopAppFinished(int exit_code, QProcess::ExitStatus status) {
+  // Intentional stop() clears the flag after waitForFinished; the finished signal may
+  // arrive on the next event-loop turn — ignore exit during/after our own teardown.
+  if (desktop_app_stopping_) return;
+  if (state_ == State::Idle || state_ == State::Stopping) return;
+  const QString label = desktop_label_.isEmpty() ? tr("アプリ") : desktop_label_;
+  // Keep 「終了中」 until Host XR uploads idle and calls stop() — avoids leftover spinner.
+  set_busy_status(tr("%1 終了中").arg(label));
+  loading_.store(false, std::memory_order_release);
+  emit logMessage(tr("Desktop app exited (%1, code %2) — ending live capture")
+                      .arg(status == QProcess::CrashExit ? tr("crash") : tr("normal"))
+                      .arg(exit_code));
+  emit desktopAppExited();
+}
+
+void YouTubeSession::stopDesktopAppMaintain() {
+  desk_maintain_timer_.stop();
+  if (desktop_rule_installed_) {
+    KwinWindowPlacer::remove_desktop_window_rule();
+    desktop_rule_installed_ = false;
+  }
+  desktop_wmclass_.clear();
+}
+
+void YouTubeSession::startDesktopAppMaintain() {
+  // No Qt-side polling. Sticky KWin arm (windowAdded) + Window Rule cover
+  // RetroArch content recreates without loadScript/unload spam (plasmashell freeze).
+  if (!desktopAppMode()) return;
+  emit logMessage(tr("Desktop app: sticky place + Window Rule on %1 (no maintain poll)")
+                      .arg(output_name_));
+}
+
+void YouTubeSession::installDesktopAppSessionRule() {
+  if (!desktopAppMode() || kwin_window_id_.isEmpty()) return;
+  QString rc, rn, err;
+  if (!KwinWindowPlacer::query_window_wmclass(kwin_window_id_, &rc, &rn, &err)) {
+    emit logMessage(tr("Desktop app: wmclass query failed (%1) — sticky arm only")
+                        .arg(err.isEmpty() ? tr("unknown") : err));
+    return;
+  }
+  // KWin complete Exact: "resourceName resourceClass" (e.g. "retroarch retroarch").
+  const QString name = rn.isEmpty() ? rc : rn;
+  const QString cls = rc.isEmpty() ? rn : rc;
+  if (name.isEmpty() && cls.isEmpty()) return;
+  const QString complete =
+      (name.isEmpty() || cls.isEmpty() || name.compare(cls, Qt::CaseInsensitive) == 0)
+          ? (cls.isEmpty() ? name : cls)
+          : (name + QLatin1Char(' ') + cls);
+  if (desktop_rule_installed_ &&
+      desktop_wmclass_.compare(complete, Qt::CaseInsensitive) == 0) {
+    return;
+  }
+  desktop_wmclass_ = complete;
+  if (vdisp_mgr_) (void)vdisp_mgr_->refresh_identity();
+  QString rule_err;
+  const int scr = vdisp_mgr_ ? vdisp_mgr_->screen_index() : -1;
+  const bool ok = (scr >= 0)
+                      ? KwinWindowPlacer::install_desktop_window_rule(complete, scr, &rule_err)
+                      : KwinWindowPlacer::install_desktop_window_rule(complete, output_name_,
+                                                                      &rule_err);
+  if (ok) {
+    desktop_rule_installed_ = true;
+    emit logMessage(tr("Desktop app: Window Rule after map complete=%1 → %2 (#%3) Exact")
+                        .arg(complete, output_name_)
+                        .arg(scr));
+  } else {
+    emit logMessage(tr("Desktop app: Window Rule install failed (%1)")
+                        .arg(rule_err.isEmpty() ? tr("unknown") : rule_err));
+  }
+}
+
+void YouTubeSession::maintainDesktopAppWindows() {
+  // Intentionally empty — former 400ms one-shot KWin scripts froze Plasma.
+}
+
 void YouTubeSession::cleanupStreaming() {
+  stopDesktopAppMaintain();
 #if defined(VRP_HAS_PIPEWIRE)
   if (capture_) capture_->stop();
 #endif
@@ -171,40 +288,42 @@ void YouTubeSession::cleanupStreaming() {
       if (!kwin_window_id_.isEmpty()) {
         closed = KwinWindowPlacer::close_window_by_id(kwin_window_id_, &err);
       }
-      if (!closed) closed = KwinWindowPlacer::close_youtube_window(&err);
-      // Place never got an id (class often google-chrome under default-profile
-      // singleton) — close windows that appeared after our pre-launch snapshot.
-      if (!closed && kwin_window_id_.isEmpty()) {
-        closed = KwinWindowPlacer::close_chrome_except(chrome_ids_before_, &err);
+      if (!desktopAppMode()) {
+        if (!closed) closed = KwinWindowPlacer::close_youtube_window(&err);
+        // Place never got an id (class often google-chrome under default-profile
+        // singleton) — close windows that appeared after our pre-launch snapshot.
+        if (!closed && kwin_window_id_.isEmpty()) {
+          closed = KwinWindowPlacer::close_chrome_except(chrome_ids_before_, &err);
+        }
       }
     }
     // After compositor close the X11 xid is often already invalid. Safe close
     // traps BadWindow; never leave a stale id for a later inject/close.
     if (!closed && x11_.have_window()) closed = x11_.close_window();
     x11_.clear();
-    emit logMessage(closed ? tr("Live browser window closed")
-                           : tr("Live browser window close: %1")
+    emit logMessage(closed ? tr("Live window closed")
+                           : tr("Live window close: %1")
                                  .arg(err.isEmpty() ? tr("not found") : err));
   }
   kwin_window_id_.clear();
   chrome_ids_before_.clear();
-  if (chrome_) chrome_->stop();
-}
-
-void YouTubeSession::destroyVirtualDisplay() {
-  if (!vdisp_) return;
-  if (vdisp_->owned() || vdisp_->running()) {
-    vdisp_->stop();
-    emit logMessage(tr("Virtual display destroyed"));
+  if (desktopAppMode()) {
+    stopDesktopAppProcess();
+  } else if (chrome_) {
+    chrome_->stop();
   }
-  (void)KdeVirtualDisplay::killOrphans(QStringLiteral("monaSphere"));
-  (void)KdeVirtualDisplay::killOrphans(QStringLiteral("monaSphereYT"));
+#if defined(VRP_HAS_PULSE)
+  // Always scrub monaSphereYt — even when Flat live audio was never started
+  // (older builds set PULSE_SINK unconditionally and left the null sink around).
+  std::thread([] { (void)PulseMonitor::restore_browser_routing(); }).detach();
+#endif
 }
 
 void YouTubeSession::mark_frame_presented() {
   if (loading_.load(std::memory_order_acquire)) {
     loading_.store(false, std::memory_order_release);
   }
+  clear_busy_status();
 }
 
 void YouTubeSession::start(const Config& cfg) {
@@ -216,16 +335,16 @@ void YouTubeSession::start(const Config& cfg) {
     stop();
   }
   cfg_ = cfg;
+  desktop_label_ = cfg.desktop_label;
+  // Token comes from VirtualDisplayManager after ensure(); cfg.restore_token is fallback.
   restore_token_ = cfg.restore_token;
-  // Incoming conf token: assume it matches current cfg size until Start refreshes grant.
-  if (!restore_token_.isEmpty() && (token_grant_w_ <= 0 || token_grant_h_ <= 0)) {
-    token_grant_w_ = cfg_.virtual_w;
-    token_grant_h_ = cfg_.virtual_h;
+  if (!cfg.virtual_name.isEmpty()) {
+    output_name_ = QStringLiteral("Virtual-") + cfg.virtual_name;
+  } else if (!cfg.output_hint.isEmpty()) {
+    output_name_ = cfg.output_hint;
+  } else {
+    output_name_ = KdeVirtualDisplay::outputNameForSpan(1);
   }
-  if (restore_token_.isEmpty()) {
-    token_grant_w_ = token_grant_h_ = 0;
-  }
-  output_name_ = cfg.output_hint.isEmpty() ? QStringLiteral("Virtual-monaSphere") : cfg.output_hint;
   portal_restore_retries_ = 0;
   portal_retry_used_ = false;
   place_tries_ = 0;
@@ -237,12 +356,22 @@ void YouTubeSession::start(const Config& cfg) {
   audio_wanted_.store(false, std::memory_order_release);
   active_.store(false, std::memory_order_release);
   loading_.store(true, std::memory_order_release);
+  {
+    const QString label = desktop_label_.isEmpty()
+                              ? (desktopAppMode() ? tr("アプリ") : tr("Live"))
+                              : desktop_label_;
+    set_busy_status(tr("%1 起動中").arg(label));
+  }
 
   if (capture_) capture_->stop();
   have_saved_cursor_ = false;  // new session — do not restore mid-restart
   stopEis();
   if (portal_) portal_->stop();
   if (chrome_) chrome_->stop();
+  stopDesktopAppProcess();
+  stopDesktopAppMaintain();
+  desktop_rule_installed_ = false;
+  desktop_wmclass_.clear();
 
   desk_ = detect_desktop_env();
   emit logMessage(tr("Live desktop: %1")
@@ -254,11 +383,45 @@ void YouTubeSession::start(const Config& cfg) {
               "On GNOME use a spare MONITOR or set live_capture=window / live_virtual=0."));
       return;
     }
-    if (!ensureVirtualDisplay()) {
-      fail(tr("Live setup aborted (virtual display)"));
+    if (!vdisp_mgr_) {
+      fail(tr("Live setup aborted (no VirtualDisplayManager)"));
       return;
     }
+    VirtualDisplayManager::Spec spec;
+    spec.name = cfg_.virtual_name.isEmpty() ? KdeVirtualDisplay::nameForSpan(1) : cfg_.virtual_name;
+    spec.width = cfg_.virtual_w;
+    spec.height = cfg_.virtual_h;
+    spec.scale = (cfg_.virtual_scale >= 1.f && cfg_.virtual_scale <= 3.f) ? cfg_.virtual_scale : 2.f;
+    spec.span = VirtualDisplayManager::spanFromName(spec.name);
+    const auto vr = vdisp_mgr_->ensure(spec);
+    if (!vr.ok) {
+      fail(tr("Live setup aborted (virtual display): %1")
+               .arg(vr.error.isEmpty() ? tr("unknown") : vr.error));
+      return;
+    }
+    // Manager is source of truth for Virtual name + KWin screen index.
+    if (!vr.output_name.isEmpty()) output_name_ = vr.output_name;
+    else if (!vdisp_mgr_->output_name().isEmpty()) output_name_ = vdisp_mgr_->output_name();
+    if (vr.screen_index < 0) {
+      emit logMessage(tr("Virtual: warning — KWin screen index unknown; place may miss Virtual"));
+    }
+    // Host sets cfg.restore_token from manager (empty for interactive setup).
+    restore_token_ = cfg_.restore_token;
+    if (restore_token_.isEmpty() && !vr.restore_token.isEmpty()) {
+      emit logMessage(tr("Virtual: x%1 has token but session requested interactive (setup)")
+                          .arg(vr.span));
+    } else if (!restore_token_.isEmpty()) {
+      emit logMessage(tr("ScreenCast: using x%1 restore token (%2 chars)")
+                          .arg(vr.span)
+                          .arg(restore_token_.size()));
+    }
     setState(State::VDispReady);
+    {
+      const QString label = desktop_label_.isEmpty()
+                                ? (desktopAppMode() ? tr("アプリ") : tr("Live"))
+                                : desktop_label_;
+      set_busy_status(tr("%1 起動中").arg(label));
+    }
   }
 
   QRect geo;
@@ -269,24 +432,87 @@ void YouTubeSession::start(const Config& cfg) {
     return;
   }
   if (!matched.isEmpty()) output_name_ = matched;
+  // Keep manager identity in sync with kscreen-matched name (index refresh).
+  if (vdisp_mgr_ && cfg_.virtual_display) {
+    (void)vdisp_mgr_->refresh_identity();
+    if (!vdisp_mgr_->output_name().isEmpty()) output_name_ = vdisp_mgr_->output_name();
+  }
 
   place_x_ = geo.x();
   place_y_ = geo.y();
   place_w_ = cfg_.virtual_w > 0 ? cfg_.virtual_w : (geo.width() > 0 ? geo.width() : 1280);
   place_h_ = cfg_.virtual_h > 0 ? cfg_.virtual_h : (geo.height() > 0 ? geo.height() : 720);
 
-  chrome_->set_url(cfg_.url);
-  chrome_->set_device_scale_factor(cfg_.chrome_scale);
-  chrome_->set_use_default_profile(cfg_.use_default_chrome_profile);
-  chrome_->set_window_size(place_w_, place_h_);
-  chrome_->clear_window_position();
-  // Borderless fullscreen on the target MONITOR (KWin also sets fullScreen after place).
-  chrome_->set_start_fullscreen(true);
-  chrome_->set_start_minimized(cfg_.virtual_display && desk_ == DesktopEnv::Kde);
+  // Flat live audio deferred: scrub any orphan monaSphereYt null sink so Plasma
+  // does not keep an “unknown microphone” output and mute the real HDMI sink.
+  if (!cfg_.enable_audio) {
+#if defined(VRP_HAS_PULSE)
+    std::thread([] { (void)PulseMonitor::restore_browser_routing(); }).detach();
+#endif
+  }
   // XTest must use Xrandr/X11 geometry (not kscreen logical) when scale≠1.
   if (!x11_.bind_output_by_name(output_name_.toStdString(), place_w_, place_h_)) {
     x11_.set_screen_rect(place_x_, place_y_, place_w_, place_h_);
   }
+
+  if (desktopAppMode()) {
+    if (desk_ != DesktopEnv::Kde) {
+      fail(tr("Desktop apps ([アプリ]) require KDE Plasma for window placement"));
+      return;
+    }
+    emit logMessage(tr("Desktop app → %1 (%2×%3): %4")
+                        .arg(output_name_)
+                        .arg(place_w_)
+                        .arg(place_h_)
+                        .arg(cfg_.exec));
+    beginPlaceDesktopApp();
+    return;
+  }
+
+  chrome_->set_url(cfg_.url);
+  // Wayland Chrome follows KWin output scale (live_virtual_scale) — do NOT also
+  // push virtual_scale into --force-device-scale-factor (that became ~400% at scale=2).
+  // X11 ozone cannot see output scale; only then mirror virtual_scale when
+  // live_chrome_scale is left at 1.
+  const bool ozone_x11 = !qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11");
+  float chrome_dsf = cfg_.chrome_scale;
+  if (ozone_x11 && cfg_.virtual_display && cfg_.virtual_scale > 1.01f &&
+      std::abs(cfg_.chrome_scale - 1.f) < 0.05f) {
+    chrome_dsf = cfg_.virtual_scale;
+  }
+  chrome_->set_device_scale_factor(chrome_dsf);
+  // Omit --force-device-scale-factor on Wayland so Chromium uses the output scale.
+  const bool follow_out = !ozone_x11 && std::abs(cfg_.chrome_scale - 1.f) < 0.05f;
+  chrome_->set_follow_output_scale(follow_out);
+  chrome_->set_use_default_profile(cfg_.use_default_chrome_profile);
+  chrome_->set_route_audio_to_yt_sink(cfg_.enable_audio);
+  // Wayland --window-size is in DIPs (logical). Physical 3840 at scale 2 → 1920.
+  int chrome_w = place_w_;
+  int chrome_h = place_h_;
+  if (follow_out && cfg_.virtual_scale > 1.01f) {
+    chrome_w = std::max(320, static_cast<int>(std::lround(
+                                  static_cast<double>(place_w_) / static_cast<double>(cfg_.virtual_scale))));
+    chrome_h = std::max(240, static_cast<int>(std::lround(
+                                  static_cast<double>(place_h_) / static_cast<double>(cfg_.virtual_scale))));
+  }
+  chrome_->set_window_size(chrome_w, chrome_h);
+  chrome_->clear_window_position();
+  if (follow_out) {
+    emit logMessage(tr("Chrome Wayland: follow output scale %1% (window %2×%3 DIP, mode %4×%5)")
+                        .arg(QString::number(static_cast<double>(cfg_.virtual_scale) * 100.0, 'f', 0))
+                        .arg(chrome_w)
+                        .arg(chrome_h)
+                        .arg(place_w_)
+                        .arg(place_h_));
+  } else {
+    emit logMessage(tr("Chrome force-device-scale-factor=%1 (virtual=%2 chrome_scale=%3 ozone=x11)")
+                        .arg(QString::number(static_cast<double>(chrome_dsf), 'f', 2))
+                        .arg(QString::number(static_cast<double>(cfg_.virtual_scale), 'f', 2))
+                        .arg(QString::number(static_cast<double>(cfg_.chrome_scale), 'f', 2)));
+  }
+  // Borderless fullscreen on the target MONITOR (KWin also sets fullScreen after place).
+  chrome_->set_start_fullscreen(true);
+  chrome_->set_start_minimized(cfg_.virtual_display && desk_ == DesktopEnv::Kde);
   if (desk_ == DesktopEnv::Gnome) {
     chrome_->set_window_position(place_x_, place_y_);
     emit logMessage(tr("Live browser → %1 (%2×%3) @%4,%5 (GNOME / window-position)")
@@ -327,8 +553,10 @@ void YouTubeSession::stop() {
       false;
 #endif
   const bool chrome_alive = chrome_ && chrome_->running();
+  const bool desk_alive =
+      desktop_app_ && desktop_app_->state() != QProcess::NotRunning;
   if (state_ == State::Idle && !loading_.load() && !active_.load() && !capture_alive &&
-      !chrome_alive && kwin_window_id_.isEmpty()) {
+      !chrome_alive && !desk_alive && kwin_window_id_.isEmpty()) {
     return;
   }
   place_timer_.stop();
@@ -337,8 +565,11 @@ void YouTubeSession::stop() {
   loading_.store(false, std::memory_order_release);
   active_.store(false, std::memory_order_release);
   audio_wanted_.store(false, std::memory_order_release);
+  // Capture + app only. Virtual stays up; VirtualDisplayManager::ensure/destroy owns it.
+  emit logMessage(tr("Live stop: capture + app (Virtual left to manager)"));
+  set_busy_status(tr("切替中"));
   cleanupStreaming();
-  destroyVirtualDisplay();
+  clear_busy_status();
   setState(State::Idle);
   emit stopped();
   emit logMessage(tr("Live capture stopped"));
@@ -346,146 +577,9 @@ void YouTubeSession::stop() {
 
 void YouTubeSession::shutdown() {
   stop();
-}
-
-bool YouTubeSession::ensureVirtualDisplay() {
-  vdisp_->set_name(QStringLiteral("monaSphere"));
-  vdisp_->set_resolution(cfg_.virtual_w, cfg_.virtual_h);
-  const float want_scale =
-      (cfg_.virtual_scale >= 1.f && cfg_.virtual_scale <= 3.f) ? cfg_.virtual_scale : 2.f;
-  vdisp_->set_scale(want_scale);
-  output_name_ = vdisp_->output_name();
-
-  auto mode_ok = [&](int mw, int mh, float sc) {
-    return std::abs(mw - cfg_.virtual_w) <= 16 && std::abs(mh - cfg_.virtual_h) <= 16 &&
-           std::abs(sc - want_scale) <= 0.15f;
-  };
-
-  int cur_w = 0, cur_h = 0;
-  float cur_sc = 0.f;
-  const bool have_mode = KdeVirtualDisplay::queryOutputMode(output_name_, &cur_w, &cur_h, &cur_sc);
-  const bool mode_good = have_mode && mode_ok(cur_w, cur_h, cur_sc);
-  const bool size_cfg_ok = vdisp_->width() == cfg_.virtual_w &&
-                           vdisp_->height() == cfg_.virtual_h &&
-                           std::abs(vdisp_->scale() - want_scale) <= 0.05f;
-
-  // Prefer our owned krfb process at the configured size. After ScreenCast stop,
-  // kscreen sometimes reports a stale mode (e.g. 1920×1080) even though the
-  // Virtual-* is still 1280×720 — recreating then wiped the restore_token and
-  // forced a second host picker during setup verify.
-  const bool trust_owned = vdisp_->running() && size_cfg_ok;
-  if (trust_owned) {
-    if (!mode_good && have_mode) {
-      emit logMessage(tr("Virtual display kscreen says %1×%2 — keeping owned %3×%4 (token kept)")
-                          .arg(cur_w)
-                          .arg(cur_h)
-                          .arg(cfg_.virtual_w)
-                          .arg(cfg_.virtual_h));
-    } else {
-      emit logMessage(tr("Reusing virtual display %1 %2×%3 @%4×")
-                          .arg(output_name_)
-                          .arg(cfg_.virtual_w)
-                          .arg(cfg_.virtual_h)
-                          .arg(QString::number(static_cast<double>(want_scale), 'f', 2)));
-    }
-  } else if (mode_good && size_cfg_ok) {
-    emit logMessage(tr("Reusing virtual display %1 %2×%3 @%4×")
-                        .arg(output_name_)
-                        .arg(cur_w)
-                        .arg(cur_h)
-                        .arg(QString::number(static_cast<double>(cur_sc), 'f', 2)));
-  } else {
-    if (have_mode && !mode_ok(cur_w, cur_h, cur_sc)) {
-      emit logMessage(tr("Virtual display stale mode %1×%2 @%3 — recreating %4×%5 @%6×")
-                          .arg(cur_w)
-                          .arg(cur_h)
-                          .arg(QString::number(static_cast<double>(cur_sc), 'f', 2))
-                          .arg(cfg_.virtual_w)
-                          .arg(cfg_.virtual_h)
-                          .arg(QString::number(static_cast<double>(want_scale), 'f', 2)));
-    }
-    // Clear token only when the configured capture size changed since grant.
-    // Recreating to the same cfg size must not wipe a just-saved restore_token.
-    const bool cfg_differs_from_grant =
-        token_grant_w_ > 0 && token_grant_h_ > 0 &&
-        (std::abs(cfg_.virtual_w - token_grant_w_) > 16 ||
-         std::abs(cfg_.virtual_h - token_grant_h_) > 16);
-    if (cfg_differs_from_grant && !restore_token_.isEmpty()) {
-      restore_token_.clear();
-      token_grant_w_ = token_grant_h_ = 0;
-      emit restoreTokenChanged(QString());
-      emit logMessage(tr("Cleared ScreenCast restore token (virtual display resolution changed)"));
-    }
-    vdisp_->stop();
-    (void)KdeVirtualDisplay::killOrphans(QStringLiteral("monaSphere"));
-    (void)KdeVirtualDisplay::killOrphans(QStringLiteral("monaSphereYT"));
-    QElapsedTimer gone;
-    gone.start();
-    while (gone.elapsed() < 4000 &&
-           (KdeVirtualDisplay::outputExists(QStringLiteral("monaSphere")) ||
-            KdeVirtualDisplay::outputExists(QStringLiteral("monaSphereYT")))) {
-      QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
-      QThread::msleep(100);
-    }
-    if (!vdisp_->start()) return false;
-    emit logMessage(tr("Virtual display starting: %1 (%2×%3 @%4×)")
-                        .arg(vdisp_->output_name())
-                        .arg(cfg_.virtual_w)
-                        .arg(cfg_.virtual_h)
-                        .arg(QString::number(static_cast<double>(want_scale), 'f', 2)));
-  }
-
-  int place_x = 0, place_y = 0;
-  if (QScreen* primary = QGuiApplication::primaryScreen()) {
-    place_x = primary->geometry().right() + 1;
-    place_y = primary->geometry().top();
-  }
-
-  QElapsedTimer wait;
-  wait.start();
-  QString matched;
-  while (wait.elapsed() < 10000) {
-    (void)KdeVirtualDisplay::enableOutput(output_name_, place_x, place_y, want_scale);
-    int mw = 0, mh = 0;
-    float sc = 1.f;
-    QRect r;
-    QString m2;
-    const bool have_rect =
-        KdeVirtualDisplay::queryOutputRect(output_name_, &r, &m2) && !r.isEmpty();
-    const bool have_good_mode =
-        KdeVirtualDisplay::queryOutputMode(output_name_, &mw, &mh, &sc, &matched) &&
-        mode_ok(mw, mh, sc);
-
-    if (have_good_mode && have_rect) {
-      if (!matched.isEmpty()) output_name_ = matched;
-      else if (!m2.isEmpty()) output_name_ = m2;
-      emit logMessage(tr("Virtual display ready: %1 mode %2×%3")
-                          .arg(output_name_)
-                          .arg(mw)
-                          .arg(mh));
-      return true;
-    }
-
-    // Owned krfb at cfg size: do not fail on stale kscreen mode — only need the
-    // output present so place/portal can target Virtual-monaSphere.
-    if (trust_owned && (have_rect || wait.elapsed() > 2000)) {
-      if (!m2.isEmpty()) output_name_ = m2;
-      else if (!matched.isEmpty()) output_name_ = matched;
-      emit logMessage(tr("Virtual display ready: %1 owned %2×%3 (kscreen mode ignored)")
-                          .arg(output_name_)
-                          .arg(cfg_.virtual_w)
-                          .arg(cfg_.virtual_h));
-      return true;
-    }
-
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
-    QThread::msleep(150);
-  }
-  emit logMessage(tr("Virtual display “%1” did not reach %2×%3 @1.0")
-                      .arg(output_name_)
-                      .arg(cfg_.virtual_w)
-                      .arg(cfg_.virtual_h));
-  return false;
+  // Virtual lifetime is Host/VirtualDisplayManager — never destroy from here
+  // (child delete order + double shutdown caused QProcess UAF / SEGV).
+  vdisp_mgr_ = nullptr;
 }
 
 bool YouTubeSession::resolveOutputRect(QRect* geo, QString* matched) {
@@ -514,12 +608,16 @@ void YouTubeSession::beginPlace() {
   emit logMessage(tr("Chrome: %1 existing window(s) before launch").arg(chrome_ids_before_.size()));
 
   QString arm_err;
-  if (!KwinWindowPlacer::arm_place_on_open(output_name_, chrome_ids_before_, &arm_err)) {
+  const int chrome_scr = vdisp_mgr_ ? vdisp_mgr_->screen_index() : -1;
+  if (!KwinWindowPlacer::arm_place_on_open(output_name_, chrome_ids_before_, &arm_err,
+                                           chrome_scr)) {
     fail(tr("KWin place arm failed: %1 — abort (will not leave Chrome on primary)")
              .arg(arm_err.isEmpty() ? tr("(no detail)") : arm_err));
     return;
   }
-  emit logMessage(tr("KWin: armed — next Chrome window → %1").arg(output_name_));
+  emit logMessage(tr("KWin: armed — next Chrome window → %1 (#%2)")
+                      .arg(output_name_)
+                      .arg(chrome_scr));
 
   if (QWidget* w = qobject_cast<QWidget*>(QObject::parent())) {
     w->activateWindow();
@@ -549,8 +647,181 @@ void YouTubeSession::beginPlaceGnome() {
   place_timer_.start(400);
 }
 
+void YouTubeSession::beginPlaceDesktopApp() {
+  setState(State::Placing);
+  // KWin Wayland: Window Rules installed before the first map often do not apply
+  // (startup/apply-on-open bug). Script-place first; install Rule only after the
+  // window exists, with Exact + wmclasscomplete on the real class string.
+  chrome_ids_before_ = KwinWindowPlacer::list_all_window_ids();
+  emit logMessage(tr("Desktop app: %1 existing window(s) before launch")
+                      .arg(chrome_ids_before_.size()));
+
+  desktop_want_names_.clear();
+  desktop_rule_installed_ = false;
+  desktop_wmclass_.clear();
+  {
+    const QFileInfo fi(cfg_.exec);
+    const QString base = fi.completeBaseName().toLower();
+    if (!base.isEmpty()) desktop_want_names_ << base;
+    if (base.contains(QLatin1String("retroarch")) ||
+        cfg_.exec.contains(QLatin1String("retroarch"), Qt::CaseInsensitive)) {
+      desktop_want_names_ << QStringLiteral("retroarch") << QStringLiteral("libretro")
+                          << QStringLiteral("com.libretro.retroarch");
+    }
+    desktop_want_names_.removeDuplicates();
+  }
+
+  QString arm_err;
+  // Pids unknown until start — name hints + exclude list (like Chrome class match).
+  if (!KwinWindowPlacer::arm_place_new_window(output_name_, chrome_ids_before_, {},
+                                              desktop_want_names_, &arm_err)) {
+    fail(tr("KWin place arm failed: %1 — abort")
+             .arg(arm_err.isEmpty() ? tr("(no detail)") : arm_err));
+    return;
+  }
+  emit logMessage(tr("KWin: armed — next desktop window → %1 (names %2)")
+                      .arg(output_name_, desktop_want_names_.join(QLatin1Char(','))));
+
+  if (QWidget* w = qobject_cast<QWidget*>(QObject::parent())) {
+    w->activateWindow();
+  }
+
+  {
+    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    if (!cfg_.pad_hook_lib.isEmpty() && !cfg_.pad_hook_sock.isEmpty()) {
+      const QString prev = env.value(QStringLiteral("LD_PRELOAD"));
+      const QString preload =
+          prev.isEmpty() ? cfg_.pad_hook_lib : (cfg_.pad_hook_lib + QLatin1Char(':') + prev);
+      env.insert(QStringLiteral("LD_PRELOAD"), preload);
+      env.insert(QStringLiteral("MONASPHERE_PAD_SOCK"), cfg_.pad_hook_sock);
+      env.insert(QStringLiteral("MONASPHERE_PAD_HOOK"), cfg_.pad_hook_lib);
+      emit logMessage(tr("Desktop app: LD_PRELOAD pad hook (%1)").arg(cfg_.pad_hook_lib));
+    } else if (!cfg_.sdl_joystick_device.isEmpty()) {
+      env.insert(QStringLiteral("SDL_JOYSTICK_HIDAPI"), QStringLiteral("0"));
+      env.insert(QStringLiteral("SDL_JOYSTICK_DEVICE"), cfg_.sdl_joystick_device);
+      emit logMessage(tr("Desktop app: SDL_JOYSTICK_DEVICE=%1 (legacy uinput)")
+                          .arg(cfg_.sdl_joystick_device));
+    }
+    desktop_app_->setProcessEnvironment(env);
+  }
+  QStringList args = cfg_.exec_args;
+  if (cfg_.exec.contains(QLatin1String("retroarch"), Qt::CaseInsensitive)) {
+    const QString ra_cfg =
+        QDir::temp().filePath(QStringLiteral("monasphere_ra_pad.cfg"));
+    {
+      QFile f(ra_cfg);
+      if (f.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        f.write("input_joypad_driver = \"sdl2\"\n");
+        f.close();
+      }
+    }
+    args.append(QStringLiteral("--appendconfig"));
+    args.append(ra_cfg);
+    emit logMessage(tr("Desktop app: RetroArch appendconfig → sdl2 joypad"));
+  }
+  desktop_app_->setProgram(cfg_.exec);
+  desktop_app_->setArguments(args);
+  emit logMessage(tr("Desktop app exec: %1 %2")
+                      .arg(cfg_.exec, args.join(QLatin1Char(' '))));
+  desktop_app_->start();
+  if (!desktop_app_->waitForStarted(5000)) {
+    KwinWindowPlacer::disarm_place_on_open();
+    fail(tr("Could not start desktop app: %1 (%2)")
+             .arg(cfg_.exec, desktop_app_->errorString()));
+    return;
+  }
+  emit logMessage(tr("Desktop app started (pid %1)")
+                      .arg(desktop_app_->processId()));
+
+  place_tries_ = 0;
+  place_timer_.start(200);
+}
+
+void YouTubeSession::pollPlaceDesktopApp() {
+  if (state_ != State::Placing) return;
+
+  QString wid;
+  QString err;
+  if (KwinWindowPlacer::poll_armed_place(&wid, &err) && !wid.isEmpty()) {
+    if (kwin_window_id_.isEmpty()) {
+      emit logMessage(tr("KWin: desktop app on %1 (%2…)").arg(output_name_, wid.left(8)));
+    }
+    kwin_window_id_ = wid;
+  }
+
+  if (!kwin_window_id_.isEmpty()) {
+    // One Chrome-style shove, then done (rule already Force-screens).
+    if (place_tries_ == 0) {
+      const qint64 root_pid = desktop_app_ ? desktop_app_->processId() : 0;
+      const QList<qint64> pids = KwinWindowPlacer::pid_tree(root_pid);
+      bool moved_ok = false;
+      QString move_wid;
+      QString move_err;
+      (void)KwinWindowPlacer::move_new_window_to_output(output_name_, chrome_ids_before_, pids,
+                                                        desktop_want_names_, &move_wid, &move_err,
+                                                        &moved_ok);
+      if (moved_ok && !move_wid.isEmpty()) kwin_window_id_ = move_wid;
+    }
+    ++place_tries_;
+    if (place_tries_ >= 2) {
+      // Rule after map only — Exact + wmclasscomplete with the real class string.
+      installDesktopAppSessionRule();
+      KwinWindowPlacer::disarm_place_on_open(/*keep_fullscreen_rule=*/true);
+      emit logMessage(tr("KWin: placed desktop app on %1 (%2…)")
+                          .arg(output_name_, kwin_window_id_.left(8)));
+      onPlaced();
+      startDesktopAppMaintain();
+      return;
+    }
+    place_timer_.start(200);
+    return;
+  }
+
+  ++place_tries_;
+  if (desktop_app_ && desktop_app_->state() == QProcess::NotRunning) {
+    KwinWindowPlacer::disarm_place_on_open();
+    fail(tr("Desktop app exited before window placement"));
+    return;
+  }
+
+  if (place_tries_ > 0 && (place_tries_ % 5) == 0) {
+    const qint64 root_pid = desktop_app_ ? desktop_app_->processId() : 0;
+    const QList<qint64> pids = KwinWindowPlacer::pid_tree(root_pid);
+    bool moved_ok = false;
+    QString move_wid;
+    QString move_err;
+    if (KwinWindowPlacer::move_new_window_to_output(output_name_, chrome_ids_before_, pids,
+                                                    desktop_want_names_, &move_wid, &move_err,
+                                                    &moved_ok) &&
+        moved_ok && !move_wid.isEmpty()) {
+      kwin_window_id_ = move_wid;
+      place_tries_ = 0;
+      emit logMessage(
+          tr("KWin: desktop app on %1 (%2…)").arg(output_name_, move_wid.left(8)));
+      place_timer_.start(200);
+      return;
+    }
+  }
+
+  if (place_tries_ < 40) {
+    if (place_tries_ == 1 || place_tries_ % 10 == 0) {
+      emit logMessage(tr("KWin: waiting for desktop app on %1…").arg(output_name_));
+    }
+    place_timer_.start(200);
+    return;
+  }
+
+  KwinWindowPlacer::disarm_place_on_open();
+  fail(tr("KWin place failed — desktop app was not moved to %1 (ScreenCast not started)")
+           .arg(output_name_));
+}
+
 void YouTubeSession::pollPlace() {
   if (state_ != State::Placing) return;
+  if (desktopAppMode()) {
+    pollPlaceDesktopApp();
+    return;
+  }
   if (desk_ == DesktopEnv::Gnome) {
     pollPlaceGnome();
     return;
@@ -667,8 +938,10 @@ void YouTubeSession::onPlaced() {
     }
   }
 
-  // Brief settle for compositor before portal maps.
-  QTimer::singleShot(300, this, [this] {
+  // Virtual is already up before place (manager ensure). Restore only needs a short
+  // beat so KWin publishes the output to the portal — 2.5s was the bulk of "slow RA".
+  const int settle_ms = restore_token_.isEmpty() ? 300 : 500;
+  QTimer::singleShot(settle_ms, this, [this] {
     if (state_ != State::Placed) return;
     beginPortal(false);
   });
@@ -805,8 +1078,8 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
     if (r.eis_fd >= 0) ::close(r.eis_fd);
     if (portal_) portal_->stop();
     restore_token_.clear();
-    token_grant_w_ = token_grant_h_ = 0;
-    emit restoreTokenChanged(QString());
+    if (vdisp_mgr_) vdisp_mgr_->clearToken(vdisp_mgr_->active_span());
+    else emit restoreTokenChanged(QString());
     fail(tr("ScreenCast is %1×%2 but MONITOR “%3” is %4×%5. "
             "On the host picker choose ONLY that MONITOR — not the whole desktop / both screens. "
             "Then Tools→Set up again.")
@@ -820,10 +1093,14 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
 
   if (!r.restore_token.isEmpty()) {
     restore_token_ = r.restore_token;
-    token_grant_w_ = cfg_.virtual_w;
-    token_grant_h_ = cfg_.virtual_h;
-    emit restoreTokenChanged(restore_token_);
-    emit logMessage(tr("Live ScreenCast token saved (%1 chars)").arg(restore_token_.size()));
+    if (vdisp_mgr_) {
+      const int span = vdisp_mgr_->active_span() > 0
+                           ? vdisp_mgr_->active_span()
+                           : VirtualDisplayManager::spanFromName(output_name_);
+      vdisp_mgr_->setToken(span, restore_token_);
+    } else {
+      emit restoreTokenChanged(restore_token_);
+    }
   } else {
     emit logMessage(tr("Live ScreenCast: portal returned no restore_token "
                        "(enable Remember on the share dialog, then Set up again)"));
@@ -836,7 +1113,12 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
     return;
   }
   if (!capture_) capture_ = std::make_unique<PipewireCapture>();
-  if (!capture_->start(r.pw_fd, r.node_id, r.pipewire_serial, cfg_.drm_modifiers)) {
+  // Prefer configured Virtual-* pixels so KWin does not resize the stream down
+  // to a hardcoded 1080p default during PipeWire format negotiation.
+  const int prefer_w = cfg_.virtual_w > 0 ? cfg_.virtual_w : r.width;
+  const int prefer_h = cfg_.virtual_h > 0 ? cfg_.virtual_h : r.height;
+  if (!capture_->start(r.pw_fd, r.node_id, r.pipewire_serial, cfg_.drm_modifiers, prefer_w,
+                       prefer_h)) {
     const QString err = QString::fromStdString(capture_->last_error());
     ::close(r.pw_fd);
     if (r.eis_fd >= 0) ::close(r.eis_fd);
@@ -868,10 +1150,20 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
       // start_from_fd owns eis_fd (success or failure).
       x11_.set_eis_inject(portal_eis_);
       eis_ok = true;
-      emit logMessage(tr("Pointer: portal EIS (%1) mapping_id=%2")
+      emit logMessage(tr("Pointer: portal EIS (%1) mapping_id=%2 region %3×%4; cursor %5×%6")
                           .arg(portal_eis_->region_local() ? tr("region-local")
                                                           : tr("desktop-global"))
-                          .arg(r.mapping_id.isEmpty() ? tr("(none)") : r.mapping_id));
+                          .arg(r.mapping_id.isEmpty() ? tr("(none)") : r.mapping_id)
+                          .arg(portal_eis_->region_w())
+                          .arg(portal_eis_->region_h())
+                          .arg(place_w_)
+                          .arg(place_h_));
+      if (portal_eis_->region_local() && portal_eis_->region_w() > 0 &&
+          (static_cast<int>(portal_eis_->region_w()) != place_w_ ||
+           static_cast<int>(portal_eis_->region_h()) != place_h_)) {
+        VRP_LOG("live: EIS logical %ux%u vs virtual %dx%d — scaling cursor into region",
+                portal_eis_->region_w(), portal_eis_->region_h(), place_w_, place_h_);
+      }
     } else {
       emit logMessage(tr("Pointer: portal EIS failed (%1) — XTest fallback")
                           .arg(QString::fromStdString(portal_eis_->last_error())));
@@ -881,11 +1173,23 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
     if (kde_eis_ && kde_eis_->start(output_name_.toStdString())) {
       x11_.set_eis_inject(&kde_eis_->core());
       eis_ok = true;
-      emit logMessage(tr("Pointer: KWin EIS region for “%1” (local=%2, logical origin %3,%4)")
+      const auto& eis = kde_eis_->core();
+      emit logMessage(tr("Pointer: KWin EIS region for “%1” (local=%2, region %3×%4 @%5,%6; "
+                         "cursor space %7×%8)")
                           .arg(output_name_)
-                          .arg(kde_eis_->core().region_local() ? tr("yes") : tr("no"))
-                          .arg(place_x_)
-                          .arg(place_y_));
+                          .arg(eis.region_local() ? tr("yes") : tr("no"))
+                          .arg(eis.region_w())
+                          .arg(eis.region_h())
+                          .arg(eis.region_x())
+                          .arg(eis.region_y())
+                          .arg(place_w_)
+                          .arg(place_h_));
+      if (eis.region_local() && eis.region_w() > 0 && eis.region_h() > 0 &&
+          (static_cast<int>(eis.region_w()) != place_w_ ||
+           static_cast<int>(eis.region_h()) != place_h_)) {
+        VRP_LOG("live: EIS logical %ux%u vs virtual %dx%d — scaling cursor into region",
+                eis.region_w(), eis.region_h(), place_w_, place_h_);
+      }
     } else {
       emit logMessage(tr("Pointer: KWin EIS unavailable (%1) — XTest fallback")
                           .arg(kde_eis_ ? QString::fromStdString(kde_eis_->last_error())
@@ -917,7 +1221,15 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
 
 void YouTubeSession::onPortalFailed(const QString& e) {
   if (state_ != State::Portal) return;
+  // Spurious overlapping start() — in-flight portal must keep running.
+  if (e.contains(QStringLiteral("already starting"), Qt::CaseInsensitive) ||
+      e.contains(QStringLiteral("already in progress"), Qt::CaseInsensitive)) {
+    VRP_LOG("live: ignoring overlapping ScreenCast start");
+    return;
+  }
   KwinWindowPlacer::disarm_portal_dialog_on_primary();
+  // Cancel restore/hung watchdogs before scheduling another Start.
+  ++portal_gen_;
 
   const bool restore_rejected =
       e.contains(QStringLiteral("restore rejected"), Qt::CaseInsensitive) ||
@@ -927,14 +1239,24 @@ void YouTubeSession::onPortalFailed(const QString& e) {
   if (restore_rejected && !restore_token_.isEmpty() && loading_.load()) {
     // Portal session is dead after Response≠0 — drop it before retry.
     if (portal_) portal_->stop();
-    // Brief settle: previous ScreenCast Close can race the next CreateSession.
     if (portal_restore_retries_ < 3 && !portal_retry_used_) {
       ++portal_restore_retries_;
       emit logMessage(tr("ScreenCast restore rejected — silent retry %1/3 (token kept)")
                           .arg(portal_restore_retries_));
-      // Virtual may still be coming up after recreate; settle before Start again.
-      QTimer::singleShot(3500, this, [this] {
+      // Virtual recreate + 4K scale: portal needs a longer settle than 1080p.
+      const int delay_ms = 4500 + portal_restore_retries_ * 1500;
+      QTimer::singleShot(delay_ms, this, [this] {
         if (!loading_.load() || active_.load()) return;
+        if (portal_ && portal_->busy()) {
+          emit logMessage(tr("ScreenCast: waiting for previous Start to finish…"));
+          QTimer::singleShot(2000, this, [this] {
+            if (!loading_.load() || active_.load()) return;
+            if (portal_ && portal_->busy()) portal_->stop();
+            setState(State::Placed);
+            beginPortal(false);
+          });
+          return;
+        }
         setState(State::Placed);
         beginPortal(false);
       });
@@ -944,11 +1266,13 @@ void YouTubeSession::onPortalFailed(const QString& e) {
       portal_retry_used_ = true;
       // Memory only — keep conf token until a successful Start replaces it.
       emit logMessage(tr("ScreenCast restore still rejected — opening host picker "
-                         "(conf token kept until a new one is saved)"));
+                         "(conf token kept until a new one is saved). "
+                         "If Virtual size/scale changed, re-run Tools → Set up live capture."));
       restore_token_.clear();
       emit toast(tr("Host: pick Virtual-monaSphere"));
-      QTimer::singleShot(900, this, [this] {
+      QTimer::singleShot(1200, this, [this] {
         if (!loading_.load() || active_.load()) return;
+        if (portal_ && portal_->busy()) portal_->stop();
         setState(State::Placed);
         beginPortal(true);
       });

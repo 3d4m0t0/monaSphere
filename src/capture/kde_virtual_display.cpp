@@ -11,6 +11,7 @@
 #include <QStandardPaths>
 #include <QThread>
 
+#include <algorithm>
 #include <cmath>
 
 namespace vrp {
@@ -155,6 +156,34 @@ KdeVirtualDisplay::~KdeVirtualDisplay() { stop(); }
 
 QString KdeVirtualDisplay::output_name() const {
   return QStringLiteral("Virtual-") + name_;
+}
+
+QString KdeVirtualDisplay::nameForSpan(int span) {
+  const int s = std::clamp(span, 1, 3);
+  return QStringLiteral("monaSphere-x%1").arg(s);
+}
+
+QString KdeVirtualDisplay::outputNameForSpan(int span) {
+  return QStringLiteral("Virtual-") + nameForSpan(span);
+}
+
+QStringList KdeVirtualDisplay::allManagedNames() {
+  // Legacy single name (pre per-span) + x1–x3 + old YT suffix.
+  return {QStringLiteral("monaSphere"), QStringLiteral("monaSphereYT"), nameForSpan(1),
+          nameForSpan(2), nameForSpan(3)};
+}
+
+int KdeVirtualDisplay::killAllManaged() {
+  int n = 0;
+  for (const QString& name : allManagedNames()) n += killOrphans(name);
+  return n;
+}
+
+bool KdeVirtualDisplay::anyManagedOutputExists() {
+  for (const QString& name : allManagedNames()) {
+    if (outputExists(name) || outputExists(QStringLiteral("Virtual-") + name)) return true;
+  }
+  return false;
 }
 
 QString KdeVirtualDisplay::detectBinary() {
@@ -309,16 +338,23 @@ bool KdeVirtualDisplay::start() {
   proc_.start();
   if (!proc_.waitForStarted(4000)) {
     owned_ = false;
+    launched_w_ = launched_h_ = 0;
+    launched_scale_ = 0.f;
     emit failed(proc_.errorString().isEmpty() ? QStringLiteral("krfb-virtualmonitor failed to start")
                                               : proc_.errorString());
     return false;
   }
   owned_ = true;
+  launched_w_ = w;
+  launched_h_ = h;
+  launched_scale_ = scale_ >= 1.f ? scale_ : 1.f;
   return true;
 }
 
 void KdeVirtualDisplay::stop() {
   stopping_ = true;
+  launched_w_ = launched_h_ = 0;
+  launched_scale_ = 0.f;
   if (proc_.state() != QProcess::NotRunning) {
     VRP_LOG("live: stopping virtual display (pid %lld)",
             static_cast<long long>(proc_.processId()));

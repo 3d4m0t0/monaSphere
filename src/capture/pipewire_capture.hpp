@@ -78,11 +78,14 @@ class PipewireCapture {
 
   /**
    * Takes ownership of pw_fd.
+   * @param prefer_w/h Preferred SPA_FORMAT_VIDEO_size (KWin resizes virtual
+   *        MONITOR streams to this). Pass live_virtual_size — a hardcoded
+   *        1920×1080 preferred size used to shrink 4K Virtual-* down to 1080p.
    * @param consumer_modifiers DRM modifiers this process can sample (from Vulkan).
    *        Empty → LINEAR only. Do not include MOD_INVALID (forces SHM demote on NVIDIA).
    */
   bool start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial = 0,
-             std::vector<uint64_t> consumer_modifiers = {});
+             std::vector<uint64_t> consumer_modifiers = {}, int prefer_w = 0, int prefer_h = 0);
   void stop();
 
   bool running() const { return running_.load(std::memory_order_acquire); }
@@ -121,6 +124,8 @@ class PipewireCapture {
 
   std::thread thread_;
   std::vector<uint64_t> consumer_modifiers_;
+  int prefer_w_ = 0;
+  int prefer_h_ = 0;
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_{false};
   std::atomic<int> width_{0};

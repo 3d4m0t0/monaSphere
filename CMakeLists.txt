@@ -212,6 +212,8 @@ add_library(vrp_core STATIC
   src/ui/vr_menu.cpp
   src/net/dlna_client.cpp
   src/input/gamepad.cpp
+  src/input/pad_filter.cpp
+  src/input/pad_hook_bridge.cpp
   third_party/miniaudio/miniaudio_impl.cpp
 )
 if(VRP_HAS_PIPEWIRE)
@@ -325,12 +327,23 @@ add_executable(vrp_player
   src/capture/desktop_env.hpp
   src/capture/kde_virtual_display.cpp
   src/capture/kde_virtual_display.hpp
+  src/capture/virtual_display_manager.cpp
+  src/capture/virtual_display_manager.hpp
   src/capture/kwin_window_placer.cpp
   src/capture/kwin_window_placer.hpp
   ${DRM_LEASE_HEADER}
   ${DRM_LEASE_CODE}
 )
 set_target_properties(vrp_player PROPERTIES OUTPUT_NAME monasphere)
+
+# LD_PRELOAD pad filter for [アプリ] guests (no /dev/uinput required).
+add_library(monasphere_padhook SHARED src/input/pad_hook_preload.cpp)
+target_include_directories(monasphere_padhook PRIVATE ${CMAKE_SOURCE_DIR}/src)
+find_package(Threads REQUIRED)
+target_link_libraries(monasphere_padhook PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+set_target_properties(monasphere_padhook PROPERTIES OUTPUT_NAME monasphere_padhook)
+add_dependencies(vrp_player monasphere_padhook)
+
 find_package(X11 REQUIRED)
 find_library(XTST_LIBRARY Xtst REQUIRED)
 find_library(XRANDR_LIBRARY Xrandr REQUIRED)
@@ -365,9 +378,12 @@ add_custom_command(TARGET vrp_player POST_BUILD
           $<TARGET_FILE_DIR:vrp_player>/shaders/gaia_sky_edr3_equirect.jpg
   COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:vrp_player>/translations
   COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_SOURCE_DIR}/translations $<TARGET_FILE_DIR:vrp_player>/translations
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:monasphere_padhook>
+          $<TARGET_FILE_DIR:vrp_player>/libmonasphere_padhook.so
 )
 
 install(TARGETS vrp_player RUNTIME DESTINATION bin)
+install(TARGETS monasphere_padhook LIBRARY DESTINATION lib)
 install(TARGETS vrp_gamepad_icons vrp_starfield ARCHIVE DESTINATION lib)
 install(FILES ${CMAKE_SOURCE_DIR}/src/ui/gamepad_icons.hpp DESTINATION include/vrp/ui)
 install(FILES ${CMAKE_SOURCE_DIR}/src/starfield/starfield.hpp DESTINATION include/vrp/starfield)

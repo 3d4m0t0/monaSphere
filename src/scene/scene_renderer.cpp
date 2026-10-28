@@ -116,6 +116,10 @@ struct PushConstants {
   int32_t is180;
   int32_t nv12;
   int32_t project;  // 1 = thumbnail samples a 90° forward window
+  int32_t cursor_on;
+  float cursor_u;
+  float cursor_v;
+  float cursor_aspect;
 };
 
 Mat4 rot_x(float a) {
@@ -1683,6 +1687,10 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   } else {
     pc.nv12 = nv12_full_range_ ? 2 : 1;
   }
+  pc.cursor_on = (mode_ == ProjectionMode::Flat && content_cursor_on_) ? 1 : 0;
+  pc.cursor_u = content_cursor_u_;
+  pc.cursor_v = content_cursor_v_;
+  pc.cursor_aspect = std::max(0.1f, content_aspect_);
   vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                      sizeof(pc), &pc);
 

@@ -254,7 +254,7 @@ class XrVulkanApp {
   std::chrono::steady_clock::time_point seek_back_next_{};
   std::chrono::steady_clock::time_point seek_fwd_next_{};
 
-  // Options / menu: short = file dialog, long = recenter (same timing as gamepad Start).
+  // Options / menu: long = VR menu (same timing as gamepad Options).
   bool menu_btn_down_ = false;
   bool menu_long_fired_ = false;
   std::chrono::steady_clock::time_point menu_down_at_{};

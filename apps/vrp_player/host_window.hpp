@@ -1,10 +1,13 @@
 #pragma once
 
 #include "drm_lease_probe.hpp"
+#include "input/pad_filter.hpp"
+#include "input/pad_hook_bridge.hpp"
 #include "options.hpp"
 #include "ui/hud_mesh.hpp"
 #include "video/video_decoder.hpp"
 #include "youtube_session.hpp"
+#include "capture/virtual_display_manager.hpp"
 #if defined(VRP_HAS_PIPEWIRE)
 #include "capture/pipewire_capture.hpp"
 #endif
@@ -79,14 +82,26 @@ class HostWindow : public QMainWindow {
   void onFsrAction(QAction* action);
   void onHzAction(QAction* action);
   void showAboutDialog();
-  /** Host Tools → Set up live capture… (portal auth / token). */
+  /** Host Tools → Set up live capture… (portal auth / token; x1→x2→x3). */
   void setupYouTubeCapture();
+  /** Start next span in yt_setup_queue_ (interactive Capture). */
+  void beginNextSetupSpan(bool first);
   /** HMD live_app entry: start (or restart) ScreenCast + Chromium --app. */
   void startLiveFromHmd(const QString& url);
-  /** Stop live capture (HMD Options / ○ long; not exposed in Tools). */
+  /** HMD [アプリ]: launch registered GUI on Virtual-monaSphere. */
+  void startLiveDesktopApp(const QString& exec, const QStringList& args, int monitor_span = 1,
+                           const QString& label = {});
+  /** Stop live capture (process exit / new launch; not exposed in Tools). */
   void stopYouTubeCapture();
   void ensureYouTubeSession();
-  void beginYouTubeCapture(bool host_setup, const QString& url_override = {});
+  void beginYouTubeCapture(bool host_setup, const QString& url_override = {},
+                           const QString& desktop_exec = {},
+                           const QStringList& desktop_args = {}, int monitor_span = 1,
+                           const QString& desktop_label = {});
+  /** After Virtual is gone: start a queued live↔app / live↔live switch. */
+  void flushPendingLiveStart();
+  /** Confirm Virtual is gone, then arm XR `video_pending_` for a queued file open. */
+  void finishQueuedVideoAfterVirtualGone();
   void onRuntimeChosen(bool wivrn);
   /** Auto (preferred_hz_==0) maps to 90 Hz; explicit 90/120 unchanged. */
   int effectivePreferredHz() const { return preferred_hz_ <= 0 ? 90 : preferred_hz_; }
@@ -102,6 +117,8 @@ class HostWindow : public QMainWindow {
   void restoreWindowGeometry();
   void saveWindowGeometry() const;
   void loadAppConf();
+  /** Re-read live_* keys from monasphere.conf (scale/size edits without app restart). */
+  void reloadLiveCaptureConf();
   void saveAppConf() const;
   void setSessionChrome(bool session_active);
   void setHealth(const QString& health, const QString& detail);
@@ -208,7 +225,6 @@ class HostWindow : public QMainWindow {
   std::mutex menu_mu_;
   vrp::VrMenu* vr_menu_ = nullptr;
   std::atomic<bool> controls_help_{false};
-  std::atomic<int64_t> controls_help_until_ms_{0};
   mutable std::mutex hud_toast_mu_;
   QString hud_toast_;
   std::chrono::steady_clock::time_point hud_toast_until_{};
@@ -289,6 +305,13 @@ class HostWindow : public QMainWindow {
   std::atomic<bool> gamepad_enabled_{true};
   /** XR thread holds SDL. The UI must not init/quit the subsystem then. */
   std::atomic<bool> gamepad_sdl_owned_{false};
+  /**
+   * [アプリ] preferred: LD_PRELOAD hook in the guest (no /dev/uinput).
+   * Optional legacy: PadFilter grab+uinput when hook lib is missing.
+   */
+  vrp::PadHookBridge pad_hook_;
+  vrp::PadFilter pad_filter_;
+  bool pad_hook_active_ = false;
   /** Confirm/back glyphs: PlayStation ×/○ while a Sony HMD or pad is connected. */
   std::atomic<bool> face_sony_{false};
   /** Menu-button caption. Sony pads say OPTION. Xbox and other XInput pads say MENU. */
@@ -356,17 +379,50 @@ class HostWindow : public QMainWindow {
   bool logged_session_refresh_hz_ = false;
   qint64 sync_lag_hold_until_ms_ = 0;  // keep 「フレーム遅れ」 visible briefly
 
-  /** Persisted ScreenCast restore token (also held by the live session). */
-  QString live_restore_token_;
+  /**
+   * ScreenCast restore tokens per Virtual span (x1–x3).
+   * Bare live_restore_token= mirrors x1 for older conf.
+   */
+  QMap<int, QString> live_restore_tokens_;
+  QString live_restore_token_;  // alias of tokens_[1]
+  /** Span used by the in-flight / last live session (1–3). */
+  int live_session_span_ = 1;
+  QString tokenForSpan(int span) const;
+  void saveTokenForSpan(int span, const QString& token);
+  /** Push conf tokens into VirtualDisplayManager (source of truth at runtime). */
+  void syncTokensIntoManager();
+  /** Width fixed at live_virtual_w_; height shrinks for x2/x3 (8:3 / 4:1). */
+  void virtualSizeForSpan(int span, int* out_w, int* out_h) const;
+  int spanFromVirtualSize(int width, int height) const;
+  vrp::VirtualDisplayManager::Spec virtualSpecForSpan(int span) const;
+  /** Destroy Virtual when leaving live (video / [アプリ] / shutdown). */
+  void destroyVirtualForLeaveLive();
   struct LiveAppEntry {
     QString name;
     QString url;
   };
   /** From conf live_app[N]=Name|URL (empty slots skipped). */
   QVector<LiveAppEntry> live_apps_;
+  struct LiveDesktopTitle {
+    QString name;
+    int monitor_span = 1;  // x1–x3 (fixed width; shorter height)
+    QStringList args;
+  };
+  struct LiveDesktopAppEntry {
+    QString name;
+    QString exec;
+    QStringList args;
+    QVector<LiveDesktopTitle> titles;
+  };
+  /** From conf live_desktop_app[N]=Name|exec and .title[M]=Name|x1…x3|args… */
+  QVector<LiveDesktopAppEntry> live_desktop_apps_;
   QString firstLiveAppUrl() const;
   bool live_capture_monitor_ = true;
   bool live_virtual_ = true;
+  /**
+   * Base Virtual size (x1). x2/x3 keep this width and reduce height
+   * (e.g. 3840×2160 → 3840×1440 → 3840×960).
+   */
   int live_virtual_w_ = 1280;
   int live_virtual_h_ = 720;
   /** krfb-virtualmonitor --scale (2 = 200%). */
@@ -379,10 +435,15 @@ class HostWindow : public QMainWindow {
   /** Filled on XR thread from PipewireDmaTexture::query_sampleable_modifiers. */
   std::vector<uint64_t> live_drm_modifiers_;
 
+  vrp::VirtualDisplayManager* vdisp_mgr_ = nullptr;
   vrp::YouTubeSession* yt_session_ = nullptr;
   /** Tools → Set up phases: Capture (interactive) → Refresh (silent restore) → Done. */
   enum class YtSetupPhase { None, Capture, Refresh };
   YtSetupPhase yt_setup_phase_ = YtSetupPhase::None;
+  /** Remaining spans for multi setup (e.g. 2,3 after x1 Capture started). */
+  QVector<int> yt_setup_queue_;
+  /** After Refresh OK, stopped → beginNextSetupSpan for the next queue entry. */
+  bool yt_setup_continue_ = false;
   /** Tools → Set up: after Streaming, auto-stop (keep vdisp + token). */
   bool yt_host_setup_stop_after_stream_ = false;
   /** Host setup / post-setup: do not bind live frames on the HMD Flat panel. */
@@ -392,10 +453,32 @@ class HostWindow : public QMainWindow {
   /** Earliest wall-clock ms when HMD restore may call portal Start (after stop settle). */
   qint64 yt_restore_ready_ms_ = 0;
   /**
+   * Queued HMD start while the previous session is Stopping / Virtual is still
+   * being removed. Flushed from stopped() after kscreen clear.
+   */
+  enum class YtPendingKind { None, Live, Desktop, Video };
+  YtPendingKind yt_pending_kind_ = YtPendingKind::None;
+  QString yt_pending_url_;
+  QString yt_pending_exec_;
+  QStringList yt_pending_args_;
+  int yt_pending_span_ = 1;
+  QString yt_pending_label_;
+  /**
+   * After Virtual is confirmed gone, XR opens pending_video_ (set with video_pending_).
+   * Used when opening a file while live/[アプリ]/Virtual still exists.
+   */
+  std::atomic<bool> yt_await_video_after_stop_{false};
+  /**
    * UI/Tools or portal Closed → XR thread tears down DMA before PipeWire stop
    * (otherwise VkImage + revoked dmabuf → SEGV).
    */
   std::atomic<bool> yt_stop_requested_{false};
+  /** Bumped on each stopYouTubeCapture — stale fallback timers must not stop the next session. */
+  std::atomic<uint64_t> yt_stop_gen_{0};
+  /** After desktop [アプリ] process exit: open AppsList only after stop() finishes. */
+  std::atomic<bool> yt_return_apps_menu_{false};
+  /** Set on Qt stopped() when return-apps was requested — XR opens menu next frame. */
+  std::atomic<bool> yt_show_apps_after_stop_{false};
   /** XR thread only: log once when async live-monitor start settles. */
   bool yt_audio_pending_log_ = false;
   int yt_audio_fail_retries_ = 0;

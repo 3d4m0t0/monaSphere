@@ -8,6 +8,7 @@
 #include "audio/pulse_monitor.hpp"
 #include "common.hpp"
 #include "input/gamepad.hpp"
+#include "input/pad_filter.hpp"
 #include "scene/fsr1_upscaler.hpp"
 #include "scene/scene_renderer.hpp"
 #include "ui/vr_menu.hpp"
@@ -17,6 +18,7 @@
 #include "video/video_decoder.hpp"
 #include "xr/xr_vulkan_app.hpp"
 #include "youtube_session.hpp"
+#include "capture/kde_virtual_display.hpp"
 #include "capture/kwin_window_placer.hpp"
 #if defined(VRP_HAS_PIPEWIRE)
 #include "capture/pipewire_capture.hpp"
@@ -76,6 +78,7 @@
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QMap>
+#include <QProcess>
 #include <QRegularExpression>
 
 #include <chrono>
@@ -128,6 +131,7 @@ HostWindow::~HostWindow() {
   shutting_down_.store(true);
   thumb_cancel_.store(true);
   if (yt_session_) yt_session_->shutdown();
+  destroyVirtualForLeaveLive();
   if (!shutdownXrSession(10000, true)) {
     VRP_ERR("XR thread did not exit in destructor — detaching (last resort)");
     if (xr_thread_.joinable()) xr_thread_.detach();
@@ -143,6 +147,7 @@ void HostWindow::closeEvent(QCloseEvent* event) {
   shutting_down_.store(true);
   thumb_cancel_.store(true);
   if (yt_session_) yt_session_->shutdown();
+  destroyVirtualForLeaveLive();
   if (!shutdownXrSession(10000, true)) {
     appendLog(tr("XR thread hung — detach"));
     VRP_ERR("XR thread join timed out on close — detaching");
@@ -707,10 +712,7 @@ void HostWindow::syncDisconnectedUi(const QString& detail) {
 }
 
 void HostWindow::showControlsHelp() {
-  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::steady_clock::now().time_since_epoch())
-                      .count();
-  controls_help_until_ms_.store(ms + 12000);
+  // Startup-only guide: stays until B/× (no countdown auto-close).
   controls_help_.store(true);
   requestHudPaint();
 }
@@ -789,17 +791,8 @@ void HostWindow::paintHudNow() {
     hud_paint_done_.store(snap.gen);
     return;
   }
-  int seconds_left = 0;
-  if (help) {
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count();
-    const int64_t left_ms = controls_help_until_ms_.load() - ms;
-    seconds_left = left_ms <= 0 ? 0 : static_cast<int>((left_ms + 999) / 1000);
-  }
   const vrp::HudPaintResult hud =
-      help     ? vrp::paint_controls_help(hud_w_, hud_h_, seconds_left, face_sony_.load(),
-                                          menu_option_.load())
+      help     ? vrp::paint_controls_help(hud_w_, hud_h_, face_sony_.load(), menu_option_.load())
       : kind == 5 ? vrp::paint_hud_toast(toast, hud_w_, hud_h_)
                   : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load(), menu_option_.load());
   QImage thumb = (!help && snap.visible) ? vrp::paint_file_thumb(snap) : QImage();
@@ -1161,9 +1154,12 @@ void migrateYoutubeConfKeysToLive() {
   in.close();
   if (clear_token) {
     for (QString& line : lines) {
-      if (line.startsWith(QStringLiteral("live_restore_token="))) {
-        line = QStringLiteral("live_restore_token=");
-        changed = true;
+      if (line.startsWith(QStringLiteral("live_restore_token"))) {
+        const int eq = line.indexOf(QLatin1Char('='));
+        if (eq > 0) {
+          line = line.left(eq + 1);
+          changed = true;
+        }
       }
     }
   }
@@ -1271,6 +1267,33 @@ QString legacyQtValue(const QString& group, const QString& key) {
   return {};
 }
 
+QString expandLiveArgPath(QString a) {
+  a = a.trimmed();
+  if (a.startsWith(QStringLiteral("~/"))) return QDir::homePath() + a.mid(1);
+  if (a == QLatin1String("~")) return QDir::homePath();
+  return a;
+}
+
+/**
+ * Conf args are `|`-separated. A field may also be shell-like argv
+ * (`-L ~/core.so ~/rom.zip`) so QProcess gets real separate arguments.
+ */
+QStringList normalizeLiveExecArgs(const QStringList& fields) {
+  QStringList out;
+  for (const QString& field : fields) {
+    const QString f = field.trimmed();
+    if (f.isEmpty()) continue;
+    const bool multi = f.contains(QLatin1Char(' ')) || f.contains(QLatin1Char('\t')) ||
+                       f.contains(QLatin1Char('"')) || f.contains(QLatin1Char('\''));
+    const QStringList toks = multi ? QProcess::splitCommand(f) : QStringList{f};
+    for (const QString& t : toks) {
+      const QString e = expandLiveArgPath(t);
+      if (!e.isEmpty()) out.push_back(e);
+    }
+  }
+  return out;
+}
+
 }  // namespace
 
 void HostWindow::saveAppConf() const {
@@ -1333,6 +1356,7 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("sky_lat"), QStringLiteral("35.68")},
       {QStringLiteral("sky_lon"), QStringLiteral("139.65")},
       {QStringLiteral("live_restore_token"), QString()},
+      {QStringLiteral("live_setup_spans"), QStringLiteral("1,2,3")},
       {QStringLiteral("live_capture"), QStringLiteral("monitor")},
       {QStringLiteral("live_output"), QString()},
       {QStringLiteral("live_virtual"), QStringLiteral("1")},
@@ -1363,8 +1387,12 @@ void HostWindow::loadAppConf() {
   bool legacy_pad_gamepad = false;
   bool saw_gamepad_key = false;
   live_apps_.clear();
+  live_desktop_apps_.clear();
   QMap<int, LiveAppEntry> live_by_index;
   QVector<LiveAppEntry> live_unindexed;
+  QMap<int, LiveDesktopAppEntry> desktop_by_index;
+  QVector<LiveDesktopAppEntry> desktop_unindexed;
+  QMap<int, QMap<int, LiveDesktopTitle>> desktop_titles_by_app;
   QString legacy_youtube_url;
   bool saw_live_app_key = false;
   while (!user.atEnd()) {
@@ -1444,8 +1472,20 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(8).toFloat(&ok);
       if (ok && v >= -180.f && v <= 180.f) sky_lon_ = v;
-    } else if (line.startsWith(QStringLiteral("live_restore_token="))) {
-      live_restore_token_ = line.mid(19);
+    } else if (line.startsWith(QStringLiteral("live_restore_token"))) {
+      // live_restore_token[xN]=…  or legacy live_restore_token=
+      const QRegularExpression span_tok(
+          QStringLiteral("^live_restore_token\\[x([1-3])\\]=(.*)$"));
+      const QRegularExpressionMatch sm = span_tok.match(line);
+      if (sm.hasMatch()) {
+        const int span = sm.captured(1).toInt();
+        const QString tok = sm.captured(2);
+        live_restore_tokens_.insert(span, tok);
+        if (span == 1) live_restore_token_ = tok;
+      } else if (line.startsWith(QStringLiteral("live_restore_token="))) {
+        live_restore_token_ = line.mid(19);
+        live_restore_tokens_.insert(1, live_restore_token_);
+      }
     } else if (line.startsWith(QStringLiteral("youtube_url="))) {
       // Legacy — migrate into live_app[0] only when no live_app entries exist.
       const QString u = line.mid(12).trimmed();
@@ -1478,6 +1518,78 @@ void HostWindow::loadAppConf() {
       }
       if (idx >= 0) live_by_index.insert(idx, {name, url});
       else live_unindexed.push_back({name, url});
+    } else if (line.startsWith(QStringLiteral("live_desktop_app"))) {
+      // live_desktop_app[N].title[M]=Name|x1…x3|arg…  (monitor span + launch options)
+      const QRegularExpression title_re(
+          QStringLiteral("^live_desktop_app\\[(\\d+)\\]\\.title\\[(\\d+)\\]=(.*)$"));
+      const QRegularExpressionMatch tm = title_re.match(line);
+      if (tm.hasMatch()) {
+        const int app_i = tm.captured(1).toInt();
+        const int title_i = tm.captured(2).toInt();
+        const QString rest = tm.captured(3).trimmed();
+        if (rest.isEmpty()) continue;
+        const QStringList parts = rest.split(QLatin1Char('|'));
+        if (parts.isEmpty() || parts[0].trimmed().isEmpty()) continue;
+        LiveDesktopTitle t;
+        t.name = parts[0].trimmed();
+        t.monitor_span = 1;
+        if (parts.size() >= 2) {
+          const QString spec = parts[1].trimmed().toLower();
+          const QRegularExpression span_re(QStringLiteral("^x([1-3])$"));
+          const QRegularExpressionMatch sm = span_re.match(spec);
+          if (sm.hasMatch()) {
+            t.monitor_span = sm.captured(1).toInt();
+          } else {
+            // Legacy Name|WxH|… → infer span from height (width is fixed now).
+            const QRegularExpression size_re(QStringLiteral("^(\\d+)x(\\d+)$"));
+            const QRegularExpressionMatch zm = size_re.match(spec);
+            if (zm.hasMatch()) {
+              const int tw = zm.captured(1).toInt();
+              const int th = zm.captured(2).toInt();
+              t.monitor_span = spanFromVirtualSize(tw, th);
+            }
+          }
+        }
+        QStringList raw_args;
+        for (int i = 2; i < parts.size(); ++i) {
+          const QString a = parts[i].trimmed();
+          if (!a.isEmpty()) raw_args.push_back(a);
+        }
+        t.args = normalizeLiveExecArgs(raw_args);
+        desktop_titles_by_app[app_i].insert(title_i, t);
+        continue;
+      }
+      // live_desktop_app[N]=Name|exec[|arg…]  or live_desktop_app=Name|exec
+      const QRegularExpression indexed(
+          QStringLiteral("^live_desktop_app\\[(\\d+)\\]=(.*)$"));
+      const QRegularExpressionMatch im = indexed.match(line);
+      QString rest;
+      int idx = -1;
+      if (im.hasMatch()) {
+        idx = im.captured(1).toInt();
+        rest = im.captured(2).trimmed();
+      } else if (line.startsWith(QStringLiteral("live_desktop_app="))) {
+        rest = line.mid(17).trimmed();
+      } else {
+        continue;
+      }
+      if (rest.isEmpty()) continue;
+      const QStringList parts = rest.split(QLatin1Char('|'));
+      if (parts.size() < 2) continue;
+      const QString name = parts[0].trimmed();
+      const QString exec = parts[1].trimmed();
+      if (name.isEmpty() || exec.isEmpty()) continue;
+      LiveDesktopAppEntry e;
+      e.name = name;
+      e.exec = expandLiveArgPath(exec);
+      QStringList raw_args;
+      for (int i = 2; i < parts.size(); ++i) {
+        const QString a = parts[i].trimmed();
+        if (!a.isEmpty()) raw_args.push_back(a);
+      }
+      e.args = normalizeLiveExecArgs(raw_args);
+      if (idx >= 0) desktop_by_index.insert(idx, e);
+      else desktop_unindexed.push_back(e);
     } else if (line.startsWith(QStringLiteral("live_capture="))) {
       const QString v = line.mid(13).trimmed().toLower();
       live_capture_monitor_ = (v != QLatin1String("window"));
@@ -1524,6 +1636,19 @@ void HostWindow::loadAppConf() {
     }
   } else {
     live_apps_ = live_unindexed;
+  }
+
+  if (!desktop_by_index.isEmpty()) {
+    for (auto it = desktop_by_index.cbegin(); it != desktop_by_index.cend(); ++it) {
+      LiveDesktopAppEntry e = it.value();
+      const auto tit = desktop_titles_by_app.constFind(it.key());
+      if (tit != desktop_titles_by_app.cend()) {
+        for (auto jt = tit->cbegin(); jt != tit->cend(); ++jt) e.titles.push_back(jt.value());
+      }
+      live_desktop_apps_.push_back(e);
+    }
+  } else {
+    live_desktop_apps_ = desktop_unindexed;
   }
 
   const bool need_live_seed = live_apps_.isEmpty();
@@ -1700,7 +1825,7 @@ void HostWindow::buildMenus() {
   connect(settings, &QMenu::aboutToShow, this, [this] { refreshGamepadActionLabel(); });
 
   auto* tools = menuBar()->addMenu(tr("Tools"));
-  tools->addAction(tr("Set up live capture…"), this, &HostWindow::setupYouTubeCapture);
+  tools->addAction(tr("Set up live capture (x1–x3)…"), this, &HostWindow::setupYouTubeCapture);
 
   auto* help = menuBar()->addMenu(tr("Help"));
   help->addAction(tr("About"), this, &HostWindow::showAboutDialog);
@@ -1721,25 +1846,142 @@ void HostWindow::refreshGamepadActionLabel() {
   act_gamepad_->setText(name);
 }
 
+QString HostWindow::tokenForSpan(int span) const {
+  const int s = std::clamp(span, 1, 3);
+  if (vdisp_mgr_) {
+    const QString t = vdisp_mgr_->token(s);
+    if (!t.isEmpty()) return t;
+  }
+  const auto it = live_restore_tokens_.constFind(s);
+  if (it != live_restore_tokens_.cend() && !it.value().isEmpty()) return it.value();
+  if (s == 1 && !live_restore_token_.isEmpty()) return live_restore_token_;
+  return {};
+}
+
+void HostWindow::saveTokenForSpan(int span, const QString& token) {
+  const int s = std::clamp(span, 1, 3);
+  // Prefer manager::setToken from session; this path syncs conf + manager without re-emit loop.
+  if (vdisp_mgr_) vdisp_mgr_->loadToken(s, token);
+  live_restore_tokens_.insert(s, token);
+  setMonasphereConfKey(QStringLiteral("live_restore_token[x%1]").arg(s), token);
+  if (s == 1) {
+    live_restore_token_ = token;
+    setMonasphereConfKey(QStringLiteral("live_restore_token"), token);
+  }
+}
+
+void HostWindow::syncTokensIntoManager() {
+  if (!vdisp_mgr_) return;
+  for (int s = 1; s <= 3; ++s) {
+    QString t = live_restore_tokens_.value(s);
+    if (t.isEmpty() && s == 1) t = live_restore_token_;
+    if (!t.isEmpty()) vdisp_mgr_->loadToken(s, t);
+  }
+}
+
+void HostWindow::virtualSizeForSpan(int span, int* out_w, int* out_h) const {
+  const int s = std::clamp(span, 1, 3);
+  const int w = live_virtual_w_ > 0 ? live_virtual_w_ : 1280;
+  const int h1 = live_virtual_h_ > 0 ? live_virtual_h_ : 720;
+  int h = h1;
+  if (s == 2) {
+    // 8:3 into fixed width (3840×1440 when w=3840).
+    h = std::max(360, (w * 3) / 8);
+  } else if (s == 3) {
+    // 4:1 into fixed width (3840×960 when w=3840).
+    h = std::max(360, w / 4);
+  }
+  if (out_w) *out_w = w;
+  if (out_h) *out_h = h;
+}
+
+int HostWindow::spanFromVirtualSize(int /*width*/, int height) const {
+  if (height <= 0) return 1;
+  int w1 = 0, h1 = 0, h2 = 0, h3 = 0;
+  virtualSizeForSpan(1, &w1, &h1);
+  virtualSizeForSpan(2, &w1, &h2);
+  virtualSizeForSpan(3, &w1, &h3);
+  const int d1 = std::abs(height - h1);
+  const int d2 = std::abs(height - h2);
+  const int d3 = std::abs(height - h3);
+  if (d2 <= d1 && d2 <= d3) return 2;
+  if (d3 <= d1 && d3 <= d2) return 3;
+  return 1;
+}
+
+vrp::VirtualDisplayManager::Spec HostWindow::virtualSpecForSpan(int span) const {
+  vrp::VirtualDisplayManager::Spec s;
+  const int sp = std::clamp(span, 1, 3);
+  s.span = sp;
+  s.name = vrp::KdeVirtualDisplay::nameForSpan(sp);
+  virtualSizeForSpan(sp, &s.width, &s.height);
+  s.scale = live_virtual_scale_;
+  return s;
+}
+
+void HostWindow::destroyVirtualForLeaveLive() {
+  if (!vdisp_mgr_) return;
+  vdisp_mgr_->destroy();
+}
+
 void HostWindow::ensureYouTubeSession() {
+  if (!vdisp_mgr_) {
+    vdisp_mgr_ = new vrp::VirtualDisplayManager(this);
+    connect(vdisp_mgr_, &vrp::VirtualDisplayManager::logMessage, this, &HostWindow::appendLog);
+    connect(vdisp_mgr_, &vrp::VirtualDisplayManager::busyStatus, this, [this](const QString& s) {
+      // Empty must clear — otherwise 「切替中」/「削除中」stick and XR skips DMA forever.
+      if (!yt_session_) return;
+      if (s.isEmpty()) yt_session_->clear_busy_status();
+      else yt_session_->set_busy_status(s);
+    });
+    connect(vdisp_mgr_, &vrp::VirtualDisplayManager::tokenChanged, this,
+            [this](int span, const QString& t) {
+              const int s = std::clamp(span, 1, 3);
+              live_session_span_ = s;
+              live_restore_tokens_.insert(s, t);
+              if (s == 1) live_restore_token_ = t;
+              // Persist non-empty; empty clear stays in-memory (other spans untouched in conf).
+              if (!t.isEmpty()) {
+                setMonasphereConfKey(QStringLiteral("live_restore_token[x%1]").arg(s), t);
+                if (s == 1) setMonasphereConfKey(QStringLiteral("live_restore_token"), t);
+                appendLog(tr("Live: saved restore token for x%1 (%2 chars)").arg(s).arg(t.size()));
+              }
+            });
+    syncTokensIntoManager();
+  }
   if (yt_session_) return;
   yt_session_ = new vrp::YouTubeSession(this);
+  yt_session_->set_virtual_manager(vdisp_mgr_);
   connect(yt_session_, &vrp::YouTubeSession::logMessage, this, &HostWindow::appendLog);
   connect(yt_session_, &vrp::YouTubeSession::toast, this, [this](const QString& m) {
     showHudToast(m);
   });
   connect(yt_session_, &vrp::YouTubeSession::restoreTokenChanged, this, [this](const QString& t) {
-    live_restore_token_ = t;
-    setMonasphereConfKey(QStringLiteral("live_restore_token"), t);
+    // Session → manager (Host persists via manager::tokenChanged).
+    if (!vdisp_mgr_) return;
+    const int span = vdisp_mgr_->active_span() > 0
+                         ? vdisp_mgr_->active_span()
+                         : (yt_session_ ? spanFromVirtualSize(yt_session_->virtual_w(),
+                                                              yt_session_->virtual_h())
+                                        : live_session_span_);
+    if (t.isEmpty()) vdisp_mgr_->clearToken(span);
+    else vdisp_mgr_->setToken(span, t);
   });
   connect(yt_session_, &vrp::YouTubeSession::failed, this, [this](const QString& e) {
+    pad_hook_.stop();
+    pad_hook_active_ = false;
+    pad_filter_.stop();
     appendLog(e);
     if (yt_setup_phase_ == YtSetupPhase::Refresh) {
       yt_setup_phase_ = YtSetupPhase::None;
+      yt_setup_queue_.clear();
+      yt_setup_continue_ = false;
       appendLog(tr("Live setup: restore verify failed — HMD live apps may ask host to approve again"));
       showHudToast(tr("Setup: restore verify failed"));
     } else if (yt_setup_phase_ == YtSetupPhase::Capture) {
       yt_setup_phase_ = YtSetupPhase::None;
+      yt_setup_queue_.clear();
+      yt_setup_continue_ = false;
       showHudToast(tr("Live setup failed"));
     } else {
       showHudToast(tr("Live capture failed"));
@@ -1754,29 +1996,44 @@ void HostWindow::ensureYouTubeSession() {
     }
     // Host Tools setup: Capture (interactive token) then optional Refresh (silent restore).
     if (yt_setup_phase_ == YtSetupPhase::Capture) {
-      const bool have_token = !live_restore_token_.isEmpty();
-      if (!have_token) {
+      const QString tok = tokenForSpan(live_session_span_);
+      if (tok.isEmpty()) {
         yt_setup_phase_ = YtSetupPhase::None;
+        yt_setup_queue_.clear();
+        yt_setup_continue_ = false;
         yt_host_setup_stop_after_stream_ = false;
-        appendLog(tr("Live setup FAILED — portal returned no restore_token. "
+        appendLog(tr("Live setup FAILED — portal returned no restore_token for x%1. "
                      "On the KDE share dialog, enable “Remember” / allow restore, "
-                     "then run Tools → Set up live capture again."));
+                     "then run Tools → Set up live capture again.")
+                      .arg(live_session_span_));
         showHudToast(tr("No token — check Remember on host dialog"));
         QTimer::singleShot(800, this, [this] { stopYouTubeCapture(); });
         return;
       }
-      appendLog(tr("Live setup: token saved (%1 chars) — stopping, then verifying restore…")
-                    .arg(live_restore_token_.size()));
-      showHudToast(tr("Token saved — verifying restore…"));
+      appendLog(tr("Live setup: x%1 token saved (%2 chars) — stopping, then verifying restore…")
+                    .arg(live_session_span_)
+                    .arg(tok.size()));
+      showHudToast(tr("Token x%1 saved — verifying…").arg(live_session_span_));
       QTimer::singleShot(1000, this, [this] { stopYouTubeCapture(); });
       return;
     }
     if (yt_setup_phase_ == YtSetupPhase::Refresh) {
-      yt_setup_phase_ = YtSetupPhase::None;
       yt_host_setup_stop_after_stream_ = false;
-      appendLog(tr("Live setup OK — restore verified (token %1 chars); closing Chrome")
-                    .arg(live_restore_token_.size()));
-      showHudToast(tr("Setup OK — use HMD live apps"));
+      appendLog(tr("Live setup OK — x%1 restore verified (token %2 chars)")
+                    .arg(live_session_span_)
+                    .arg(tokenForSpan(live_session_span_).size()));
+      if (!yt_setup_queue_.isEmpty()) {
+        const int next = yt_setup_queue_.front();
+        yt_setup_continue_ = true;
+        yt_setup_phase_ = YtSetupPhase::None;
+        showHudToast(tr("x%1 OK — next: approve x%2 on host").arg(live_session_span_).arg(next));
+        appendLog(tr("Live setup: continuing with x%1…").arg(next));
+      } else {
+        yt_setup_continue_ = false;
+        yt_setup_phase_ = YtSetupPhase::None;
+        showHudToast(tr("Setup OK — all spans ready"));
+        appendLog(tr("Live setup: all queued spans registered"));
+      }
       QTimer::singleShot(1000, this, [this] { stopYouTubeCapture(); });
       return;
     }
@@ -1786,36 +2043,160 @@ void HostWindow::ensureYouTubeSession() {
     }
   });
   connect(yt_session_, &vrp::YouTubeSession::streamLost, this, [this] {
-    // Portal Session.Closed on Qt thread — XR must drop DMA before PipeWire teardown.
+    // Portal Session.Closed often arrives *before* QProcess::finished when RetroArch
+    // exits. Arm [アプリ] return here so stopped() still opens the menu after Virtual
+    // delete (same procedure as desktopAppExited).
+    if (yt_session_ && yt_session_->desktop_app_mode()) {
+      yt_return_apps_menu_.store(true, std::memory_order_release);
+    }
     yt_stop_requested_.store(true, std::memory_order_release);
   });
+  connect(yt_session_, &vrp::YouTubeSession::desktopAppExited, this, [this] {
+    // Ignore exit while a Live/[アプリ] switch is queued — stop() killed the old app on purpose.
+    if (yt_pending_kind_ != YtPendingKind::None) {
+      appendLog(tr("Desktop app exited during switch — ignored (queued session owns teardown)"));
+      return;
+    }
+    // 「終了中」→ XR DMA drop → stop() (Virtual stays) → stopped() destroys Virtual → [アプリ].
+    yt_return_apps_menu_.store(true, std::memory_order_release);
+    pad_hook_.set_block_guest(false);
+    pad_filter_.stop();  // legacy uinput grab only
+    yt_stop_requested_.store(true, std::memory_order_release);
+    appendLog(tr("Desktop app exited — Virtual 削除後に [アプリ]"));
+    showHudToast(tr("終了中…"));
+    const uint64_t stop_gen = yt_stop_gen_.load(std::memory_order_acquire);
+    QTimer::singleShot(4000, this, [this, stop_gen] {
+      if (yt_stop_gen_.load(std::memory_order_acquire) != stop_gen) return;
+      if (yt_pending_kind_ != YtPendingKind::None) return;
+      if (!yt_session_) return;
+      if (yt_session_->state() == vrp::YouTubeSession::State::Idle) {
+        if (yt_return_apps_menu_.exchange(false, std::memory_order_acq_rel)) {
+          destroyVirtualForLeaveLive();
+          yt_show_apps_after_stop_.store(true, std::memory_order_release);
+        }
+        return;
+      }
+      yt_session_->clear_busy_status();
+      yt_session_->stop();
+    });
+  });
   connect(yt_session_, &vrp::YouTubeSession::stopped, this, [this] {
-    // Portal needs settle time before the next restore_token Start.
-    yt_restore_ready_ms_ = QDateTime::currentMSecsSinceEpoch() + 5000;
-    if (yt_setup_phase_ == YtSetupPhase::Capture && !live_restore_token_.isEmpty()) {
+    pad_hook_.stop();
+    pad_hook_active_ = false;
+    pad_filter_.stop();
+    const bool virt_up = vdisp_mgr_ && vdisp_mgr_->alive();
+    yt_restore_ready_ms_ =
+        QDateTime::currentMSecsSinceEpoch() + (virt_up ? 800 : 2000);
+    // Video queue wins over [アプリ] return (open_video while live).
+    if (yt_await_video_after_stop_.load(std::memory_order_acquire) ||
+        yt_pending_kind_ == YtPendingKind::Video) {
+      yt_pending_kind_ = YtPendingKind::None;
+      yt_return_apps_menu_.store(false, std::memory_order_release);
+      appendLog(tr("Live cleanup done — removing Virtual before video"));
+      finishQueuedVideoAfterVirtualGone();
+      return;
+    }
+    if (yt_pending_kind_ != YtPendingKind::None) {
+      // Next start() → VirtualDisplayManager::ensure (reuse or recreate by resolution).
+      yt_return_apps_menu_.store(false, std::memory_order_release);
+      appendLog(tr("Live cleanup done — starting queued session (Virtual manager decides)"));
+      flushPendingLiveStart();
+      return;
+    }
+    if (yt_return_apps_menu_.exchange(false, std::memory_order_acq_rel)) {
+      destroyVirtualForLeaveLive();
+      if (yt_session_) yt_session_->clear_busy_status();
+      yt_show_apps_after_stop_.store(true, std::memory_order_release);
+      appendLog(tr("Live cleanup done — Virtual gone, opening [アプリ]"));
+      return;
+    }
+    if (yt_setup_phase_ == YtSetupPhase::Capture && !tokenForSpan(live_session_span_).isEmpty()) {
       yt_setup_phase_ = YtSetupPhase::Refresh;
-      appendLog(tr("Live setup: verifying ScreenCast restore (no HMD preview)…"));
-      QTimer::singleShot(3500, this, [this] {
+      appendLog(tr("Live setup: verifying ScreenCast restore for x%1 (no HMD preview)…")
+                    .arg(live_session_span_));
+      const int span = live_session_span_;
+      QTimer::singleShot(3500, this, [this, span] {
         if (yt_setup_phase_ != YtSetupPhase::Refresh) return;
         // Silent restore while still in setup — proves token works before HMD use.
         yt_hmd_suppress_live_.store(true, std::memory_order_release);
-        beginYouTubeCapture(/*host_setup=*/false);
+        beginYouTubeCapture(/*host_setup=*/false, /*url_override=*/{}, /*desktop_exec=*/{},
+                            /*desktop_args=*/{}, span);
+      });
+      return;
+    }
+    if (yt_setup_continue_) {
+      yt_setup_continue_ = false;
+      QTimer::singleShot(3500, this, [this] {
+        if (yt_setup_queue_.isEmpty()) return;
+        beginNextSetupSpan(/*first=*/false);
       });
       return;
     }
     if (yt_setup_phase_ == YtSetupPhase::Refresh) {
       // Refresh restore failed before Streaming — clear phase; keep suppress until HMD.
       yt_setup_phase_ = YtSetupPhase::None;
+      yt_setup_queue_.clear();
     }
+    // Plain stop (Tools / no queued switch): drop Virtual.
+    // Never reach here after a switch — pending path returns above. A stale fallback
+    // stop() used to land here and destroy Virtual under a new x3 session.
+    destroyVirtualForLeaveLive();
   });
 }
 
-void HostWindow::setupYouTubeCapture() {
-  // Host Tools: interactive auth → save token → stop → silent restore verify → stop.
-  // HMD Flat stays idle for the whole sequence (no live leftover frames).
+void HostWindow::beginNextSetupSpan(bool first) {
+  if (yt_setup_queue_.isEmpty()) {
+    yt_setup_phase_ = YtSetupPhase::None;
+    yt_setup_continue_ = false;
+    yt_hmd_suppress_live_.store(true, std::memory_order_release);
+    appendLog(tr("Live setup: finished (no spans left in queue)"));
+    return;
+  }
+  const int span = yt_setup_queue_.takeFirst();
+  live_session_span_ = span;
   yt_setup_phase_ = YtSetupPhase::Capture;
+  yt_setup_continue_ = false;
   yt_hmd_suppress_live_.store(true, std::memory_order_release);
-  beginYouTubeCapture(/*host_setup=*/true);
+  int setup_w = 0, setup_h = 0;
+  virtualSizeForSpan(span, &setup_w, &setup_h);
+  QStringList left;
+  for (int s : yt_setup_queue_) left << QStringLiteral("x%1").arg(s);
+  appendLog(tr("Live setup: registering token for x%1 (%2×%3)%4")
+                .arg(span)
+                .arg(setup_w)
+                .arg(setup_h)
+                .arg(left.isEmpty() ? QString()
+                                    : tr(" — then %1").arg(left.join(QStringLiteral(", ")))));
+  if (!first) {
+    showHudToast(tr("Host: pick %1 (Remember)")
+                     .arg(vrp::KdeVirtualDisplay::outputNameForSpan(span)));
+  }
+  beginYouTubeCapture(/*host_setup=*/true, /*url_override=*/{}, /*desktop_exec=*/{},
+                      /*desktop_args=*/{}, span);
+}
+
+void HostWindow::setupYouTubeCapture() {
+  // Host Tools: for each span — interactive auth → token → stop → silent restore verify.
+  // Default queue x1→x2→x3 so ultrawide tokens are registered in one Tools run.
+  // Override with live_setup_spans=1,2 or live_setup_spans=2,3 etc.
+  reloadLiveCaptureConf();
+  yt_setup_queue_.clear();
+  yt_setup_continue_ = false;
+  {
+    const QString list = monasphereConfValue(QStringLiteral("live_setup_spans")).trimmed();
+    if (!list.isEmpty()) {
+      for (const QString& part : list.split(QLatin1Char(','))) {
+        bool ok = false;
+        const int v = part.trimmed().toInt(&ok);
+        if (ok && v >= 1 && v <= 3 && !yt_setup_queue_.contains(v)) yt_setup_queue_.push_back(v);
+      }
+    }
+  }
+  if (yt_setup_queue_.isEmpty()) yt_setup_queue_ = {1, 2, 3};
+  QStringList shown;
+  for (int s : yt_setup_queue_) shown << QStringLiteral("x%1").arg(s);
+  appendLog(tr("Live setup: registering tokens for %1").arg(shown.join(QStringLiteral(" → "))));
+  beginNextSetupSpan(/*first=*/true);
 }
 
 QString HostWindow::firstLiveAppUrl() const {
@@ -1823,20 +2204,121 @@ QString HostWindow::firstLiveAppUrl() const {
   return QStringLiteral("https://www.youtube.com/");
 }
 
+void HostWindow::flushPendingLiveStart() {
+  if (yt_pending_kind_ == YtPendingKind::None) return;
+  if (!xr_running_.load(std::memory_order_acquire)) {
+    appendLog(tr("Live: queued switch aborted — XR session not running (HMD lost during teardown)"));
+    yt_pending_kind_ = YtPendingKind::None;
+    yt_pending_url_.clear();
+    yt_pending_exec_.clear();
+    yt_pending_args_.clear();
+    yt_pending_label_.clear();
+    yt_pending_span_ = 1;
+    if (yt_session_) yt_session_->clear_busy_status();
+    return;
+  }
+  const YtPendingKind kind = yt_pending_kind_;
+  const QString url = yt_pending_url_;
+  const QString exec = yt_pending_exec_;
+  const QStringList args = yt_pending_args_;
+  const int span = yt_pending_span_;
+  const QString label = yt_pending_label_;
+  yt_pending_kind_ = YtPendingKind::None;
+  yt_pending_url_.clear();
+  yt_pending_exec_.clear();
+  yt_pending_args_.clear();
+  yt_pending_label_.clear();
+  yt_pending_span_ = 1;
+  yt_hmd_start_waits_ = 0;
+
+  const bool kept_virtual = yt_session_ && yt_session_->virtual_display_alive();
+  appendLog(kept_virtual ? tr("Live: Virtual kept → start queued %1 (x%2)")
+                               .arg(kind == YtPendingKind::Live
+                                        ? tr("browser")
+                                        : (kind == YtPendingKind::Desktop ? tr("app") : tr("video")))
+                               .arg(span)
+                         : tr("Live: after Virtual gone → start queued %1 (x%2)")
+                               .arg(kind == YtPendingKind::Live
+                                        ? tr("browser")
+                                        : (kind == YtPendingKind::Desktop ? tr("app") : tr("video")))
+                               .arg(span));
+
+  const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
+  const int wait_ms =
+      now_ms < yt_restore_ready_ms_ ? static_cast<int>(yt_restore_ready_ms_ - now_ms) : 0;
+  // Extra settle only when Virtual topology changed (Monado DEVICE_LOST risk).
+  const int gate_ms = wait_ms + (kept_virtual ? 50 : 800);
+  auto xr_ok = [this] {
+    return xr_running_.load(std::memory_order_acquire) &&
+           !xr_stop_.load(std::memory_order_acquire);
+  };
+  if (kind == YtPendingKind::Live) {
+    QTimer::singleShot(gate_ms, this, [this, url, xr_ok] {
+      if (!xr_ok()) {
+        appendLog(tr("Live: queued browser aborted — XR not healthy after Virtual change"));
+        if (yt_session_) yt_session_->clear_busy_status();
+        return;
+      }
+      startLiveFromHmd(url);
+    });
+  } else if (kind == YtPendingKind::Desktop) {
+    QTimer::singleShot(gate_ms, this, [this, exec, args, span, label, xr_ok] {
+      if (!xr_ok()) {
+        appendLog(tr("Live: queued app aborted — XR not healthy after Virtual change"));
+        if (yt_session_) yt_session_->clear_busy_status();
+        return;
+      }
+      startLiveDesktopApp(exec, args, span, label);
+    });
+  } else if (kind == YtPendingKind::Video) {
+    QTimer::singleShot(gate_ms, this, [this, xr_ok] {
+      if (!xr_ok()) {
+        appendLog(tr("Live: queued video aborted — XR not healthy after Virtual change"));
+        return;
+      }
+      finishQueuedVideoAfterVirtualGone();
+    });
+  }
+}
+
+void HostWindow::finishQueuedVideoAfterVirtualGone() {
+  destroyVirtualForLeaveLive();
+  const auto deadline = QDateTime::currentMSecsSinceEpoch() + 8000;
+  while (QDateTime::currentMSecsSinceEpoch() < deadline) {
+    if (!vrp::KdeVirtualDisplay::anyManagedOutputExists()) break;
+    QThread::msleep(200);
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  }
+  const bool gone = !vrp::KdeVirtualDisplay::anyManagedOutputExists();
+  yt_await_video_after_stop_.store(false, std::memory_order_release);
+  if (yt_session_) yt_session_->clear_busy_status();
+  if (!gone) {
+    appendLog(tr("Virtual still listed — opening queued video anyway"));
+  } else {
+    appendLog(tr("Virtual removed — opening queued video"));
+  }
+  video_pending_.store(true, std::memory_order_release);
+}
+
 void HostWindow::startLiveFromHmd(const QString& url) {
   const QString open_url = url.trimmed().isEmpty() ? firstLiveAppUrl() : url.trimmed();
 
   // Prefer conf on disk (Tools setup may have just rewritten it).
-  const QString from_conf = monasphereConfValue(QStringLiteral("live_restore_token"));
-  if (!from_conf.isEmpty()) live_restore_token_ = from_conf;
+  reloadLiveCaptureConf();
+  const QString tok = tokenForSpan(1);
+  if (!tok.isEmpty()) {
+    live_restore_token_ = tok;
+    live_restore_tokens_.insert(1, tok);
+  }
 
   yt_hmd_suppress_live_.store(false, std::memory_order_release);
   yt_setup_phase_ = YtSetupPhase::None;
 
-  if (live_restore_token_.isEmpty()) {
-    appendLog(tr("Live: no restore token — use Tools → Set up live capture on the host first "
+  if (tokenForSpan(1).isEmpty()) {
+    appendLog(tr("Live: no restore token for x1 — use Tools → Set up live capture on the host first "
                  "(KDE: enable Remember on the share dialog)"));
-    showHudToast(tr("Host: Set up live capture first"));
+    showHudToast(tr("Host: Set up live capture first (x1)"));
+    yt_pending_kind_ = YtPendingKind::None;
     if (yt_session_ &&
         (yt_session_->active() || yt_session_->loading() ||
          yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
@@ -1848,15 +2330,21 @@ void HostWindow::startLiveFromHmd(const QString& url) {
   if (yt_session_ &&
       (yt_session_->active() || yt_session_->loading() ||
        yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
-    if (++yt_hmd_start_waits_ > 10) {
-      yt_hmd_start_waits_ = 0;
-      appendLog(tr("Live: previous session still busy — starting restore anyway"));
-    } else {
-      appendLog(tr("Live: waiting for previous session to stop… (%1)").arg(yt_hmd_start_waits_));
+    yt_pending_kind_ = YtPendingKind::Live;
+    yt_pending_url_ = open_url;
+    yt_pending_exec_.clear();
+    yt_pending_args_.clear();
+    yt_pending_label_.clear();
+    yt_pending_span_ = 1;
+    const bool reuse =
+        vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(1));
+    yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
+    appendLog(reuse ? tr("Live: queueing browser (Virtual reuse if same resolution)")
+                    : tr("Live: queueing browser (Virtual will recreate on start)"));
+    if (yt_session_->state() != vrp::YouTubeSession::State::Stopping) {
       stopYouTubeCapture();
-      QTimer::singleShot(1500, this, [this, open_url] { startLiveFromHmd(open_url); });
-      return;
     }
+    return;
   }
   yt_hmd_start_waits_ = 0;
 
@@ -1872,36 +2360,193 @@ void HostWindow::startLiveFromHmd(const QString& url) {
   beginYouTubeCapture(/*host_setup=*/false, open_url);
 }
 
-void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_override) {
+void HostWindow::startLiveDesktopApp(const QString& exec, const QStringList& args, int monitor_span,
+                                     const QString& label) {
+  const QString open_exec = exec.trimmed();
+  if (open_exec.isEmpty()) {
+    appendLog(tr("Desktop app: empty exec"));
+    return;
+  }
+  const int span = std::clamp(monitor_span > 0 ? monitor_span : 1, 1, 3);
+
+  reloadLiveCaptureConf();
+  yt_hmd_suppress_live_.store(false, std::memory_order_release);
+  yt_setup_phase_ = YtSetupPhase::None;
+
+  const QString tok = tokenForSpan(span);
+  if (tok.isEmpty()) {
+    appendLog(tr("Live: no restore token for x%1 — use Tools → Set up live capture at that "
+                 "span on the host first (Remember on the share dialog)")
+                  .arg(span));
+    showHudToast(tr("Host: Set up live capture first (x%1)").arg(span));
+    yt_pending_kind_ = YtPendingKind::None;
+    if (yt_session_ &&
+        (yt_session_->active() || yt_session_->loading() ||
+         yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
+      stopYouTubeCapture();
+    }
+    return;
+  }
+
+  if (yt_session_ &&
+      (yt_session_->active() || yt_session_->loading() ||
+       yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
+    yt_pending_kind_ = YtPendingKind::Desktop;
+    yt_pending_url_.clear();
+    yt_pending_exec_ = open_exec;
+    yt_pending_args_ = args;
+    yt_pending_span_ = span;
+    yt_pending_label_ = label;
+    const bool reuse =
+        vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(span));
+    yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
+    appendLog(reuse ? tr("Live: queueing desktop app (Virtual reuse if same resolution)")
+                    : tr("Live: queueing desktop app (Virtual will recreate on start)"));
+    if (yt_session_->state() != vrp::YouTubeSession::State::Stopping) {
+      stopYouTubeCapture();
+    }
+    return;
+  }
+  yt_hmd_start_waits_ = 0;
+
+  const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
+  if (now_ms < yt_restore_ready_ms_) {
+    const int wait_ms = static_cast<int>(yt_restore_ready_ms_ - now_ms);
+    appendLog(tr("Live: waiting %1 ms for ScreenCast settle…").arg(wait_ms));
+    QTimer::singleShot(wait_ms + 50, this, [this, open_exec, args, span, label] {
+      startLiveDesktopApp(open_exec, args, span, label);
+    });
+    return;
+  }
+
+  int use_w = 0, use_h = 0;
+  virtualSizeForSpan(span, &use_w, &use_h);
+  appendLog(tr("Desktop app HMD: %1 x%2 (%3×%4, token %5 chars)")
+                .arg(label.isEmpty() ? open_exec : label)
+                .arg(span)
+                .arg(use_w)
+                .arg(use_h)
+                .arg(tok.size()));
+  beginYouTubeCapture(/*host_setup=*/false, /*url_override=*/{}, open_exec, args, span, label);
+}
+
+void HostWindow::reloadLiveCaptureConf() {
+  QFile user(monasphereConfPath());
+  if (!user.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+  while (!user.atEnd()) {
+    const QString line = QString::fromUtf8(user.readLine()).trimmed();
+    if (line.startsWith(QStringLiteral("live_restore_token"))) {
+      const QRegularExpression span_tok(
+          QStringLiteral("^live_restore_token\\[x([1-3])\\]=(.*)$"));
+      const QRegularExpressionMatch sm = span_tok.match(line);
+      if (sm.hasMatch()) {
+        const int span = sm.captured(1).toInt();
+        const QString tok = sm.captured(2);
+        live_restore_tokens_.insert(span, tok);
+        if (span == 1) live_restore_token_ = tok;
+      } else if (line.startsWith(QStringLiteral("live_restore_token="))) {
+        live_restore_token_ = line.mid(19);
+        live_restore_tokens_.insert(1, live_restore_token_);
+      }
+    } else if (line.startsWith(QStringLiteral("live_capture="))) {
+      const QString v = line.mid(13).trimmed().toLower();
+      live_capture_monitor_ = (v != QLatin1String("window"));
+    } else if (line.startsWith(QStringLiteral("live_output="))) {
+      live_output_ = line.mid(12).trimmed();
+    } else if (line.startsWith(QStringLiteral("live_virtual="))) {
+      bool ok = false;
+      const int v = line.mid(13).toInt(&ok);
+      if (ok) live_virtual_ = v != 0;
+    } else if (line.startsWith(QStringLiteral("live_virtual_size="))) {
+      const QString v = line.mid(18).trimmed().toLower();
+      const QRegularExpression re(QStringLiteral("^(\\d+)x(\\d+)$"));
+      const QRegularExpressionMatch m = re.match(v);
+      if (m.hasMatch()) {
+        const int w = m.captured(1).toInt();
+        const int h = m.captured(2).toInt();
+        if (w >= 640 && w <= 7680 && h >= 360 && h <= 4320) {
+          live_virtual_w_ = w;
+          live_virtual_h_ = h;
+        }
+      }
+    } else if (line.startsWith(QStringLiteral("live_virtual_scale="))) {
+      bool ok = false;
+      const float v = line.mid(19).toFloat(&ok);
+      if (ok && v >= 1.f && v <= 3.f) live_virtual_scale_ = v;
+    } else if (line.startsWith(QStringLiteral("live_chrome_scale="))) {
+      bool ok = false;
+      const float v = line.mid(17).toFloat(&ok);
+      if (ok && v >= 1.f && v <= 3.f) live_chrome_scale_ = v;
+    } else if (line.startsWith(QStringLiteral("live_cursor_scale="))) {
+      bool ok = false;
+      const int v = line.mid(17).toInt(&ok);
+      if (ok && v >= 1 && v <= 6) live_cursor_scale_ = v;
+    } else if (line.startsWith(QStringLiteral("live_chrome_profile="))) {
+      const QString v = line.mid(19).trimmed().toLower();
+      live_chrome_default_profile_ = (v != QLatin1String("isolated"));
+    }
+  }
+  syncTokensIntoManager();
+}
+
+void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_override,
+                                     const QString& desktop_exec, const QStringList& desktop_args,
+                                     int monitor_span, const QString& desktop_label) {
 #if !defined(VRP_HAS_PIPEWIRE)
   appendLog(tr("Live capture requires PipeWire (libpipewire-0.3)"));
   return;
 #else
+  // Pick up conf edits (esp. live_virtual_scale / size) without restarting the app.
+  reloadLiveCaptureConf();
   if (!live_capture_monitor_) {
     appendLog(tr("Live WINDOW capture disabled — MONITOR + virtual display only"));
     return;
   }
+  // Invalidate stale stop fallbacks from the previous session switch.
+  yt_stop_gen_.fetch_add(1, std::memory_order_acq_rel);
+  const int span = std::clamp(monitor_span > 0 ? monitor_span : 1, 1, 3);
+  live_session_span_ = span;
+  int use_w = 0, use_h = 0;
+  virtualSizeForSpan(span, &use_w, &use_h);
+  appendLog(tr("Live Virtual config x%1 → %2×%3 @ scale %4 (%5)")
+                .arg(span)
+                .arg(use_w)
+                .arg(use_h)
+                .arg(QString::number(static_cast<double>(live_virtual_scale_), 'f', 2))
+                .arg(vrp::KdeVirtualDisplay::outputNameForSpan(span)));
   yt_host_setup_stop_after_stream_ = host_setup;
   ensureYouTubeSession();
 
   if (host_setup) {
-    // Force interactive picker for this run. Do not wipe monasphere.conf yet —
-    // only replace live_restore_token when Start returns a new one. A failed
-    // setup must not erase a previously working token.
-    if (!live_restore_token_.isEmpty()) {
-      appendLog(tr("Live host setup — interactive re-auth (keeping conf token until replaced)"));
+    // Force interactive picker for this run. Do not wipe monasphere.conf —
+    // only replace live_restore_token[xN] when Start returns a new one.
+    if (!tokenForSpan(span).isEmpty()) {
+      appendLog(tr("Live host setup — interactive re-auth for x%1 (keeping other span tokens)")
+                    .arg(span));
     }
-    live_restore_token_.clear();
     yt_hmd_suppress_live_.store(true, std::memory_order_release);
   }
 
   vrp::YouTubeSession::Config cfg;
-  cfg.url = !url_override.isEmpty() ? url_override : firstLiveAppUrl();
-  cfg.restore_token = host_setup ? QString() : live_restore_token_;
-  cfg.output_hint = live_output_.isEmpty() ? QStringLiteral("Virtual-monaSphere") : live_output_;
+  cfg.exec = expandLiveArgPath(desktop_exec.trimmed());
+  cfg.exec_args = normalizeLiveExecArgs(desktop_args);
+  cfg.desktop_label = desktop_label.trimmed();
+  if (cfg.exec.isEmpty()) {
+    cfg.url = !url_override.isEmpty() ? url_override : firstLiveAppUrl();
+  } else {
+    cfg.url.clear();
+    if (cfg.desktop_label.isEmpty()) {
+      const QFileInfo fi(cfg.exec);
+      cfg.desktop_label = fi.completeBaseName().isEmpty() ? cfg.exec : fi.completeBaseName();
+    }
+  }
+  cfg.restore_token = host_setup ? QString() : tokenForSpan(span);
+  // Per-span Virtual name → independent ScreenCast Remember tokens (same name = last auth wins).
+  cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
+  cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
   cfg.virtual_display = live_virtual_;
-  cfg.virtual_w = live_virtual_w_;
-  cfg.virtual_h = live_virtual_h_;
+  cfg.virtual_w = use_w;
+  cfg.virtual_h = use_h;
   cfg.virtual_scale = live_virtual_scale_;
   cfg.chrome_scale = live_chrome_scale_;
   cfg.use_default_chrome_profile = live_chrome_default_profile_;
@@ -1915,13 +2560,34 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
     appendLog(tr("ScreenCast: announcing %1 Vulkan-sampleable DRM modifier(s)")
                   .arg(live_drm_modifiers_.size()));
   }
-  if (live_chrome_default_profile_) {
+  if (cfg.exec.isEmpty() && live_chrome_default_profile_) {
     appendLog(tr("Chrome: using default profile (logins/cookies)"));
   }
   if (host_setup) {
-    appendLog(tr("Live setup — pick Virtual-monaSphere, enable Remember/allow restore, "
-                 "then capture will stop and Chrome will close"));
-    showHudToast(tr("Host: share Virtual-monaSphere + Remember"));
+    appendLog(tr("Live setup — pick %1, enable Remember/allow restore, "
+                 "then capture will stop and Chrome will close")
+                  .arg(cfg.output_hint));
+    showHudToast(tr("Host: share %1 + Remember").arg(cfg.output_hint));
+  }
+  // [アプリ] pad: prefer LD_PRELOAD hook (no uinput). Legacy grab+uinput if hook .so missing.
+  pad_hook_active_ = false;
+  if (!cfg.exec.isEmpty()) {
+    const QString hook_lib =
+        QCoreApplication::applicationDirPath() + QStringLiteral("/libmonasphere_padhook.so");
+    if (QFile::exists(hook_lib) && pad_hook_.start()) {
+      pad_hook_active_ = true;
+      cfg.pad_hook_lib = hook_lib;
+      cfg.pad_hook_sock = QString::fromStdString(pad_hook_.socket_path());
+      appendLog(tr("Pad hook: LD_PRELOAD %1 (PS long=menu, L3+R3=recenter; no uinput)")
+                    .arg(hook_lib));
+    } else if (pad_filter_.start()) {
+      const QString node = QString::fromStdString(pad_filter_.uinput_event_path());
+      cfg.sdl_joystick_device = node;
+      appendLog(tr("Pad filter (legacy uinput): %1")
+                    .arg(node.isEmpty() ? tr("monaSphere Virtual Pad") : node));
+    } else {
+      appendLog(tr("Pad hook unavailable — falling back to PS+R1/PS+L1 chords"));
+    }
   }
   yt_session_->start(cfg);
   live_output_ = yt_session_->output_name();
@@ -1933,23 +2599,27 @@ void HostWindow::stopYouTubeCapture() {
     QMetaObject::invokeMethod(this, [this] { stopYouTubeCapture(); }, Qt::QueuedConnection);
     return;
   }
+  // Do not stop pad_hook here while XR still drains DMA — early stop made the XR
+  // thread fall into pass-through mid-teardown. Hook/filter end in stopped().
+  pad_filter_.stop();
   yt_audio_pending_log_ = false;
   yt_audio_fail_retries_ = 0;
   if (yt_session_) yt_session_->clear_audio_wanted();
-  appendLog(tr("Stopping live capture…"));
+  appendLog(tr("Stopping live capture… (DMA → PipeWire → app → Virtual)"));
   // While XR is running, tear down on the XR thread: reset DMA → stop PipeWire →
   // then finish portal/Chrome here. Doing capture->stop() on the UI thread races
   // VkImage imports (SEGV after tray "Stop sharing" / Tools → Stop).
   if (xr_running_.load(std::memory_order_acquire)) {
+    const uint64_t stop_gen = yt_stop_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
     yt_stop_requested_.store(true, std::memory_order_release);
     // Fallback if XR never drains the flag (was wedged on audio lock).
-    QTimer::singleShot(2500, this, [this] {
+    // Only force-stop while still Stopping — never touch a new session that already
+    // started after pending was flushed (x3→x3 was killed here + Virtual destroyed).
+    QTimer::singleShot(2500, this, [this, stop_gen] {
+      if (yt_stop_gen_.load(std::memory_order_acquire) != stop_gen) return;
       if (!yt_session_) return;
-      if (!yt_session_->active() && !yt_session_->loading() &&
-          yt_session_->state() == vrp::YouTubeSession::State::Idle) {
-        return;
-      }
-      appendLog(tr("Live stop fallback (UI)"));
+      if (yt_session_->state() != vrp::YouTubeSession::State::Stopping) return;
+      appendLog(tr("Live stop fallback (UI) — still Stopping"));
       yt_session_->stop();
       std::thread([] { (void)vrp::PulseMonitor::restore_browser_routing(); }).detach();
     });
@@ -3610,6 +4280,30 @@ void HostWindow::xrThreadMain() {
         }
         menu.set_live_apps(std::move(apps));
       }
+      {
+        std::vector<vrp::VrMenu::DesktopApp> apps;
+        apps.reserve(static_cast<size_t>(live_desktop_apps_.size()));
+        for (const LiveDesktopAppEntry& a : live_desktop_apps_) {
+          if (a.name.isEmpty() || a.exec.isEmpty()) continue;
+          vrp::VrMenu::DesktopApp d;
+          d.name = a.name.toStdString();
+          d.exec = a.exec.toStdString();
+          d.args.reserve(static_cast<size_t>(a.args.size()));
+          for (const QString& arg : a.args) d.args.push_back(arg.toStdString());
+          d.titles.reserve(static_cast<size_t>(a.titles.size()));
+          for (const LiveDesktopTitle& t : a.titles) {
+            if (t.name.isEmpty()) continue;
+            vrp::VrMenu::DesktopTitle dt;
+            dt.name = t.name.toStdString();
+            dt.monitor_span = std::clamp(t.monitor_span > 0 ? t.monitor_span : 1, 1, 3);
+            dt.args.reserve(static_cast<size_t>(t.args.size()));
+            for (const QString& arg : t.args) dt.args.push_back(arg.toStdString());
+            d.titles.push_back(std::move(dt));
+          }
+          apps.push_back(std::move(d));
+        }
+        menu.set_desktop_apps(std::move(apps));
+      }
       audio.set_volume(menu.volume());
       menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
       menu.set_fsr(preferred_fsr_);
@@ -4039,8 +4733,6 @@ void HostWindow::xrThreadMain() {
       if (cmd == 4 && xr.recenter()) {
         look_yaw = 0.f;
         look_pitch = 0.f;
-        showControlsHelp();
-        help_shown = true;
       }
 
       const int p = proj_req_.exchange(-1);
@@ -4103,7 +4795,9 @@ void HostWindow::xrThreadMain() {
         {
           std::lock_guard<std::mutex> lock(video_mu_);
           path = pending_video_;
+          pending_video_.clear();
         }
+        if (yt_session_) yt_session_->clear_busy_status();
         if (!path.empty()) {
           if (!open_media(path)) {
             const QString err = QString::fromStdString(
@@ -4116,6 +4810,9 @@ void HostWindow::xrThreadMain() {
             play_wanted = true;
             show_idle_screen = false;
             decoder.play();
+            QMetaObject::invokeMethod(
+                this, [this] { appendLog(tr("Queued video open after Virtual removal")); },
+                Qt::QueuedConnection);
           }
         }
       }
@@ -4128,63 +4825,116 @@ void HostWindow::xrThreadMain() {
       bool pad_nav_left = false;
       bool pad_nav_right = false;
       bool pad_face_y = false;
-      const bool want_gamepad = gamepad_enabled_.load();
+      // [アプリ]: LD_PRELOAD hook (preferred) or legacy uinput PadFilter, else PS+R1 chords.
+      // Hook: guest owns pad while menu closed; host SDL navigates menu and sends BLOCK.
+      const bool desk_app_live_pad =
+          yt_session_ && yt_session_->desktop_app_mode() && yt_session_->active() &&
+          !yt_session_->loading() && !yt_session_->show_busy_overlay();
+      const bool desk_menu_open = menu.visible() || menu.controls_visible();
+      const bool desk_app_pass = desk_app_live_pad && !desk_menu_open;
+      const bool hook_on = pad_hook_active_ && pad_hook_.running();
+      const bool filter_on = pad_filter_.running();
+      // With hook: take SDL only while VR menu is open. With filter: never SDL while filtering.
+      const bool want_gamepad =
+          gamepad_enabled_.load() &&
+          ((hook_on && desk_app_live_pad && desk_menu_open) ||
+           (!hook_on && !filter_on && !desk_app_pass) ||
+           (!hook_on && !desk_app_live_pad));
+
+      auto apply_gp = [&](const vrp::GamepadInput::State& gp) {
+        if (!gp.present) return;
+        if (gp.name != last_gamepad_name || gp.connection != last_gamepad_connection) {
+          const QString name = QString::fromStdString(gp.name);
+          const QString how = QString::fromStdString(gp.connection);
+          QMetaObject::invokeMethod(
+              this,
+              [this, name, how] {
+                const QString shown = name.isEmpty() ? tr("SDL gamepad") : name;
+                QString method = how;
+                if (method.isEmpty()) method = tr("unknown connection");
+                else if (method == QLatin1String("virtual")) method = tr("virtual");
+                appendLog(tr("SDL gamepad: %1 (%2)").arg(shown, method));
+              },
+              Qt::QueuedConnection);
+        }
+        last_gamepad_name = gp.name;
+        last_gamepad_connection = gp.connection;
+        pad_present = true;
+        pad_sony = gp.sony_face;
+        {
+          std::lock_guard<std::mutex> lock(gamepad_name_mu_);
+          gamepad_seen_name_ = QString::fromStdString(gp.name);
+        }
+        pad_nav_up = gp.nav_up;
+        pad_nav_down = gp.nav_down;
+        pad_nav_left = gp.nav_left;
+        pad_nav_right = gp.nav_right;
+        if (std::fabs(gp.stick_x) > 0.15f || std::fabs(gp.stick_y) > 0.15f) {
+          input.stick_x = gp.stick_x;
+          input.stick_y = gp.stick_y;
+        }
+        if (std::fabs(gp.stick_rx) > 0.15f || std::fabs(gp.stick_ry) > 0.15f) {
+          input.stick_rx = gp.stick_rx;
+          input.stick_ry = gp.stick_ry;
+        }
+        input.confirm = input.confirm || gp.confirm;
+        input.confirm_held = input.confirm_held || gp.confirm_held;
+        input.back = input.back || gp.back;
+        input.back_held = input.back_held || gp.back_held;
+        input.menu_toggle = input.menu_toggle || gp.menu_toggle;
+        input.seek_back = input.seek_back || gp.seek_back;
+        input.seek_forward = input.seek_forward || gp.seek_forward;
+        input.seek_back_held = input.seek_back_held || gp.seek_back_held;
+        input.seek_forward_held = input.seek_forward_held || gp.seek_forward_held;
+        input.l2_held = input.l2_held || gp.l2_held;
+        input.r2_held = input.r2_held || gp.r2_held;
+        input.seek_scrubbing = input.seek_scrubbing || gp.seek_scrubbing;
+        input.recenter = input.recenter || gp.recenter;
+        input.view_reset = input.view_reset || gp.view_reset;
+        pad_face_y = gp.face_y;
+      };
+
+      if (desk_app_live_pad && hook_on) {
+        if (gamepad.pass_through_watching()) gamepad.end_pass_through_watch();
+        pad_hook_.set_block_guest(desk_menu_open);
+        const auto edges = pad_hook_.pump();
+        if (edges.menu_toggle) input.menu_toggle = true;
+        if (edges.recenter) input.recenter = true;
+        if (edges.client_hello) {
+          QMetaObject::invokeMethod(
+              this, [this] { appendLog(tr("Pad hook: guest connected")); }, Qt::QueuedConnection);
+        }
+        if (!desk_menu_open) gamepad_sdl_owned_.store(false);
+      } else if (desk_app_live_pad && filter_on) {
+        if (gamepad.pass_through_watching()) gamepad.end_pass_through_watch();
+        gamepad_sdl_owned_.store(false);
+        const auto edges = pad_filter_.pump(/*guest_forward=*/!desk_menu_open);
+        if (edges.menu_toggle) input.menu_toggle = true;
+        if (edges.recenter) input.recenter = true;
+        if (desk_menu_open) apply_gp(pad_filter_.snapshot());
+      } else if (desk_app_pass && !hook_on && !filter_on) {
+        if (!gamepad.pass_through_watching()) {
+          gamepad.begin_pass_through_watch();
+          gamepad_sdl_owned_.store(false);
+          gamepad_logged = false;
+          last_gamepad_name.clear();
+          last_gamepad_connection.clear();
+          std::lock_guard<std::mutex> lock(gamepad_name_mu_);
+          gamepad_seen_name_.clear();
+        }
+        const auto pass = gamepad.poll_pass_through();
+        if (pass.menu_toggle) input.menu_toggle = true;
+        if (pass.recenter) input.recenter = true;
+      } else if (gamepad.pass_through_watching()) {
+        gamepad.end_pass_through_watch();
+      }
+
       if (want_gamepad) {
         gamepad_sdl_owned_.store(true);
         if (gamepad.ensure_open()) {
           const auto gp = gamepad.poll();
           if (gp.present) {
-            if (gp.name != last_gamepad_name || gp.connection != last_gamepad_connection) {
-              const QString name = QString::fromStdString(gp.name);
-              const QString how = QString::fromStdString(gp.connection);
-              QMetaObject::invokeMethod(
-                  this,
-                  [this, name, how] {
-                    const QString shown = name.isEmpty() ? tr("SDL gamepad") : name;
-                    QString method = how;
-                    if (method.isEmpty()) method = tr("unknown connection");
-                    else if (method == QLatin1String("virtual")) method = tr("virtual");
-                    appendLog(tr("SDL gamepad: %1 (%2)").arg(shown, method));
-                  },
-                  Qt::QueuedConnection);
-            }
-            last_gamepad_name = gp.name;
-            last_gamepad_connection = gp.connection;
-            pad_present = true;
-            pad_sony = gp.sony_face;
-            {
-              std::lock_guard<std::mutex> lock(gamepad_name_mu_);
-              gamepad_seen_name_ = QString::fromStdString(gp.name);
-            }
-            pad_nav_up = gp.nav_up;
-            pad_nav_down = gp.nav_down;
-            pad_nav_left = gp.nav_left;
-            pad_nav_right = gp.nav_right;
-            // Leave the HMD stick alone while the gamepad stick is centered.
-            // A cross-key press is nav_*, not a stick at ±1.
-            if (std::fabs(gp.stick_x) > 0.15f || std::fabs(gp.stick_y) > 0.15f) {
-              input.stick_x = gp.stick_x;
-              input.stick_y = gp.stick_y;
-            }
-            if (std::fabs(gp.stick_rx) > 0.15f || std::fabs(gp.stick_ry) > 0.15f) {
-              input.stick_rx = gp.stick_rx;
-              input.stick_ry = gp.stick_ry;
-            }
-            input.confirm = input.confirm || gp.confirm;
-            input.confirm_held = input.confirm_held || gp.confirm_held;
-            input.back = input.back || gp.back;
-            input.back_held = input.back_held || gp.back_held;
-            input.menu_toggle = input.menu_toggle || gp.menu_toggle;
-            input.seek_back = input.seek_back || gp.seek_back;
-            input.seek_forward = input.seek_forward || gp.seek_forward;
-            input.seek_back_held = input.seek_back_held || gp.seek_back_held;
-            input.seek_forward_held = input.seek_forward_held || gp.seek_forward_held;
-            input.l2_held = input.l2_held || gp.l2_held;
-            input.r2_held = input.r2_held || gp.r2_held;
-            input.seek_scrubbing = input.seek_scrubbing || gp.seek_scrubbing;
-            input.recenter = input.recenter || gp.recenter;
-            input.view_reset = input.view_reset || gp.view_reset;
-            pad_face_y = gp.face_y;
+            apply_gp(gp);
           } else {
             last_gamepad_name.clear();
             last_gamepad_connection.clear();
@@ -4201,10 +4951,11 @@ void HostWindow::xrThreadMain() {
           if (!gamepad_logged) {
             gamepad_logged = true;
             QMetaObject::invokeMethod(
-                this, [this] { appendLog(tr("Gamepad open failed. Recenter only")); }, Qt::QueuedConnection);
+                this, [this] { appendLog(tr("Gamepad open failed. Recenter only")); },
+                Qt::QueuedConnection);
           }
         }
-      } else if (gamepad_was) {
+      } else if (gamepad_was && !want_gamepad) {
         gamepad.close();
         gamepad_sdl_owned_.store(false);
         gamepad_logged = false;
@@ -4214,6 +4965,12 @@ void HostWindow::xrThreadMain() {
         gamepad_seen_name_.clear();
       }
       gamepad_was = want_gamepad;
+      // L3+R3 recenter before live handlers (works during 起動中).
+      if (input.recenter && xr.recenter()) {
+        look_yaw = 0.f;
+        look_pitch = 0.f;
+        input.recenter = false;
+      }
       {
         bool hmd_sony = false;
         const auto st = xr.status();
@@ -4278,6 +5035,7 @@ void HostWindow::xrThreadMain() {
             yt_session_ && yt_session_->active() && yt_cap && !yt_cap->running();
         if (capture_dead) yt_stop_requested_.store(true, std::memory_order_release);
         if (yt_stop_requested_.exchange(false, std::memory_order_acq_rel)) {
+          // Keep yt_return_apps_menu_ until YouTubeSession::stopped — then [アプリ] menu.
           if (!scene.wait_previous_submit(0)) {
             while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
             }
@@ -4290,23 +5048,70 @@ void HostWindow::xrThreadMain() {
           if (yt_session_) yt_session_->stop_capture_from_xr();
           yt_audio_pending_log_ = false;
           yt_audio_fail_retries_ = 0;
-          // Drop leftover live/spinner on the Flat panel after Tools auto-stop.
+          // Keep Flat busy spinner through teardown (stop() owns the status text).
           play_wanted = false;
-          show_idle_screen = true;
-          (void)texture.upload_idle_screen();
-          if (texture.view()) scene.set_texture(texture.view(), texture.sampler());
+          show_idle_screen = false;
+          if (yt_session_) {
+            const bool reuse_next =
+                yt_pending_kind_ != YtPendingKind::None && vdisp_mgr_ &&
+                vdisp_mgr_->matches(virtualSpecForSpan(yt_pending_span_));
+            yt_session_->set_busy_status(reuse_next ? tr("切替中") : tr("Virtual 削除中"));
+          }
+          opt_.projection = vrp::ProjectionMode::Flat;
+          opt_.stereo = vrp::StereoLayout::Mono;
+          opt_.stereo_full = true;
+          scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
+          menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
           scene.set_content_aspect(16.f / 9.f);
           fsr_need_process = false;
+          fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
+          fsr_src_samp = VK_NULL_HANDLE;
+          fsr_src_w = fsr_src_h = 0;
+          fsr_src_nv12 = 0;
+          (void)fsr.poll();
+          look_yaw = 0.f;
+          look_pitch = 0.f;
+          scene.set_view_offset(0.f, 0.f);
+          hud_paint();
           // Host setup keeps suppress; HMD open clears it in startLiveFromHmd.
+          // Delay UI stop(): DMA reset first, then app/Virtual — avoids DEVICE_LOST
+          // when KWin tears the output under a still-submitting XR frame.
+          const uint64_t stop_gen = yt_stop_gen_.load(std::memory_order_acquire);
           QMetaObject::invokeMethod(
               this,
-              [this] {
-                if (yt_session_) yt_session_->stop();
-                std::thread([] { (void)vrp::PulseMonitor::restore_browser_routing(); }).detach();
-                appendLog(tr("Live capture stopped"));
+              [this, stop_gen] {
+                QTimer::singleShot(350, this, [this, stop_gen] {
+                  if (yt_stop_gen_.load(std::memory_order_acquire) != stop_gen) return;
+                  if (!yt_session_) return;
+                  if (yt_session_->state() == vrp::YouTubeSession::State::Idle &&
+                      !yt_session_->active() && !yt_session_->loading()) {
+                    return;
+                  }
+                  const bool reuse_next =
+                      yt_pending_kind_ != YtPendingKind::None && vdisp_mgr_ &&
+                      vdisp_mgr_->matches(virtualSpecForSpan(yt_pending_span_));
+                  yt_session_->set_busy_status(reuse_next ? tr("切替中") : tr("Virtual 削除中"));
+                  yt_session_->stop();
+                  std::thread([] { (void)vrp::PulseMonitor::restore_browser_routing(); }).detach();
+                  appendLog(tr("Live capture stopped (after DMA settle)"));
+                });
               },
               Qt::QueuedConnection);
         }
+      }
+
+      // [アプリ] return: only after stop() destroyed Virtual / portal (see stopped()).
+      if (yt_show_apps_after_stop_.exchange(false, std::memory_order_acq_rel)) {
+        play_wanted = false;
+        show_idle_screen = true;
+        if (yt_session_) yt_session_->clear_busy_status();
+        (void)texture.upload_idle_screen();
+        if (texture.view()) scene.set_texture(texture.view(), texture.sampler());
+        scene.set_content_aspect(16.f / 9.f);
+        menu.show_apps_list();
+        help_swallow_back_ = true;
+        help_swallow_menu_ = true;
+        hud_paint();
       }
 
       // Live audio → Flat stereo→4.0 OpenAL (never block XR on Pulse/pactl).
@@ -4366,14 +5171,16 @@ void HostWindow::xrThreadMain() {
       }
 
       // Live session (loading or streaming): L stick = cursor, R stick = scroll (no look).
-      // ○ short = browser Back; ○ long-press or Options = close live → file menu.
+      // Options long = VR menu (stream keeps running). ○ does not stop live.
+      // Switching app / opening video from the menu stops after Virtual is removed, then
+      // launches the new target (see open_live / open_desktop_app / open_video below).
       if (yt_session) {
         auto exit_live_to_menu = [&] {
-          // Same-frame: stop flag + idle before the ScreenCast bind path below can
-          // re-attach the last capture (Options / ○ long used to leave a stuck frame).
+          // Same-frame: stop flag + busy spinner before ScreenCast can re-attach.
           yt_stop_requested_.store(true, std::memory_order_release);
           play_wanted = false;
-          show_idle_screen = true;
+          show_idle_screen = false;
+          if (yt_session_) yt_session_->set_busy_status(tr("Virtual 削除中"));
           opt_.projection = vrp::ProjectionMode::Flat;
           opt_.stereo = vrp::StereoLayout::Mono;
           opt_.stereo_full = true;
@@ -4394,8 +5201,6 @@ void HostWindow::xrThreadMain() {
 #if defined(VRP_HAS_PIPEWIRE)
           pw_dma_tex.reset();
 #endif
-          (void)texture.upload_idle_screen();
-          if (texture.view()) scene.set_texture(texture.view(), texture.sampler());
           thumb_latched = false;
           wait_stop_frame = false;
           stop_frame_shown = false;
@@ -4409,23 +5214,46 @@ void HostWindow::xrThreadMain() {
           QMetaObject::invokeMethod(this, [this] { stopYouTubeCapture(); }, Qt::QueuedConnection);
         };
 
-        // Live: L stick = mouse cursor, R stick = scroll (look disabled below).
+        // YouTube live: L stick = mouse, R stick = scroll (paused while VR menu is open).
+        // [アプリ] live: no remap — SDL pad is released so the app sees the controller.
+        const bool desk_app_live = yt_session_->desktop_app_mode();
+        const bool live_menu_open = menu.visible() || menu.controls_visible();
         {
           static bool yt_inject_logged = false;
           static bool yt_focus_armed = false;
           static bool yt_prev_up = false, yt_prev_down = false, yt_prev_left = false,
                       yt_prev_right = false;
+          static bool desk_pass_logged = false;
           if (!yt_live) {
             yt_inject_logged = false;
             yt_focus_armed = false;
             yt_prev_up = yt_prev_down = yt_prev_left = yt_prev_right = false;
+            desk_pass_logged = false;
+          } else if (desk_app_live || live_menu_open) {
+            if (desk_app_live && !desk_pass_logged) {
+              desk_pass_logged = true;
+              const bool hook = pad_hook_active_ && pad_hook_.running();
+              const bool filt = pad_filter_.running();
+              QMetaObject::invokeMethod(
+                  this,
+                  [this, hook, filt] {
+                    if (hook) {
+                      appendLog(tr("Desktop app: LD_PRELOAD pad hook — PS long=menu, L3+R3=recenter"));
+                    } else if (filt) {
+                      appendLog(tr("Desktop app: legacy uinput filter — PS long=menu, L3+R3=recenter"));
+                    } else {
+                      appendLog(tr("Desktop app: pad chords — PS+R1 menu, PS+L1 recenter"));
+                    }
+                  },
+                  Qt::QueuedConnection);
+            }
           } else if (!yt_session_->x11().can_inject()) {
             if (!yt_inject_logged) {
               yt_inject_logged = true;
               QMetaObject::invokeMethod(
                   this,
                   [this] {
-                    appendLog(tr("Live: pointer inject unavailable (no X11 window / screen)"));
+                    appendLog(tr("Live: pointer inject unavailable (no EIS / inject target)"));
                   },
                   Qt::QueuedConnection);
             }
@@ -4448,12 +5276,16 @@ void HostWindow::xrThreadMain() {
                   Qt::QueuedConnection);
             }
 
-            // Exponential stick curve: very wide fine band; max speed only near stick edge.
-            constexpr float kCursorPx = 420.f;
+            // Stick speed scales with Virtual mode width so 1080p and 4K feel alike.
+            // live_cursor_scale multiplies gain (1–6). Full stick ≈ 0.45×width/s at scale 1.
             constexpr float kCursorDead = 0.16f;
             constexpr float kCursorExp = 3.4f;
+            constexpr float kWidthsPerSec = 0.45f;
             const float cscale =
                 static_cast<float>(std::clamp(live_cursor_scale_, 1, 6));
+            const float px_w =
+                static_cast<float>(std::max(320, yt_session_->place_w()));
+            const float base_px = px_w * kWidthsPerSec;
             const float lx = input.stick_x;
             const float ly = input.stick_y;
             const float mag = std::sqrt(lx * lx + ly * ly);
@@ -4461,7 +5293,7 @@ void HostWindow::xrThreadMain() {
               const float t =
                   std::clamp((mag - kCursorDead) / (1.f - kCursorDead), 0.f, 1.f);
               const float shaped = std::pow(t, kCursorExp);
-              const float speed = shaped * kCursorPx * cscale;
+              const float speed = shaped * base_px * cscale;
               const float nx = lx / mag;
               const float ny = ly / mag;
               yt_session_->x11().move_cursor(nx * speed * static_cast<float>(dt),
@@ -4479,7 +5311,8 @@ void HostWindow::xrThreadMain() {
                                      static_cast<float>(dt));
               }
             }
-            constexpr float kStep = 72.f;
+            // D-pad: ~4% of mode width per tap, also × live_cursor_scale.
+            const float kStep = std::max(24.f, px_w * 0.04f) * cscale;
             auto step = [&](bool now, bool& prev, float dx, float dy) {
               if (now && !prev) yt_session_->x11().move_cursor(dx, dy);
               prev = now;
@@ -4491,31 +5324,12 @@ void HostWindow::xrThreadMain() {
             if (input.confirm) yt_session_->x11().click();
           }
         }
-        if (input.menu_toggle) {
-          exit_live_to_menu();
-        } else if (yt_live) {
-          static bool yt_back_tracking = false;
-          static bool yt_back_long_fired = false;
-          static std::chrono::steady_clock::time_point yt_back_since{};
-          constexpr auto kYtBackLong = std::chrono::milliseconds(650);
-          if (input.back_held) {
-            if (!yt_back_tracking) {
-              yt_back_tracking = true;
-              yt_back_long_fired = false;
-              yt_back_since = std::chrono::steady_clock::now();
-            } else if (!yt_back_long_fired &&
-                       std::chrono::steady_clock::now() - yt_back_since >= kYtBackLong) {
-              yt_back_long_fired = true;
-              exit_live_to_menu();
-            }
-          } else if (yt_back_tracking) {
-            if (!yt_back_long_fired && yt_session_->x11().can_inject()) {
-              (void)yt_session_->x11().key_back();
-            }
-            yt_back_tracking = false;
-            yt_back_long_fired = false;
-          }
-        } else if (input.back || input.back_held) {
+        // Options long opens/closes the VR menu without stopping live (handled by VrMenu).
+        // ○ never ends live; YouTube short ○ = browser Back. Loading: ○ cancels start.
+        if (yt_live && !live_menu_open && !desk_app_live && input.back &&
+            yt_session_->x11().can_inject()) {
+          (void)yt_session_->x11().key_back();
+        } else if (!yt_live && (input.back || input.back_held)) {
           // Loading: ○ cancels ScreenCast wait.
           exit_live_to_menu();
         }
@@ -4530,24 +5344,10 @@ void HostWindow::xrThreadMain() {
         hud_paint();
       }
 
-      // Dismiss controls help *before* building pad input. Previously dismiss ran late
-      // in the frame while pad stayed empty whenever help was up — and a stuck
-      // help_shown frame could leave menus dead after the card vanished visually.
-      if (controls_help_.load()) {
-        const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch())
-                                .count();
-        const bool timeout = now_ms >= controls_help_until_ms_.load();
-        const bool used = input.confirm || input.back || input.menu_toggle || input.seek_back ||
-                          input.seek_forward || std::fabs(input.stick_x) > 0.55f ||
-                          std::fabs(input.stick_y) > 0.55f;
-        // help_shown: same frame that opened the card — ignore button dismiss only.
-        if (timeout || (used && !help_shown)) {
-          if (input.back || input.back_held) help_swallow_back_ = true;
-          if (input.confirm || input.confirm_held) help_swallow_confirm_ = true;
-          if (input.menu_toggle) help_swallow_menu_ = true;
-          hideControlsHelp();
-        }
+      // Controls help (startup only): close with B/× only — no countdown, no other keys.
+      if (controls_help_.load() && !help_shown && (input.back || input.back_held)) {
+        help_swallow_back_ = true;
+        hideControlsHelp();
       }
 
       vrp::VrMenu::PadInput pad;
@@ -4555,23 +5355,27 @@ void HostWindow::xrThreadMain() {
       if (help_swallow_confirm_ && !input.confirm && !input.confirm_held)
         help_swallow_confirm_ = false;
       if (help_swallow_menu_ && !input.menu_toggle) help_swallow_menu_ = false;
-      // While live session (streaming/loading): leave the file menu alone.
+      // Options long always reaches the menu (video + live + [アプリ]), like playback.
+      // While live and the menu is closed, leave sticks/confirm for cursor or the app.
       // While the help card is still up, do not drive the VR menu underneath it.
-      if (!yt_session && !controls_help_.load()) {
-        pad.stick_x = input.stick_x;
-        pad.stick_y = input.stick_y;
-        pad.nav_up = pad_nav_up;
-        pad.nav_down = pad_nav_down;
-        pad.nav_left = pad_nav_left;
-        pad.nav_right = pad_nav_right;
-        if (!help_swallow_confirm_) {
-          pad.confirm = input.confirm;
-          pad.confirm_held = input.confirm_held;
-        }
+      if (!controls_help_.load()) {
         if (!help_swallow_menu_) pad.menu_toggle = input.menu_toggle;
-        if (!help_swallow_back_) {
-          pad.back = input.back;
-          pad.back_held = input.back_held;
+        const bool drive_menu = !yt_session || menu.visible() || menu.controls_visible();
+        if (drive_menu) {
+          pad.stick_x = input.stick_x;
+          pad.stick_y = input.stick_y;
+          pad.nav_up = pad_nav_up;
+          pad.nav_down = pad_nav_down;
+          pad.nav_left = pad_nav_left;
+          pad.nav_right = pad_nav_right;
+          if (!help_swallow_confirm_) {
+            pad.confirm = input.confirm;
+            pad.confirm_held = input.confirm_held;
+          }
+          if (!help_swallow_back_) {
+            pad.back = input.back;
+            pad.back_held = input.back_held;
+          }
         }
       }
       if (!yt_session) {
@@ -4612,10 +5416,7 @@ void HostWindow::xrThreadMain() {
         apply_projection(opt_.projection, opt_.stereo, opt_.stereo_full);
       };
 
-      if (menu_out.open_live && !menu_out.live_url.empty()) {
-        const QString live_url = QString::fromStdString(menu_out.live_url);
-        QMetaObject::invokeMethod(
-            this, [this, live_url] { startLiveFromHmd(live_url); }, Qt::QueuedConnection);
+      auto prepare_live_flat = [&] {
         play_wanted = false;
         show_idle_screen = true;
         if (decoder.is_open()) decoder.pause();
@@ -4631,13 +5432,85 @@ void HostWindow::xrThreadMain() {
         (void)texture.upload_idle_screen();
         if (texture.view()) scene.set_texture(texture.view(), texture.sampler());
         hud_paint();
+      };
+
+      if (menu_out.open_live && !menu_out.live_url.empty()) {
+        const QString live_url = QString::fromStdString(menu_out.live_url);
+        if (yt_session_ &&
+            (yt_session_->active() || yt_session_->loading() ||
+             yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
+          const bool reuse = vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(1));
+          yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
+          show_idle_screen = false;
+        }
+        QMetaObject::invokeMethod(
+            this, [this, live_url] { startLiveFromHmd(live_url); }, Qt::QueuedConnection);
+        prepare_live_flat();
+        if (yt_session_ && !yt_session_->busy_status().isEmpty()) show_idle_screen = false;
+      }
+
+      if (menu_out.open_desktop_app && !menu_out.desktop_app_exec.empty()) {
+        const QString desk_exec = QString::fromStdString(menu_out.desktop_app_exec);
+        QStringList desk_args;
+        desk_args.reserve(static_cast<int>(menu_out.desktop_app_args.size()));
+        for (const std::string& a : menu_out.desktop_app_args) {
+          desk_args.push_back(QString::fromStdString(a));
+        }
+        const int desk_span = menu_out.desktop_monitor_span > 0 ? menu_out.desktop_monitor_span : 1;
+        const QString desk_label = QString::fromStdString(menu_out.desktop_app_label);
+        if (yt_session_ &&
+            (yt_session_->active() || yt_session_->loading() ||
+             yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
+          const bool reuse = vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(desk_span));
+          yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
+          show_idle_screen = false;
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this, desk_exec, desk_args, desk_span, desk_label] {
+              startLiveDesktopApp(desk_exec, desk_args, desk_span, desk_label);
+            },
+            Qt::QueuedConnection);
+        prepare_live_flat();
+        if (yt_session_ && !yt_session_->busy_status().isEmpty()) show_idle_screen = false;
       }
 
       if (menu_out.open_video) {
-        if (yt_live || yt_loading) {
-          QMetaObject::invokeMethod(this, [this] { stopYouTubeCapture(); }, Qt::QueuedConnection);
-        }
-        if (!open_media(menu_out.video_path)) {
+        const std::string vpath = menu_out.video_path;
+        const bool session_busy =
+            yt_live || yt_loading ||
+            (yt_session_ &&
+             (yt_session_->active() || yt_session_->loading() ||
+              yt_session_->state() != vrp::YouTubeSession::State::Idle));
+        const bool virtual_up =
+            (yt_session_ && yt_session_->virtual_display_alive()) ||
+            vrp::KdeVirtualDisplay::anyManagedOutputExists();
+        if (session_busy || virtual_up) {
+          // Never open_media while Flat DMA / Virtual still live — HMD freezes (audio may play).
+          {
+            std::lock_guard<std::mutex> lock(video_mu_);
+            pending_video_ = vpath;
+          }
+          yt_await_video_after_stop_.store(true, std::memory_order_release);
+          if (yt_session_) {
+            yt_session_->set_busy_status(tr("Virtual 削除中"));
+          }
+          play_wanted = false;
+          show_idle_screen = false;
+          prepare_live_flat();
+          if (session_busy) {
+            yt_stop_requested_.store(true, std::memory_order_release);
+          } else {
+            QMetaObject::invokeMethod(
+                this, [this] { finishQueuedVideoAfterVirtualGone(); }, Qt::QueuedConnection);
+          }
+          QMetaObject::invokeMethod(
+              this,
+              [this] {
+                appendLog(tr("Video queued — waiting until Virtual is removed"));
+              },
+              Qt::QueuedConnection);
+        } else if (!open_media(vpath)) {
           const QString err = QString::fromStdString(
               decoder.info().error.empty() ? "GPU busy or open failed" : decoder.info().error);
           QMetaObject::invokeMethod(
@@ -4701,6 +5574,10 @@ void HostWindow::xrThreadMain() {
         // so a 2:1 VR frame does not leave a oversized idle screen.
         apply_projection(vrp::ProjectionMode::Flat, vrp::StereoLayout::Mono, true);
         scene.set_content_aspect(16.f / 9.f);
+        // Stop ends VR viewing — reset stick look to front.
+        look_yaw = 0.f;
+        look_pitch = 0.f;
+        scene.set_view_offset(0.f, 0.f);
         if (!scene.wait_previous_submit(0)) {
           while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
           }
@@ -4842,11 +5719,10 @@ void HostWindow::xrThreadMain() {
         stop_pts = -1.0;
       }
 
-      if (input.recenter && xr.recenter()) {
+      // EOF auto-loop: treat as playback end → face forward again for 180/360.
+      if (decoder.consume_looped()) {
         look_yaw = 0.f;
         look_pitch = 0.f;
-        showControlsHelp();
-        help_shown = true;
       }
 
       menu.set_playback(decoder.is_playing() || decoder.is_priming(), decoder.position());
@@ -4994,22 +5870,6 @@ void HostWindow::xrThreadMain() {
         showControlsHelp();
         help_shown = true;
       }
-      {
-        // Countdown paint only — dismiss is handled before pad build above.
-        const auto now_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-        const int64_t left_ms = controls_help_until_ms_.load() - now_ms;
-        const int sec = left_ms <= 0 ? 0 : static_cast<int>((left_ms + 999) / 1000);
-        static int help_drawn_sec = -1;
-        if (!controls_help_.load()) {
-          help_drawn_sec = -1;
-        } else if (help_shown) {
-          help_drawn_sec = sec;
-        } else if (sec != help_drawn_sec) {
-          help_drawn_sec = sec;
-          hud_paint();
-        }
-      }
 
       // While the bar is moving, show the prebuilt thumb at or behind the bar. After release, keep it
       // until the decoded frame at the stop time is bound, then start from that frame.
@@ -5038,6 +5898,7 @@ void HostWindow::xrThreadMain() {
       if (!yt_suppress) yt_suppress_idle_uploaded = false;
       if (yt_suppress) {
         show_idle_screen = true;
+        scene.set_content_cursor(0.5f, 0.5f, false);
         // Still exercise DMA-BUF → Vulkan import (NVIDIA experiment) without painting.
         // Do not reset the texture every frame — that aborted arming/import.
         if (pw_dma && yt_session_ && yt_cap && yt_cap->running() &&
@@ -5077,21 +5938,24 @@ void HostWindow::xrThreadMain() {
           fsr_need_process = false;
         }
       }
-      // Spinner while loading (even if open set show_idle_screen). Live frames only
-      // when not forcing idle (Options / ○ long sets show_idle_screen to drop last frame).
+      // Spinner while loading / Virtual create-destroy. busy_status keeps the overlay
+      // even if show_idle was set (live↔app switch waits on Virtual 削除中).
       else if (!seek_visual && !opt_.clear_only && yt_session_ &&
-               ((yt_session_->loading() && !yt_session_->active()) ||
+               ((yt_session_->show_busy_overlay() && !yt_session_->active()) ||
                 (!show_idle_screen && yt_session_->active() && yt_cap && yt_cap->running()))) {
-        show_idle_screen = false;
+        if (yt_session_->loading() || yt_session_->active() || yt_session_->show_busy_overlay())
+          show_idle_screen = false;
         bool yt_picture = false;
         auto set_yt_aspect = [&](int tw, int th) {
-          if (live_virtual_w_ > 0 && live_virtual_h_ > 0) {
-            scene.set_content_aspect(static_cast<float>(live_virtual_w_) /
-                                     static_cast<float>(live_virtual_h_));
+          int aw = tw, ah = th;
+          if (yt_session_ && yt_session_->virtual_w() > 0 && yt_session_->virtual_h() > 0) {
+            aw = yt_session_->virtual_w();
+            ah = yt_session_->virtual_h();
           } else {
-            scene.set_content_aspect(static_cast<float>(std::max(1, tw)) /
-                                     static_cast<float>(std::max(1, th)));
+            virtualSizeForSpan(live_session_span_, &aw, &ah);
           }
+          scene.set_content_aspect(static_cast<float>(std::max(1, aw)) /
+                                   static_cast<float>(std::max(1, ah)));
         };
         // Desktop capture is sRGB/gamma; Flat shader expects linear unless rgba_gamma.
         auto bind_last_yt = [&] {
@@ -5110,7 +5974,13 @@ void HostWindow::xrThreadMain() {
           return false;
         };
 
-        if (yt_live && yt_cap && yt_cap->running()) {
+        // Skip DMA only while tearing down (切替/削除/終了). 「起動中」must still import
+        // so mark_frame_presented() can clear the spinner — otherwise it spins forever.
+        const QString yt_busy = yt_session_->busy_status();
+        const bool yt_busy_teardown =
+            yt_busy.contains(QStringLiteral("切替")) || yt_busy.contains(QStringLiteral("削除")) ||
+            yt_busy.contains(QStringLiteral("終了"));
+        if (yt_live && yt_cap && yt_cap->running() && !yt_busy_teardown) {
           {
             const auto status = yt_cap->drain_status();
             for (const std::string& s : status) {
@@ -5182,14 +6052,41 @@ void HostWindow::xrThreadMain() {
             yt_picture = true;
           }
           if (yt_picture && yt_session_) yt_session_->mark_frame_presented();
+          // Portal AvailableCursorModes=0 → Hidden stream; draw stick cursor on Flat.
+          if (yt_picture && yt_session_ && !yt_session_->embedded_cursor() &&
+              opt_.projection == vrp::ProjectionMode::Flat) {
+            scene.set_content_cursor(yt_session_->x11().cursor_u(), yt_session_->x11().cursor_v(),
+                                     true);
+          } else {
+            scene.set_content_cursor(0.5f, 0.5f, false);
+          }
+        } else {
+          scene.set_content_cursor(0.5f, 0.5f, false);
         }
 
-        if (yt_loading && !yt_picture) {
+        if (yt_session_->show_busy_overlay() && !yt_picture) {
           yt_spin_phase += static_cast<float>(dt) * 9.5f;
           if (yt_spin_phase > 6.2831853f) yt_spin_phase = std::fmod(yt_spin_phase, 6.2831853f);
-          const int sw = live_virtual_w_ > 0 ? live_virtual_w_ : 960;
-          const int sh = live_virtual_h_ > 0 ? live_virtual_h_ : 540;
-          (void)texture.try_upload_spinner(sw, sh, yt_spin_phase);
+          const int sw = std::clamp(yt_session_->virtual_w() > 0 ? yt_session_->virtual_w()
+                                                                : (live_virtual_w_ > 0 ? live_virtual_w_ : 1280),
+                                    320, 1920);
+          const int sh = std::clamp(yt_session_->virtual_h() > 0 ? yt_session_->virtual_h()
+                                                                : (live_virtual_h_ > 0 ? live_virtual_h_ : 720),
+                                    180, 1080);
+          const QString status = yt_session_->busy_status();
+          const QImage busy = vrp::paint_live_busy(sw, sh, yt_spin_phase, status);
+          if (!busy.isNull()) {
+            vrp::VideoFrame ph;
+            ph.width = busy.width();
+            ph.height = busy.height();
+            ph.rgba.resize(static_cast<size_t>(ph.width) * static_cast<size_t>(ph.height) * 4u);
+            for (int y = 0; y < busy.height(); ++y) {
+              const uchar* src = busy.constScanLine(y);
+              uint8_t* dst = ph.rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(ph.width) * 4u;
+              std::memcpy(dst, src, static_cast<size_t>(ph.width) * 4u);
+            }
+            (void)texture.try_upload(ph);
+          }
           if (texture.poll_present() && texture.view()) {
             scene.set_texture(texture.view(), texture.sampler());
             scene.set_content_aspect(static_cast<float>(sw) / static_cast<float>(std::max(1, sh)));
@@ -5200,6 +6097,7 @@ void HostWindow::xrThreadMain() {
 #endif
       if (!seek_visual && !opt_.clear_only && decoder.is_open() && !show_idle_screen &&
           !(yt_session_ && yt_session_->active())) {
+        scene.set_content_cursor(0.5f, 0.5f, false);
         bool video_updated = false;
         int nv12_mode = 0;
         VkImageView src_y = VK_NULL_HANDLE;
@@ -5506,8 +6404,13 @@ void HostWindow::xrThreadMain() {
       }
       float look_x = 0.f;
       float look_y = 0.f;
-      // Live streaming/loading: R stick is scroll (or unused) — do not rotate Flat.
-      if (!(yt_session_ && (yt_session_->active() || yt_session_->loading()))) {
+      // R-stick look: 180° / 360° VR video only (not Flat, not live).
+      const bool vr_look =
+          decoder.is_open() && !show_idle_screen &&
+          (opt_.projection == vrp::ProjectionMode::Deg180 ||
+           opt_.projection == vrp::ProjectionMode::Deg360) &&
+          !(yt_session_ && (yt_session_->active() || yt_session_->loading()));
+      if (vr_look) {
         auto look_axis = [](float v) {
           constexpr float kDead = 0.20f;
           const float mag = std::fabs(v);
@@ -5526,6 +6429,10 @@ void HostWindow::xrThreadMain() {
         constexpr float kPi = 3.14159265f;
         if (look_yaw > kPi) look_yaw -= 2.f * kPi;
         else if (look_yaw < -kPi) look_yaw += 2.f * kPi;
+      } else if (opt_.projection == vrp::ProjectionMode::Flat || show_idle_screen) {
+        // Flat / idle: keep view centered (do not leave a leftover VR look offset).
+        look_yaw = 0.f;
+        look_pitch = 0.f;
       }
       scene.set_view_offset(look_yaw, look_pitch);
       scene.set_comfort_grid(look_x != 0.f || look_y != 0.f);
@@ -5628,6 +6535,21 @@ void HostWindow::xrThreadMain() {
           health = "Error";
           detail = "Session lost";
           xr_stop_.store(true);
+          // Virtual delete can kill Monado mid-switch — never open portal on a dead HMD.
+          QMetaObject::invokeMethod(
+              this,
+              [this] {
+                if (yt_pending_kind_ == YtPendingKind::None) return;
+                appendLog(tr("Live: queued switch cancelled — XR session lost"));
+                yt_pending_kind_ = YtPendingKind::None;
+                yt_pending_url_.clear();
+                yt_pending_exec_.clear();
+                yt_pending_args_.clear();
+                yt_pending_label_.clear();
+                yt_pending_span_ = 1;
+                if (yt_session_) yt_session_->clear_busy_status();
+              },
+              Qt::QueuedConnection);
         } else if (healthy) {
           health = cur.tracking_valid ? "OK" : "Wait";
           detail = cur.tracking_valid ? "Drawing" : "Pose not ready";

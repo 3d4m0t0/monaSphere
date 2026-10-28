@@ -184,8 +184,9 @@ void earth_sky_matrix(std::int64_t unix_utc_sec, float lat_deg, float lon_deg, f
   const double sP = std::sin(P);
   const double cP = std::cos(P);
 
-  // Equatorial app (Y up, RA=0 → −Z) → local horizon app (Y up, −Z = north).
+  // Equatorial app (Y up, RA=0 → −Z) → local horizon app (Y up, −Z = north, +X = east).
   // Hour angle H = LST − RA; local up matches sin(alt) = sinδ sinφ + cosδ cosφ cos H.
+  // Looking toward −Z (north): +X is right = east. Equinox sunrise (H=−90°) → +X.
   // Column-major 3×3 in the upper-left of out_m4.
   auto set_col = [&](int c, double x, double y, double z) {
     out_m4[c * 4 + 0] = static_cast<float>(x);
@@ -193,9 +194,10 @@ void earth_sky_matrix(std::int64_t unix_utc_sec, float lat_deg, float lon_deg, f
     out_m4[c * 4 + 2] = static_cast<float>(z);
     out_m4[c * 4 + 3] = 0.f;
   };
-  set_col(0, -cL, sL * cP, sL * sP);
+  // Previous (−cL / −sL) put sunrise at −X (west). Flip local X for +X = east.
+  set_col(0, cL, sL * cP, sL * sP);
   set_col(1, 0.0, sP, -cP);
-  set_col(2, -sL, -cL * cP, -cL * sP);
+  set_col(2, sL, -cL * cP, -cL * sP);
   out_m4[12] = out_m4[13] = out_m4[14] = 0.f;
   out_m4[3] = out_m4[7] = out_m4[11] = 0.f;
   out_m4[15] = 1.f;

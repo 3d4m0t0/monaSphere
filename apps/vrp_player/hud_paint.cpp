@@ -211,7 +211,7 @@ void paint_transport_icon(HudCanvas& c, const QRect& r, TransportIcon kind, bool
 using DpadDir = icons::DpadDir;
 using StickMotion = icons::StickMotion;
 
-enum class HelpIcon { None, A, B, X, Y, Stick, StickR, StickR3, Speed, SpeedReset, Start };
+enum class HelpIcon { None, A, B, X, Y, Stick, StickR, StickR3, Speed, SpeedReset, Start, Guide };
 
 constexpr int kIcon = icons::kDefaultFaceSize;
 constexpr int kStick = kIcon;
@@ -271,6 +271,22 @@ void paint_start_button(HudCanvas& c, const QRect& r) {
                  });
 }
 
+QString guide_button_text() {
+  return menu_button_option ? QStringLiteral("PS") : QStringLiteral("GUIDE");
+}
+
+int guide_button_width() { return icons::menu_chip_width(guide_button_text()); }
+
+int guide_icon_height() { return icons::menu_chip_height(guide_button_text()); }
+
+void paint_guide_button(HudCanvas& c, const QRect& r) {
+  const QString text = guide_button_text();
+  c.paint_cached(hud_key({34, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height())}, text), r,
+                 r.width(), r.height(), [&](QPainter& p) {
+                   icons::paint_menu_chip(p, QRect(0, 0, r.width(), r.height()), text);
+                 });
+}
+
 void paint_stick_icon(HudCanvas& c, const QRect& r, const QString& hand, StickMotion motion) {
   c.paint_cached(hud_key({20, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height()),
                           static_cast<uint64_t>(motion)},
@@ -287,6 +303,7 @@ int help_icon_width(HelpIcon kind) {
   if (kind == HelpIcon::A || kind == HelpIcon::B || kind == HelpIcon::X || kind == HelpIcon::Y)
     return kFace;
   if (kind == HelpIcon::Start) return menu_button_width();
+  if (kind == HelpIcon::Guide) return guide_button_width();
   if (kind == HelpIcon::Stick) return kTrigW * 2 + kTrigGap + 8 + kStick;
   if (kind == HelpIcon::StickR || kind == HelpIcon::StickR3) return kStick;
   if (kind == HelpIcon::Speed) return kTrigW * 2 + kTrigGap;
@@ -311,6 +328,13 @@ int paint_help_icons(HudCanvas& c, int x, int y, int h, HelpIcon kind) {
     const int start_w = menu_button_width();
     paint_start_button(c, QRect(x, by, start_w, start_h));
     return start_w;
+  }
+  if (kind == HelpIcon::Guide) {
+    const int gh = guide_icon_height();
+    const int by = y + (h - gh) / 2;
+    const int gw = guide_button_width();
+    paint_guide_button(c, QRect(x, by, gw, gh));
+    return gw;
   }
   if (kind == HelpIcon::Stick) {
     constexpr int kTrigW = 44;
@@ -996,6 +1020,39 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
   return canvas.take();
 }
 
+QImage paint_live_busy(int width, int height, float phase, const QString& status) {
+  const int w = std::clamp(width > 0 ? width : 1280, 64, 3840);
+  const int h = std::clamp(height > 0 ? height : 720, 64, 2160);
+  QImage img(w, h, QImage::Format_RGBA8888);
+  img.fill(QColor(28, 32, 44, 200));
+  QPainter p(&img);
+  p.setRenderHint(QPainter::Antialiasing, true);
+  p.setPen(Qt::NoPen);
+  // Match HMD menu network spinner (orbit 22, dot 11).
+  constexpr float kOrbit = 22.f;
+  constexpr int kDot = 11;
+  const int cx = w / 2;
+  const int cy = h / 2 - (status.isEmpty() ? 0 : 18);
+  for (int i = 0; i < 3; ++i) {
+    const float a = phase + static_cast<float>(i) * (2.f * 3.14159265f / 3.f);
+    const int dx = static_cast<int>(std::lround(kOrbit * std::cos(static_cast<double>(a))));
+    const int dy = static_cast<int>(std::lround(kOrbit * std::sin(static_cast<double>(a))));
+    const float pulse = 0.45f + 0.55f * (0.5f + 0.5f * std::sin(static_cast<double>(
+                                               phase * 1.7f + static_cast<float>(i))));
+    const int alpha = std::clamp(static_cast<int>(70.f + 185.f * pulse), 40, 255);
+    p.setBrush(QColor(230, 240, 255, alpha));
+    p.drawEllipse(QRectF(cx + dx - kDot / 2.0, cy + dy - kDot / 2.0, kDot, kDot));
+  }
+  if (!status.isEmpty()) {
+    QFont font = deUiFont(22, QFont::DemiBold);
+    p.setFont(font);
+    p.setPen(QColor(230, 240, 255, 240));
+    const QRect tr(0, cy + static_cast<int>(kOrbit) + 20, w, 40);
+    p.drawText(tr, Qt::AlignHCenter | Qt::AlignTop, status);
+  }
+  return img;
+}
+
 HudPaintResult paint_hud_toast(const QString& text, int width, int height) {
   HudCanvas& canvas = shared_hud_canvas();
   canvas.begin(width, height);
@@ -1018,8 +1075,7 @@ HudPaintResult paint_hud_toast(const QString& text, int width, int height) {
   return canvas.take();
 }
 
-HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool sony_face,
-                                   bool menu_option) {
+HudPaintResult paint_controls_help(int width, int height, bool sony_face, bool menu_option) {
   // Flat seat uses Y (XInput) or △ (Sony). Keep face style in sync with Options branding.
   sony_face_buttons = sony_face || menu_option;
   menu_button_option = menu_option || sony_face;
@@ -1033,12 +1089,12 @@ HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool
   };
   // HelpIcon::Y paints △ when sony_face_buttons, otherwise the letter Y.
   const Row rows[] = {
-      {HelpIcon::Start, "long-press", "Recenter"},
-      {HelpIcon::Start, nullptr, "File dialog"},
+      {HelpIcon::Guide, "long-press", "Menu"},
+      {HelpIcon::Start, "long-press", "Menu"},
+      {HelpIcon::Stick, "L3+R3", "Recenter"},
       {HelpIcon::B, nullptr, "Playback controls"},
       {HelpIcon::A, nullptr, "Play or pause"},
-      {HelpIcon::Stick, nullptr, "Seek"},
-      {HelpIcon::StickR, nullptr, "Look"},
+      {HelpIcon::StickR, nullptr, "Look (180° / 360°)"},
       {HelpIcon::StickR3, nullptr, "Reset view"},
       {HelpIcon::Speed, nullptr, "Playback speed"},
       {HelpIcon::SpeedReset, nullptr, "Speed ×1"},
@@ -1100,9 +1156,6 @@ HudPaintResult paint_controls_help(int width, int height, int seconds_left, bool
     const int tw = name_fm.horizontalAdvance(close);
     const int fy = panel_y + panel_h - foot_h;
     const int fx = panel_x + panel_w - pad - tw - 8 - kFace;
-    canvas.text(QRect(panel_x + pad, fy, std::max(0, fx - panel_x - pad - 8), foot_h),
-                QString::number(std::max(0, seconds_left)), body_font, QColor(180, 190, 205),
-                Qt::AlignVCenter | Qt::AlignLeft);
     paint_face_button(canvas, QRect(fx, fy + (foot_h - kFace) / 2, kFace, kFace), false);
     canvas.text(QRect(fx + kFace + 6, fy, tw + 4, foot_h), close, body_font, QColor(230, 236, 245),
                 Qt::AlignVCenter | Qt::AlignLeft);

@@ -686,7 +686,7 @@ void XrVulkanApp::create_actions() {
   }
 
   // Oculus Touch / PSVR2 Sense (typical under Monado)
-  // Options short = file dialog, Options long = recenter (see poll_actions).
+  // Options long = menu; HMD system = recenter (pad: PS long=menu, L3+R3=recenter).
   // △ = Flat seats. R3 = reset look. ○ = back. Recenter also on HMD function.
   if (want(ControllerProfile::OculusTouch)) {
     suggest("/interaction_profiles/oculus/touch_controller",
@@ -1112,7 +1112,8 @@ XrVulkanApp::InputState XrVulkanApp::poll_actions() {
   st.flat_scale = edge(flat_scale_action_);
   st.view_reset = edge(view_reset_action_);
 
-  // Options / menu button: short release toggles the file dialog; long press recenters.
+  // Options / menu button: long press toggles the VR menu (same as video). Short is unused
+  // so DualSense Options can pass through to desktop apps. Pad recenter is L3+R3; HMD system stays.
   {
     constexpr auto kMenuLongPress = std::chrono::milliseconds(700);
     const bool menu_down = action_down(menu_toggle_action_);
@@ -1122,11 +1123,10 @@ XrVulkanApp::InputState XrVulkanApp::poll_actions() {
         menu_long_fired_ = false;
         menu_down_at_ = now;
       } else if (!menu_long_fired_ && now - menu_down_at_ >= kMenuLongPress) {
-        st.recenter = true;
+        st.menu_toggle = true;
         menu_long_fired_ = true;
       }
     } else if (menu_btn_down_) {
-      if (!menu_long_fired_) st.menu_toggle = true;
       menu_btn_down_ = false;
       menu_long_fired_ = false;
     }

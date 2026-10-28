@@ -99,7 +99,8 @@ MoonState moon_at_unix(std::int64_t unix_utc_sec);
  * Equatorial app-space → local horizon app-space (column-major 4×4, no translation).
  *
  * - Directions are geocentric (Earth radius ignored — parallel rays).
- * - Y = local up (sin altitude), −Z = true north, +X = east.
+ * - Y = local up (sin altitude), −Z = true north, +X = east
+ *   (looking north: east is to the right — equinox sunrise at +X).
  * - NCP lands at (0, sin lat, −cos lat); altitude matches the HA formula
  *   sin(alt) = sinδ sinφ + cosδ cosφ cos(LST − RA).
  * - Local sidereal time from lon + UTC rotates the sky once per sidereal day.

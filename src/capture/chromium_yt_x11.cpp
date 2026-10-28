@@ -401,14 +401,37 @@ bool ChromiumYtX11::ensure_inject_target() {
   return window_ != 0 || screen_input_;
 }
 
+void ChromiumYtX11::eis_abs_from_cursor(double* ax, double* ay) const {
+  if (!ax || !ay || !eis_) return;
+  if (!eis_->region_local()) {
+    *ax = static_cast<double>(eis_ox_) + static_cast<double>(cursor_x_);
+    *ay = static_cast<double>(eis_oy_) + static_cast<double>(cursor_y_);
+    return;
+  }
+  // cursor_* is configured Virtual size (often physical mode). libei regions
+  // are compositor-logical (mode / scale). Map so 4K@scale3 → 1280×720 region.
+  const uint32_t rw = eis_->region_w();
+  const uint32_t rh = eis_->region_h();
+  if (rw > 1 && rh > 1 && width_ > 1 && height_ > 1 &&
+      (static_cast<int>(rw) != width_ || static_cast<int>(rh) != height_)) {
+    *ax = static_cast<double>(cursor_x_) * static_cast<double>(rw - 1) /
+          static_cast<double>(width_ - 1);
+    *ay = static_cast<double>(cursor_y_) * static_cast<double>(rh - 1) /
+          static_cast<double>(height_ - 1);
+  } else {
+    *ax = static_cast<double>(cursor_x_);
+    *ay = static_cast<double>(cursor_y_);
+  }
+}
+
 void ChromiumYtX11::set_cursor(float x, float y) {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   (void)ensure_inject_target();
   cursor_x_ = std::clamp(x, 0.f, static_cast<float>(std::max(1, width_ - 1)));
   cursor_y_ = std::clamp(y, 0.f, static_cast<float>(std::max(1, height_ - 1)));
   if (eis_ && eis_->ready()) {
-    const double ax = eis_->region_local() ? cursor_x_ : (eis_ox_ + cursor_x_);
-    const double ay = eis_->region_local() ? cursor_y_ : (eis_oy_ + cursor_y_);
+    double ax = 0, ay = 0;
+    eis_abs_from_cursor(&ax, &ay);
     eis_->warp(ax, ay);
     return;
   }
@@ -423,8 +446,8 @@ void ChromiumYtX11::move_cursor(float dx, float dy) {
   cursor_x_ = std::clamp(cursor_x_ + dx, 0.f, static_cast<float>(std::max(1, width_ - 1)));
   cursor_y_ = std::clamp(cursor_y_ + dy, 0.f, static_cast<float>(std::max(1, height_ - 1)));
   if (eis_ && eis_->ready()) {
-    const double ax = eis_->region_local() ? cursor_x_ : (eis_ox_ + cursor_x_);
-    const double ay = eis_->region_local() ? cursor_y_ : (eis_oy_ + cursor_y_);
+    double ax = 0, ay = 0;
+    eis_abs_from_cursor(&ax, &ay);
     eis_->warp(ax, ay);
     return;
   }
@@ -554,12 +577,12 @@ bool ChromiumYtX11::focus_window() {
 bool ChromiumYtX11::click() {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (eis_ && eis_->ready()) {
-    const double ax = eis_->region_local() ? cursor_x_ : (eis_ox_ + cursor_x_);
-    const double ay = eis_->region_local() ? cursor_y_ : (eis_oy_ + cursor_y_);
+    double ax = 0, ay = 0;
+    eis_abs_from_cursor(&ax, &ay);
     eis_->warp(ax, ay);
     eis_->click_left();
-    VRP_LOG("live-x11: click at %.0f,%.0f [eis]", static_cast<double>(cursor_x_),
-            static_cast<double>(cursor_y_));
+    VRP_LOG("live-x11: click at %.0f,%.0f → eis %.0f,%.0f", static_cast<double>(cursor_x_),
+            static_cast<double>(cursor_y_), ax, ay);
     return true;
   }
   if (!ensure_inject_target()) return false;
@@ -629,8 +652,8 @@ bool ChromiumYtX11::scroll(float dy) {
   if (notches == 0) return true;
 
   if (eis_ && eis_->ready()) {
-    const double ax = eis_->region_local() ? cursor_x_ : (eis_ox_ + cursor_x_);
-    const double ay = eis_->region_local() ? cursor_y_ : (eis_oy_ + cursor_y_);
+    double ax = 0, ay = 0;
+    eis_abs_from_cursor(&ax, &ay);
     eis_->warp(ax, ay);
     eis_->scroll_discrete(notches);
     return true;

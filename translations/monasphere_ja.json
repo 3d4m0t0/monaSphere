@@ -427,8 +427,13 @@
     },
     {
       "context": "monaSphere",
-      "source": "File dialog",
-      "translation": "ファイルダイアログを開く"
+      "source": "Menu",
+      "translation": "メニュー"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Recenter (always)",
+      "translation": "リセンター（常時）"
     },
     {
       "context": "monaSphere",

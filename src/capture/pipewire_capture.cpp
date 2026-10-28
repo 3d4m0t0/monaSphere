@@ -117,6 +117,9 @@ struct PwState {
   int sync_seq = 0;
   /** Consumer-sampleable DRM modifiers (LINEAR at minimum). Copied from PipewireCapture. */
   std::vector<uint64_t> consumer_modifiers;
+  /** Preferred stream size — KWin virtual MONITOR follows this on negotiate. */
+  uint32_t prefer_w = 1920;
+  uint32_t prefer_h = 1080;
 };
 
 void on_core_done(void* data, uint32_t /*id*/, int seq) {
@@ -146,8 +149,8 @@ const pw_core_events kCoreEvents = {
 };
 
 /** Plain EnumFormat (MemFd-friendly). Keep this first in connect params. */
-spa_pod* build_format_plain(spa_pod_builder* b) {
-  spa_rectangle def_size{1920, 1080};
+spa_pod* build_format_plain(spa_pod_builder* b, uint32_t prefer_w, uint32_t prefer_h) {
+  spa_rectangle def_size{prefer_w, prefer_h};
   spa_rectangle min_size{64, 64};
   spa_rectangle max_size{8192, 8192};
   spa_fraction def_fps{60, 1};
@@ -171,9 +174,10 @@ spa_pod* build_format_plain(spa_pod_builder* b) {
  * Announce Vulkan-sampleable modifiers (no MOD_INVALID — that made KWin pick
  * modifier-less, fail on NVIDIA, and demote to MemFd).
  */
-spa_pod* build_format_modifier(spa_pod_builder* b, const std::vector<uint64_t>& mods) {
+spa_pod* build_format_modifier(spa_pod_builder* b, const std::vector<uint64_t>& mods,
+                               uint32_t prefer_w, uint32_t prefer_h) {
   spa_pod_frame f[2];
-  spa_rectangle def_size{1920, 1080};
+  spa_rectangle def_size{prefer_w, prefer_h};
   spa_rectangle min_size{64, 64};
   spa_rectangle max_size{8192, 8192};
   spa_fraction def_fps{60, 1};
@@ -509,7 +513,7 @@ bool PipewireCapture::take_latest_dma(PipewireDmaFrame& out, uint64_t& seen_seq)
 }
 
 bool PipewireCapture::start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial,
-                            std::vector<uint64_t> consumer_modifiers) {
+                            std::vector<uint64_t> consumer_modifiers, int prefer_w, int prefer_h) {
   stop();
   if (pw_fd < 0) {
     set_error("bad pipewire fd");
@@ -517,6 +521,8 @@ bool PipewireCapture::start(int pw_fd, uint32_t node_id, uint64_t pipewire_seria
   }
   consumer_modifiers_ = std::move(consumer_modifiers);
   if (consumer_modifiers_.empty()) consumer_modifiers_.push_back(DRM_FORMAT_MOD_LINEAR);
+  prefer_w_ = prefer_w > 0 ? prefer_w : 0;
+  prefer_h_ = prefer_h > 0 ? prefer_h : 0;
   stop_.store(false);
   running_.store(true);
   thread_ = std::thread([this, pw_fd, node_id, pipewire_serial] {
@@ -596,6 +602,11 @@ void PipewireCapture::thread_main(int pw_fd, uint32_t node_id, uint64_t serial) 
   pw_stream_add_listener(st.stream, &stream_listener, &kStreamEvents, &st);
 
   st.consumer_modifiers = consumer_modifiers_;
+  // KWin resizes virtual MONITOR streams to the preferred SPA size. Prefer the
+  // configured Virtual-* mode (e.g. 3840×2160); never default to 1920×1080 or a
+  // 4K setup is silently shrunk on negotiate.
+  st.prefer_w = prefer_w_ > 0 ? static_cast<uint32_t>(prefer_w_) : 1920u;
+  st.prefer_h = prefer_h_ > 0 ? static_cast<uint32_t>(prefer_h_) : 1080u;
   {
     std::string line = "pipewire: announcing ";
     line += std::to_string(st.consumer_modifiers.size());
@@ -608,14 +619,16 @@ void PipewireCapture::thread_main(int pw_fd, uint32_t node_id, uint64_t serial) 
     }
     if (st.consumer_modifiers.size() > 8) line += " …";
     VRP_LOG("%s", line.c_str());
+    VRP_LOG("pipewire: prefer size %ux%u (virtual MONITOR follows this on KWin)", st.prefer_w,
+            st.prefer_h);
   }
 
   uint8_t pod_buf[8192];
   spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
   // DMA-BUF (modifier) first, SHM plain second — PipeWire docs priority order.
   const spa_pod* params[2];
-  params[0] = build_format_modifier(&builder, st.consumer_modifiers);
-  params[1] = build_format_plain(&builder);
+  params[0] = build_format_modifier(&builder, st.consumer_modifiers, st.prefer_w, st.prefer_h);
+  params[1] = build_format_plain(&builder, st.prefer_w, st.prefer_h);
 
   // MAP_BUFFERS: CPU path stays reliable for MemFd / linear DmaBuf.
   const auto flags = static_cast<pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT |

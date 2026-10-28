@@ -165,8 +165,13 @@ bool ChromiumYtLauncher::start() {
   args << QStringLiteral("--no-first-run");
   args << QStringLiteral("--no-default-browser-check");
   args << QStringLiteral("--disable-features=TranslateUI,ChromeWhatsNewUI");
-  args << QStringLiteral("--force-device-scale-factor=%1")
-              .arg(QString::number(static_cast<double>(scale), 'f', 2));
+  // Passing --force-device-scale-factor=1 on Wayland overrides the output's 200%
+  // with 100%; passing virtual_scale on top of output scale doubles it (~400%).
+  // follow_output_scale_: omit the flag so DE scale is the single source of truth.
+  if (!follow_output_scale_) {
+    args << QStringLiteral("--force-device-scale-factor=%1")
+                .arg(QString::number(static_cast<double>(scale), 'f', 2));
+  }
   args << QStringLiteral("--window-size=%1,%2").arg(w).arg(h);
   if (have_pos_) {
     args << QStringLiteral("--window-position=%1,%2").arg(window_x_).arg(window_y_);
@@ -177,11 +182,13 @@ bool ChromiumYtLauncher::start() {
   if (start_fullscreen_) {
     args << QStringLiteral("--start-fullscreen");
   }
+  // Default Wayland so Virtual live_virtual_scale matches desktop Chrome.
+  // Opt out: MONASPHERE_YT_X11=1 (old XWayland path; XTest fallback only).
   if (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
-    if (!qEnvironmentVariableIsEmpty("MONASPHERE_YT_WAYLAND")) {
-      args << QStringLiteral("--ozone-platform=wayland");
-    } else {
+    if (!qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11")) {
       args << QStringLiteral("--ozone-platform=x11");
+    } else {
+      args << QStringLiteral("--ozone-platform=wayland");
     }
   }
   // Shared singleton often navigates an existing tab — force a new app window.
@@ -196,8 +203,16 @@ bool ChromiumYtLauncher::start() {
           profile_note.toUtf8().constData());
 
   QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  env.insert(QStringLiteral("PULSE_SINK"), QStringLiteral("monaSphereYt"));
-  env.insert(QStringLiteral("PIPEWIRE_NODE"), QStringLiteral("monaSphereYt"));
+  if (route_audio_to_yt_sink_) {
+    // Only when Flat live monitor owns the null sink (enable_audio).
+    env.insert(QStringLiteral("PULSE_SINK"), QStringLiteral("monaSphereYt"));
+    env.insert(QStringLiteral("PIPEWIRE_NODE"), QStringLiteral("monaSphereYt"));
+  } else {
+    // Avoid a leftover monaSphereYt becoming Chrome's (and then the session's)
+    // default — that showed up as an unknown “microphone” output in Plasma.
+    env.remove(QStringLiteral("PULSE_SINK"));
+    env.remove(QStringLiteral("PIPEWIRE_NODE"));
+  }
 
   if (shared_session_) {
     QProcess det;

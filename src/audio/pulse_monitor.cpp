@@ -431,12 +431,16 @@ std::string PulseMonitor::ensure_yt_null_sink() {
     return monitor;
   }
 
-  // device.class=filter: hide from many mixer UIs; still unload on stop.
+  // Internal capture sink only. Never use audio-input-microphone — Plasma then
+  // lists monaSphereYt as an unknown mic/output and default routing breaks.
+  // device.class=filter + media.role=filter: hide from most mixer pickers.
   FILE* p = popen("pactl load-module module-null-sink "
                   "sink_name=monaSphereYt "
-                  "sink_properties=device.description=monaSphereYt,"
+                  "sink_properties=device.description=\"monaSphere live (internal)\","
                   "device.class=filter,"
-                  "device.icon_name=audio-input-microphone "
+                  "media.role=filter,"
+                  "node.virtual=true,"
+                  "device.icon_name=audio-card "
                   "rate=48000 channels=2 2>/dev/null",
                   "r");
   uint32_t mod = 0;
@@ -685,6 +689,27 @@ int PulseMonitor::restore_browser_routing() {
   for (int i = 0; i < 40; ++i) pa_mainloop_iterate(ps.ml, 1, nullptr);
   if (st.moved > 0 || st.unmuted > 0)
     VRP_LOG("PulseMonitor: restored (moved=%d unmuted=%d) → %s", st.moved, st.unmuted, dest.c_str());
+
+  // If the session default was somehow monaSphereYt, pick a real hardware sink.
+  if (dest == kYtSinkName || dest.find("monaSphereYt") != std::string::npos) {
+    FILE* sinks = popen("pactl list short sinks 2>/dev/null", "r");
+    if (sinks) {
+      char line[512];
+      while (std::fgets(line, sizeof(line), sinks)) {
+        char name[256]{};
+        unsigned idx = 0;
+        if (std::sscanf(line, "%u %255s", &idx, name) != 2) continue;
+        if (std::strcmp(name, kYtSinkName) == 0) continue;
+        char cmd[384];
+        std::snprintf(cmd, sizeof(cmd), "pactl set-default-sink %s 2>/dev/null", name);
+        if (std::system(cmd) == 0) {
+          VRP_LOG("PulseMonitor: default sink was %s — switched to %s", dest.c_str(), name);
+          break;
+        }
+      }
+      (void)pclose(sinks);
+    }
+  }
   ps.disconnect();
   // Remove null sink from the mixer after streams have left it.
   destroy_yt_null_sink();

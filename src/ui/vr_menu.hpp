@@ -71,6 +71,13 @@ class VrMenu {
     std::filesystem::path path;
     /** Non-empty for DLNA / HTTP stream items (takes precedence over path for open). */
     std::string url;
+    /** Non-empty for [アプリ] items (conf live_desktop_app). */
+    std::string exec;
+    std::vector<std::string> exec_args;
+    /** Per-title Virtual span x1–x3 (fixed width, shorter height). */
+    int monitor_span = 1;
+    /** App index into desktop_apps_ when drilling into titles (-1 = none). */
+    int desktop_app_index = -1;
     /** DLNA ContentDirectory object id (containers / items). */
     std::string dlna_id;
     bool is_dir = false;
@@ -160,6 +167,14 @@ class VrMenu {
     bool open_live = false;
     /** Target URL when open_live (from conf live_app[N]=Name|URL). */
     std::string live_url;
+    /** Launch registered desktop GUI on Virtual MONITOR (conf live_desktop_app). */
+    bool open_desktop_app = false;
+    std::string desktop_app_exec;
+    std::vector<std::string> desktop_app_args;
+    /** 1–3 = Virtual span (fixed live_virtual width; height from aspect). */
+    int desktop_monitor_span = 1;
+    /** Busy-status label (app or title name). */
+    std::string desktop_app_label;
   };
 
   struct PadInput {
@@ -188,9 +203,24 @@ class VrMenu {
     std::string url;
   };
 
+  struct DesktopTitle {
+    std::string name;
+    int monitor_span = 1;  // x1–x3
+    std::vector<std::string> args;
+  };
+
+  struct DesktopApp {
+    std::string name;
+    std::string exec;
+    std::vector<std::string> args;
+    std::vector<DesktopTitle> titles;
+  };
+
   void init(const std::filesystem::path& start_dir);
   /** HMD Roots entries [Name] → ScreenCast live browser (conf live_app[N]=). */
   void set_live_apps(std::vector<LiveApp> apps);
+  /** HMD [アプリ] list (conf live_desktop_app[N]=). */
+  void set_desktop_apps(std::vector<DesktopApp> apps);
   void set_media(const std::string& path, double duration_sec);
   void set_media_info(const std::string& video_codec, const std::string& res, const std::string& fps,
                        const std::string& bitrate, const std::string& audio_codec,
@@ -224,6 +254,8 @@ class VrMenu {
   bool controls_visible() const { return controls_visible_; }
   /** Show the file browser at Roots (e.g. after closing live capture). */
   void show_file_browser();
+  /** Show [アプリ] list (after desktop-app process exit). */
+  void show_apps_list();
   bool seek_bar_only() const { return seek_bar_only_; }
   /** While thumbs are still building, keep a seek bar up (unless playback controls are open). */
   void set_thumb_bar_force(bool on);
@@ -273,8 +305,11 @@ class VrMenu {
     HomeTree = 1,
     RemovableList = 2,
     RemovableTree = 3,
-    NetworkList = 4,  // DLNA MediaServer discovery
-    NetworkTree = 5,  // ContentDirectory browse
+    NetworkHub = 4,   // DLNA / smb (todo)
+    NetworkList = 5,  // DLNA MediaServer discovery
+    NetworkTree = 6,  // ContentDirectory browse
+    AppsList = 7,     // live_desktop_app entries
+    AppTitles = 8,    // titles under one live_desktop_app
   };
 
   /** [|<][<][>/||][□][>][>|] [Vol] [Fmt] [FSR] [Hz] */
@@ -368,6 +403,9 @@ class VrMenu {
   float dlna_spin_phase_ = 0.f;
   std::string dlna_pending_select_;
   std::vector<LiveApp> live_apps_;
+  std::vector<DesktopApp> desktop_apps_;
+  /** Index into desktop_apps_ while place_ == AppTitles. */
+  int desktop_app_focus_ = -1;
   std::vector<Entry> entries_;
   int cursor_ = 0;
   int scroll_ = 0;

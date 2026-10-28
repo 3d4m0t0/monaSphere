@@ -427,8 +427,13 @@
     },
     {
       "context": "monaSphere",
-      "source": "File dialog",
-      "translation": "Dateidialog"
+      "source": "Menu",
+      "translation": "Menü"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Recenter (always)",
+      "translation": "Recenter (immer)"
     },
     {
       "context": "monaSphere",
