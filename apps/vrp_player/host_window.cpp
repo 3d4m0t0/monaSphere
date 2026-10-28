@@ -2084,9 +2084,8 @@ void HostWindow::ensureYouTubeSession() {
     pad_hook_.stop();
     pad_hook_active_ = false;
     pad_filter_.stop();
-    const bool virt_up = vdisp_mgr_ && vdisp_mgr_->alive();
-    yt_restore_ready_ms_ =
-        QDateTime::currentMSecsSinceEpoch() + (virt_up ? 800 : 2000);
+    // No fixed settle — next start waits only if still before this timestamp (usually now).
+    yt_restore_ready_ms_ = QDateTime::currentMSecsSinceEpoch();
     // Video queue wins over [アプリ] return (open_video while live).
     if (yt_await_video_after_stop_.load(std::memory_order_acquire) ||
         yt_pending_kind_ == YtPendingKind::Video) {
@@ -2243,17 +2242,13 @@ void HostWindow::flushPendingLiveStart() {
                                         : (kind == YtPendingKind::Desktop ? tr("app") : tr("video")))
                                .arg(span));
 
-  const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
-  const int wait_ms =
-      now_ms < yt_restore_ready_ms_ ? static_cast<int>(yt_restore_ready_ms_ - now_ms) : 0;
-  // Extra settle only when Virtual topology changed (Monado DEVICE_LOST risk).
-  const int gate_ms = wait_ms + (kept_virtual ? 50 : 800);
+  // Virtual destroy/ensure already waited for topology; start on next event-loop turn.
   auto xr_ok = [this] {
     return xr_running_.load(std::memory_order_acquire) &&
            !xr_stop_.load(std::memory_order_acquire);
   };
   if (kind == YtPendingKind::Live) {
-    QTimer::singleShot(gate_ms, this, [this, url, xr_ok] {
+    QTimer::singleShot(0, this, [this, url, xr_ok] {
       if (!xr_ok()) {
         appendLog(tr("Live: queued browser aborted — XR not healthy after Virtual change"));
         if (yt_session_) yt_session_->clear_busy_status();
@@ -2262,7 +2257,7 @@ void HostWindow::flushPendingLiveStart() {
       startLiveFromHmd(url);
     });
   } else if (kind == YtPendingKind::Desktop) {
-    QTimer::singleShot(gate_ms, this, [this, exec, args, span, label, xr_ok] {
+    QTimer::singleShot(0, this, [this, exec, args, span, label, xr_ok] {
       if (!xr_ok()) {
         appendLog(tr("Live: queued app aborted — XR not healthy after Virtual change"));
         if (yt_session_) yt_session_->clear_busy_status();
@@ -2271,7 +2266,7 @@ void HostWindow::flushPendingLiveStart() {
       startLiveDesktopApp(exec, args, span, label);
     });
   } else if (kind == YtPendingKind::Video) {
-    QTimer::singleShot(gate_ms, this, [this, xr_ok] {
+    QTimer::singleShot(0, this, [this, xr_ok] {
       if (!xr_ok()) {
         appendLog(tr("Live: queued video aborted — XR not healthy after Virtual change"));
         return;
@@ -2351,8 +2346,7 @@ void HostWindow::startLiveFromHmd(const QString& url) {
   const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
   if (now_ms < yt_restore_ready_ms_) {
     const int wait_ms = static_cast<int>(yt_restore_ready_ms_ - now_ms);
-    appendLog(tr("Live: waiting %1 ms for ScreenCast settle…").arg(wait_ms));
-    QTimer::singleShot(wait_ms + 50, this, [this, open_url] { startLiveFromHmd(open_url); });
+    QTimer::singleShot(wait_ms, this, [this, open_url] { startLiveFromHmd(open_url); });
     return;
   }
 
@@ -2412,8 +2406,7 @@ void HostWindow::startLiveDesktopApp(const QString& exec, const QStringList& arg
   const qint64 now_ms = QDateTime::currentMSecsSinceEpoch();
   if (now_ms < yt_restore_ready_ms_) {
     const int wait_ms = static_cast<int>(yt_restore_ready_ms_ - now_ms);
-    appendLog(tr("Live: waiting %1 ms for ScreenCast settle…").arg(wait_ms));
-    QTimer::singleShot(wait_ms + 50, this, [this, open_exec, args, span, label] {
+    QTimer::singleShot(wait_ms, this, [this, open_exec, args, span, label] {
       startLiveDesktopApp(open_exec, args, span, label);
     });
     return;

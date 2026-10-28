@@ -6,6 +6,7 @@
 #include <QDBusMessage>
 #include <QDBusReply>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
 #include <QMutex>
@@ -189,8 +190,15 @@ int loadAndRunScript(const QString& script, QString* error_out, bool keep_loaded
     *error_out = run_reply.error().message();
   }
   if (!keep_loaded) {
-    // Wait for callDBus report — no nested QEventLoop (deadlocks poll_armed_place).
-    QThread::msleep(250);
+    // Wait until the script reports (or short cap) — no nested QEventLoop.
+    const QString prior = placeHub().reporter.last;
+    QElapsedTimer wait;
+    wait.start();
+    while (wait.elapsed() < 800) {
+      const QString cur = placeHub().reporter.last;
+      if (!cur.isEmpty() && cur != prior) break;
+      QThread::msleep(10);
+    }
     (void)unloadScript(script_id, plugin_name);
     delete heap_dir;
     return ok ? script_id : -1;

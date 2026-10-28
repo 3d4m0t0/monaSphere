@@ -4,8 +4,11 @@
 #include "capture/kwin_window_placer.hpp"
 #include "common.hpp"
 
+#include "capture/kde_virtual_display.hpp"
+
 #include <QCoreApplication>
 #include <QCursor>
+#include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -15,6 +18,7 @@
 #include <QIODevice>
 #include <QScreen>
 #include <QThread>
+#include <QTimer>
 #include <QWidget>
 #include <QWindow>
 
@@ -431,12 +435,8 @@ void YouTubeSession::start(const Config& cfg) {
              .arg(output_name_.isEmpty() ? tr("(empty)") : output_name_));
     return;
   }
+  // Name from kscreen geo is enough — screen_index already set in ensure()/commit_identity.
   if (!matched.isEmpty()) output_name_ = matched;
-  // Keep manager identity in sync with kscreen-matched name (index refresh).
-  if (vdisp_mgr_ && cfg_.virtual_display) {
-    (void)vdisp_mgr_->refresh_identity();
-    if (!vdisp_mgr_->output_name().isEmpty()) output_name_ = vdisp_mgr_->output_name();
-  }
 
   place_x_ = geo.x();
   place_y_ = geo.y();
@@ -750,8 +750,8 @@ void YouTubeSession::pollPlaceDesktopApp() {
   }
 
   if (!kwin_window_id_.isEmpty()) {
-    // One Chrome-style shove, then done (rule already Force-screens).
-    if (place_tries_ == 0) {
+    // Window seen → one shove + post-map Rule → portal (no fixed extra ticks).
+    {
       const qint64 root_pid = desktop_app_ ? desktop_app_->processId() : 0;
       const QList<qint64> pids = KwinWindowPlacer::pid_tree(root_pid);
       bool moved_ok = false;
@@ -762,18 +762,12 @@ void YouTubeSession::pollPlaceDesktopApp() {
                                                         &moved_ok);
       if (moved_ok && !move_wid.isEmpty()) kwin_window_id_ = move_wid;
     }
-    ++place_tries_;
-    if (place_tries_ >= 2) {
-      // Rule after map only — Exact + wmclasscomplete with the real class string.
-      installDesktopAppSessionRule();
-      KwinWindowPlacer::disarm_place_on_open(/*keep_fullscreen_rule=*/true);
-      emit logMessage(tr("KWin: placed desktop app on %1 (%2…)")
-                          .arg(output_name_, kwin_window_id_.left(8)));
-      onPlaced();
-      startDesktopAppMaintain();
-      return;
-    }
-    place_timer_.start(200);
+    installDesktopAppSessionRule();
+    KwinWindowPlacer::disarm_place_on_open(/*keep_fullscreen_rule=*/true);
+    emit logMessage(tr("KWin: placed desktop app on %1 (%2…)")
+                        .arg(output_name_, kwin_window_id_.left(8)));
+    onPlaced();
+    startDesktopAppMaintain();
     return;
   }
 
@@ -938,13 +932,8 @@ void YouTubeSession::onPlaced() {
     }
   }
 
-  // Virtual is already up before place (manager ensure). Restore only needs a short
-  // beat so KWin publishes the output to the portal — 2.5s was the bulk of "slow RA".
-  const int settle_ms = restore_token_.isEmpty() ? 300 : 500;
-  QTimer::singleShot(settle_ms, this, [this] {
-    if (state_ != State::Placed) return;
-    beginPortal(false);
-  });
+  // Virtual already ready from ensure(); place just finished — start ScreenCast now.
+  beginPortal(false);
 }
 
 void YouTubeSession::beginPortal(bool after_reject) {
@@ -1009,11 +998,8 @@ void YouTubeSession::beginPortal(bool after_reject) {
     armPortalWatchdog(!restore_token_.isEmpty() && !after_reject);
   };
 
-  if (interactive) {
-    QTimer::singleShot(400, this, launch);
-  } else {
-    launch();
-  }
+  // Portal dialog arm (if any) already returned — Start immediately.
+  launch();
 }
 
 void YouTubeSession::armPortalWatchdog(bool had_token) {
@@ -1036,7 +1022,7 @@ void YouTubeSession::armPortalWatchdog(bool had_token) {
         ++portal_restore_retries_;
         emit logMessage(tr("ScreenCast restore hung — silent retry %1/2 (token kept)")
                             .arg(portal_restore_retries_));
-        QTimer::singleShot(2000, this, [this] {
+        QTimer::singleShot(0, this, [this] {
           if (!loading_.load() || active_.load()) return;
           setState(State::Placed);
           beginPortal(false);
@@ -1047,7 +1033,7 @@ void YouTubeSession::armPortalWatchdog(bool had_token) {
       emit logMessage(tr("ScreenCast restore hung — opening host picker (conf token kept)"));
       restore_token_.clear();
       emit toast(tr("Host: pick Virtual-monaSphere"));
-      QTimer::singleShot(400, this, [this] {
+      QTimer::singleShot(0, this, [this] {
         if (!loading_.load() || active_.load()) return;
         setState(State::Placed);
         beginPortal(true);
@@ -1200,8 +1186,8 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
   // Keep beginPortal snapshot; only fill in if that failed.
   if (eis_ok) rememberSeatCursor();
 
-  // Re-focus after ScreenCast steals attention from the Chrome window.
-  QTimer::singleShot(400, this, [this] {
+  // Re-focus once the event loop turns (ScreenCast just stole activation).
+  QTimer::singleShot(0, this, [this] {
     if (!active_.load()) return;
     if (desk_ == DesktopEnv::Kde) {
       QString err;
@@ -1241,25 +1227,34 @@ void YouTubeSession::onPortalFailed(const QString& e) {
     if (portal_) portal_->stop();
     if (portal_restore_retries_ < 3 && !portal_retry_used_) {
       ++portal_restore_retries_;
-      emit logMessage(tr("ScreenCast restore rejected — silent retry %1/3 (token kept)")
+      emit logMessage(tr("ScreenCast restore rejected — silent retry %1/3 when ready (token kept)")
                           .arg(portal_restore_retries_));
-      // Virtual recreate + 4K scale: portal needs a longer settle than 1080p.
-      const int delay_ms = 4500 + portal_restore_retries_ * 1500;
-      QTimer::singleShot(delay_ms, this, [this] {
-        if (!loading_.load() || active_.load()) return;
-        if (portal_ && portal_->busy()) {
-          emit logMessage(tr("ScreenCast: waiting for previous Start to finish…"));
-          QTimer::singleShot(2000, this, [this] {
-            if (!loading_.load() || active_.load()) return;
-            if (portal_ && portal_->busy()) portal_->stop();
-            setState(State::Placed);
-            beginPortal(false);
-          });
+      // Proceed as soon as portal is idle and Virtual output is listed (cap 8s).
+      const qint64 t0 = QDateTime::currentMSecsSinceEpoch();
+      const int gen = portal_gen_;
+      auto* tick = new QTimer(this);
+      tick->setInterval(50);
+      connect(tick, &QTimer::timeout, this, [this, tick, t0, gen] {
+        if (gen != portal_gen_ || !loading_.load() || active_.load()) {
+          tick->stop();
+          tick->deleteLater();
           return;
         }
+        if (portal_ && portal_->busy()) {
+          if (QDateTime::currentMSecsSinceEpoch() - t0 < 8000) return;
+          portal_->stop();
+        }
+        if (!output_name_.isEmpty() &&
+            !KdeVirtualDisplay::outputExists(output_name_) &&
+            QDateTime::currentMSecsSinceEpoch() - t0 < 8000) {
+          return;
+        }
+        tick->stop();
+        tick->deleteLater();
         setState(State::Placed);
         beginPortal(false);
       });
+      tick->start();
       return;
     }
     if (!portal_retry_used_) {
@@ -1270,7 +1265,7 @@ void YouTubeSession::onPortalFailed(const QString& e) {
                          "If Virtual size/scale changed, re-run Tools → Set up live capture."));
       restore_token_.clear();
       emit toast(tr("Host: pick Virtual-monaSphere"));
-      QTimer::singleShot(1200, this, [this] {
+      QTimer::singleShot(0, this, [this] {
         if (!loading_.load() || active_.load()) return;
         if (portal_ && portal_->busy()) portal_->stop();
         setState(State::Placed);

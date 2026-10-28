@@ -309,7 +309,6 @@ VirtualDisplayManager::Result VirtualDisplayManager::ensure(const Spec& want_in)
     if (!wait_gone(8000)) {
       emit logMessage(tr("Virtual: still listed after stop — continuing"));
     }
-    QThread::msleep(350);
   }
 
   emit busyStatus(tr("Virtual 作成中"));
@@ -376,7 +375,6 @@ void VirtualDisplayManager::destroy() {
   screen_index_ = -1;
   if (wait_gone(8000)) {
     emit logMessage(tr("Virtual: removed"));
-    QThread::msleep(350);
   } else {
     emit logMessage(tr("Virtual: still listed after destroy — continuing"));
   }
