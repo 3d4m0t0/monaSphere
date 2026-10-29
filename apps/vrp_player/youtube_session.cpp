@@ -443,11 +443,21 @@ void YouTubeSession::start(const Config& cfg) {
   place_w_ = cfg_.virtual_w > 0 ? cfg_.virtual_w : (geo.width() > 0 ? geo.width() : 1280);
   place_h_ = cfg_.virtual_h > 0 ? cfg_.virtual_h : (geo.height() > 0 ? geo.height() : 720);
 
-  // Flat live audio deferred: scrub any orphan monaSphereYt null sink so Plasma
-  // does not keep an “unknown microphone” output and mute the real HDMI sink.
   if (!cfg_.enable_audio) {
 #if defined(VRP_HAS_PULSE)
+    // Scrub orphan monaSphereYt so Plasma does not keep a filter sink around.
     std::thread([] { (void)PulseMonitor::restore_browser_routing(); }).detach();
+#endif
+  } else {
+#if defined(VRP_HAS_PULSE)
+    // Sink before guest so PULSE_SINK / PIPEWIRE_NODE can bind at process start.
+    const std::string mon = PulseMonitor::ensure_yt_null_sink();
+    if (mon.empty()) {
+      emit logMessage(tr("Live audio: could not create monaSphereYt — system sink only"));
+    } else {
+      emit logMessage(tr("Live audio: monaSphereYt ready before guest (%1)")
+                          .arg(QString::fromStdString(mon)));
+    }
 #endif
   }
   // XTest must use Xrandr/X11 geometry (not kscreen logical) when scale≠1.
@@ -688,6 +698,10 @@ void YouTubeSession::beginPlaceDesktopApp() {
 
   {
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    if (cfg_.enable_audio) {
+      env.insert(QStringLiteral("PULSE_SINK"), QStringLiteral("monaSphereYt"));
+      env.insert(QStringLiteral("PIPEWIRE_NODE"), QStringLiteral("monaSphereYt"));
+    }
     if (!cfg_.pad_hook_lib.isEmpty() && !cfg_.pad_hook_sock.isEmpty()) {
       const QString prev = env.value(QStringLiteral("LD_PRELOAD"));
       const QString preload =

@@ -48,6 +48,15 @@ struct PulseSession {
   bool ready = false;
   bool failed = false;
 
+  bool pump(int timeout_ms) {
+    if (!ml) return false;
+    if (timeout_ms < 0) timeout_ms = 0;
+    if (pa_mainloop_prepare(ml, timeout_ms * 1000) < 0) return false;
+    if (pa_mainloop_poll(ml) < 0) return false;
+    if (pa_mainloop_dispatch(ml) < 0) return false;
+    return true;
+  }
+
   bool connect(const char* app) {
     ml = pa_mainloop_new();
     if (!ml) return false;
@@ -66,7 +75,10 @@ struct PulseSession {
     if (pa_context_connect(ctx, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) return false;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!ready && !failed && std::chrono::steady_clock::now() < deadline) {
-      if (pa_mainloop_iterate(ml, 1, nullptr) < 0) break;
+      const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now())
+                           .count();
+      if (!pump(static_cast<int>(std::min<std::chrono::milliseconds::rep>(rem, 50)))) break;
     }
     return ready;
   }
@@ -90,7 +102,10 @@ struct PulseSession {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (pa_operation_get_state(op) == PA_OPERATION_RUNNING &&
            std::chrono::steady_clock::now() < deadline) {
-      if (pa_mainloop_iterate(ml, 1, nullptr) < 0) break;
+      const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now())
+                           .count();
+      if (!pump(static_cast<int>(std::min<std::chrono::milliseconds::rep>(rem, 50)))) break;
     }
     const bool ok = pa_operation_get_state(op) == PA_OPERATION_DONE;
     pa_operation_unref(op);
@@ -1522,22 +1537,12 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
   st_->live_thread = std::thread([this] {
     if (!st_) return;
     std::vector<int16_t> buf(static_cast<size_t>(PulseMonitor::kRate / 50 * PulseMonitor::kChannels));
-    std::vector<int16_t> upmixed;
-    auto last_route = std::chrono::steady_clock::now();
-    auto last_dbg = last_route;
+    auto last_dbg = std::chrono::steady_clock::now();
     uint64_t frames_in = 0;
     uint64_t frames_queued = 0;
     double peak = 0.0;
     while (!st_->live_stop.load(std::memory_order_relaxed)) {
       const auto now = std::chrono::steady_clock::now();
-      // Chrome can spawn new sink-inputs while a video plays — keep isolating.
-      if (now - last_route >= std::chrono::seconds(1)) {
-        const int n = PulseMonitor::route_browser_to_yt_sink();
-        if (n > 0) {
-          push_audio_status("live audio: re-routed/muted " + std::to_string(n) + " stream(s)");
-        }
-        last_route = now;
-      }
       if (!st_->playing.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         continue;
@@ -1559,14 +1564,9 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
         push_audio_status("live audio: WARNING use_spatial=0 — dropping monitor PCM");
         continue;
       }
+      // Stereo Soft HRTF only — no live 4.0 side-diff (muddy/noisy in field).
       const int16_t* qsrc = buf.data();
-      int q_ch = PulseMonitor::kChannels;
       int q_left = got;
-      if (st_->use_stereo_upmix) {
-        st_->stereo_upmix.process(buf.data(), got, upmixed);
-        qsrc = upmixed.data();
-        q_ch = StereoSurround::kOutChannels;
-      }
       while (q_left > 0 && !st_->live_stop.load() && st_->playing.load()) {
         const int n = st_->spatial.queue_interleaved_s16(qsrc, q_left);
         if (n <= 0) {
@@ -1574,17 +1574,16 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
           continue;
         }
         frames_queued += static_cast<uint64_t>(n);
-        qsrc += n * q_ch;
+        qsrc += n * PulseMonitor::kChannels;
         q_left -= n;
       }
       if (now - last_dbg >= std::chrono::seconds(2)) {
         char line[256];
         std::snprintf(line, sizeof(line),
-                      "live audio: Flat surround feed peak=%.3f in=%llu q=%llu upmix=%d spatial=%d src=%s",
+                      "live audio: Flat surround feed peak=%.3f in=%llu q=%llu upmix=0 spatial=%d src=%s",
                       peak, static_cast<unsigned long long>(frames_in),
-                      static_cast<unsigned long long>(frames_queued),
-                      st_->use_stereo_upmix ? 1 : 0, st_->use_spatial ? 1 : 0,
-                      st_->live_mon.source().c_str());  // copy under mutex
+                      static_cast<unsigned long long>(frames_queued), st_->use_spatial ? 1 : 0,
+                      st_->live_mon.source().c_str());
         push_audio_status(line);
         peak = 0.0;
         frames_in = 0;
@@ -1637,22 +1636,26 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
     return false;
   }
 
-  constexpr uint64_t kMaskQuad = 0x00000033ull;
-  if (!st_->spatial.configure(kMaskQuad, StereoSurround::kOutChannels, 48000, device_name_)) {
-    fail("OpenAL configure failed for live monitor");
+  // Stereo FL|FR Soft HRTF on HMD device (device_name_ from ensure_output).
+  constexpr uint64_t kMaskStereo = 0x00000003ull;  // FL|FR
+  VRP_LOG("Audio: Soft configure begin (device='%s' monitor=%s)",
+          device_name_.empty() ? "(default)" : device_name_.c_str(), monitor.c_str());
+  if (!st_->spatial.configure(kMaskStereo, PulseMonitor::kChannels, 48000, device_name_)) {
+    fail(st_->spatial.last_error().empty() ? "OpenAL configure failed for live monitor"
+                                           : st_->spatial.last_error());
     return false;
   }
+  VRP_LOG("Audio: Soft configure ok (stereo HRTF)");
   if (cancelled()) {
     st_->spatial.flush();
     st_->spatial.pause();
     return false;
   }
   st_->use_spatial = true;
-  st_->use_stereo_upmix = true;
+  st_->use_stereo_upmix = false;
+  st_->stereo_upmix.clear();
   st_->out_rate = 48000;
   st_->out_channels = 2;
-  st_->stereo_upmix.reset(st_->out_rate);
-  st_->stereo_upmix.set_rear_gain(surround_gain_);
   spatial_active_.store(true, std::memory_order_release);
   has_audio_ = true;
   live_monitor_.store(true, std::memory_order_release);
@@ -1680,25 +1683,14 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
   st_->playing.store(true, std::memory_order_release);
   st_->spatial.play();
   playing_ = true;
-
-  const uint64_t route_gen = gen;
-  std::thread([this, route_gen] {
-    for (int i = 0; i < 120; ++i) {
-      if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
-      if (!live_monitor_.load(std::memory_order_acquire)) return;
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
-      if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
-      if (!live_monitor_.load(std::memory_order_acquire)) return;
-      (void)PulseMonitor::route_browser_to_yt_sink();
-    }
-  }).detach();
+  // Guest→yt routing is async after Soft is up (see request_start_live_monitor).
 
   {
     char line[256];
     std::snprintf(line, sizeof(line),
-                  "live audio: Chrome PCM → stereo side-diff 4.0 → OpenAL Soft HRTF "
-                  "(gain=%.2f vol=%.2f) monitor=%s module=%u",
-                  static_cast<double>(surround_gain_), static_cast<double>(volume_), monitor.c_str(),
+                  "live audio: guest PCM → stereo OpenAL Soft HRTF "
+                  "(vol=%.2f) monitor=%s module=%u",
+                  static_cast<double>(volume_), monitor.c_str(),
                   PulseMonitor::last_module_index());
     push_audio_status(line);
   }
@@ -1730,29 +1722,58 @@ void AudioPlayer::request_start_live_monitor() {
       fail("OpenAL Soft HRTF unavailable for live monitor");
       return;
     }
-    if (!is_output_ready() && !ensure_output(device_name_)) return;
+    if (!is_output_ready() && !ensure_output(device_name_)) {
+      fail(last_error_.empty() ? "live monitor: HMD output not ready" : last_error_);
+      return;
+    }
     if (cancelled()) return;
+    VRP_LOG("Audio: live start — Soft target sink='%s'",
+            device_name_.empty() ? "(default)" : device_name_.c_str());
 
-    // Pulse can take seconds — never hold live_ops_mu_ here (XR Stop must not wedge).
+    // Sink name only — never await browser route here (route used to hang Soft start).
     const std::string monitor = PulseMonitor::ensure_yt_null_sink();
     if (cancelled()) return;
     if (monitor.empty()) {
       fail("could not create monaSphereYt null sink");
       return;
     }
-    (void)PulseMonitor::route_browser_to_yt_sink();
-    if (cancelled()) return;
+    VRP_LOG("Audio: live start — Soft first (monitor=%s); browser route async", monitor.c_str());
 
-    std::lock_guard<std::mutex> lock(live_ops_mu_);
-    if (cancelled()) return;
-    if (st_) st_->pending_yt_monitor = monitor;
-    const bool ok = start_live_monitor_with_gen(gen);
-    if (st_) st_->pending_yt_monitor.clear();
-    if (cancelled()) {
-      if (ok) stop_live_monitor();
-      return;
+    VRP_LOG("Audio: live start — configuring Soft HRTF");
+    {
+      std::lock_guard<std::mutex> lock(live_ops_mu_);
+      if (cancelled()) return;
+      if (st_) st_->pending_yt_monitor = monitor;
+      const bool ok = start_live_monitor_with_gen(gen);
+      if (st_) st_->pending_yt_monitor.clear();
+      if (cancelled()) {
+        if (ok) stop_live_monitor();
+        return;
+      }
+      if (!ok) {
+        VRP_LOG("Audio: live start failed: %s", last_error_.c_str());
+        return;
+      }
     }
-    if (!ok) VRP_LOG("Audio: live start failed: %s", last_error_.c_str());
+    // Soft is up. Shared Chrome ignores PULSE_SINK and creates sink-inputs only
+    // when media plays — move onto yt off the Soft critical path (~30s).
+    const uint64_t route_gen = gen;
+    std::thread([this, route_gen] {
+      VRP_LOG("Audio: live route worker start");
+      (void)PulseMonitor::route_browser_to_yt_sink();
+      for (int i = 0; i < 60; ++i) {
+        if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
+        if (!live_monitor_.load(std::memory_order_acquire)) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
+        if (!live_monitor_.load(std::memory_order_acquire)) return;
+        const int n = PulseMonitor::route_browser_to_yt_sink();
+        if (n > 0) {
+          VRP_LOG("Audio: live route retry moved %d stream(s) (t+%dms)", n, (i + 1) * 500);
+        }
+      }
+      VRP_LOG("Audio: live route worker done");
+    }).detach();
 #endif
   }).detach();
 }

@@ -207,6 +207,9 @@ bool ChromiumYtLauncher::start() {
     // Only when Flat live monitor owns the null sink (enable_audio).
     env.insert(QStringLiteral("PULSE_SINK"), QStringLiteral("monaSphereYt"));
     env.insert(QStringLiteral("PIPEWIRE_NODE"), QStringLiteral("monaSphereYt"));
+    if (shared_session_ || chrome_running) {
+      VRP_LOG("live: Chrome shared/running — PULSE_SINK may not apply; rely on Pulse move");
+    }
   } else {
     // Avoid a leftover monaSphereYt becoming Chrome's (and then the session's)
     // default — that showed up as an unknown “microphone” output in Plasma.

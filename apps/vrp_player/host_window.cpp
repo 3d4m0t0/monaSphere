@@ -2543,12 +2543,10 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   cfg.virtual_scale = live_virtual_scale_;
   cfg.chrome_scale = live_chrome_scale_;
   cfg.use_default_chrome_profile = live_chrome_default_profile_;
-  // Flat OpenAL live path disabled: Soft HRTF JIT SEGV while live_thread feeds
-  // (cores after live_ops_mu_ serialization). Chrome stays on the system sink.
-  // Re-enable only after OpenAL lifetime is proven safe on Stop.
-  cfg.enable_audio = false;
+  // Flat live: Chrome/[アプリ] → monaSphereYt → monitor → stereo Soft HRTF (worker thread).
+  cfg.enable_audio = true;
   cfg.drm_modifiers = live_drm_modifiers_;
-  appendLog(tr("Live audio: system sink only (Flat OpenAL deferred)"));
+  appendLog(tr("Live audio: stereo Soft HRTF (monaSphereYt → monitor)"));
   if (!live_drm_modifiers_.empty()) {
     appendLog(tr("ScreenCast: announcing %1 Vulkan-sampleable DRM modifier(s)")
                   .arg(live_drm_modifiers_.size()));
@@ -5107,9 +5105,8 @@ void HostWindow::xrThreadMain() {
         hud_paint();
       }
 
-      // Live audio → Flat stereo→4.0 OpenAL (never block XR on Pulse/pactl).
-      // Chrome PCM is diverted to a hidden null sink, monitored, then the same
-      // surround path as file Flat (side-diff rear + OpenAL Soft HRTF).
+      // Live audio → Flat stereo Soft HRTF (never block XR on Pulse/pactl).
+      // Guest PCM → monaSphereYt → monitor → Soft on HMD HDMI.
       if (yt_live && yt_session_ && yt_session_->audio_wanted() && !audio.live_monitor_active() &&
           !audio.live_monitor_busy()) {
         yt_audio_pending_log_ = true;
@@ -5122,7 +5119,7 @@ void HostWindow::xrThreadMain() {
           QMetaObject::invokeMethod(
               this,
               [this] {
-                appendLog(tr("Live audio: Chrome → Flat surround (OpenAL Soft HRTF 4.0)"));
+                appendLog(tr("Live audio: Flat path active (stereo → Soft HRTF)"));
               },
               Qt::QueuedConnection);
         } else {

@@ -114,12 +114,9 @@ class AudioPlayer {
   float surround_gain() const { return surround_gain_; }
 
   /**
-   * Live stereo from a Pulse monitor (browser) → same Flat path
-   * (stereo side-diff upmix → OpenAL Soft HRTF). Diverts browser streams to a
-   * null sink so the HMD does not double-play system audio.
-   *
-   * Prefer request_* from the XR thread — Pulse/OpenAL setup can take hundreds of
-   * ms and must not block xrWaitFrame.
+   * Live stereo from a Pulse monitor (browser/[アプリ]) → stereo OpenAL Soft HRTF
+   * on the HMD sink. Guest streams go to monaSphereYt so Soft does not double-play
+   * system audio. Prefer request_* from XR — never run Soft/Pulse on the XR thread.
    */
   bool start_live_monitor();
   void stop_live_monitor();

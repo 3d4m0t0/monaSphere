@@ -161,6 +161,82 @@ Switching live↔live / live↔app / app↔app **reuses Virtual** when WxH match
 (spinner:「切替中」). A different span/size waits until Virtual is removed
 (「Virtual 削除中」), then creates the next size and launches.
 
+## Flat live audio (verified)
+
+Field-checked: Live YouTube / `[アプリ]` ↔ Live 切替 ↔ VR 動画切替, with **stereo
+(2ch) OpenAL Soft HRTF** on the HMD sounding correct. This is the supported path;
+do not reintroduce mute-competitors, Soft-before-route inversion, or
+`pa_mainloop_iterate(block=1)` in Live helpers.
+
+### Signal path
+
+```
+Chrome / [アプリ]
+    │  PULSE_SINK / PIPEWIRE_NODE=monaSphereYt   (new processes)
+    │  + pactl move-sink-input                   (shared Chrome / late sink-inputs)
+    ▼
+monaSphereYt  (null sink, device.class=filter)
+    │  .monitor
+    ▼
+PulseMonitor  (S16 stereo @ 48 kHz, audio worker)
+    ▼
+OpenAL Soft HRTF  stereo FL|FR  →  HMD HDMI
+    app name monaSphereHrtf  (never open Soft on monaSphereYt)
+```
+
+File / VR playback may still use stereo→4.0 side-diff upmix (`surround_gain`).
+**Live Flat does not** — it stays pure stereo Soft HRTF (`use_stereo_upmix=false`).
+
+### Startup order (must keep)
+
+1. **`enable_audio=true`** on Live / `[アプリ]` session (`host_window`).
+2. **`PulseMonitor::ensure_yt_null_sink()`** before guest launch (`youtube_session`)
+   so new processes can bind `PULSE_SINK=monaSphereYt`.
+3. Guest starts (Chrome may be **shared** — `chrome_running=1`; env often ignored).
+4. ScreenCast streaming → `audio_wanted`; XR calls **`request_start_live_monitor()`**.
+5. **Soft first:** ensure yt sink → Soft configure / play / monitor record on the
+   audio worker. **Do not** await browser route on this path.
+6. **Route second:** detached worker (~30s, 500ms ticks) runs
+   `PulseMonitor::route_browser_to_yt_sink()` via **`pactl` only** (no Pulse
+   mainloop). Shared Chrome creates sink-inputs only after media plays.
+7. Stop: `request_stop_live_monitor` / restore routing + unload null sink when
+   Live ends; XR must not call Soft/Pulse on its own thread.
+
+### Soft open rules
+
+- `alcOpenDevice(nullptr)` with temporary `PULSE_SINK=<HMD>`; restore env after open.
+- Passing the full sink name to `alcOpenDevice` can **hang** on PipeWire-Pulse
+  (`live_op_busy` sticks; no Soft/peak logs).
+- Soft identifies as `monaSphereHrtf` so route helpers never move it onto yt.
+
+### Pulse / mainloop rules
+
+- Live Pulse helpers use **timed** `pa_mainloop_prepare` / `poll` / `dispatch`.
+  Never `pa_mainloop_iterate(block=1)` — idle block hung Soft start inside
+  `drain()` after “routing browsers” (no Soft configure log).
+- Browser move is **pactl** (`list sink-inputs` + `move-sink-input` + unmute on yt).
+- **Do not mute** other HMD sink-inputs during route (Soft/Chrome race → silence).
+
+### Code map
+
+| Piece | Where |
+|-------|--------|
+| `enable_audio`, XR `request_start_live_monitor` | `apps/vrp_player/host_window.cpp` |
+| yt sink before guest, `audio_wanted` | `apps/vrp_player/youtube_session.cpp` |
+| Soft first + route worker | `src/audio/audio_player.cpp` |
+| Soft open / HRTF | `src/audio/openal_spatial.cpp` |
+| null sink, pactl route, monitor record | `src/audio/pulse_monitor.cpp` |
+| Chrome `PULSE_SINK` / shared warning | `src/capture/chromium_yt.cpp` |
+
+### Healthy log order
+
+`Soft first (monitor=…)` → `configuring Soft HRTF` → `Soft configure ok` →
+`live route worker start` → `no browser sink-input yet` and/or
+`moved N` / `route retry moved` → peaks / status line for live audio.
+
+Silent Live: Soft never opened (hang/busy) or Chrome never landed on
+`monaSphereYt` (shared session + no move yet — play media and wait for route).
+
 ## Limits
 
 - NVIDIA DMA-BUF import is **experimental** (OPAQUE_FD fallback, explicit DRM
@@ -172,8 +248,7 @@ Switching live↔live / live↔app / app↔app **reuses Virtual** when WxH match
 - Pointer: KDE uses KWin EIS; GNOME uses portal RemoteDesktop.ConnectToEIS.
 - `restore_token` behaviour differs by desktop (GNOME / KDE / wlroots).
 - DRM / EME titles that Chrome paints black stay black when captured.
-- Flat OpenAL surround is temporarily off (OpenAL Soft HRTF SEGV on stop/play).
-  Chrome audio uses the system sink (often the HMD) until that path is re-enabled.
+- Live audio design: see **Flat live audio (verified)** above.
 - GStreamer is not used; only libpipewire + portal.
 - Live Chromium defaults to `--ozone-platform=wayland` (picks up Virtual
   `live_virtual_scale` like normal desktop Chrome). Opt out with

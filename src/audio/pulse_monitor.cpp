@@ -8,6 +8,7 @@
 #include <pulse/simple.h>
 #endif
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -24,10 +25,26 @@ namespace {
 std::atomic<uint32_t> g_yt_null_module{0};
 
 #if defined(VRP_HAS_PULSE)
+/**
+ * Timed Pulse mainloop — never use pa_mainloop_iterate(block=1).
+ * block=1 waits forever when idle; Live Soft start hung in drain() after route
+ * Pass 1 (log stopped at "routing browsers", never reached Soft configure).
+ */
 struct PulseSession {
   pa_mainloop* ml = nullptr;
   pa_context* ctx = nullptr;
   bool ready = false;
+  bool failed = false;
+
+  /** One prepare/poll/dispatch with a hard timeout (ms). Never blocks forever. */
+  bool pump(int timeout_ms) {
+    if (!ml) return false;
+    if (timeout_ms < 0) timeout_ms = 0;
+    if (pa_mainloop_prepare(ml, timeout_ms * 1000) < 0) return false;
+    if (pa_mainloop_poll(ml) < 0) return false;
+    if (pa_mainloop_dispatch(ml) < 0) return false;
+    return true;
+  }
 
   bool connect(const char* app) {
     ml = pa_mainloop_new();
@@ -41,12 +58,16 @@ struct PulseSession {
           auto* s = static_cast<PulseSession*>(u);
           const auto st = pa_context_get_state(c);
           if (st == PA_CONTEXT_READY) s->ready = true;
-          if (st == PA_CONTEXT_FAILED || st == PA_CONTEXT_TERMINATED) s->ready = false;
+          if (st == PA_CONTEXT_FAILED || st == PA_CONTEXT_TERMINATED) s->failed = true;
         },
         this);
     if (pa_context_connect(ctx, nullptr, PA_CONTEXT_NOFLAGS, nullptr) < 0) return false;
-    for (int i = 0; i < 200 && !ready; ++i) {
-      if (pa_mainloop_iterate(ml, 1, nullptr) < 0) break;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!ready && !failed && std::chrono::steady_clock::now() < deadline) {
+      const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now())
+                           .count();
+      if (!pump(static_cast<int>(std::min<std::chrono::milliseconds::rep>(rem, 50)))) break;
     }
     return ready;
   }
@@ -62,25 +83,32 @@ struct PulseSession {
       ml = nullptr;
     }
     ready = false;
+    failed = false;
   }
 
   ~PulseSession() { disconnect(); }
 
   bool wait_op(pa_operation* op, int timeout_ms = 3000) {
     if (!op) return false;
-    const auto t0 = std::chrono::steady_clock::now();
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (pa_operation_get_state(op) == PA_OPERATION_RUNNING &&
-           std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
-                   .count() < timeout_ms) {
-      if (pa_mainloop_iterate(ml, 1, nullptr) < 0) break;
+           std::chrono::steady_clock::now() < deadline) {
+      const auto rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now())
+                           .count();
+      if (!pump(static_cast<int>(std::min<std::chrono::milliseconds::rep>(rem, 50)))) break;
     }
     const bool ok = pa_operation_get_state(op) == PA_OPERATION_DONE;
     pa_operation_unref(op);
     return ok;
   }
 
+  /** Non-blocking dispatch of already-queued events (moves, etc.). */
   void drain(int n = 40) {
-    for (int i = 0; i < n; ++i) pa_mainloop_iterate(ml, 1, nullptr);
+    for (int i = 0; i < n; ++i) {
+      if (!pump(0)) break;
+    }
   }
 };
 
@@ -533,100 +561,126 @@ int PulseMonitor::route_browser_to_yt_sink() {
 #if !defined(VRP_HAS_PULSE)
   return 0;
 #else
-  // Overlapping callers (GUI poll + live thread + start retries) must not run
-  // concurrent PulseSession mainloops against the same server.
+  // pactl-only: no Pulse mainloop. Soft start must never block on this.
+  // Shared Chrome creates sink-inputs only after media plays — callers retry.
   static std::mutex route_mu;
   std::unique_lock<std::mutex> route_lock(route_mu, std::try_to_lock);
   if (!route_lock.owns_lock()) return 0;
 
-  PulseSession ps;
-  if (!ps.connect("monaSphere-yt-route")) {
-    return pactl_silence_hmd_competitors();
+  const uint32_t yt_idx = pactl_yt_sink_index();
+  if (yt_idx == 0) {
+    VRP_LOG("PulseMonitor: route skip — %s missing", kYtSinkName);
+    return 0;
   }
-  if (!sink_exists(ps, kYtSinkName)) return 0;
-  const uint32_t yt_idx = sink_index_by_name(ps, kYtSinkName);
 
-  struct MoveSt {
-    uint32_t yt_idx = PA_INVALID_INDEX;
-    int moved = 0;
-    int muted = 0;
-    int browser_seen = 0;
-    int dumped = 0;
-  } st;
-  st.yt_idx = yt_idx;
+  FILE* list = popen("pactl list sink-inputs 2>/dev/null", "r");
+  if (!list) return 0;
 
-  // Pass 1: move browser streams onto the null sink (so we can monitor them).
-  ps.wait_op(pa_context_get_sink_input_info_list(
-      ps.ctx,
-      [](pa_context* c, const pa_sink_input_info* i, int eol, void* u) {
-        auto* s = static_cast<MoveSt*>(u);
-        if (eol || !i) return;
-        const char* app = input_prop(i, "application.name");
-        const char* bin = input_prop(i, "application.process.binary");
-        if (s->dumped < 12) {
-          VRP_LOG("PulseMonitor: sink-input #%u app='%s' bin='%s' sink=%u mute=%d", i->index,
-                  app ? app : "?", bin ? bin : "?", i->sink, i->mute ? 1 : 0);
-          ++s->dumped;
-        }
-        if (!is_browser_input(i)) return;
-        ++s->browser_seen;
-        if (i->sink == s->yt_idx) return;
-        pa_operation* op =
-            pa_context_move_sink_input_by_name(c, i->index, kYtSinkName, nullptr, nullptr);
-        if (op) {
-          pa_operation_unref(op);
-          ++s->moved;
-        }
-        VRP_LOG("PulseMonitor: move sink-input #%u (%s / %s) → %s", i->index, app ? app : "?",
-                bin ? bin : "?", kYtSinkName);
-      },
-      &st));
-  ps.drain(80);
+  int moved = 0;
+  int browser_seen = 0;
+  int dumped = 0;
+  int cur = -1;
+  bool browser = false;
+  bool ours = false;
+  uint32_t sink_idx = 0;
+  bool have_sink = false;
+  std::string app_name;
+  std::string app_bin;
 
-  // Pass 2: unmute streams on null sink; mute EVERYTHING else that is not our
-  // OpenAL/miniaudio. Name matching alone misses some Chrome/PipeWire labels —
-  // those streams drown Flat HRTF as plain stereo on the HMD.
-  ps.wait_op(pa_context_get_sink_input_info_list(
-      ps.ctx,
-      [](pa_context* c, const pa_sink_input_info* i, int eol, void* u) {
-        auto* s = static_cast<MoveSt*>(u);
-        if (eol || !i) return;
-        if (is_mona_openal_input(i)) {
-          if (i->mute) {
-            pa_operation* op = pa_context_set_sink_input_mute(c, i->index, 0, nullptr, nullptr);
-            if (op) pa_operation_unref(op);
-          }
-          return;
-        }
-        if (i->sink == s->yt_idx) {
-          if (i->mute) {
-            pa_operation* op = pa_context_set_sink_input_mute(c, i->index, 0, nullptr, nullptr);
-            if (op) pa_operation_unref(op);
-          }
-          return;
-        }
-        if (!i->mute) {
-          pa_operation* op = pa_context_set_sink_input_mute(c, i->index, 1, nullptr, nullptr);
-          if (op) {
-            pa_operation_unref(op);
-            ++s->muted;
-          }
-          const char* app = input_prop(i, "application.name");
-          VRP_LOG("PulseMonitor: muted HMD competitor sink-input #%u (%s)", i->index,
-                  app ? app : "?");
-        }
-      },
-      &st));
-  ps.drain(40);
+  auto flush = [&] {
+    if (cur < 0) return;
+    if (dumped < 12) {
+      VRP_LOG("PulseMonitor: sink-input #%d app='%s' bin='%s' sink=%u", cur,
+              app_name.empty() ? "?" : app_name.c_str(),
+              app_bin.empty() ? "?" : app_bin.c_str(), have_sink ? sink_idx : 0u);
+      ++dumped;
+    }
+    if (ours || !browser) {
+      cur = -1;
+      browser = ours = false;
+      sink_idx = 0;
+      have_sink = false;
+      app_name.clear();
+      app_bin.clear();
+      return;
+    }
+    ++browser_seen;
+    const bool on_yt = have_sink && sink_idx == yt_idx;
+    if (!on_yt) {
+      char cmd[192];
+      std::snprintf(cmd, sizeof(cmd), "pactl move-sink-input %d %s 2>/dev/null", cur, kYtSinkName);
+      if (std::system(cmd) == 0) {
+        ++moved;
+        VRP_LOG("PulseMonitor: move sink-input #%d (%s / %s) → %s", cur,
+                app_name.empty() ? "?" : app_name.c_str(),
+                app_bin.empty() ? "?" : app_bin.c_str(), kYtSinkName);
+      }
+    }
+    // Keep browser unmuted on yt (never mute HMD competitors — Soft/Chrome race → silence).
+    {
+      char cmd[128];
+      std::snprintf(cmd, sizeof(cmd), "pactl set-sink-input-mute %d 0 2>/dev/null", cur);
+      (void)std::system(cmd);
+    }
+    cur = -1;
+    browser = ours = false;
+    sink_idx = 0;
+    have_sink = false;
+    app_name.clear();
+    app_bin.clear();
+  };
 
-  const int pactl_muted = pactl_silence_hmd_competitors();
-  if (st.moved > 0 || st.muted > 0 || pactl_muted > 0) {
-    VRP_LOG("PulseMonitor: live audio isolate (moved=%d muted=%d pactl=%d browser_seen=%d)", st.moved,
-            st.muted, pactl_muted, st.browser_seen);
-  } else if (st.browser_seen == 0) {
+  char line[512];
+  while (std::fgets(line, sizeof(line), list)) {
+    unsigned id = 0;
+    if (std::sscanf(line, "Sink Input #%u", &id) == 1) {
+      flush();
+      cur = static_cast<int>(id);
+      continue;
+    }
+    if (contains_ci(line, "chrome") || contains_ci(line, "chromium") ||
+        contains_ci(line, "monasphereyt") || contains_ci(line, "brave") ||
+        contains_ci(line, "google-chrome") || contains_ci(line, "firefox") ||
+        contains_ci(line, "librewolf") || contains_ci(line, "msedge")) {
+      browser = true;
+    }
+    // Soft / miniaudio on HMD — never move onto yt.
+    if (contains_ci(line, "application.process.binary = \"monasphere\"") ||
+        contains_ci(line, "application.name = \"monasphere\"") ||
+        contains_ci(line, "application.name = \"monaSphereHrtf\"") ||
+        contains_ci(line, "application.id = \"monaSphereHrtf\"") ||
+        contains_ci(line, "openal") || contains_ci(line, "alsoft") ||
+        contains_ci(line, "miniaudio")) {
+      ours = true;
+    }
+    {
+      char val[256]{};
+      if (std::sscanf(line, "\tapplication.name = \"%255[^\"]\"", val) == 1 ||
+          std::sscanf(line, "    application.name = \"%255[^\"]\"", val) == 1)
+        app_name = val;
+      if (std::sscanf(line, "\tapplication.process.binary = \"%255[^\"]\"", val) == 1 ||
+          std::sscanf(line, "    application.process.binary = \"%255[^\"]\"", val) == 1)
+        app_bin = val;
+    }
+    unsigned sidx = 0;
+    if (std::sscanf(line, "\tSink: %u", &sidx) == 1 ||
+        std::sscanf(line, "    Sink: %u", &sidx) == 1) {
+      sink_idx = sidx;
+      have_sink = true;
+    }
+  }
+  flush();
+  (void)pclose(list);
+
+  if (moved > 0) {
+    VRP_LOG("PulseMonitor: moved %d browser stream(s) → %s (seen=%d)", moved, kYtSinkName,
+            browser_seen);
+  } else if (browser_seen == 0) {
     VRP_LOG("PulseMonitor: no browser sink-input yet (will retry)");
+  } else {
+    VRP_LOG("PulseMonitor: browser already on %s (seen=%d)", kYtSinkName, browser_seen);
   }
-  return st.moved + st.muted + pactl_muted;
+  return moved;
 #endif
 }
 
@@ -686,7 +740,7 @@ int PulseMonitor::restore_browser_routing() {
         }
       },
       &st));
-  for (int i = 0; i < 40; ++i) pa_mainloop_iterate(ps.ml, 1, nullptr);
+  ps.drain(40);
   if (st.moved > 0 || st.unmuted > 0)
     VRP_LOG("PulseMonitor: restored (moved=%d unmuted=%d) → %s", st.moved, st.unmuted, dest.c_str());
 

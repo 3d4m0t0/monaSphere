@@ -9,7 +9,7 @@ namespace vrp {
 
 /**
  * PulseAudio / PipeWire monitor capture → interleaved S16 stereo @ 48 kHz.
- * Used to feed browser (live) audio into the Flat stereo→4.0 OpenAL path.
+ * Used to feed Live/[アプリ] audio into Flat stereo OpenAL Soft HRTF.
  *
  * open/read/close are mutex-serialized. Prefer interrupt() then join the reader
  * thread before close() — never free pa_simple while another thread is in read.
@@ -51,9 +51,13 @@ class PulseMonitor {
   static std::string ensure_yt_null_sink();
   /** Unload monaSphereYt null sink (Pulse module + PipeWire node). */
   static void destroy_yt_null_sink();
-  /** Move Chrome onto the live null sink; mute other HMD competitors. */
+  /**
+   * Move browser sink-inputs onto monaSphereYt (pactl; no Pulse mainloop).
+   * Soft start must not await this — call from an async retry worker only.
+   * Does not mute HMD competitors (that raced Soft/Chrome into silence).
+   */
   static int route_browser_to_yt_sink();
-  /** Restore mutes/moves, then destroy the null sink. */
+  /** Move yt streams back to the default sink, then destroy the null sink. */
   static int restore_browser_routing();
   static constexpr const char* kYtSinkName = "monaSphereYt";
 

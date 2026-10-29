@@ -92,7 +92,7 @@ Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://curs
 | XR | OpenXR 1.x（ランタイムは Monado を想定 / Monado is the expected runtime） |
 | 入力 / Input | XR コントローラ / ゲームパッド（任意） / XR controllers or gamepad (optional) |
 | 映像 / Video | ローカルファイル（FFmpeg）。未導入時はプレースホルダ表示のみ / Local files via FFmpeg. Placeholder only if FFmpeg is absent |
-| 音声 / Audio | FFmpeg + OpenAL Soft HRTF（2ch は側差で後方 4.0 合成、`surround_gain`）。フォールバックは miniaudio / FFmpeg + OpenAL Soft HRTF (2ch → 4.0, `surround_gain`); miniaudio fallback |
+| 音声 / Audio | ファイル: FFmpeg + OpenAL Soft HRTF（2ch→4.0 側差、`surround_gain`）。Live/[アプリ]: Pulse `monaSphereYt` → stereo Soft HRTF（アップミックスなし）。詳細は [`data/README_live.md`](data/README_live.md)。フォールバックは miniaudio / Files: FFmpeg + Soft HRTF (2ch→4.0). Live/[アプリ]: yt null sink → stereo Soft HRTF (no upmix); see `data/README_live.md`. miniaudio fallback |
 | UI | Qt 6 Widgets（ホストウィンドウ / host window） |
 
 ## 依存するライブラリ / Dependencies
@@ -115,8 +115,8 @@ Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://curs
 |----------------------|-------------|
 | FFmpeg（libavcodec / libavformat / libavutil / libswscale / libswresample） | 動画・音声デコード / Video and audio decode |
 | SDL2 | ゲームパッド / Gamepad |
-| PulseAudio（libpulse） | 出力デバイス列挙・HMD 向けプロファイル補助 / Output devices and HMD profile helpers |
-| OpenAL Soft（`libopenal.so.1`） | HRTF バイノーラル（世界固定スピーカー＋頭部追跡）。2ch は側差＋遅延で BL/BR を合成 / HRTF binaural; 2ch side-diff + delay → BL/BR |
+| PulseAudio（libpulse）+ pactl | 出力列挙・HMD プロファイル；Live は null sink / monitor / browser move / Device enum, HMD profiles; Live null sink, monitor, browser move |
+| OpenAL Soft（`libopenal.so.1`） | HRTF バイノーラル（世界固定スピーカー＋頭部追跡）。ファイル 2ch は側差→BL/BR；Live は stereo Soft のまま / HRTF binaural; file 2ch→BL/BR; Live stays stereo Soft |
 
 **同梱（third_party） / Bundled**
 
@@ -141,7 +141,8 @@ At runtime, **Monado** (`monado-service`) and `XR_RUNTIME_JSON` are required.
 - ハードウェアデコード連携（環境により NVDEC / VA-API 等）
 - NVIDIA 環境での CUDA↔Vulkan NV12 経路（条件を満たす場合）
 - XR メニュー、リセンター、コントローラ / ゲームパッド操作
-- OpenAL Soft HRTF（世界固定スピーカー＋頭部追跡）。2ch は側差＋遅延で後方サラウンドを合成
+- OpenAL Soft HRTF（世界固定スピーカー＋頭部追跡）。ファイル 2ch は側差で後方合成；Live/[アプリ] は stereo Soft HRTF（[`data/README_live.md`](data/README_live.md)）
+- Live ブラウザ / デスクトップアプリ（ScreenCast + Virtual MONITOR）
 - ロケール準備（`tr` / `VRP_TR`、詳細は `translations/README.md`）
 
 ### English
@@ -154,7 +155,8 @@ At runtime, **Monado** (`monado-service`) and `XR_RUNTIME_JSON` are required.
 - Hardware decode (NVDEC, VA-API, and similar, when available)
 - CUDA↔Vulkan NV12 path on NVIDIA when the requirements are met
 - XR menu, recenter, and controller / gamepad input
-- OpenAL Soft HRTF (world-locked speakers + head tracking); stereo side-diff rear upmix to 4.0
+- OpenAL Soft HRTF (world-locked speakers + head tracking); file 2ch→4.0 upmix; Live/[アプリ] stereo Soft HRTF (see [`data/README_live.md`](data/README_live.md))
+- Live browser / desktop apps (ScreenCast + Virtual MONITOR)
 - Locale groundwork (`tr` / `VRP_TR`; see `translations/README.md`)
 
 ## 動作環境

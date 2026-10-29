@@ -136,15 +136,34 @@ bool OpenAlSpatial::init(const std::string& pulse_sink) {
 #else
   std::lock_guard<std::recursive_mutex> lock(mu_);
   shutdown_unlocked();
-  // Prefer the same Pulse sink miniaudio uses (e.g. jamesdsp → HMD). Default
-  // OpenAL Soft otherwise follows the Pulse default (often HDMI/TV).
+  // Prefer the same Pulse sink miniaudio uses (e.g. jamesdsp → HMD). Soft must
+  // never land on monaSphereYt (that is the guest-capture null sink).
   const std::string want =
       (!pulse_sink.empty() && pulse_sink != "default") ? pulse_sink : std::string{};
+  if (!want.empty() && want.find("monaSphereYt") != std::string::npos) {
+    impl_->last_error = "refusing OpenAL on monaSphereYt";
+    VRP_ERR("openal: %s", impl_->last_error.c_str());
+    return false;
+  }
+  // Identify Soft to Pulse so route helpers never mute it. Open via default
+  // device + PULSE_SINK — passing the full sink name to alcOpenDevice can hang
+  // on PipeWire-Pulse (Live audio then never logs Soft HRTF / peaks; busy sticks).
+  ::setenv("PULSE_PROP_application.name", "monaSphereHrtf", 1);
+  ::setenv("PULSE_PROP_application.id", "monaSphereHrtf", 1);
+  const char* prev_sink = ::getenv("PULSE_SINK");
+  const std::string prev_sink_copy = prev_sink ? prev_sink : std::string{};
   if (!want.empty()) {
     ::setenv("PULSE_SINK", want.c_str(), 1);
-    impl_->device = alcOpenDevice(want.c_str());
+    VRP_LOG("OpenAL: opening default device with PULSE_SINK=%s", want.c_str());
+  } else {
+    VRP_LOG("OpenAL: opening default device");
   }
-  if (!impl_->device) impl_->device = alcOpenDevice(nullptr);
+  impl_->device = alcOpenDevice(nullptr);
+  // Restore so later QProcessEnvironment::systemEnvironment() is not stuck on HMD.
+  if (!prev_sink_copy.empty())
+    ::setenv("PULSE_SINK", prev_sink_copy.c_str(), 1);
+  else
+    ::unsetenv("PULSE_SINK");
   if (!impl_->device) {
     impl_->last_error = "OpenAL デバイスを開けません";
     VRP_ERR("openal: %s", impl_->last_error.c_str());
@@ -165,9 +184,7 @@ bool OpenAlSpatial::init(const std::string& pulse_sink) {
   alListenerfv(AL_ORIENTATION, orient);
   impl_->ready = true;
   impl_->pulse_sink = want;
-  if (!want.empty()) {
-    VRP_LOG("OpenAL: opened (pulse_sink=%s)", want.c_str());
-  }
+  VRP_LOG("OpenAL: opened (pulse_sink=%s)", want.empty() ? "(default)" : want.c_str());
   return true;
 #endif
 }
