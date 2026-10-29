@@ -163,9 +163,9 @@ Switching live↔live / live↔app / app↔app **reuses Virtual** when WxH match
 
 ## Flat live audio (verified)
 
-Field-checked: Live YouTube / `[アプリ]` ↔ Live 切替 ↔ VR 動画切替, with **stereo
-(2ch) OpenAL Soft HRTF** on the HMD sounding correct. This is the supported path;
-do not reintroduce mute-competitors, Soft-before-route inversion, or
+Field-checked routing (yt sink / Soft-first / pactl move) with Live ↔ `[アプリ]` ↔
+VR 動画切替. Soft layout matches **file 2ch**: side-diff → Soft HRTF 4.0.
+Do not reintroduce mute-competitors, Soft-before-route inversion, or
 `pa_mainloop_iterate(block=1)` in Live helpers.
 
 ### Signal path
@@ -180,12 +180,21 @@ monaSphereYt  (null sink, device.class=filter)
     ▼
 PulseMonitor  (S16 stereo @ 48 kHz, audio worker)
     ▼
-OpenAL Soft HRTF  stereo FL|FR  →  HMD HDMI
+StereoSurround  (L−R + 14 ms + HPF 180 Hz → BL/BR; gain = surround_gain)
+    ▼
+OpenAL Soft HRTF  4.0 (FL|FR|BL|BR)  →  HMD HDMI
     app name monaSphereHrtf  (never open Soft on monaSphereYt)
 ```
 
-File / VR playback may still use stereo→4.0 side-diff upmix (`surround_gain`).
-**Live Flat does not** — it stays pure stereo Soft HRTF (`use_stereo_upmix=false`).
+Same Soft + `StereoSurround` path as local file 2ch. Shared knobs:
+
+| Knob | Conf / UI | Applies to |
+|------|-----------|------------|
+| Master volume | HMD menu / conf `volume` | file, Live, `[アプリ]` (one `AudioPlayer`) |
+| Rear upmix | conf `surround_gain` (0..2, default `0.55`) | file 2ch, Live, `[アプリ]` |
+
+`surround_gain` has no HMD UI — edit `~/.config/monasphere/monasphere.conf` and
+restart the HMD session (applied at Soft start via `audio.set_surround_gain`).
 
 ### Startup order (must keep)
 
@@ -230,9 +239,10 @@ File / VR playback may still use stereo→4.0 side-diff upmix (`surround_gain`).
 
 ### Healthy log order
 
-`Soft first (monitor=…)` → `configuring Soft HRTF` → `Soft configure ok` →
+`Soft first (monitor=…)` → `configuring Soft HRTF` →
+`Soft configure ok (4.0 HRTF, stereo side-diff upmix)` →
 `live route worker start` → `no browser sink-input yet` and/or
-`moved N` / `route retry moved` → peaks / status line for live audio.
+`moved N` / `route retry moved` → feed line with `upmix=1 gain=…`.
 
 Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 `monaSphereYt` (shared session + no move yet — play media and wait for route).
@@ -262,6 +272,8 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 
 | Key | Meaning |
 |-----|---------|
+| `surround_gain` | Stereo→4.0 rear level for **file / Live / [アプリ]** (0..2, default `0.55`) |
+| `volume` | Master level (HMD menu); same `AudioPlayer` for file / Live / `[アプリ]` |
 | `live_capture` | `monitor` (default) or `window` |
 | `live_virtual` | `1` = app starts/stops `krfb-virtualmonitor` (KDE Wayland only) |
 | `live_virtual_size` | e.g. `1280x720` (managed virtual output `Virtual-monaSphere`) |

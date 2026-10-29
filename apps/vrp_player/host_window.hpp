@@ -338,7 +338,7 @@ class HostWindow : public QMainWindow {
   bool thumb_jpeg_ = true;
   /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */
   float milkyway_gain_ = 1.f;
-  /** monasphere.conf `surround_gain`. Stereo→4.0 rear upmix (default 0.55; no UI). */
+  /** monasphere.conf `surround_gain`. Stereo→4.0 rear for file / Live / [アプリ] (default 0.55; no UI). */
   float surround_gain_ = 0.55f;
   /**
    * Earth-horizon sky observer. When `sky_from_timezone=1` (default), filled from the

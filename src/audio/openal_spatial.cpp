@@ -276,8 +276,10 @@ bool OpenAlSpatial::configure(uint64_t channel_mask, int channels, int sample_ra
     for (int i = 0; i < kBuffersPerSource; ++i) sp.free_ids[i] = sp.buffers[i];
     sp.free_count = kBuffersPerSource;
     sp.mono.resize(static_cast<size_t>(kBufferFrames));
+    // REFERENCE_DISTANCE = speaker radius so the seat (origin) is unity gain;
+    // keep kSpeakerDist for HRTF layout without the old ×0.4 inverse drop.
     alSourcef(sp.source, AL_ROLLOFF_FACTOR, lfe ? 0.f : 1.f);
-    alSourcef(sp.source, AL_REFERENCE_DISTANCE, 1.f);
+    alSourcef(sp.source, AL_REFERENCE_DISTANCE, lfe ? 1.f : kSpeakerDist);
     alSourcef(sp.source, AL_MAX_DISTANCE, 20.f);
     alSourcef(sp.source, AL_GAIN, lfe ? 0.65f : 1.f);
     if (lfe) {

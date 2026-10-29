@@ -2543,10 +2543,11 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   cfg.virtual_scale = live_virtual_scale_;
   cfg.chrome_scale = live_chrome_scale_;
   cfg.use_default_chrome_profile = live_chrome_default_profile_;
-  // Flat live: Chrome/[アプリ] → monaSphereYt → monitor → stereo Soft HRTF (worker thread).
+  // Flat live: Chrome/[アプリ] → monaSphereYt → monitor → Soft 4.0 (same as file 2ch).
   cfg.enable_audio = true;
   cfg.drm_modifiers = live_drm_modifiers_;
-  appendLog(tr("Live audio: stereo Soft HRTF (monaSphereYt → monitor)"));
+  appendLog(tr("Live audio: Soft HRTF 4.0 (monaSphereYt → side-diff, surround_gain=%1)")
+                .arg(QString::number(static_cast<double>(surround_gain_), 'f', 2)));
   if (!live_drm_modifiers_.empty()) {
     appendLog(tr("ScreenCast: announcing %1 Vulkan-sampleable DRM modifier(s)")
                   .arg(live_drm_modifiers_.size()));
@@ -5105,7 +5106,7 @@ void HostWindow::xrThreadMain() {
         hud_paint();
       }
 
-      // Live audio → Flat stereo Soft HRTF (never block XR on Pulse/pactl).
+      // Live audio → Flat Soft 4.0 (same side-diff as file 2ch; never block XR on Pulse).
       // Guest PCM → monaSphereYt → monitor → Soft on HMD HDMI.
       if (yt_live && yt_session_ && yt_session_->audio_wanted() && !audio.live_monitor_active() &&
           !audio.live_monitor_busy()) {
@@ -5119,7 +5120,7 @@ void HostWindow::xrThreadMain() {
           QMetaObject::invokeMethod(
               this,
               [this] {
-                appendLog(tr("Live audio: Flat path active (stereo → Soft HRTF)"));
+                appendLog(tr("Live audio: Flat path active (2ch → Soft HRTF 4.0)"));
               },
               Qt::QueuedConnection);
         } else {

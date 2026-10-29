@@ -1564,9 +1564,16 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
         push_audio_status("live audio: WARNING use_spatial=0 — dropping monitor PCM");
         continue;
       }
-      // Stereo Soft HRTF only — no live 4.0 side-diff (muddy/noisy in field).
+      // Same path as file 2ch: stereo → StereoSurround → Soft 4.0 HRTF.
+      std::vector<int16_t> upmixed;
       const int16_t* qsrc = buf.data();
+      int q_ch = PulseMonitor::kChannels;
       int q_left = got;
+      if (st_->use_stereo_upmix) {
+        st_->stereo_upmix.process(buf.data(), got, upmixed);
+        qsrc = upmixed.data();
+        q_ch = StereoSurround::kOutChannels;
+      }
       while (q_left > 0 && !st_->live_stop.load() && st_->playing.load()) {
         const int n = st_->spatial.queue_interleaved_s16(qsrc, q_left);
         if (n <= 0) {
@@ -1574,16 +1581,18 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
           continue;
         }
         frames_queued += static_cast<uint64_t>(n);
-        qsrc += n * PulseMonitor::kChannels;
+        qsrc += n * q_ch;
         q_left -= n;
       }
       if (now - last_dbg >= std::chrono::seconds(2)) {
         char line[256];
         std::snprintf(line, sizeof(line),
-                      "live audio: Flat surround feed peak=%.3f in=%llu q=%llu upmix=0 spatial=%d src=%s",
+                      "live audio: Flat surround feed peak=%.3f in=%llu q=%llu upmix=%d "
+                      "gain=%.2f spatial=%d src=%s",
                       peak, static_cast<unsigned long long>(frames_in),
-                      static_cast<unsigned long long>(frames_queued), st_->use_spatial ? 1 : 0,
-                      st_->live_mon.source().c_str());
+                      static_cast<unsigned long long>(frames_queued),
+                      st_->use_stereo_upmix ? 1 : 0, static_cast<double>(surround_gain_),
+                      st_->use_spatial ? 1 : 0, st_->live_mon.source().c_str());
         push_audio_status(line);
         peak = 0.0;
         frames_in = 0;
@@ -1636,26 +1645,28 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
     return false;
   }
 
-  // Stereo FL|FR Soft HRTF on HMD device (device_name_ from ensure_output).
-  constexpr uint64_t kMaskStereo = 0x00000003ull;  // FL|FR
-  VRP_LOG("Audio: Soft configure begin (device='%s' monitor=%s)",
-          device_name_.empty() ? "(default)" : device_name_.c_str(), monitor.c_str());
-  if (!st_->spatial.configure(kMaskStereo, PulseMonitor::kChannels, 48000, device_name_)) {
+  // Same Soft layout as file 2ch: QUAD after side-diff upmix (device from ensure_output).
+  constexpr uint64_t kMaskQuad = 0x00000033ull;  // FL|FR|BL|BR
+  VRP_LOG("Audio: Soft configure begin (device='%s' monitor=%s surround_gain=%.2f)",
+          device_name_.empty() ? "(default)" : device_name_.c_str(), monitor.c_str(),
+          static_cast<double>(surround_gain_));
+  if (!st_->spatial.configure(kMaskQuad, StereoSurround::kOutChannels, 48000, device_name_)) {
     fail(st_->spatial.last_error().empty() ? "OpenAL configure failed for live monitor"
                                            : st_->spatial.last_error());
     return false;
   }
-  VRP_LOG("Audio: Soft configure ok (stereo HRTF)");
+  VRP_LOG("Audio: Soft configure ok (4.0 HRTF, stereo side-diff upmix)");
   if (cancelled()) {
     st_->spatial.flush();
     st_->spatial.pause();
     return false;
   }
   st_->use_spatial = true;
-  st_->use_stereo_upmix = false;
-  st_->stereo_upmix.clear();
+  st_->use_stereo_upmix = true;
   st_->out_rate = 48000;
-  st_->out_channels = 2;
+  st_->out_channels = 2;  // monitor is stereo; upmix → 4.0 before Soft
+  st_->stereo_upmix.reset(st_->out_rate);
+  st_->stereo_upmix.set_rear_gain(surround_gain_);
   spatial_active_.store(true, std::memory_order_release);
   has_audio_ = true;
   live_monitor_.store(true, std::memory_order_release);
@@ -1688,10 +1699,10 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
   {
     char line[256];
     std::snprintf(line, sizeof(line),
-                  "live audio: guest PCM → stereo OpenAL Soft HRTF "
-                  "(vol=%.2f) monitor=%s module=%u",
-                  static_cast<double>(volume_), monitor.c_str(),
-                  PulseMonitor::last_module_index());
+                  "live audio: guest PCM → Soft HRTF 4.0 side-diff "
+                  "(vol=%.2f surround_gain=%.2f) monitor=%s module=%u",
+                  static_cast<double>(volume_), static_cast<double>(surround_gain_),
+                  monitor.c_str(), PulseMonitor::last_module_index());
     push_audio_status(line);
   }
   return true;

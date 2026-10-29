@@ -109,14 +109,18 @@ class AudioPlayer {
   /** True when OpenAL Soft HRTF is active (file or live Flat path). */
   bool spatial_active() const { return spatial_active_.load(std::memory_order_acquire); }
 
-  /** Stereo→4.0 rear upmix gain (0..2, default 0.55). Ignored for discrete multichannel. */
+  /**
+   * Stereo→4.0 rear upmix gain (0..2, default 0.55). Shared by file / Live / [アプリ]
+   * 2ch Soft path (`monasphere.conf` surround_gain). Ignored for discrete multichannel.
+   */
   void set_surround_gain(float g);
   float surround_gain() const { return surround_gain_; }
 
   /**
-   * Live stereo from a Pulse monitor (browser/[アプリ]) → stereo OpenAL Soft HRTF
-   * on the HMD sink. Guest streams go to monaSphereYt so Soft does not double-play
-   * system audio. Prefer request_* from XR — never run Soft/Pulse on the XR thread.
+   * Live stereo from a Pulse monitor (browser/[アプリ]) → same Soft 4.0 path as file
+   * 2ch (side-diff upmix + surround_gain) on the HMD sink. Guest streams go to
+   * monaSphereYt so Soft does not double-play system audio. Prefer request_* from
+   * XR — never run Soft/Pulse on the XR thread.
    */
   bool start_live_monitor();
   void stop_live_monitor();
