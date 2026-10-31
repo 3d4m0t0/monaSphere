@@ -898,6 +898,17 @@ void KwinWindowPlacer::remove_desktop_window_rule() {
   g_desk_rule_output.clear();
 }
 
+void KwinWindowPlacer::clear_live_session_rules() {
+  QMutexLocker lock(&arm().mu);
+  // Full disarm (scripts + bookkeeping) then force-remove rules from kwinrulesrc.
+  disarmLocked(/*keep_fullscreen_rule=*/false);
+  removeTempWindowRuleById(kTempRuleId);
+  removeTempWindowRuleById(kDeskRuleId);
+  g_desk_rule_class.clear();
+  g_desk_rule_output.clear();
+  VRP_LOG("kwin-place: cleared live session Window Rules (Virtual teardown)");
+}
+
 QStringList KwinWindowPlacer::list_all_window_ids(QString* error_out) {
   BusGuard guard;
   guard.clearLast();

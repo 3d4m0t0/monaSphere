@@ -82,7 +82,7 @@ class HostWindow : public QMainWindow {
   void onFsrAction(QAction* action);
   void onHzAction(QAction* action);
   void showAboutDialog();
-  /** Host Tools → Set up live capture… (portal auth / token; x1→x2→x3). */
+  /** Host Tools → Set up live capture… (one Remember for Virtual-monaSphere). */
   void setupYouTubeCapture();
   /** Start next span in yt_setup_queue_ (interactive Capture). */
   void beginNextSetupSpan(bool first);
@@ -348,7 +348,12 @@ class HostWindow : public QMainWindow {
   float sky_lat_ = 35.68f;
   float sky_lon_ = 139.65f;
   vrp::FsrMode preferred_fsr_ = vrp::FsrMode::Quality;
+  /** Browser Live only (not [アプリ]); conf `live_fsr`, default Performance.
+   *  Provisional: □ / X cycles Off→UQ→Q→P while Live (menus closed). */
+  vrp::FsrMode live_fsr_ = vrp::FsrMode::Performance;
   std::atomic<int> fsr_req_{-1};       // -1 none; else FsrMode
+  /** 8K+ source: runtime FSR forced Off; preferred_fsr_ kept for restore. */
+  std::atomic<bool> fsr_locked_8k_{false};
   int monado_desired_mode_ = -1;       // cached XRT_COMPOSITOR_DESIRED_MODE
   bool monado_hz_restarted_ = false;   // one restart after parsing modes
   QMap<int, double> monado_mode_hz_;   // mode index → refresh Hz
@@ -380,11 +385,11 @@ class HostWindow : public QMainWindow {
   qint64 sync_lag_hold_until_ms_ = 0;  // keep 「フレーム遅れ」 visible briefly
 
   /**
-   * ScreenCast restore tokens per Virtual span (x1–x3).
-   * Bare live_restore_token= mirrors x1 for older conf.
+   * ScreenCast restore token for Virtual-monaSphere (shared by x1–x3 sizes).
+   * Legacy live_restore_token[xN] is still read as a fallback.
    */
   QMap<int, QString> live_restore_tokens_;
-  QString live_restore_token_;  // alias of tokens_[1]
+  QString live_restore_token_;
   /** Span used by the in-flight / last live session (1–3). */
   int live_session_span_ = 1;
   QString tokenForSpan(int span) const;

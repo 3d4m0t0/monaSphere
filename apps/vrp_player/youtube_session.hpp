@@ -64,8 +64,8 @@ class YouTubeSession : public QObject {
     /** Absolute path of libmonasphere_padhook.so for LD_PRELOAD. */
     QString pad_hook_lib;
     QString restore_token;
-    QString output_hint;  // e.g. Virtual-monaSphere-x1
-    /** krfb --name (monaSphere-xN). Empty → derive from output_hint / x1. */
+    QString output_hint;  // Virtual-monaSphere
+    /** krfb --name (monaSphere). Empty → derive from output_hint. */
     QString virtual_name;
     bool virtual_display = true;
     int virtual_w = 1960;

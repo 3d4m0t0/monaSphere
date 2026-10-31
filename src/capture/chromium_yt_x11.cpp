@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -132,6 +133,15 @@ ChromiumYtX11::~ChromiumYtX11() { clear(); }
 
 void ChromiumYtX11::set_error(const std::string& e) {
   last_error_ = e;
+  // "not found yet" is expected during place — log at most every ~2s.
+  if (e.find("not found yet") != std::string::npos) {
+    static auto last = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (last.time_since_epoch().count() != 0 &&
+        now - last < std::chrono::seconds(2))
+      return;
+    last = now;
+  }
   VRP_LOG("live-x11: %s", e.c_str());
 }
 
@@ -228,6 +238,7 @@ bool ChromiumYtX11::bind_output_by_name(const std::string& output_name_substr, i
       return false;
     }
   }
+  const bool changed = !have_place_ || place_x_ != x || place_y_ != y || width_ != cw || height_ != ch;
   place_x_ = x;
   place_y_ = y;
   have_place_ = true;
@@ -241,8 +252,10 @@ bool ChromiumYtX11::bind_output_by_name(const std::string& output_name_substr, i
   screen_input_ = true;
   cursor_x_ = std::clamp(cursor_x_, 0.f, static_cast<float>(std::max(1, width_ - 1)));
   cursor_y_ = std::clamp(cursor_y_, 0.f, static_cast<float>(std::max(1, height_ - 1)));
-  VRP_LOG("live-x11: bind Xrandr origin @%d,%d (crtc %dx%d) cfg clamp %dx%d", x, y, w, h, cw,
-          ch);
+  if (changed) {
+    VRP_LOG("live-x11: bind Xrandr origin @%d,%d (crtc %dx%d) cfg clamp %dx%d", x, y, w, h, cw,
+            ch);
+  }
   return true;
 }
 

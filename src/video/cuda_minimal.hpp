@@ -12,10 +12,15 @@ using CUdeviceptr = unsigned long long;
 using CUdevice = int;
 using CUcontext = struct CUctx_st*;
 using CUstream = struct CUstream_st*;
+using CUevent = struct CUevent_st*;
 using CUexternalMemory = struct CUextMemory_st*;
 using CUresult = int;
 
 constexpr CUresult CUDA_SUCCESS = 0;
+/** cuEventCreate flag: skip timing for cheaper events. */
+constexpr unsigned int CU_EVENT_DISABLE_TIMING = 0x2u;
+/** cuStreamCreate: does not sync with NULL stream. */
+constexpr unsigned int CU_STREAM_NON_BLOCKING = 0x1u;
 
 enum CUexternalMemoryHandleType {
   CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD = 1,
@@ -100,6 +105,12 @@ struct Api {
   CUresult (*cuMemcpyDtoD)(CUdeviceptr, CUdeviceptr, size_t) = nullptr;
   CUresult (*cuMemcpyDtoDAsync)(CUdeviceptr, CUdeviceptr, size_t, CUstream) = nullptr;
   CUresult (*cuStreamSynchronize)(CUstream) = nullptr;
+  CUresult (*cuStreamCreate)(CUstream*, unsigned int) = nullptr;
+  CUresult (*cuStreamDestroy)(CUstream) = nullptr;
+  CUresult (*cuEventCreate)(CUevent*, unsigned int) = nullptr;
+  CUresult (*cuEventDestroy)(CUevent) = nullptr;
+  CUresult (*cuEventRecord)(CUevent, CUstream) = nullptr;
+  CUresult (*cuEventSynchronize)(CUevent) = nullptr;
   CUresult (*cuPointerGetAttribute)(void*, unsigned int, CUdeviceptr) = nullptr;
   CUresult (*cuGetErrorName)(CUresult, const char**) = nullptr;
   CUresult (*cuGetErrorString)(CUresult, const char**) = nullptr;

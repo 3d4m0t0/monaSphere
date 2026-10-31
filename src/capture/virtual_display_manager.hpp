@@ -18,12 +18,12 @@ namespace vrp {
  *  - none → create
  *
  * Identity (after ensure / refresh):
- *  - output_name: kscreen/KWin name (e.g. Virtual-monaSphere-x3)
+ *  - output_name: always Virtual-monaSphere (span only changes WxH)
  *  - screen_index: workspace.screens[] index for Window Rule Force screen
  *
  * Token policy:
- *  - one restore token per span x1–x3 (conf: live_restore_token[xN])
- *  - ensure() does not clear other spans' tokens
+ *  - one restore token for Virtual-monaSphere (conf: live_restore_token)
+ *  - span x1–x3 share that token; resolution changes do not need re-auth
  *  - setToken() after portal Start; clearToken() on reject / wrong-stream
  *  - Host persists via tokenChanged (manager is in-memory source of truth)
  *
@@ -34,7 +34,7 @@ class VirtualDisplayManager : public QObject {
   Q_OBJECT
  public:
   struct Spec {
-    QString name;  // krfb --name (monaSphere-xN)
+    QString name;  // krfb --name (monaSphere; span ignored for naming)
     int width = 1280;
     int height = 720;
     float scale = 2.f;
@@ -70,9 +70,9 @@ class VirtualDisplayManager : public QObject {
   bool alive() const;
   bool matches(const Spec& want) const;
 
-  /** Expected / last matched compositor output name (Virtual-monaSphere-xN). */
+  /** Expected / last matched compositor output name (Virtual-monaSphere). */
   QString output_name() const;
-  /** krfb --name (monaSphere-xN). */
+  /** krfb --name (monaSphere). */
   QString name() const;
   /**
    * KWin screen index for Window Rules. Valid after successful ensure/refresh.
@@ -90,7 +90,7 @@ class VirtualDisplayManager : public QObject {
    */
   bool refresh_identity(QString* error_out = nullptr);
 
-  /** Derive span 1–3 from monaSphere-xN / Virtual-monaSphere-xN. */
+  /** Legacy monaSphere-xN → 1–3; plain Virtual-monaSphere → 1. */
   static int spanFromName(const QString& name_or_output);
   static Spec normalize(Spec want);
 
@@ -110,7 +110,7 @@ class VirtualDisplayManager : public QObject {
  signals:
   void logMessage(const QString& msg);
   void busyStatus(const QString& status);
-  /** Persist live_restore_token[xN] (empty = cleared in memory; Host may ignore empty). */
+  /** Persist live_restore_token (span arg kept for API; always the shared grant). */
   void tokenChanged(int span, const QString& token);
 
  private:

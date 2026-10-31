@@ -90,6 +90,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <vector>
 #include <atomic>
 #include <filesystem>
 #include <unistd.h>
@@ -795,7 +796,8 @@ void HostWindow::paintHudNow() {
       help     ? vrp::paint_controls_help(hud_w_, hud_h_, face_sony_.load(), menu_option_.load())
       : kind == 5 ? vrp::paint_hud_toast(toast, hud_w_, hud_h_)
                   : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load(), menu_option_.load());
-  QImage thumb = (!help && snap.visible) ? vrp::paint_file_thumb(snap) : QImage();
+  // Skip thumb work while DLNA/network spinner owns the list (lightening 9).
+  QImage thumb = (!help && snap.visible && !snap.network_loading) ? vrp::paint_file_thumb(snap) : QImage();
   if (!thumb.isNull() && thumb.format() != QImage::Format_RGBA8888) {
     thumb = thumb.convertToFormat(QImage::Format_RGBA8888);
   }
@@ -1298,6 +1300,7 @@ QStringList normalizeLiveExecArgs(const QStringList& fields) {
 
 void HostWindow::saveAppConf() const {
   setMonasphereConfKey(QStringLiteral("fsr"), QString::number(static_cast<int>(preferred_fsr_)));
+  setMonasphereConfKey(QStringLiteral("live_fsr"), QString::number(static_cast<int>(live_fsr_)));
   setMonasphereConfKey(QStringLiteral("runtime"), usingWivrn() ? QStringLiteral("wivrn") : QStringLiteral("monado"));
   setMonasphereConfKey(QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2));
   setMonasphereConfKey(QStringLiteral("flat_distance"),
@@ -1337,6 +1340,8 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("volume"), QStringLiteral("0.2")},
       {QStringLiteral("fsr"),
        QString::number(fsr_migrated >= 0 ? fsr_migrated : static_cast<int>(vrp::FsrMode::Quality))},
+      // Browser Live only (not [アプリ]). 0=Off 1=UQ 2=Q 3=P — default Performance.
+      {QStringLiteral("live_fsr"), QString::number(static_cast<int>(vrp::FsrMode::Performance))},
       {QStringLiteral("hz"), QStringLiteral("0")},
       {QStringLiteral("runtime"),
        runtime_migrated == QLatin1String("wivrn") ? QStringLiteral("wivrn") : QStringLiteral("monado")},
@@ -1356,7 +1361,8 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("sky_lat"), QStringLiteral("35.68")},
       {QStringLiteral("sky_lon"), QStringLiteral("139.65")},
       {QStringLiteral("live_restore_token"), QString()},
-      {QStringLiteral("live_setup_spans"), QStringLiteral("1,2,3")},
+      // One Remember for Virtual-monaSphere (x1 size). Span sizes share that token.
+      {QStringLiteral("live_setup_spans"), QStringLiteral("1")},
       {QStringLiteral("live_capture"), QStringLiteral("monitor")},
       {QStringLiteral("live_output"), QString()},
       {QStringLiteral("live_virtual"), QStringLiteral("1")},
@@ -1401,6 +1407,10 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const int v = line.mid(4).toInt(&ok);
       if (ok && v >= 0 && v <= 3) preferred_fsr_ = static_cast<vrp::FsrMode>(v);
+    } else if (line.startsWith(QStringLiteral("live_fsr="))) {
+      bool ok = false;
+      const int v = line.mid(9).toInt(&ok);
+      if (ok && v >= 0 && v <= 3) live_fsr_ = static_cast<vrp::FsrMode>(v);
     } else if (line.startsWith(QStringLiteral("hz="))) {
       bool ok = false;
       const int v = line.mid(3).toInt(&ok);
@@ -1825,7 +1835,7 @@ void HostWindow::buildMenus() {
   connect(settings, &QMenu::aboutToShow, this, [this] { refreshGamepadActionLabel(); });
 
   auto* tools = menuBar()->addMenu(tr("Tools"));
-  tools->addAction(tr("Set up live capture (x1–x3)…"), this, &HostWindow::setupYouTubeCapture);
+  tools->addAction(tr("Set up live capture…"), this, &HostWindow::setupYouTubeCapture);
 
   auto* help = menuBar()->addMenu(tr("Help"));
   help->addAction(tr("About"), this, &HostWindow::showAboutDialog);
@@ -1846,37 +1856,33 @@ void HostWindow::refreshGamepadActionLabel() {
   act_gamepad_->setText(name);
 }
 
-QString HostWindow::tokenForSpan(int span) const {
-  const int s = std::clamp(span, 1, 3);
+QString HostWindow::tokenForSpan(int /*span*/) const {
+  // Shared ScreenCast grant for Virtual-monaSphere (all spans / resolutions).
   if (vdisp_mgr_) {
-    const QString t = vdisp_mgr_->token(s);
+    const QString t = vdisp_mgr_->token(1);
     if (!t.isEmpty()) return t;
   }
-  const auto it = live_restore_tokens_.constFind(s);
-  if (it != live_restore_tokens_.cend() && !it.value().isEmpty()) return it.value();
-  if (s == 1 && !live_restore_token_.isEmpty()) return live_restore_token_;
+  if (!live_restore_token_.isEmpty()) return live_restore_token_;
+  for (int s = 1; s <= 3; ++s) {
+    const QString t = live_restore_tokens_.value(s);
+    if (!t.isEmpty()) return t;
+  }
   return {};
 }
 
-void HostWindow::saveTokenForSpan(int span, const QString& token) {
-  const int s = std::clamp(span, 1, 3);
+void HostWindow::saveTokenForSpan(int /*span*/, const QString& token) {
   // Prefer manager::setToken from session; this path syncs conf + manager without re-emit loop.
-  if (vdisp_mgr_) vdisp_mgr_->loadToken(s, token);
-  live_restore_tokens_.insert(s, token);
-  setMonasphereConfKey(QStringLiteral("live_restore_token[x%1]").arg(s), token);
-  if (s == 1) {
-    live_restore_token_ = token;
-    setMonasphereConfKey(QStringLiteral("live_restore_token"), token);
-  }
+  if (vdisp_mgr_) vdisp_mgr_->loadToken(1, token);
+  live_restore_token_ = token;
+  live_restore_tokens_.clear();
+  if (!token.isEmpty()) live_restore_tokens_.insert(1, token);
+  setMonasphereConfKey(QStringLiteral("live_restore_token"), token);
 }
 
 void HostWindow::syncTokensIntoManager() {
   if (!vdisp_mgr_) return;
-  for (int s = 1; s <= 3; ++s) {
-    QString t = live_restore_tokens_.value(s);
-    if (t.isEmpty() && s == 1) t = live_restore_token_;
-    if (!t.isEmpty()) vdisp_mgr_->loadToken(s, t);
-  }
+  const QString t = tokenForSpan(1);
+  vdisp_mgr_->loadToken(1, t);
 }
 
 void HostWindow::virtualSizeForSpan(int span, int* out_w, int* out_h) const {
@@ -1935,16 +1941,14 @@ void HostWindow::ensureYouTubeSession() {
       else yt_session_->set_busy_status(s);
     });
     connect(vdisp_mgr_, &vrp::VirtualDisplayManager::tokenChanged, this,
-            [this](int span, const QString& t) {
-              const int s = std::clamp(span, 1, 3);
-              live_session_span_ = s;
-              live_restore_tokens_.insert(s, t);
-              if (s == 1) live_restore_token_ = t;
-              // Persist non-empty; empty clear stays in-memory (other spans untouched in conf).
+            [this](int /*span*/, const QString& t) {
+              live_restore_token_ = t;
+              live_restore_tokens_.clear();
+              if (!t.isEmpty()) live_restore_tokens_.insert(1, t);
+              // Persist non-empty; empty clear stays in-memory.
               if (!t.isEmpty()) {
-                setMonasphereConfKey(QStringLiteral("live_restore_token[x%1]").arg(s), t);
-                if (s == 1) setMonasphereConfKey(QStringLiteral("live_restore_token"), t);
-                appendLog(tr("Live: saved restore token for x%1 (%2 chars)").arg(s).arg(t.size()));
+                setMonasphereConfKey(QStringLiteral("live_restore_token"), t);
+                appendLog(tr("Live: saved restore token (%1 chars)").arg(t.size()));
               }
             });
     syncTokensIntoManager();
@@ -2160,7 +2164,8 @@ void HostWindow::beginNextSetupSpan(bool first) {
   virtualSizeForSpan(span, &setup_w, &setup_h);
   QStringList left;
   for (int s : yt_setup_queue_) left << QStringLiteral("x%1").arg(s);
-  appendLog(tr("Live setup: registering token for x%1 (%2×%3)%4")
+  appendLog(tr("Live setup: Remember %1 at x%2 (%3×%4)%5")
+                .arg(vrp::KdeVirtualDisplay::outputNameForSpan(span))
                 .arg(span)
                 .arg(setup_w)
                 .arg(setup_h)
@@ -2175,26 +2180,14 @@ void HostWindow::beginNextSetupSpan(bool first) {
 }
 
 void HostWindow::setupYouTubeCapture() {
-  // Host Tools: for each span — interactive auth → token → stop → silent restore verify.
-  // Default queue x1→x2→x3 so ultrawide tokens are registered in one Tools run.
-  // Override with live_setup_spans=1,2 or live_setup_spans=2,3 etc.
+  // Host Tools: one interactive Remember for Virtual-monaSphere at x1 size, then
+  // silent restore verify. x2/x3 later reuse the same name/token (resolution only).
   reloadLiveCaptureConf();
   yt_setup_queue_.clear();
   yt_setup_continue_ = false;
-  {
-    const QString list = monasphereConfValue(QStringLiteral("live_setup_spans")).trimmed();
-    if (!list.isEmpty()) {
-      for (const QString& part : list.split(QLatin1Char(','))) {
-        bool ok = false;
-        const int v = part.trimmed().toInt(&ok);
-        if (ok && v >= 1 && v <= 3 && !yt_setup_queue_.contains(v)) yt_setup_queue_.push_back(v);
-      }
-    }
-  }
-  if (yt_setup_queue_.isEmpty()) yt_setup_queue_ = {1, 2, 3};
-  QStringList shown;
-  for (int s : yt_setup_queue_) shown << QStringLiteral("x%1").arg(s);
-  appendLog(tr("Live setup: registering tokens for %1").arg(shown.join(QStringLiteral(" → "))));
+  yt_setup_queue_ = {1};
+  appendLog(tr("Live setup: Remember %1 once (x1 size; token shared for x2/x3)")
+                .arg(vrp::KdeVirtualDisplay::outputNameForSpan(1)));
   beginNextSetupSpan(/*first=*/true);
 }
 
@@ -2310,9 +2303,9 @@ void HostWindow::startLiveFromHmd(const QString& url) {
   yt_setup_phase_ = YtSetupPhase::None;
 
   if (tokenForSpan(1).isEmpty()) {
-    appendLog(tr("Live: no restore token for x1 — use Tools → Set up live capture on the host first "
-                 "(KDE: enable Remember on the share dialog)"));
-    showHudToast(tr("Host: Set up live capture first (x1)"));
+    appendLog(tr("Live: no restore token — use Tools → Set up live capture on the host first "
+                 "(pick Virtual-monaSphere, enable Remember)"));
+    showHudToast(tr("Host: Set up live capture first"));
     yt_pending_kind_ = YtPendingKind::None;
     if (yt_session_ &&
         (yt_session_->active() || yt_session_->loading() ||
@@ -2369,10 +2362,9 @@ void HostWindow::startLiveDesktopApp(const QString& exec, const QStringList& arg
 
   const QString tok = tokenForSpan(span);
   if (tok.isEmpty()) {
-    appendLog(tr("Live: no restore token for x%1 — use Tools → Set up live capture at that "
-                 "span on the host first (Remember on the share dialog)")
-                  .arg(span));
-    showHudToast(tr("Host: Set up live capture first (x%1)").arg(span));
+    appendLog(tr("Live: no restore token — use Tools → Set up live capture on the host first "
+                 "(pick Virtual-monaSphere, enable Remember)"));
+    showHudToast(tr("Host: Set up live capture first"));
     yt_pending_kind_ = YtPendingKind::None;
     if (yt_session_ &&
         (yt_session_->active() || yt_session_->loading() ||
@@ -2512,10 +2504,9 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
 
   if (host_setup) {
     // Force interactive picker for this run. Do not wipe monasphere.conf —
-    // only replace live_restore_token[xN] when Start returns a new one.
+    // only replace live_restore_token when Start returns a new one.
     if (!tokenForSpan(span).isEmpty()) {
-      appendLog(tr("Live host setup — interactive re-auth for x%1 (keeping other span tokens)")
-                    .arg(span));
+      appendLog(tr("Live host setup — interactive re-auth (keeping existing token until replaced)"));
     }
     yt_hmd_suppress_live_.store(true, std::memory_order_release);
   }
@@ -2534,7 +2525,7 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
     }
   }
   cfg.restore_token = host_setup ? QString() : tokenForSpan(span);
-  // Per-span Virtual name → independent ScreenCast Remember tokens (same name = last auth wins).
+  // Fixed Virtual-monaSphere; span only picks WxH. One ScreenCast Remember token.
   cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
   cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
   cfg.virtual_display = live_virtual_;
@@ -2747,6 +2738,7 @@ void HostWindow::rebuildFsrMenu() {
     a->deleteLater();
   }
   fsr_menu_->clear();
+  const bool locked = fsr_locked_8k_.load();
   struct Item {
     vrp::FsrMode mode;
     const char* label;
@@ -2761,8 +2753,19 @@ void HostWindow::rebuildFsrMenu() {
     auto* a = fsr_menu_->addAction(tr(it.label));
     a->setCheckable(true);
     a->setData(static_cast<int>(it.mode));
+    // 8K+: only Off is meaningful — gray out / unselectable for other presets.
+    a->setEnabled(!locked || it.mode == vrp::FsrMode::Off);
     fsr_group_->addAction(a);
-    if (it.mode == preferred_fsr_) a->setChecked(true);
+    if (locked) {
+      if (it.mode == vrp::FsrMode::Off) a->setChecked(true);
+    } else if (it.mode == preferred_fsr_) {
+      a->setChecked(true);
+    }
+  }
+  if (locked) {
+    fsr_menu_->setTitle(tr("FSR (8K: Off)"));
+  } else {
+    fsr_menu_->setTitle(tr("FSR"));
   }
 }
 
@@ -2809,6 +2812,10 @@ void HostWindow::onAudioDeviceAction(QAction* action) {
 
 void HostWindow::onFsrAction(QAction* action) {
   if (!action) return;
+  if (fsr_locked_8k_.load()) {
+    rebuildFsrMenu();
+    return;
+  }
   const auto mode = static_cast<vrp::FsrMode>(action->data().toInt());
   preferred_fsr_ = mode;
   saveAppConf();
@@ -4410,12 +4417,97 @@ void HostWindow::xrThreadMain() {
     bool vaapi_hud_pending = true;
     bool pending_video_rebind = false;
     bool fsr_need_process = false;
+    bool force_fsr_refresh = true;
+    /** Browser Live FSR armed (not [アプリ]); drives post-end_frame allow-list. */
+    bool live_fsr_armed = false;
+    auto cuda_clear_samples = [&] { cuda_tex.clear_display_sample(); };
     VkImageView fsr_src_y = VK_NULL_HANDLE;
     VkImageView fsr_src_uv = VK_NULL_HANDLE;
     VkSampler fsr_src_samp = VK_NULL_HANDLE;
     int fsr_src_w = 0;
     int fsr_src_h = 0;
     int fsr_src_nv12 = 0;
+    auto arm_live_fsr = [&](bool on) {
+      if (on == live_fsr_armed) return;
+      live_fsr_armed = on;
+      if (on) {
+        fsr.set_mode(live_fsr_);
+        fsr.invalidate();
+        force_fsr_refresh = true;
+        QMetaObject::invokeMethod(
+            this,
+            [this] {
+              appendLog(QStringLiteral("Live FSR1: %1 (conf live_fsr)")
+                            .arg(QString::fromUtf8(vrp::fsr_mode_name(live_fsr_))));
+            },
+            Qt::QueuedConnection);
+      } else {
+        const auto restore =
+            fsr_locked_8k_.load() ? vrp::FsrMode::Off : preferred_fsr_;
+        fsr.set_mode(restore);
+        fsr.invalidate();
+        force_fsr_refresh = true;
+        fsr_need_process = false;
+        fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
+        fsr_src_samp = VK_NULL_HANDLE;
+        fsr_src_w = fsr_src_h = 0;
+        fsr_src_nv12 = 0;
+      }
+    };
+    // 8K+: force FSR Off for this media session (do not re-evaluate from per-frame
+    // display vs coded size — that oscillated lock/unlock and blanked / jerked video).
+    auto sync_fsr_source_lock = [&](bool lock, int log_w = 0, int log_h = 0) {
+      const bool was = fsr_locked_8k_.load();
+      if (lock == was) {
+        if (lock && fsr.mode() != vrp::FsrMode::Off) {
+          fsr.set_mode(vrp::FsrMode::Off);
+          menu.set_fsr(vrp::FsrMode::Off);
+          fsr.invalidate();
+          force_fsr_refresh = true;
+          pending_video_rebind = true;
+        }
+        return;
+      }
+      fsr_locked_8k_.store(lock);
+      menu.set_fsr_locked(lock);
+      fsr.invalidate();
+      if (lock) {
+        fsr.set_mode(vrp::FsrMode::Off);
+        menu.set_fsr(vrp::FsrMode::Off);
+        force_fsr_refresh = true;
+        pending_video_rebind = true;
+        fsr_need_process = false;
+        fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
+        fsr_src_samp = VK_NULL_HANDLE;
+        fsr_src_w = fsr_src_h = 0;
+        fsr_src_nv12 = 0;
+        QMetaObject::invokeMethod(
+            this,
+            [this, log_w, log_h] {
+              rebuildFsrMenu();
+              if (log_w > 0 && log_h > 0) {
+                appendLog(tr("FSR1: Off (8K %1×%2 — upscale useless)").arg(log_w).arg(log_h));
+              } else {
+                appendLog(tr("FSR1: Off (8K source — upscale useless)"));
+              }
+            },
+            Qt::QueuedConnection);
+      } else {
+        fsr.set_mode(preferred_fsr_);
+        menu.set_fsr(preferred_fsr_);
+        force_fsr_refresh = true;
+        pending_video_rebind = true;
+        QMetaObject::invokeMethod(
+            this,
+            [this] {
+              rebuildFsrMenu();
+              appendLog(QStringLiteral("FSR1: %1")
+                            .arg(QString::fromUtf8(vrp::fsr_mode_name(preferred_fsr_))));
+            },
+            Qt::QueuedConnection);
+      }
+      hud_paint();
+    };
     bool thumb_latched = false;
     bool seek_settle = false;
     std::chrono::steady_clock::time_point seek_settle_from{};
@@ -4423,12 +4515,15 @@ void HostWindow::xrThreadMain() {
     bool stop_frame_shown = false;
     bool stop_seek_sent = false;
     bool stop_upload_sent = false;
+    bool stop_seek_pending = false;
+    double stop_seek_sec = 0;
     uint64_t stop_seq = 0;
     double stop_pts = -1.0;
     // Translucent flat panel (startup / after Stop) until playback shows frames again.
     bool show_idle_screen = true;
     bool yt_suppress_idle_uploaded = false;
     float yt_spin_phase = 0.f;
+    QString yt_busy_atlas_status;
     bool have_pending_thumb = false;
     int thumb_idx = -1;
     vrp::VideoFrame pending_thumb;
@@ -4440,6 +4535,7 @@ void HostWindow::xrThreadMain() {
       stop_frame_shown = false;
       stop_seek_sent = false;
       stop_upload_sent = false;
+      stop_seek_pending = false;
       stop_seq = 0;
       stop_pts = -1.0;
       show_idle_screen = true;
@@ -4452,6 +4548,8 @@ void HostWindow::xrThreadMain() {
       fsr_src_samp = VK_NULL_HANDLE;
       fsr_src_w = fsr_src_h = 0;
       fsr_src_nv12 = 0;
+      // File path must not keep Live FSR arm / stale front from a prior capture.
+      arm_live_fsr(false);
 
       // Wait for the eye GPU to finish BEFORE halt_decode. Returning false after a
       // halt left the demux/decode threads dead while is_open() stayed true — play
@@ -4482,16 +4580,22 @@ void HostWindow::xrThreadMain() {
       decoder.stop_thumbnail_build();
       join_preview_worker();
       pending_upload = {};
-      cuda_tex.drain_copies();
-
       // Stop further BC7 submits; images are safe to drop now that the eye fence is idle.
       const uint64_t bc7_build = bc7.begin_build();
-      (void)texture.upload_idle_screen();
-      scene.set_texture(texture.view(), texture.sampler());
-      cuda_tex.reset_slots(decoder.cuda_context());
-      vaapi_tex.reset();
-      bc7.release_images();
-      decoder.close();
+      {
+        void* cu_ctx = decoder.cuda_context();
+        cuda_tex.drain_copies(cu_ctx);
+        (void)texture.upload_idle_screen();
+        scene.set_texture(texture.view(), texture.sampler());
+        cuda_clear_samples();
+        fsr.invalidate();
+        force_fsr_refresh = false;
+        // Tear CUDA imports + async stream on the still-alive NVDEC context, then close.
+        cuda_tex.reset_slots(cu_ctx);
+        vaapi_tex.reset();
+        bc7.release_images();
+        decoder.close();
+      }
 
       const bool ok = decoder.open(path, hwaccel_);
       const bool network_url =
@@ -4617,6 +4721,16 @@ void HostWindow::xrThreadMain() {
       if (ok) {
         std::lock_guard<std::mutex> lock(session_media_mu_);
         session_video_path_ = path;
+        const auto& info = decoder.info();
+        // Latch 8K FSR lock from coded size; invalidate so the new file never
+        // samples the previous media's FSR front.
+        const bool lock8k = vrp::fsr_locked_for_resolution(info.width, info.height);
+        sync_fsr_source_lock(lock8k, info.width, info.height);
+        fsr.invalidate();
+        pending_video_rebind = true;
+        force_fsr_refresh = true;
+      } else {
+        sync_fsr_source_lock(false);
       }
       return ok;
     };
@@ -4665,12 +4779,9 @@ void HostWindow::xrThreadMain() {
     uint64_t seek_paint_gen = 0;
     uint64_t seek_paint_pixels = 0;
     uint64_t hud_mesh_applied = 0;
-    bool stop_seek_pending = false;
-    double stop_seek_sec = 0;
     std::vector<XrCompositionLayerProjectionView> proj_views;
     XrCompositionLayerProjection layer{};
     auto last_status = std::chrono::steady_clock::now();
-    bool force_fsr_refresh = true;
     float look_yaw = 0.f;
     float look_pitch = 0.f;
     int flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
@@ -4742,11 +4853,14 @@ void HostWindow::xrThreadMain() {
       }
 
       const int fsr_pick = fsr_req_.exchange(-1);
-      if (fsr_pick >= 0) {
+      if (fsr_pick >= 0 && !fsr_locked_8k_.load()) {
         const auto mode = static_cast<vrp::FsrMode>(fsr_pick);
+        preferred_fsr_ = mode;
         fsr.set_mode(mode);
         menu.set_fsr(mode);
+        fsr.invalidate();
         force_fsr_refresh = true;
+        pending_video_rebind = true;
         hud_paint();
       }
 
@@ -4816,6 +4930,7 @@ void HostWindow::xrThreadMain() {
       bool pad_nav_down = false;
       bool pad_nav_left = false;
       bool pad_nav_right = false;
+      bool pad_face_x = false;
       bool pad_face_y = false;
       // [アプリ]: LD_PRELOAD hook (preferred) or legacy uinput PadFilter, else PS+R1 chords.
       // Hook: guest owns pad while menu closed; host SDL navigates menu and sends BLOCK.
@@ -4883,6 +4998,7 @@ void HostWindow::xrThreadMain() {
         input.seek_scrubbing = input.seek_scrubbing || gp.seek_scrubbing;
         input.recenter = input.recenter || gp.recenter;
         input.view_reset = input.view_reset || gp.view_reset;
+        pad_face_x = gp.face_x;
         pad_face_y = gp.face_y;
       };
 
@@ -4987,6 +5103,12 @@ void HostWindow::xrThreadMain() {
       // distance). XR triangle is flat_scale; Options/menu stays menu_toggle.
       // Allowed with or without a video so the idle translucent screen can be seated too.
       const bool yt_live = yt_session_ && yt_session_->active();
+      // Disarm Live FSR when not in browser Live (idle / [アプリ] / file).
+      if (live_fsr_armed &&
+          !(yt_live && yt_session_ && !yt_session_->desktop_app_mode() &&
+            live_fsr_ != vrp::FsrMode::Off)) {
+        arm_live_fsr(false);
+      }
       const bool yt_loading = yt_session_ && yt_session_->loading();
       // Setup spinner / portal wait: same session as live (no R-stick look).
       const bool yt_session = yt_live || yt_loading;
@@ -5019,6 +5141,43 @@ void HostWindow::xrThreadMain() {
         showHudToast(toast);
         QMetaObject::invokeMethod(
             this, [this, toast] { appendLog(tr("Flat scale: %1").arg(toast)); }, Qt::QueuedConnection);
+      }
+
+      // Provisional Live FSR cycle: □ / X while browser Live, menus closed.
+      // Off → UQ → Q → P → Off; writes conf live_fsr. Skips [アプリ].
+      const bool can_live_fsr_cycle =
+          yt_live && yt_session_ && !yt_session_->desktop_app_mode() && menus_closed;
+      if (can_live_fsr_cycle && pad_face_x) {
+        live_fsr_ = vrp::next_fsr_mode(live_fsr_);
+        const auto mode = live_fsr_;
+        QMetaObject::invokeMethod(
+            this,
+            [this, mode] {
+              setMonasphereConfKey(QStringLiteral("live_fsr"),
+                                   QString::number(static_cast<int>(mode)));
+            },
+            Qt::QueuedConnection);
+        if (mode == vrp::FsrMode::Off) {
+          arm_live_fsr(false);
+        } else if (live_fsr_armed) {
+          fsr.set_mode(mode);
+          fsr.invalidate();
+          force_fsr_refresh = true;
+        } else {
+          arm_live_fsr(true);
+        }
+        QString toast;
+        switch (mode) {
+          case vrp::FsrMode::Off: toast = QStringLiteral("Live FSR Off"); break;
+          case vrp::FsrMode::UltraQuality: toast = QStringLiteral("Live FSR UQ"); break;
+          case vrp::FsrMode::Quality: toast = QStringLiteral("Live FSR Q"); break;
+          case vrp::FsrMode::Performance: toast = QStringLiteral("Live FSR P"); break;
+        }
+        showHudToast(toast);
+        QMetaObject::invokeMethod(
+            this,
+            [this, toast] { appendLog(toast + QStringLiteral(" (□)")); },
+            Qt::QueuedConnection);
       }
 
       // Safe live teardown on XR: drop dma-buf imports before PipeWire stop.
@@ -5060,7 +5219,8 @@ void HostWindow::xrThreadMain() {
           fsr_src_samp = VK_NULL_HANDLE;
           fsr_src_w = fsr_src_h = 0;
           fsr_src_nv12 = 0;
-          (void)fsr.poll();
+          arm_live_fsr(false);
+          fsr.invalidate();
           look_yaw = 0.f;
           look_pitch = 0.f;
           scene.set_view_offset(0.f, 0.f);
@@ -5420,6 +5580,8 @@ void HostWindow::xrThreadMain() {
         fsr_src_w = fsr_src_h = 0;
         fsr_src_nv12 = 0;
         (void)fsr.poll();
+        sync_fsr_source_lock(false);
+        arm_live_fsr(false);
         (void)texture.upload_idle_screen();
         if (texture.view()) scene.set_texture(texture.view(), texture.sampler());
         hud_paint();
@@ -5579,9 +5741,9 @@ void HostWindow::xrThreadMain() {
         fsr_src_samp = VK_NULL_HANDLE;
         fsr_src_w = fsr_src_h = 0;
         fsr_src_nv12 = 0;
-        // Drain an in-flight FSR pass without rebinding it — otherwise the post-end_frame
-        // poll queues the last video frame over the idle slate on the next eye submit.
-        (void)fsr.poll();
+        // Drop published FSR so post-end_frame cannot overlay the idle slate.
+        fsr.invalidate();
+        force_fsr_refresh = true;
         (void)texture.upload_idle_screen();
         scene.set_texture(texture.view(), texture.sampler());
         thumb_latched = false;
@@ -5602,10 +5764,12 @@ void HostWindow::xrThreadMain() {
         }
         hud_paint();
       }
-      if (menu_out.fsr_changed) {
+      if (menu_out.fsr_changed && !fsr_locked_8k_.load()) {
         fsr.set_mode(menu_out.fsr);
         menu.set_fsr(menu_out.fsr);
+        fsr.invalidate();
         force_fsr_refresh = true;
+        pending_video_rebind = true;
         preferred_fsr_ = menu_out.fsr;
         QMetaObject::invokeMethod(
             this,
@@ -5613,7 +5777,8 @@ void HostWindow::xrThreadMain() {
               preferred_fsr_ = mode;
               saveAppConf();
               rebuildFsrMenu();
-              appendLog(QString("FSR1: %1").arg(QString::fromUtf8(vrp::fsr_mode_name(mode))));
+              appendLog(QStringLiteral("FSR1: %1")
+                            .arg(QString::fromUtf8(vrp::fsr_mode_name(mode))));
             },
             Qt::QueuedConnection);
         hud_paint();
@@ -5774,7 +5939,7 @@ void HostWindow::xrThreadMain() {
           request_preview(preview_hi);
         }
         static auto last_hud_paint = std::chrono::steady_clock::time_point{};
-        // DLNA spinner needs ~60 fps; idle browser can stay at 10 fps.
+        // DLNA spinner ~60 fps (paint_vr_menu spin-only reuses chrome quads); idle ~10 fps.
         const auto hud_interval =
             menu.network_busy() ? std::chrono::milliseconds(16) : std::chrono::milliseconds(100);
         if (hud_dirty || now - last_hud_paint > hud_interval) {
@@ -5890,35 +6055,7 @@ void HostWindow::xrThreadMain() {
       if (yt_suppress) {
         show_idle_screen = true;
         scene.set_content_cursor(0.5f, 0.5f, false);
-        // Still exercise DMA-BUF → Vulkan import (NVIDIA experiment) without painting.
-        // Do not reset the texture every frame — that aborted arming/import.
-        if (pw_dma && yt_session_ && yt_cap && yt_cap->running() &&
-            !yt_session_->dma_disabled() && !pw_dma_tex.import_abandoned()) {
-          vrp::PipewireDmaFrame dma;
-          if (yt_cap->take_latest_dma(dma, yt_session_->dma_seq())) {
-            if (pw_dma_tex.try_import(dma)) {
-              if (!yt_session_->dma_logged()) {
-                yt_session_->dma_logged() = true;
-                const QString note =
-                    tr("display path: PipeWire DMA-BUF zero-copy %1x%2 modifier=0x%3 (setup/no paint)")
-                        .arg(dma.width)
-                        .arg(dma.height)
-                        .arg(dma.modifier, 0, 16);
-                QMetaObject::invokeMethod(
-                    this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
-              }
-            } else if (pw_dma_tex.import_abandoned()) {
-              yt_session_->dma_disabled() = true;
-              const QString err = QString::fromStdString(pw_dma_tex.last_error());
-              const QString note =
-                  tr("ScreenCast: DMA-BUF import failed (%1, modifier=0x%2) — CPU RGBA fallback")
-                      .arg(err.isEmpty() ? tr("unknown") : err)
-                      .arg(dma.modifier, 0, 16);
-              QMetaObject::invokeMethod(
-                  this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
-            }
-          }
-        }
+        // Setup: do not DMA-import (GPU cost with nothing painted on HMD).
         if (!seek_visual) {
           if (!yt_suppress_idle_uploaded) {
             (void)texture.upload_idle_screen();
@@ -5948,19 +6085,52 @@ void HostWindow::xrThreadMain() {
           scene.set_content_aspect(static_cast<float>(std::max(1, aw)) /
                                    static_cast<float>(std::max(1, ah)));
         };
+        // Browser Live (not [アプリ]): optional FSR from conf live_fsr. Desktop apps skip.
+        const bool live_browser_fsr = yt_live && yt_session_ && !yt_session_->desktop_app_mode() &&
+                                     live_fsr_ != vrp::FsrMode::Off;
         // Desktop capture is sRGB/gamma; Flat shader expects linear unless rgba_gamma.
-        auto bind_last_yt = [&] {
-          if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.view()) {
-            scene.set_texture_gamma(pw_dma_tex.view(), pw_dma_tex.sampler());
-            set_yt_aspect(pw_dma_tex.width(), pw_dma_tex.height());
+        // FSR output is also gamma RGBA → set_texture_gamma / queue_texture_gamma.
+        // DMA = UNORM gamma → FSR blit mode 3; CPU VideoTexture = VK_SRGB → mode 0.
+        auto bind_yt_rgba = [&](VkImageView view, VkSampler samp, int w, int h, bool fresh,
+                                int rgba_mode) -> bool {
+          if (!view || !samp || w < 8 || h < 8) return false;
+          set_yt_aspect(w, h);
+          const bool want =
+              live_browser_fsr && !vrp::fsr_locked_for_resolution(w, h);
+          arm_live_fsr(want);
+          if (!want) {
+            scene.set_texture_gamma(view, samp);
             fsr_need_process = false;
             return true;
           }
+          // Prefer stable FSR front once published — avoid raw↔FSR brightness flicker.
+          if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
+            scene.set_texture_gamma(fsr.output_view(), fsr.output_sampler());
+            force_fsr_refresh = false;
+          } else if (fsr.output_view() && fsr.output_sampler()) {
+            scene.set_texture_gamma(fsr.output_view(), fsr.output_sampler());
+          } else {
+            scene.set_texture_gamma(view, samp);
+          }
+          if (fresh || force_fsr_refresh || !fsr.output_view()) {
+            fsr_src_y = view;
+            fsr_src_uv = view;
+            fsr_src_samp = samp;
+            fsr_src_w = w;
+            fsr_src_h = h;
+            fsr_src_nv12 = rgba_mode;
+            fsr_need_process = true;
+          }
+          return true;
+        };
+        auto bind_last_yt = [&] {
+          if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.view()) {
+            return bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
+                                pw_dma_tex.height(), false, /*rgba_mode=*/3);
+          }
           if (texture.view() && texture.width() > 8 && texture.height() > 8) {
-            scene.set_texture_gamma(texture.view(), texture.sampler());
-            set_yt_aspect(texture.width(), texture.height());
-            fsr_need_process = false;
-            return true;
+            return bind_yt_rgba(texture.view(), texture.sampler(), texture.width(), texture.height(),
+                                false, /*rgba_mode=*/0);
           }
           return false;
         };
@@ -6021,21 +6191,15 @@ void HostWindow::xrThreadMain() {
             }
           }
           if (imported_dma && pw_dma_tex.poll_present() && pw_dma_tex.view()) {
-            scene.set_texture_gamma(pw_dma_tex.view(), pw_dma_tex.sampler());
-            set_yt_aspect(pw_dma_tex.width(), pw_dma_tex.height());
-            fsr_need_process = false;
-            yt_picture = true;
+            yt_picture = bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
+                                      pw_dma_tex.height(), true, /*rgba_mode=*/3);
           } else if (dma_live && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.view()) {
-            scene.set_texture_gamma(pw_dma_tex.view(), pw_dma_tex.sampler());
-            set_yt_aspect(pw_dma_tex.width(), pw_dma_tex.height());
-            fsr_need_process = false;
-            yt_picture = true;
+            yt_picture = bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
+                                      pw_dma_tex.height(), false, /*rgba_mode=*/3);
           } else if (got_cpu) {
             if (texture.poll_present() && texture.view()) {
-              scene.set_texture_gamma(texture.view(), texture.sampler());
-              set_yt_aspect(texture.width(), texture.height());
-              fsr_need_process = false;
-              yt_picture = true;
+              yt_picture = bind_yt_rgba(texture.view(), texture.sampler(), texture.width(),
+                                        texture.height(), true, /*rgba_mode=*/0);
             } else if (bind_last_yt()) {
               yt_picture = true;
             }
@@ -6058,29 +6222,51 @@ void HostWindow::xrThreadMain() {
         if (yt_session_->show_busy_overlay() && !yt_picture) {
           yt_spin_phase += static_cast<float>(dt) * 9.5f;
           if (yt_spin_phase > 6.2831853f) yt_spin_phase = std::fmod(yt_spin_phase, 6.2831853f);
-          const int sw = std::clamp(yt_session_->virtual_w() > 0 ? yt_session_->virtual_w()
-                                                                : (live_virtual_w_ > 0 ? live_virtual_w_ : 1280),
-                                    320, 1920);
-          const int sh = std::clamp(yt_session_->virtual_h() > 0 ? yt_session_->virtual_h()
-                                                                : (live_virtual_h_ > 0 ? live_virtual_h_ : 720),
-                                    180, 1080);
           const QString status = yt_session_->busy_status();
-          const QImage busy = vrp::paint_live_busy(sw, sh, yt_spin_phase, status);
-          if (!busy.isNull()) {
-            vrp::VideoFrame ph;
-            ph.width = busy.width();
-            ph.height = busy.height();
+          auto qimage_to_frame = [](const QImage& img, vrp::VideoFrame& ph) {
+            ph.width = img.width();
+            ph.height = img.height();
             ph.rgba.resize(static_cast<size_t>(ph.width) * static_cast<size_t>(ph.height) * 4u);
-            for (int y = 0; y < busy.height(); ++y) {
-              const uchar* src = busy.constScanLine(y);
-              uint8_t* dst = ph.rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(ph.width) * 4u;
+            for (int y = 0; y < img.height(); ++y) {
+              const uchar* src = img.constScanLine(y);
+              uint8_t* dst =
+                  ph.rgba.data() + static_cast<size_t>(y) * static_cast<size_t>(ph.width) * 4u;
               std::memcpy(dst, src, static_cast<size_t>(ph.width) * 4u);
             }
-            (void)texture.try_upload(ph);
+          };
+          // Spinners once; panel (bg+text) only when status changes; animate = center blit.
+          if (!texture.busy_ready() || status != yt_busy_atlas_status) {
+            if (!texture.busy_ready()) {
+              const QVector<QImage> spins = vrp::paint_live_busy_spinner_atlas();
+              if (spins.size() == vrp::VideoTexture::kBusyFrameCount) {
+                std::vector<vrp::VideoFrame> sframes(
+                    static_cast<size_t>(vrp::VideoTexture::kBusyFrameCount));
+                bool ok = true;
+                for (int i = 0; i < vrp::VideoTexture::kBusyFrameCount; ++i) {
+                  if (spins[i].isNull() || spins[i].width() != vrp::VideoTexture::kBusySpinnerW ||
+                      spins[i].height() != vrp::VideoTexture::kBusySpinnerH) {
+                    ok = false;
+                    break;
+                  }
+                  qimage_to_frame(spins[i], sframes[static_cast<size_t>(i)]);
+                }
+                if (ok)
+                  (void)texture.ensure_busy_spinners(sframes.data(),
+                                                     vrp::VideoTexture::kBusyFrameCount);
+              }
+            }
+            const QImage panel = vrp::paint_live_busy_panel(vrp::VideoTexture::kBusyPanelW,
+                                                            vrp::VideoTexture::kBusyPanelH, status);
+            if (!panel.isNull()) {
+              vrp::VideoFrame pf;
+              qimage_to_frame(panel, pf);
+              if (texture.upload_busy_panel(pf)) yt_busy_atlas_status = status;
+            }
           }
-          if (texture.poll_present() && texture.view()) {
-            scene.set_texture(texture.view(), texture.sampler());
-            scene.set_content_aspect(static_cast<float>(sw) / static_cast<float>(std::max(1, sh)));
+          if (VkImageView bv = texture.present_busy(yt_spin_phase)) {
+            scene.set_texture(bv, texture.sampler());
+            scene.set_content_aspect(static_cast<float>(vrp::VideoTexture::kBusyPanelW) /
+                                     static_cast<float>(vrp::VideoTexture::kBusyPanelH));
             fsr_need_process = false;
           }
         }
@@ -6147,14 +6333,38 @@ void HostWindow::xrThreadMain() {
           src_h = texture.height();
         }
 
+        // FSR 8K lock is latched at open_media — do not re-sync from per-frame src size.
+
         if (force_fsr_refresh) pending_video_rebind = true;
 
-        // XR critical path: only publish completed FSR / queue raw. Never submit FSR here —
-        // compute + queue contention before end_frame causes head-turn jitter.
+        if (decoder.gpu_path_active() && cuda_tex.width() > 0 && cuda_tex.height() > 0) {
+          src_w = cuda_tex.width();
+          src_h = cuda_tex.height();
+        } else if (decoder.vaapi_path_active() && vaapi_tex.width() > 0 && vaapi_tex.height() > 0) {
+          src_w = vaapi_tex.width();
+          src_h = vaapi_tex.height();
+        }
+
+        auto queue_file_raw = [&] {
+          if (!src_y || !src_samp || src_w <= 0 || src_h <= 0) return false;
+          if (decoder.gpu_path_active()) {
+            scene.queue_nv12_texture(src_y, src_uv ? src_uv : src_y, src_samp, cuda_tex.full_range());
+          } else if (decoder.vaapi_path_active()) {
+            scene.queue_nv12_texture(src_y, src_uv ? src_uv : src_y, src_samp,
+                                    vaapi_tex.full_range());
+          } else {
+            scene.queue_texture(src_y, src_samp);
+          }
+          return true;
+        };
+
+        // XR critical path: publish completed FSR / queue raw. Never submit FSR here.
+        bool bound_file_video = false;
         if (fsr.enabled()) {
           if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
             scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
             force_fsr_refresh = false;
+            bound_file_video = true;
           }
           if (pending_video_rebind && src_y && src_samp && src_w > 0 && src_h > 0) {
             fsr_src_y = src_y;
@@ -6164,31 +6374,27 @@ void HostWindow::xrThreadMain() {
             fsr_src_h = src_h;
             fsr_src_nv12 = nv12_mode;
             fsr_need_process = true;
-            // Bootstrap until the first FSR front buffer exists.
+            // Bootstrap raw until this media's FSR front exists (invalidate clears it).
             if (!fsr.output_view()) {
-              if (decoder.gpu_path_active() || decoder.vaapi_path_active()) {
-                scene.queue_nv12_texture(src_y, src_uv ? src_uv : src_y, src_samp,
-                                         decoder.gpu_path_active() ? cuda_tex.full_range()
-                                                                   : vaapi_tex.full_range());
-              } else {
-                scene.queue_texture(src_y, src_samp);
-              }
+              bound_file_video = queue_file_raw() || bound_file_video;
             }
             pending_video_rebind = false;
             force_fsr_refresh = false;
           }
         } else if (pending_video_rebind && src_y && src_samp && src_w > 0 && src_h > 0) {
-          if (decoder.gpu_path_active()) {
-            scene.queue_nv12_texture(src_y, src_uv, src_samp, cuda_tex.full_range());
-          } else if (decoder.vaapi_path_active()) {
-            scene.queue_nv12_texture(src_y, src_uv, src_samp, vaapi_tex.full_range());
-          } else {
-            scene.queue_texture(src_y, src_samp);
-          }
+          (void)fsr.poll();
+          bound_file_video = queue_file_raw();
           pending_video_rebind = false;
           force_fsr_refresh = false;
         }
-        if (reveal_stop && video_updated) stop_frame_shown = true;
+        // GPU/VAAPI seek land uses take_latest — poll_present may already be consumed.
+        if (reveal_stop && (video_updated || (stop_upload_sent && bound_file_video))) {
+          stop_frame_shown = true;
+        } else if (reveal_stop && stop_upload_sent && src_y && src_samp && src_w > 0 &&
+                   src_h > 0 && !stop_frame_shown) {
+          if (!fsr.enabled() || !fsr.output_view()) (void)queue_file_raw();
+          stop_frame_shown = true;
+        }
       }
 
       // The still stays up through the 0.5s settle. Play starts after that, at the landed PTS.
@@ -6457,17 +6663,21 @@ void HostWindow::xrThreadMain() {
         }
       }
 
+      // Idle / clear_only: sky only (no translucent content panel fill).
+      scene.set_content_draw(!show_idle_screen && !opt_.clear_only);
       scene.render_frame(xr, fi, proj_views, layer);
       std::vector<XrCompositionLayerBaseHeader*> layers = {
           reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
       xr.end_frame(fi, layers);
 
       // FSR after end_frame so predictedDisplayTime submit is not delayed by upscale.
-      // Skip idle slate and live RGBA — a late poll must not replace those panels.
-      if (fsr.enabled() && !show_idle_screen && !(yt_session_ && yt_session_->active()) &&
-          !(yt_session_ && yt_session_->loading())) {
+      // File video; browser Live when live_fsr_armed. Skip idle / [アプリ] / loading.
+      const bool skip_yt_fsr =
+          yt_session_ && (yt_session_->active() || yt_session_->loading()) && !live_fsr_armed;
+      if (fsr.enabled() && !show_idle_screen && !skip_yt_fsr) {
         if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
           scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+          force_fsr_refresh = false;
         }
         if (fsr_need_process && !fsr.busy() && fsr_src_y && fsr_src_samp && fsr_src_w > 0 &&
             fsr_src_h > 0) {
@@ -6476,12 +6686,14 @@ void HostWindow::xrThreadMain() {
           fsr_need_process = false;
           if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
             scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+            force_fsr_refresh = false;
           }
         }
-      } else if (fsr.enabled() &&
-                 (show_idle_screen || (yt_session_ && (yt_session_->active() || yt_session_->loading())))) {
+      } else if (fsr.enabled() && (show_idle_screen || skip_yt_fsr)) {
         (void)fsr.poll();
         fsr_need_process = false;
+      } else if (!fsr.enabled()) {
+        force_fsr_refresh = false;
       }
 
       const double frame_ms =

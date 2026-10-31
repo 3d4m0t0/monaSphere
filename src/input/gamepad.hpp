@@ -30,6 +30,8 @@ class GamepadInput {
     bool back = false;     // B edge
     bool back_held = false;  // B level (for long-press)
     bool menu_toggle = false;  // PS / Guide long press (Options long also)
+    /** X / □ edge. Browser Live FSR cycle (provisional test). */
+    bool face_x = false;
     /** Y / △ edge. Flat scale cycle when menus are closed. */
     bool face_y = false;
     bool recenter = false;     // L3+R3 chord
@@ -100,6 +102,7 @@ class GamepadInput {
   std::chrono::steady_clock::time_point pass_recenter_chord_at_{};
   bool prev_a_ = false;
   bool prev_b_ = false;
+  bool prev_x_ = false;
   bool prev_y_ = false;
   bool prev_r3_ = false;
   bool lb_held_ = false;

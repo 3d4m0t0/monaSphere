@@ -277,11 +277,37 @@ bool load_jpeg_rgba(const std::string& path, std::vector<uint8_t>& rgba, int& w,
       continue;
     }
     if (avcodec_send_packet(ctx, pkt) == 0 && avcodec_receive_frame(ctx, frame) == 0) {
+      // Avoid deprecated YUVJ* → swscaler "deprecated pixel format" spam.
+      AVPixelFormat src_fmt = static_cast<AVPixelFormat>(frame->format);
+      bool src_full = frame->color_range == AVCOL_RANGE_JPEG;
+      switch (src_fmt) {
+        case AV_PIX_FMT_YUVJ420P:
+          src_fmt = AV_PIX_FMT_YUV420P;
+          src_full = true;
+          break;
+        case AV_PIX_FMT_YUVJ422P:
+          src_fmt = AV_PIX_FMT_YUV422P;
+          src_full = true;
+          break;
+        case AV_PIX_FMT_YUVJ444P:
+          src_fmt = AV_PIX_FMT_YUV444P;
+          src_full = true;
+          break;
+        case AV_PIX_FMT_YUVJ440P:
+          src_fmt = AV_PIX_FMT_YUV440P;
+          src_full = true;
+          break;
+        default:
+          break;
+      }
       SwsContext* sws =
-          sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format),
-                         frame->width, frame->height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr,
-                         nullptr);
+          sws_getContext(frame->width, frame->height, src_fmt, frame->width, frame->height, AV_PIX_FMT_RGBA,
+                         SWS_BILINEAR, nullptr, nullptr, nullptr);
       if (sws) {
+        if (src_full) {
+          const int* c = sws_getCoefficients(SWS_CS_DEFAULT);
+          sws_setColorspaceDetails(sws, c, 1, c, 1, 0, 1 << 16, 1 << 16);
+        }
         w = frame->width;
         h = frame->height;
         const int row = w * 4;
@@ -1070,8 +1096,9 @@ void SceneRenderer::build_meshes() {
   }
 
   // Galactic-plane glow sphere (outside stars). Soft band in milkyway.frag.
+  // 128×64 ≈ 16k tris/eye (was 256×128 / 65k) — equirect LOD hides the coarser mesh.
   {
-    auto [mw_v, mw_i] = starfield::build_sky_sphere(98.f, 256, 128);
+    auto [mw_v, mw_i] = starfield::build_sky_sphere(98.f, 128, 64);
     milkyway_index_count_ = static_cast<uint32_t>(mw_i.size());
     if (!mw_v.empty() && !mw_i.empty()) {
       upload(mw_v.data(), mw_v.size() * sizeof(starfield::SkyVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -1657,52 +1684,55 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
     }
   }
 
-  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
-  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &dset_, 0, nullptr);
+  // Idle / clear_only: sky only — skip translucent content panel fill cost.
+  if (content_draw_) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &dset_, 0, nullptr);
 
-  Mat4 model = Mat4::identity();
+    Mat4 model = Mat4::identity();
 
-  if (mode_ == ProjectionMode::Flat) {
-    // FOV defines horizontal half-extent; height follows content aspect.
-    const float half_w =
-        std::tan(flat_fov_deg_ * 0.5f * static_cast<float>(M_PI) / 180.f) * distance_;
-    const float aspect = std::max(0.1f, content_aspect_);
-    const float half_h = half_w / aspect;
-    // Mesh is built as half-size (aspect×1) with aspect=16/9.
-    constexpr float mesh_half_w = 16.f / 9.f;
-    constexpr float mesh_half_h = 1.f;
-    model.m[0] = half_w / mesh_half_w;
-    model.m[5] = half_h / mesh_half_h;
-    // −Z = true north after facing-north recenter (sky earth_sky_matrix).
-    model.m[14] = -distance_;
-  }
+    if (mode_ == ProjectionMode::Flat) {
+      // FOV defines horizontal half-extent; height follows content aspect.
+      const float half_w =
+          std::tan(flat_fov_deg_ * 0.5f * static_cast<float>(M_PI) / 180.f) * distance_;
+      const float aspect = std::max(0.1f, content_aspect_);
+      const float half_h = half_w / aspect;
+      // Mesh is built as half-size (aspect×1) with aspect=16/9.
+      constexpr float mesh_half_w = 16.f / 9.f;
+      constexpr float mesh_half_h = 1.f;
+      model.m[0] = half_w / mesh_half_w;
+      model.m[5] = half_h / mesh_half_h;
+      // −Z = true north after facing-north recenter (sky earth_sky_matrix).
+      model.m[14] = -distance_;
+    }
 
-  PushConstants pc{};
-  pc.mvp = Mat4::mul(proj, Mat4::mul(content_view, model));
-  pc.viewIndex = static_cast<int32_t>(view_index);
-  pc.stereoMode = static_cast<int32_t>(stereo_);
-  pc.is180 = (mode_ == ProjectionMode::Deg180) ? 1 : 0;
-  if (!nv12_) {
-    pc.nv12 = rgba_gamma_ ? 3 : 0;  // 3 = gamma RGBA (FSR) → linearize in shader
-  } else {
-    pc.nv12 = nv12_full_range_ ? 2 : 1;
-  }
-  pc.cursor_on = (mode_ == ProjectionMode::Flat && content_cursor_on_) ? 1 : 0;
-  pc.cursor_u = content_cursor_u_;
-  pc.cursor_v = content_cursor_v_;
-  pc.cursor_aspect = std::max(0.1f, content_aspect_);
-  vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                     sizeof(pc), &pc);
+    PushConstants pc{};
+    pc.mvp = Mat4::mul(proj, Mat4::mul(content_view, model));
+    pc.viewIndex = static_cast<int32_t>(view_index);
+    pc.stereoMode = static_cast<int32_t>(stereo_);
+    pc.is180 = (mode_ == ProjectionMode::Deg180) ? 1 : 0;
+    if (!nv12_) {
+      pc.nv12 = rgba_gamma_ ? 3 : 0;  // 3 = gamma RGBA (FSR) → linearize in shader
+    } else {
+      pc.nv12 = nv12_full_range_ ? 2 : 1;
+    }
+    pc.cursor_on = (mode_ == ProjectionMode::Flat && content_cursor_on_) ? 1 : 0;
+    pc.cursor_u = content_cursor_u_;
+    pc.cursor_v = content_cursor_v_;
+    pc.cursor_aspect = std::max(0.1f, content_aspect_);
+    vkCmdPushConstants(cmd, layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(pc), &pc);
 
-  if (mode_ == ProjectionMode::Flat) {
-    VkDeviceSize off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_quad_, &off);
-    vkCmdDraw(cmd, 6, 1, 0, 0);
-  } else {
-    VkDeviceSize off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_sphere_, &off);
-    vkCmdBindIndexBuffer(cmd, ibo_sphere_, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, 0);
+    if (mode_ == ProjectionMode::Flat) {
+      VkDeviceSize off = 0;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_quad_, &off);
+      vkCmdDraw(cmd, 6, 1, 0, 0);
+    } else {
+      VkDeviceSize off = 0;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_sphere_, &off);
+      vkCmdBindIndexBuffer(cmd, ibo_sphere_, 0, VK_INDEX_TYPE_UINT32);
+      vkCmdDrawIndexed(cmd, sphere_index_count_, 1, 0, 0, 0);
+    }
   }
 
   // The cage turns with the picture. The eye stays at the center.
@@ -1724,6 +1754,8 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
 
   // Head-locked-ish HUD: fixed in app space in front of origin (after recenter = forward).
   if (hud_visible_ && hud_dset_ && vbo_hud_ && hud_vert_count_ >= 6) {
+    // Content may be skipped (idle sky) — ensure picture pipeline is bound for HUD verts.
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &hud_dset_, 0, nullptr);
     Mat4 hud_model = Mat4::identity();
     const float half_h = hud_half_w_ * hud_aspect_;

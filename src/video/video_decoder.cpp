@@ -50,6 +50,47 @@ std::string av_err(int err) {
   return buf;
 }
 
+/** YUVJ* is deprecated; swscale warns on every getContext unless mapped to YUV* + range. */
+AVPixelFormat sws_drop_j(AVPixelFormat fmt, bool* was_full) {
+  switch (fmt) {
+    case AV_PIX_FMT_YUVJ420P:
+      if (was_full) *was_full = true;
+      return AV_PIX_FMT_YUV420P;
+    case AV_PIX_FMT_YUVJ422P:
+      if (was_full) *was_full = true;
+      return AV_PIX_FMT_YUV422P;
+    case AV_PIX_FMT_YUVJ444P:
+      if (was_full) *was_full = true;
+      return AV_PIX_FMT_YUV444P;
+    case AV_PIX_FMT_YUVJ440P:
+      if (was_full) *was_full = true;
+      return AV_PIX_FMT_YUV440P;
+    default:
+      return fmt;
+  }
+}
+
+void sws_set_range(SwsContext* sws, bool src_full, bool dst_full) {
+  if (!sws) return;
+  const int* c = sws_getCoefficients(SWS_CS_DEFAULT);
+  sws_setColorspaceDetails(sws, c, src_full ? 1 : 0, c, dst_full ? 1 : 0, 0, 1 << 16, 1 << 16);
+}
+
+/** sws_getContext that never passes deprecated YUVJ*; applies JPEG range when needed. */
+SwsContext* sws_make(int src_w, int src_h, AVPixelFormat src_fmt, int dst_w, int dst_h, AVPixelFormat dst_fmt,
+                     int flags, bool src_full = false, bool dst_full = false) {
+  bool src_j = false;
+  bool dst_j = false;
+  const AVPixelFormat s = sws_drop_j(src_fmt, &src_j);
+  const AVPixelFormat d = sws_drop_j(dst_fmt, &dst_j);
+  SwsContext* sws = sws_getContext(src_w, src_h, s, dst_w, dst_h, d, flags, nullptr, nullptr, nullptr);
+  if (!sws) return nullptr;
+  const bool sf = src_full || src_j;
+  const bool df = dst_full || dst_j;
+  if (sf || df) sws_set_range(sws, sf, df);
+  return sws;
+}
+
 struct HwOpaque {
   AVPixelFormat hw_pix_fmt = AV_PIX_FMT_NONE;
 };
@@ -137,7 +178,8 @@ struct JpegStill {
     if (!ctx) return false;
     ctx->width = width;
     ctx->height = height;
-    ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+    // YUV420P + JPEG range (not deprecated YUVJ420P — avoids swscaler log spam).
+    ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     ctx->time_base = AVRational{1, 25};
     ctx->color_range = AVCOL_RANGE_JPEG;
     ctx->strict_std_compliance = FF_COMPLIANCE_UNOFFICIAL;
@@ -153,15 +195,16 @@ struct JpegStill {
       reset();
       return false;
     }
-    yuv->format = AV_PIX_FMT_YUVJ420P;
+    yuv->format = AV_PIX_FMT_YUV420P;
+    yuv->color_range = AVCOL_RANGE_JPEG;
     yuv->width = width;
     yuv->height = height;
     if (av_frame_get_buffer(yuv, 32) < 0) {
       reset();
       return false;
     }
-    sws = sws_getContext(width, height, AV_PIX_FMT_RGBA, width, height, AV_PIX_FMT_YUVJ420P, SWS_FAST_BILINEAR,
-                         nullptr, nullptr, nullptr);
+    sws = sws_make(width, height, AV_PIX_FMT_RGBA, width, height, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR,
+                   /*src_full=*/true, /*dst_full=*/true);
     if (!sws) {
       reset();
       return false;
@@ -216,8 +259,9 @@ bool decode_seek_jpeg(const uint8_t* data, size_t n, std::vector<uint8_t>& rgba,
     pkt->flags |= AV_PKT_FLAG_KEY;
     if (avcodec_send_packet(ctx, pkt) == 0 && avcodec_receive_frame(ctx, frame) == 0 && frame->width > 0 &&
         frame->height > 0) {
-      sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), frame->width,
-                           frame->height, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+      const bool full = frame->color_range == AVCOL_RANGE_JPEG;
+      sws = sws_make(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), frame->width,
+                     frame->height, AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, full, /*dst_full=*/true);
       if (sws) {
         w = frame->width;
         h = frame->height;
@@ -530,8 +574,9 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
         }
         if (cuda_lock.owns_lock()) cuda_lock.unlock();
         if (!sws) {
-          sws = sws_getContext(src->width, src->height, static_cast<AVPixelFormat>(src->format), thumb_w, thumb_h,
-                               AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+          const bool full = src->color_range == AVCOL_RANGE_JPEG;
+          sws = sws_make(src->width, src->height, static_cast<AVPixelFormat>(src->format), thumb_w, thumb_h,
+                         AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, full, /*dst_full=*/true);
           if (!sws) break;
         }
         sws_scale(sws, src->data, src->linesize, 0, src->height, rgba->data, rgba->linesize);
@@ -708,8 +753,9 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
           scale_failed = true;
           break;
         }
-        sws = sws_getContext(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), dst_w,
-                             dst_h, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+        const bool full = frame->color_range == AVCOL_RANGE_JPEG;
+        sws = sws_make(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), dst_w, dst_h,
+                       AV_PIX_FMT_RGBA, SWS_BILINEAR, full, /*dst_full=*/true);
         if (!sws) {
           av_free(rgba_buf);
           rgba_buf = nullptr;
@@ -1852,8 +1898,9 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
       if (!ff_->sws || ff_->sws_src_fmt != src_fmt || src->width != ff_->sws_src_w ||
           src->height != ff_->sws_src_h) {
         if (ff_->sws) sws_freeContext(ff_->sws);
-        ff_->sws = sws_getContext(src->width, src->height, src_fmt, display_w_, display_h_, AV_PIX_FMT_RGBA,
-                                  SWS_BILINEAR, nullptr, nullptr, nullptr);
+        const bool full = src->color_range == AVCOL_RANGE_JPEG;
+        ff_->sws = sws_make(src->width, src->height, src_fmt, display_w_, display_h_, AV_PIX_FMT_RGBA,
+                            SWS_BILINEAR, full, /*dst_full=*/true);
         ff_->sws_src_fmt = src_fmt;
         ff_->sws_src_w = src->width;
         ff_->sws_src_h = src->height;
@@ -1996,8 +2043,17 @@ bool VideoTexture::upload_idle_screen() {
 }
 
 bool VideoTexture::try_upload_spinner(int width, int height, float phase) {
+  // Same discrete 8-frame / 120° motif as Live Flat + DLNA menu spinner.
   const int w = std::clamp(width > 0 ? width : 640, 64, 1920);
   const int h = std::clamp(height > 0 ? height : 360, 64, 1080);
+  constexpr float kPeriod = 2.09439510239f;
+  constexpr int kFrames = 8;
+  float p = std::fmod(phase, kPeriod);
+  if (p < 0.f) p += kPeriod;
+  const int idx =
+      std::clamp(static_cast<int>(p / kPeriod * static_cast<float>(kFrames)), 0, kFrames - 1);
+  const float snap = kPeriod * static_cast<float>(idx) / static_cast<float>(kFrames);
+
   VideoFrame ph;
   ph.width = w;
   ph.height = h;
@@ -2011,16 +2067,15 @@ bool VideoTexture::try_upload_spinner(int width, int height, float phase) {
   }
   const float cx = 0.5f * static_cast<float>(w);
   const float cy = 0.5f * static_cast<float>(h);
-  // Match HMD menu network spinner (orbit 22px, ~dot 11 → rad 5.5).
   constexpr float orbit = 22.f;
   constexpr float rad = 5.5f;
   const float r2 = rad * rad;
   for (int di = 0; di < 3; ++di) {
-    const float a = phase + static_cast<float>(di) * (2.f * 3.14159265f / 3.f);
+    const float a = snap + static_cast<float>(di) * kPeriod;
     const float dx = orbit * std::cos(a);
     const float dy = orbit * std::sin(a);
     const float pulse =
-        0.45f + 0.55f * (0.5f + 0.5f * std::sin(phase * 1.7f + static_cast<float>(di)));
+        0.45f + 0.55f * (0.5f + 0.5f * std::sin(snap * 1.7f + static_cast<float>(di)));
     const int alpha = std::clamp(static_cast<int>(70.f + 185.f * pulse), 40, 255);
     const int x0 = std::max(0, static_cast<int>(cx + dx - rad - 1.f));
     const int y0 = std::max(0, static_cast<int>(cy + dy - rad - 1.f));
@@ -2042,9 +2097,199 @@ bool VideoTexture::try_upload_spinner(int width, int height, float phase) {
   return try_upload(ph);
 }
 
+void VideoTexture::destroy_busy_atlas() {
+  if (!device_) {
+    busy_panel_ready_ = false;
+    busy_spinners_ready_ = false;
+    busy_spinner_idx_ = -1;
+    return;
+  }
+  wait_fence();
+  auto destroy_one = [&](Slot& s) {
+    if (s.view) vkDestroyImageView(device_, s.view, nullptr);
+    if (s.image) vkDestroyImage(device_, s.image, nullptr);
+    if (s.memory) vkFreeMemory(device_, s.memory, nullptr);
+    s = {};
+  };
+  destroy_one(busy_panel_);
+  for (Slot& s : busy_spinners_) destroy_one(s);
+  busy_panel_ready_ = false;
+  busy_spinners_ready_ = false;
+  busy_spinner_idx_ = -1;
+}
+
+bool VideoTexture::ensure_staging(VkDeviceSize bytes) {
+  if (bytes <= staging_size_ && staging_mapped_) return true;
+  if (staging_mapped_) {
+    vkUnmapMemory(device_, staging_mem_);
+    staging_mapped_ = nullptr;
+  }
+  if (staging_) vkDestroyBuffer(device_, staging_, nullptr);
+  if (staging_mem_) vkFreeMemory(device_, staging_mem_, nullptr);
+  staging_ = VK_NULL_HANDLE;
+  staging_mem_ = VK_NULL_HANDLE;
+  staging_size_ = 0;
+  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = bytes;
+  bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  if (vkCreateBuffer(device_, &bci, nullptr, &staging_) != VK_SUCCESS) return false;
+  VkMemoryRequirements breq{};
+  vkGetBufferMemoryRequirements(device_, staging_, &breq);
+  VkMemoryAllocateInfo bmai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  bmai.allocationSize = breq.size;
+  bmai.memoryTypeIndex = find_memory_type(
+      breq.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (vkAllocateMemory(device_, &bmai, nullptr, &staging_mem_) != VK_SUCCESS) return false;
+  vkBindBufferMemory(device_, staging_, staging_mem_, 0);
+  staging_size_ = bytes;
+  return vkMapMemory(device_, staging_mem_, 0, staging_size_, 0, &staging_mapped_) == VK_SUCCESS;
+}
+
+bool VideoTexture::upload_slot_rgba(Slot& slot, int w, int h, const uint8_t* rgba, size_t rgba_bytes) {
+  const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * static_cast<VkDeviceSize>(h) * 4u;
+  if (!rgba || rgba_bytes < static_cast<size_t>(bytes) || !ensure_staging(bytes)) return false;
+  if (!slot.image && !create_slot(slot, w, h)) return false;
+  std::memcpy(staging_mapped_, rgba, static_cast<size_t>(bytes));
+
+  std::unique_lock<std::mutex> qlock;
+  if (queue_mu_) qlock = std::unique_lock<std::mutex>(*queue_mu_);
+  vkResetCommandBuffer(cmd_, 0);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(cmd_, &bi) != VK_SUCCESS) return false;
+  transition_image(cmd_, slot.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+  VkBufferImageCopy copy{};
+  copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  copy.imageSubresource.layerCount = 1;
+  copy.imageExtent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1};
+  vkCmdCopyBufferToImage(cmd_, staging_, slot.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+  transition_image(cmd_, slot.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+  if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) return false;
+  if (vkResetFences(device_, 1, &fence_) != VK_SUCCESS) return false;
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd_;
+  if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return false;
+  wait_fence();
+  return true;
+}
+
+bool VideoTexture::ensure_busy_spinners(const VideoFrame* frames, int frame_count) {
+  if (busy_spinners_ready_) return true;
+  if (!frames || frame_count != kBusyFrameCount || !device_ || !cmd_ || !fence_) return false;
+  for (int i = 0; i < frame_count; ++i) {
+    if (frames[i].width != kBusySpinnerW || frames[i].height != kBusySpinnerH ||
+        frames[i].rgba.size() <
+            static_cast<size_t>(kBusySpinnerW) * static_cast<size_t>(kBusySpinnerH) * 4u)
+      return false;
+  }
+  wait_fence();
+  in_flight_ = false;
+  for (int i = 0; i < kBusyFrameCount; ++i) {
+    if (!upload_slot_rgba(busy_spinners_[i], kBusySpinnerW, kBusySpinnerH, frames[i].rgba.data(),
+                          frames[i].rgba.size())) {
+      destroy_busy_atlas();
+      return false;
+    }
+  }
+  busy_spinners_ready_ = true;
+  busy_spinner_idx_ = -1;
+  VRP_LOG("VideoTexture: busy spinners %dx%d × %d in VRAM", kBusySpinnerW, kBusySpinnerH,
+          kBusyFrameCount);
+  return true;
+}
+
+bool VideoTexture::upload_busy_panel(const VideoFrame& panel) {
+  if (!device_ || !cmd_ || !fence_) return false;
+  if (panel.width != kBusyPanelW || panel.height != kBusyPanelH ||
+      panel.rgba.size() < static_cast<size_t>(kBusyPanelW) * static_cast<size_t>(kBusyPanelH) * 4u)
+    return false;
+  wait_fence();
+  in_flight_ = false;
+  // Recreate panel slot so a fresh UNDEFINED→upload clears any old spinner pixels.
+  if (busy_panel_.image) {
+    if (busy_panel_.view) vkDestroyImageView(device_, busy_panel_.view, nullptr);
+    if (busy_panel_.image) vkDestroyImage(device_, busy_panel_.image, nullptr);
+    if (busy_panel_.memory) vkFreeMemory(device_, busy_panel_.memory, nullptr);
+    busy_panel_ = {};
+  }
+  if (!upload_slot_rgba(busy_panel_, kBusyPanelW, kBusyPanelH, panel.rgba.data(), panel.rgba.size()))
+    return false;
+  busy_panel_ready_ = true;
+  busy_spinner_idx_ = -1;  // force center blit after text/bg rewrite
+  return true;
+}
+
+VkImageView VideoTexture::present_busy(float phase_rad) {
+  if (!busy_ready() || !busy_panel_.image) return VK_NULL_HANDLE;
+  constexpr float kPeriod = 2.09439510239f;  // 2π/3 — same as kLiveBusyPeriod
+  float p = std::fmod(phase_rad, kPeriod);
+  if (p < 0.f) p += kPeriod;
+  const int idx =
+      std::clamp(static_cast<int>(p / kPeriod * static_cast<float>(kBusyFrameCount)), 0,
+                 kBusyFrameCount - 1);
+  if (idx == busy_spinner_idx_) return busy_panel_.view;
+
+  // Partial update: only the center spinner rect (above status text).
+  constexpr int kOx = (kBusyPanelW - kBusySpinnerW) / 2;
+  constexpr int kOy = (kBusyPanelH - kBusySpinnerH) / 2 - 18;
+
+  std::unique_lock<std::mutex> qlock;
+  if (queue_mu_) qlock = std::unique_lock<std::mutex>(*queue_mu_);
+  wait_fence();
+  vkResetCommandBuffer(cmd_, 0);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(cmd_, &bi) != VK_SUCCESS) return busy_panel_.view;
+
+  transition_image(cmd_, busy_panel_.image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+  transition_image(cmd_, busy_spinners_[idx].image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
+                   VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                   VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+  VkImageCopy region{};
+  region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.srcSubresource.layerCount = 1;
+  region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.dstSubresource.layerCount = 1;
+  region.dstOffset = {kOx, kOy, 0};
+  region.extent = {static_cast<uint32_t>(kBusySpinnerW), static_cast<uint32_t>(kBusySpinnerH), 1};
+  vkCmdCopyImage(cmd_, busy_spinners_[idx].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, busy_panel_.image,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+  transition_image(cmd_, busy_panel_.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+  transition_image(cmd_, busy_spinners_[idx].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+
+  if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) return busy_panel_.view;
+  if (vkResetFences(device_, 1, &fence_) != VK_SUCCESS) return busy_panel_.view;
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd_;
+  if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return busy_panel_.view;
+  wait_fence();
+  busy_spinner_idx_ = idx;
+  return busy_panel_.view;
+}
+
 void VideoTexture::shutdown() {
   wait_fence();
   in_flight_ = false;
+  destroy_busy_atlas();
   if (staging_mapped_) {
     vkUnmapMemory(device_, staging_mem_);
     staging_mapped_ = nullptr;
@@ -2108,7 +2353,8 @@ bool VideoTexture::create_slot(Slot& slot, int width, int height) {
   ici.arrayLayers = 1;
   ici.samples = VK_SAMPLE_COUNT_1_BIT;
   ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-  ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+              VK_IMAGE_USAGE_SAMPLED_BIT;
   ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (vkCreateImage(device_, &ici, nullptr, &slot.image) != VK_SUCCESS) return false;
 

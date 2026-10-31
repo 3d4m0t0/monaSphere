@@ -158,19 +158,20 @@ QString KdeVirtualDisplay::output_name() const {
   return QStringLiteral("Virtual-") + name_;
 }
 
-QString KdeVirtualDisplay::nameForSpan(int span) {
-  const int s = std::clamp(span, 1, 3);
-  return QStringLiteral("monaSphere-x%1").arg(s);
+QString KdeVirtualDisplay::nameForSpan(int /*span*/) {
+  // Fixed name: resolution varies per span, one ScreenCast Remember token.
+  return QStringLiteral("monaSphere");
 }
 
-QString KdeVirtualDisplay::outputNameForSpan(int span) {
-  return QStringLiteral("Virtual-") + nameForSpan(span);
+QString KdeVirtualDisplay::outputNameForSpan(int /*span*/) {
+  return QStringLiteral("Virtual-monaSphere");
 }
 
 QStringList KdeVirtualDisplay::allManagedNames() {
-  // Legacy single name (pre per-span) + x1–x3 + old YT suffix.
-  return {QStringLiteral("monaSphere"), QStringLiteral("monaSphereYT"), nameForSpan(1),
-          nameForSpan(2), nameForSpan(3)};
+  // Canonical + legacy per-span names (pre single-name policy) + old YT suffix.
+  return {QStringLiteral("monaSphere"), QStringLiteral("monaSphereYT"),
+          QStringLiteral("monaSphere-x1"), QStringLiteral("monaSphere-x2"),
+          QStringLiteral("monaSphere-x3")};
 }
 
 int KdeVirtualDisplay::killAllManaged() {

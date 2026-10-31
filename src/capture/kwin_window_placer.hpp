@@ -74,7 +74,7 @@ class KwinWindowPlacer {
 
   /**
    * KWin workspace.screens[] index for an output name substring
-   * (e.g. Virtual-monaSphere-x3). -1 if missing.
+   * (e.g. Virtual-monaSphere). -1 if missing.
    */
   static int query_output_index(const QString& output_substr, QString* error_out = nullptr);
 
@@ -89,6 +89,12 @@ class KwinWindowPlacer {
   static bool install_desktop_window_rule(const QString& wmclass, const QString& output_substr,
                                           QString* error_out = nullptr);
   static void remove_desktop_window_rule();
+  /**
+   * Drop monaSphere Live / [アプリ] Window Rules even if arm state is stale.
+   * Call when tearing down Virtual so Force-screen no longer targets a dead index
+   * (that churn leaves plasmashell chasing "unexisting screen geometry").
+   */
+  static void clear_live_session_rules();
   /** Non-blocking: true once placement reported success. */
   static bool poll_armed_place(QString* out_window_id, QString* error_out = nullptr);
   /**

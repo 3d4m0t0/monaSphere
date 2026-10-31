@@ -26,7 +26,8 @@ class Fsr1Upscaler {
    * Non-blocking: returns false if a prior submit is still in flight, or if the new
    * submit has not finished yet. Returns true when output_view() was published and
    * is safe to bind (front buffer is stable while the next pass writes the back).
-   * nv12: 0=RGBA src_y only, 1=limited, 2=full-range.
+   * nv12: 0=RGBA from VK_SRGB (blit encodes to gamma), 1=NV12 limited, 2=full-range,
+   *       3=RGBA already gamma (UNORM Live/ScreenCast — blit copies as-is).
    */
   bool process(VkImageView src_y, VkImageView src_uv, VkSampler src_sampler, int src_w, int src_h,
                int nv12);
@@ -34,10 +35,20 @@ class Fsr1Upscaler {
   /** Finish a completed async pass without starting new work. True if front was updated. */
   bool poll();
 
+  /**
+   * Drop the published front so callers must bootstrap raw until a new process()+poll()
+   * publishes. Use on mode Off / media switch / force refresh — never sample a stale RT.
+   * Bumps epoch so output_view() stays null until a process submitted after this invalidate.
+   */
+  void invalidate();
+
   /** True while a compute submit is outstanding (safe to sample output_view front). */
   bool busy() const { return in_flight_; }
 
-  VkImageView output_view() const { return out_view_; }
+  /** Valid only when published epoch matches current invalidate epoch. */
+  VkImageView output_view() const {
+    return (published_epoch_ == epoch_ && out_view_) ? out_view_ : VK_NULL_HANDLE;
+  }
   VkSampler output_sampler() const { return sampler_; }
   int output_width() const { return out_w_; }
   int output_height() const { return out_h_; }
@@ -124,6 +135,9 @@ class Fsr1Upscaler {
   VkImageView out_view_ = VK_NULL_HANDLE;
   int out_w_ = 0;
   int out_h_ = 0;
+  uint64_t epoch_ = 1;
+  uint64_t submit_epoch_ = 0;
+  uint64_t published_epoch_ = 0;
 };
 
 }  // namespace vrp

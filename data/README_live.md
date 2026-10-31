@@ -31,14 +31,13 @@ live_virtual_scale=2     # 1.0–3.0 — krfb Virtual MONITOR scale (2 = 200%)
 live_chrome_scale=1      # Chromium --force-device-scale-factor (keep 1 when Virtual is scaled)
 live_cursor_scale=1      # 1–6 stick cursor gain (exponential curve; lower = slower)
 live_chrome_profile=default  # default = system Chrome logins; isolated = monasphere profile
+# FSR1 for browser Live only (not [アプリ] / not file UI). 0=Off 1=UQ 2=Q 3=P (default).
+live_fsr=3
 live_output=             # filled with Virtual-monaSphere on first setup
+# One ScreenCast Remember token for Virtual-monaSphere (x2/x3 sizes reuse it).
 live_restore_token=
-# Per-span tokens (x1–x3). Bare live_restore_token= is x1.
-# live_restore_token[x1]=
-# live_restore_token[x2]=
-# live_restore_token[x3]=
-# Tools → Set up live capture registers these spans in order (default x1→x2→x3).
-live_setup_spans=1,2,3
+# Tools → Set up uses x1 size once (ignored if missing; setup always auth once at x1).
+live_setup_spans=1
 # HMD Roots menu — indexed slots (Name|URL). Empty slots are ignored; fill the next index to add.
 live_app[0]=YouTube|https://www.youtube.com/
 live_app[1]=
@@ -78,17 +77,15 @@ Legacy `youtube_*` keys are renamed to `live_*` on startup (and
 output name changes — re-run Set up).
 
 3. **Tools → Set up live capture…** — host prep only:
-   - forces a new portal picker (conf token is replaced only when Start returns a new one)
-   - **creates** `krfb-virtualmonitor` (`Virtual-monaSphere-xN` per span) for this session
+   - **creates** `Virtual-monaSphere` once at **x1** size (`live_virtual_size`)
+   - pick it with **Remember** → one `live_restore_token` (shared by later x2/x3 sizes)
+   - silent restore verify, then stop / destroy Virtual
    - KWin place **before** launch; ScreenCast only after place succeeds
-   - pick **that Virtual** and enable **Remember** / allow restore
-     (KDE hides this unless `persist_mode` is accepted) → token written for that span
-   - on Streaming success: **stops capture, closes Chrome, and destroys Virtual-***
-   - if conf still has `live_restore_token[xN]=` empty after setup, the portal did not
+   - if conf still has `live_restore_token=` empty after setup, the portal did not
      grant persistence — re-run Set up with Remember checked.
 4. In the HMD file menu, open a **`[Name]`** from `live_app[N]=` (default `[YouTube]`)
-   — recreates Virtual and restores ScreenCast with the saved token (no picker if
-   still valid).
+   — recreates Virtual at the requested span size and restores ScreenCast with the
+   same token (no picker if still valid).
 5. Leave the live app in the HMD (Options / ○ long) to stop Chromium / PipeWire
    and destroy the managed virtual display.
 
@@ -282,9 +279,9 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 | `live_cursor_scale` | `1`–`6` stick/D-pad gain (default `1`; base speed scales with `live_virtual_size`) |
 | `live_chrome_profile` | `default` (system logins) or `isolated` (scale always applies) |
 | `live_output` | Output name substring for Chromium placement |
-| `live_restore_token` | Alias of `live_restore_token[x1]` (legacy) |
-| `live_restore_token[xN]` | Portal restore token for span N (N=1..3); refreshed after each Start at that size |
-| `live_setup_spans` | e.g. `1,2,3` — spans registered in one **Tools → Set up** run (host approves each) |
+| `live_restore_token` | ScreenCast Remember token for `Virtual-monaSphere` (shared by all spans) |
+| `live_restore_token[xN]` | Legacy; still read as fallback, new saves go to `live_restore_token` |
+| `live_setup_spans` | Kept for compat; setup always authenticates once at x1 size |
 | `live_app[N]` | `Name\|https://…` → HMD Roots `[Name]`; empty value = unused slot |
 | `live_desktop_app[N]` | `Name\|/path/to/app[\|arg…]` → HMD `[アプリ]` list; process exit ends capture |
 | `live_desktop_app[N].title[M]` | `Name\|x1…x3[\|arg…]` → titles (monitor span + launch args) |
@@ -320,15 +317,11 @@ so wider aspects fit without exploding pixel count (4K-friendly):
 | x2 | 8:3 | 3840×1440 |
 | x3 | 4:1 | 3840×960 |
 
-ScreenCast restore tokens are stored **per span** (`live_restore_token[x1]` … `[x3]`).
-Each span uses a **distinct Virtual name** (`Virtual-monaSphere-x1` … `-x3`) so the
-portal Remember grant is not overwritten when you auth another size (same name
-used to make only the last-auth’d token work).
-**Tools → Set up live capture (x1–x3)…** walks `live_setup_spans` (default `1,2,3`):
-for each span it creates that Virtual, asks you to pick it with **Remember**,
-verifies restore, then continues to the next (toast: “next: approve x2 on host”).
-Re-run setup once after upgrading if tokens were granted under the old shared
-`Virtual-monaSphere` name. Use `live_setup_spans=2,3` to register only those.
+ScreenCast restore uses **one token** for the fixed name **`Virtual-monaSphere`**.
+**Tools → Set up live capture…** authenticates once at x1 size; x2/x3 only change
+resolution and reuse that token (re-auth only if the portal rejects restore).
+If you still have only legacy `live_restore_token[xN]=` entries, they are accepted as
+fallback; new grants are written to `live_restore_token=`.
 HMD navigation is **`[アプリ]` → App → Title`**. Omitting titles keeps a flat list
 (A launches with x1).
 

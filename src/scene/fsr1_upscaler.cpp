@@ -418,8 +418,24 @@ bool Fsr1Upscaler::poll() {
   out_view_ = out_rt_[out_front_].view;
   out_w_ = pending_w_;
   out_h_ = pending_h_;
+  published_epoch_ = submit_epoch_;
   in_flight_ = false;
-  return true;
+  return published_epoch_ == epoch_;
+}
+
+void Fsr1Upscaler::invalidate() {
+  // Finish any in-flight pass but do not publish it — caller is switching media/mode
+  // and must not sample a front from the previous source.
+  if (device_ && fence_ && in_flight_) {
+    (void)vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    in_flight_ = false;
+  }
+  ++epoch_;
+  if (epoch_ == 0) epoch_ = 1;
+  submit_epoch_ = 0;
+  published_epoch_ = 0;
+  out_view_ = VK_NULL_HANDLE;
+  out_w_ = out_h_ = 0;
 }
 
 bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_sampler, int src_w,
@@ -567,6 +583,7 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
   }
   pending_w_ = dst_w;
   pending_h_ = dst_h;
+  submit_epoch_ = epoch_;
   in_flight_ = true;
 
   // Fast path: publish immediately when the GPU already finished.

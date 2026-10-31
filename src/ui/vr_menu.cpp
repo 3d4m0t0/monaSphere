@@ -262,7 +262,23 @@ void VrMenu::set_rate(float r) {
 }
 
 void VrMenu::set_fsr(FsrMode m) {
+  if (fsr_locked_) {
+    fsr_ = FsrMode::Off;
+    bump();
+    return;
+  }
   fsr_ = m;
+  bump();
+}
+
+void VrMenu::set_fsr_locked(bool locked) {
+  if (fsr_locked_ == locked) return;
+  fsr_locked_ = locked;
+  if (locked) {
+    fsr_ = FsrMode::Off;
+    pick_fsr_ = FsrMode::Off;
+    if (controls_edit_ == ControlsEdit::FsrPick) close_controls_edit();
+  }
   bump();
 }
 
@@ -1476,7 +1492,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         volume_ = pick_volume_;
         save_volume();
       }
-      if (controls_edit_ == ControlsEdit::FsrPick && fsr_ != pick_fsr_) {
+      if (controls_edit_ == ControlsEdit::FsrPick && !fsr_locked_ && fsr_ != pick_fsr_) {
         // Restore mode from when the picker opened.
         fsr_ = pick_fsr_;
         out.fsr_changed = true;
@@ -1599,6 +1615,10 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         return;
       }
       if (controls_edit_ == ControlsEdit::FsrPick && dy != 0) {
+        if (fsr_locked_) {
+          nav_cooldown_ = 0.15f;
+          return;
+        }
         picker_cursor_ = (picker_cursor_ + (dy < 0 ? -1 : 1) + 4) % 4;
         fsr_ = static_cast<FsrMode>(picker_cursor_);
         out.fsr_changed = true;
@@ -1823,6 +1843,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
           picker_cursor_ = static_cast<int>(projection_);
           break;
         case kFsr:
+          if (fsr_locked_) break;  // 8K+: FSR forced Off, picker disabled
           controls_edit_ = ControlsEdit::FsrPick;
           picker_cursor_ = static_cast<int>(fsr_);
           pick_fsr_ = fsr_;
@@ -1977,7 +1998,8 @@ void VrMenu::publish_hud_snapshot() {
   s.info_display_hz = info_display_hz_;
   s.volume = volume_;
   s.rate = rate_;
-  s.fsr = fsr_;
+  s.fsr = fsr_locked_ ? FsrMode::Off : fsr_;
+  s.fsr_locked = fsr_locked_;
   s.preferred_hz = preferred_hz_;
   s.display_hz = display_hz_;
   s.preview_w = preview_w_;

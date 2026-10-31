@@ -91,7 +91,10 @@ class PipewireCapture {
   bool running() const { return running_.load(std::memory_order_acquire); }
   std::string last_error() const;
 
-  /** Copy latest CPU RGBA frame if newer than `seen_seq`. */
+  /**
+   * Move latest CPU RGBA frame if newer than `seen_seq` (no full-buffer copy).
+   * Same pattern as take_latest_dma / VideoDecoder::take_latest.
+   */
   bool take_latest(VideoFrame& out, uint64_t& seen_seq);
 
   /** Move latest dma-buf frame if newer than `seen_seq` (transfers FD ownership). */

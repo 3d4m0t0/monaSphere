@@ -1,6 +1,7 @@
 #include "video/pipewire_dma_texture.hpp"
 
 #include <drm/drm_fourcc.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -181,6 +182,15 @@ void PipewireDmaTexture::destroy_slot(Slot& slot) {
   if (slot.image) vkDestroyImage(device_, slot.image, nullptr);
   if (slot.memory) vkFreeMemory(device_, slot.memory, nullptr);
   slot = {};
+}
+
+bool PipewireDmaTexture::dma_buf_key(int fd, uint64_t* out_key) {
+  if (!out_key || fd < 0) return false;
+  struct stat st {};
+  if (::fstat(fd, &st) != 0) return false;
+  // Dups of the same PipeWire pool buffer share st_dev + st_ino.
+  *out_key = (static_cast<uint64_t>(st.st_dev) * 0x9E3779B97F4A7C15ull) ^ static_cast<uint64_t>(st.st_ino);
+  return *out_key != 0;
 }
 
 void PipewireDmaTexture::reset() {
@@ -539,12 +549,11 @@ bool PipewireDmaTexture::try_import(const PipewireDmaFrame& frame) {
     return false;
   }
 
-  if (!wait_fence()) return false;
-
   const int w = frame.width;
   const int h = frame.height;
 
   if (width_ != 0 && (w != width_ || h != height_)) {
+    if (!wait_fence()) return false;
     destroy_slot(slots_[0]);
     destroy_slot(slots_[1]);
     destroy_slot(slots_[2]);
@@ -554,6 +563,25 @@ bool PipewireDmaTexture::try_import(const PipewireDmaFrame& frame) {
     prev_slot_ = 0;
     display_slot_.store(0);
   }
+
+  // Reuse: flip only — no QueueSubmit/fence (lightening 7). Image already
+  // SHADER_READ_ONLY from first import; dma-buf implicit sync for producer writes.
+  uint64_t key = 0;
+  const bool have_key = dma_buf_key(frame.fd, &key);
+  if (have_key) {
+    for (int i = 0; i < 3; ++i) {
+      if (!slots_[i].image || slots_[i].buf_key != key) continue;
+      width_ = w;
+      height_ = h;
+      prev_slot_ = display_slot_.load(std::memory_order_relaxed);
+      display_slot_.store(i, std::memory_order_release);
+      valid_.store(true, std::memory_order_release);
+      present_gen_.fetch_add(1, std::memory_order_release);
+      return true;
+    }
+  }
+
+  if (!wait_fence()) return false;
 
   int write = 0;
   if (valid_.load()) {
@@ -595,6 +623,7 @@ bool PipewireDmaTexture::try_import(const PipewireDmaFrame& frame) {
     return false;
   }
 
+  slot.buf_key = have_key ? key : 0;
   width_ = w;
   height_ = h;
   prev_slot_ = display_slot_.load(std::memory_order_relaxed);
@@ -603,8 +632,9 @@ bool PipewireDmaTexture::try_import(const PipewireDmaFrame& frame) {
   present_gen_.fetch_add(1, std::memory_order_release);
   if (!import_logged_) {
     import_logged_ = true;
-    VRP_LOG("display path: PipeWire DMA-BUF zero-copy %dx%d modifier=0x%llx%s", w, h,
-            static_cast<unsigned long long>(mod), nvidia_ ? " (NVIDIA)" : "");
+    VRP_LOG("display path: PipeWire DMA-BUF zero-copy %dx%d modifier=0x%llx%s "
+            "(slot reuse, acquire skip)",
+            w, h, static_cast<unsigned long long>(mod), nvidia_ ? " (NVIDIA)" : "");
   }
   return true;
 }

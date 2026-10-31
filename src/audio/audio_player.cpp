@@ -1767,20 +1767,33 @@ void AudioPlayer::request_start_live_monitor() {
       }
     }
     // Soft is up. Shared Chrome ignores PULSE_SINK and creates sink-inputs only
-    // when media plays — move onto yt off the Soft critical path (~30s).
+    // when media plays — move onto yt off the Soft critical path (backoff, early exit).
     const uint64_t route_gen = gen;
     std::thread([this, route_gen] {
       VRP_LOG("Audio: live route worker start");
       (void)PulseMonitor::route_browser_to_yt_sink();
-      for (int i = 0; i < 60; ++i) {
+      int stable_on_yt = 0;
+      int elapsed_ms = 0;
+      for (int i = 0; i < 40; ++i) {
         if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
         if (!live_monitor_.load(std::memory_order_acquire)) return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        // 500ms ×5, then 1s — fewer pactl forks once the guest is quiet.
+        const int sleep_ms = (i < 5) ? 500 : 1000;
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        elapsed_ms += sleep_ms;
         if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
         if (!live_monitor_.load(std::memory_order_acquire)) return;
         const int n = PulseMonitor::route_browser_to_yt_sink();
         if (n > 0) {
-          VRP_LOG("Audio: live route retry moved %d stream(s) (t+%dms)", n, (i + 1) * 500);
+          VRP_LOG("Audio: live route retry moved %d stream(s) (t+%dms)", n, elapsed_ms);
+          stable_on_yt = 0;
+        } else if (n < 0) {
+          if (++stable_on_yt >= 2) {
+            VRP_LOG("Audio: live route worker done (browser on yt, t+%dms)", elapsed_ms);
+            return;
+          }
+        } else {
+          stable_on_yt = 0;
         }
       }
       VRP_LOG("Audio: live route worker done");

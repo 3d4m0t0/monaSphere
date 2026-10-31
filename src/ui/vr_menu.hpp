@@ -126,6 +126,8 @@ class VrMenu {
     float volume = 1.f;
     float rate = 1.f;
     FsrMode fsr = FsrMode::Off;
+    /** True for 8K+ sources: FSR chip grayed, picker blocked. */
+    bool fsr_locked = false;
     int preferred_hz = 0;   // 0 = auto
     float display_hz = 0.f; // measured / reported
     int preview_w = 0;
@@ -234,6 +236,9 @@ class VrMenu {
   float rate() const { return rate_; }
   void set_fsr(FsrMode m);
   FsrMode fsr() const { return fsr_; }
+  /** 8K+ source: gray out FSR and refuse picker / mode changes. */
+  void set_fsr_locked(bool locked);
+  bool fsr_locked() const { return fsr_locked_; }
   void save_last_dir() const;
   std::filesystem::path load_last_dir() const;
   void set_preferred_hz(int hz);
@@ -461,6 +466,7 @@ class VrMenu {
   float volume_ = 0.2f;
   float rate_ = 1.f;
   FsrMode fsr_ = FsrMode::Quality;
+  bool fsr_locked_ = false;
   int preferred_hz_ = 0;   // 0 = auto
   float display_hz_ = 0.f;
   int pick_hz_ = 0;        // pending selection while in HzPick / HzConfirm

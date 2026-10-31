@@ -298,10 +298,38 @@ class VideoTexture {
    */
   bool upload_idle_screen();
   /**
-   * Dark slate + orbiting dots (same motif as DLNA loading). Non-blocking via try_upload.
-   * @param phase radians; advance ~9.5 rad/s for ~1.5 rev/s.
+   * Dark slate + shared 8-frame / 120° 3-dot spinner (Live / DLNA motif).
+   * Non-blocking via try_upload. @param phase radians; advance ~9.5 rad/s.
    */
   bool try_upload_spinner(int width, int height, float phase);
+
+  /**
+   * Live Flat busy (partial update):
+   *  - panel 1920×1080: bg + text (upload only when status changes)
+   *  - spinner 256²×8: blit only the center 256×256 each animation step
+   */
+  static constexpr int kBusyPanelW = 1920;
+  static constexpr int kBusyPanelH = 1080;
+  static constexpr int kBusySpinnerW = 256;
+  static constexpr int kBusySpinnerH = 256;
+  static constexpr int kBusyFrameCount = 8;
+  /** Upload 8 spinner frames once (256²). */
+  bool ensure_busy_spinners(const VideoFrame* frames, int frame_count);
+  /** Full panel (bg+text). Spinner hole at center is filled by present_busy. */
+  bool upload_busy_panel(const VideoFrame& panel);
+  void destroy_busy_atlas();
+  bool busy_ready() const { return busy_panel_ready_ && busy_spinners_ready_; }
+  /**
+   * Blit current spinner frame into panel center if index changed; return panel view.
+   * phase wraps on 2π/3 (3-dot motif).
+   */
+  VkImageView present_busy(float phase_rad);
+  int busy_width() const { return busy_ready() ? kBusyPanelW : 0; }
+  int busy_height() const { return busy_ready() ? kBusyPanelH : 0; }
+
+  /** @deprecated aliases for call sites still using atlas naming */
+  static constexpr int kBusyAtlasW = kBusyPanelW;
+  static constexpr int kBusyAtlasH = kBusyPanelH;
 
   VkImageView view() const { return slots_[display_].view; }
   VkSampler sampler() const { return sampler_; }
@@ -333,6 +361,12 @@ class VideoTexture {
   bool valid_ = false;
   bool rebind_ = false;
 
+  Slot busy_panel_{};
+  Slot busy_spinners_[kBusyFrameCount]{};
+  bool busy_panel_ready_ = false;
+  bool busy_spinners_ready_ = false;
+  int busy_spinner_idx_ = -1;
+
   VkSampler sampler_ = VK_NULL_HANDLE;
   VkBuffer staging_ = VK_NULL_HANDLE;
   VkDeviceMemory staging_mem_ = VK_NULL_HANDLE;
@@ -343,6 +377,8 @@ class VideoTexture {
   void destroy_slots();
   bool create_slot(Slot& slot, int width, int height);
   void ensure_size(int width, int height);
+  bool ensure_staging(VkDeviceSize bytes);
+  bool upload_slot_rgba(Slot& slot, int w, int h, const uint8_t* rgba, size_t rgba_bytes);
   void wait_fence();
   bool fence_ready() const;
 };

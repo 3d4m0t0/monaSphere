@@ -39,6 +39,25 @@ inline float fsr_mode_scale(FsrMode m) {
   }
 }
 
+/** Off → UQ → Q → P → Off (Live □ / X provisional cycle). */
+inline FsrMode next_fsr_mode(FsrMode m) {
+  switch (m) {
+    case FsrMode::Off: return FsrMode::UltraQuality;
+    case FsrMode::UltraQuality: return FsrMode::Quality;
+    case FsrMode::Quality: return FsrMode::Performance;
+    case FsrMode::Performance: return FsrMode::Off;
+  }
+  return FsrMode::Off;
+}
+
+/**
+ * FSR1 output long-edge is capped at ~7680; on 8K sources the upscale is effectively
+ * a no-op while blit+EASU+RCAS still cost GPU — force Off and lock the UI.
+ */
+inline bool fsr_locked_for_resolution(int w, int h) {
+  return std::max(w, h) >= 7680;
+}
+
 /** Which OpenXR interaction profile(s) to suggest. Applied at HMD connect. */
 enum class ControllerProfile : uint8_t {
   Auto = 0,            // suggest all known XR profiles

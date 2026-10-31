@@ -497,7 +497,9 @@ bool PipewireCapture::take_latest(VideoFrame& out, uint64_t& seen_seq) {
   if (s == seen_seq) return false;
   std::lock_guard<std::mutex> lock(frame_mu_);
   if (latest_.rgba.empty()) return false;
-  out = latest_;
+  // Move — avoid duplicating ~W×H×4 on the CPU fallback path every frame.
+  out = std::move(latest_);
+  latest_ = {};
   seen_seq = s;
   return true;
 }

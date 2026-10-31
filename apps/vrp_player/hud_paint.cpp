@@ -476,13 +476,24 @@ int paint_stick_cluster(HudCanvas& c, int x, int y, int h, const QString& label,
 }
 
 void draw_chip(HudCanvas& c, const QRect& r, const QString& text, const QFont& font, bool selected,
-               bool editing = false) {
+               bool editing = false, bool disabled = false) {
+  const bool lit = !disabled && (selected || editing);
   c.paint_cached(hud_key({7, static_cast<uint64_t>(r.width()), static_cast<uint64_t>(r.height()),
-                         selected ? 1ull : 0ull, editing ? 1ull : 0ull}),
+                         lit ? 1ull : 0ull, editing && !disabled ? 1ull : 0ull, disabled ? 1ull : 0ull}),
                  r, r.width(), r.height(), [&](QPainter& p) {
-                   draw_flat_square(p, QRect(0, 0, r.width(), r.height()), selected, editing);
+                   if (disabled) {
+                     p.setRenderHint(QPainter::Antialiasing, true);
+                     const QRectF rf = QRectF(0, 0, r.width(), r.height()).adjusted(0.5, 0.5, -0.5, -0.5);
+                     p.setPen(Qt::NoPen);
+                     p.setBrush(QColor(28, 32, 40));
+                     p.drawRoundedRect(rf, 4.0, 4.0);
+                   } else {
+                     draw_flat_square(p, QRect(0, 0, r.width(), r.height()), selected, editing);
+                   }
                  });
-  c.text(r, text, font, selected || editing ? QColor(20, 28, 40) : QColor(245, 248, 252), Qt::AlignCenter);
+  const QColor ink = disabled ? QColor(110, 118, 130)
+                              : (lit ? QColor(20, 28, 40) : QColor(245, 248, 252));
+  c.text(r, text, font, ink, Qt::AlignCenter);
 }
 
 void draw_mode_chip(HudCanvas& c, const QRect& r, const QString& top, const QString& bottom, const QFont& font,
@@ -718,8 +729,10 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
   x += fmt_w + gap;
 
   const QRect fsr_r(x, y, fsr_w, chip_h);
-  draw_chip(c, fsr_r, fsr_label(snap.fsr), hint_font, sel == 8,
-            snap.controls_edit == VrMenu::ControlsEdit::FsrPick);
+  draw_chip(c, fsr_r, fsr_label(snap.fsr_locked ? FsrMode::Off : snap.fsr), hint_font,
+            !snap.fsr_locked && sel == 8,
+            !snap.fsr_locked && snap.controls_edit == VrMenu::ControlsEdit::FsrPick,
+            snap.fsr_locked);
   x += fsr_w + gap;
 
   const QRect hz_r(x, y, hz_w, chip_h);
@@ -887,15 +900,84 @@ void paint_seek_bar_only(HudCanvas& c, const VrMenu::Snapshot& snap, int width, 
   paint_scrub_bar(c, snap, panel.bar, panel.time, hint_font);
 }
 
+namespace {
+
+/** Chrome+list+scroll without spinner; reused while only network_spin_phase changes. */
+struct NetworkSpinBase {
+  bool valid = false;
+  uint64_t key = 0;
+  int box_x = 0;
+  int box_y = 0;
+  std::vector<HudVertex> verts;
+};
+NetworkSpinBase g_network_spin_base;
+
+uint64_t network_menu_content_key(const VrMenu::Snapshot& snap, int width, int height, bool sony_face,
+                                  bool menu_option) {
+  uint64_t h = 14695981039346656037ull;
+  auto mix = [&](uint64_t v) {
+    h ^= v;
+    h *= 1099511628211ull;
+  };
+  mix(static_cast<uint64_t>(width));
+  mix(static_cast<uint64_t>(height));
+  mix(sony_face ? 1u : 0u);
+  mix(menu_option ? 1u : 0u);
+  mix(static_cast<uint64_t>(snap.screen));
+  mix(static_cast<uint64_t>(snap.entries.size()));
+  mix(static_cast<uint64_t>(snap.cursor));
+  mix(static_cast<uint64_t>(snap.format_cursor));
+  mix(static_cast<uint64_t>(std::lround(snap.scroll_f * 1000.f)));
+  mix(static_cast<uint64_t>(std::lround(snap.focus * 1000.f)));
+  for (unsigned char c : snap.title) mix(c);
+  for (const auto& e : snap.entries) {
+    mix(e.is_dir ? 1u : 0u);
+    mix(e.is_special ? 1u : 0u);
+    for (unsigned char c : e.name) mix(c);
+  }
+  return h;
+}
+
+void paint_network_spinner(HudCanvas& canvas, const QRect& box, float phase) {
+  constexpr int kSz = kLiveBusySpinnerW;
+  const int idx = live_busy_spinner_frame_index(phase);
+  canvas.paint_cached(hud_key({91, static_cast<uint64_t>(idx), static_cast<uint64_t>(kSz)}), box, kSz, kSz,
+                      [idx](QPainter& p) {
+                        p.setCompositionMode(QPainter::CompositionMode_SourceOver);
+                        p.drawImage(QRect(0, 0, kSz, kSz), live_busy_spinner_hud_frame(idx));
+                      });
+}
+
+}  // namespace
+
 HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height, bool sony_face,
                              bool menu_option) {
   sony_face_buttons = sony_face || menu_option;
   menu_button_option = menu_option || sony_face;
   HudCanvas& canvas = shared_hud_canvas();
-  canvas.begin(width, height);
   const QFont title_font = deUiFont(22, QFont::DemiBold);
   const QFont body_font = deUiFont(16, QFont::Normal);
   const QFont hint_font = deUiFont(13, QFont::Normal);
+
+  if (!snap.network_loading) g_network_spin_base.valid = false;
+
+  // Lightening 9: DLNA/network busy — reuse frozen chrome quads; only retarget spinner UVs.
+  if (snap.visible && !snap.controls_visible && snap.screen == VrMenu::Screen::Browser &&
+      snap.network_loading && g_network_spin_base.valid) {
+    const uint64_t ck = network_menu_content_key(snap, width, height, sony_face, menu_option);
+    if (ck == g_network_spin_base.key) {
+      canvas.begin(width, height);
+      canvas.set_verts(g_network_spin_base.verts);
+      constexpr int kSz = kLiveBusySpinnerW;
+      paint_network_spinner(
+          canvas, QRect(g_network_spin_base.box_x, g_network_spin_base.box_y, kSz, kSz),
+          snap.network_spin_phase);
+      return canvas.take();
+    }
+    g_network_spin_base.valid = false;
+  }
+
+  canvas.begin(width, height);
 
   if (!snap.visible && !snap.controls_visible) {
     if (snap.seek_bar_only) paint_seek_bar_only(canvas, snap, width, height, hint_font);
@@ -956,30 +1038,6 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
     }
     canvas.set_clip({});
 
-    if (snap.network_loading) {
-      const int cx = list_x + list_w / 2;
-      const int cy = list_top + (max_rows * row_h) / 2;
-      constexpr float kOrbit = 22.f;
-      constexpr int kDot = 11;
-      for (int i = 0; i < 3; ++i) {
-        const float a = snap.network_spin_phase + static_cast<float>(i) * (2.f * 3.14159265f / 3.f);
-        const int dx = static_cast<int>(std::lround(kOrbit * std::cos(static_cast<double>(a))));
-        const int dy = static_cast<int>(std::lround(kOrbit * std::sin(static_cast<double>(a))));
-        const float pulse = 0.45f + 0.55f * (0.5f + 0.5f * std::sin(static_cast<double>(
-                                                   snap.network_spin_phase * 1.7f + static_cast<float>(i))));
-        const int alpha = std::clamp(static_cast<int>(70.f + 185.f * pulse), 40, 255);
-        const QRect dot(cx + dx - kDot / 2, cy + dy - kDot / 2, kDot, kDot);
-        canvas.paint_cached(
-            hud_key({90, static_cast<uint64_t>(kDot), static_cast<uint64_t>(alpha)}), dot, kDot, kDot,
-            [alpha](QPainter& p) {
-              p.setRenderHint(QPainter::Antialiasing, true);
-              p.setPen(Qt::NoPen);
-              p.setBrush(QColor(230, 240, 255, alpha));
-              p.drawEllipse(QRectF(0.5, 0.5, kDot - 1.0, kDot - 1.0));
-            });
-      }
-    }
-
     if (show_scroll) {
       const QRect track(list_x + list_w + kScrollGap, list_top + 2, kScrollW, max_rows * row_h - 4);
       canvas.paint_cached(hud_key({10, static_cast<uint64_t>(track.width()), static_cast<uint64_t>(track.height())}),
@@ -1002,6 +1060,20 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
                             p.drawRoundedRect(QRectF(0, 0, thumb.width(), thumb.height()), 4, 4);
                           });
     }
+
+    if (snap.network_loading) {
+      // Spinner last so a spin-only tick can restore chrome+list+scroll then append.
+      constexpr int kSz = kLiveBusySpinnerW;
+      const int cx = list_x + list_w / 2;
+      const int cy = list_top + (max_rows * row_h) / 2;
+      const QRect box(cx - kSz / 2, cy - kSz / 2, kSz, kSz);
+      g_network_spin_base.verts = canvas.copy_verts();
+      g_network_spin_base.key = network_menu_content_key(snap, width, height, sony_face, menu_option);
+      g_network_spin_base.box_x = box.x();
+      g_network_spin_base.box_y = box.y();
+      g_network_spin_base.valid = true;
+      paint_network_spinner(canvas, box, snap.network_spin_phase);
+    }
   } else if (snap.screen == VrMenu::Screen::Format) {
     const int n = format_menu_count(snap.projection);
     for (int i = 0; i < n; ++i) {
@@ -1020,21 +1092,28 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
   return canvas.take();
 }
 
-QImage paint_live_busy(int width, int height, float phase, const QString& status) {
-  const int w = std::clamp(width > 0 ? width : 1280, 64, 3840);
-  const int h = std::clamp(height > 0 ? height : 720, 64, 2160);
-  QImage img(w, h, QImage::Format_RGBA8888);
-  img.fill(QColor(28, 32, 44, 200));
+int live_busy_spinner_frame_index(float phase_rad) {
+  float p = std::fmod(phase_rad, kLiveBusyPeriod);
+  if (p < 0.f) p += kLiveBusyPeriod;
+  return std::clamp(static_cast<int>(p / kLiveBusyPeriod * static_cast<float>(kLiveBusyFrames)), 0,
+                    kLiveBusyFrames - 1);
+}
+
+QImage paint_live_busy_spinner(float phase, bool opaque_bg) {
+  QImage img(kLiveBusySpinnerW, kLiveBusySpinnerH, QImage::Format_RGBA8888);
+  if (opaque_bg)
+    img.fill(QColor(28, 32, 44, 200));  // Flat panel blit (no alpha punch-through)
+  else
+    img.fill(Qt::transparent);  // HMD menu overlay
   QPainter p(&img);
   p.setRenderHint(QPainter::Antialiasing, true);
   p.setPen(Qt::NoPen);
-  // Match HMD menu network spinner (orbit 22, dot 11).
   constexpr float kOrbit = 22.f;
   constexpr int kDot = 11;
-  const int cx = w / 2;
-  const int cy = h / 2 - (status.isEmpty() ? 0 : 18);
+  const int cx = kLiveBusySpinnerW / 2;
+  const int cy = kLiveBusySpinnerH / 2;
   for (int i = 0; i < 3; ++i) {
-    const float a = phase + static_cast<float>(i) * (2.f * 3.14159265f / 3.f);
+    const float a = phase + static_cast<float>(i) * kLiveBusyPeriod;
     const int dx = static_cast<int>(std::lround(kOrbit * std::cos(static_cast<double>(a))));
     const int dy = static_cast<int>(std::lround(kOrbit * std::sin(static_cast<double>(a))));
     const float pulse = 0.45f + 0.55f * (0.5f + 0.5f * std::sin(static_cast<double>(
@@ -1043,14 +1122,62 @@ QImage paint_live_busy(int width, int height, float phase, const QString& status
     p.setBrush(QColor(230, 240, 255, alpha));
     p.drawEllipse(QRectF(cx + dx - kDot / 2.0, cy + dy - kDot / 2.0, kDot, kDot));
   }
-  if (!status.isEmpty()) {
-    QFont font = deUiFont(22, QFont::DemiBold);
-    p.setFont(font);
-    p.setPen(QColor(230, 240, 255, 240));
-    const QRect tr(0, cy + static_cast<int>(kOrbit) + 20, w, 40);
-    p.drawText(tr, Qt::AlignHCenter | Qt::AlignTop, status);
-  }
   return img;
+}
+
+QImage paint_live_busy_panel(int width, int height, const QString& status) {
+  const int w = std::clamp(width > 0 ? width : kLiveBusyPanelW, 64, 3840);
+  const int h = std::clamp(height > 0 ? height : kLiveBusyPanelH, 64, 2160);
+  QImage img(w, h, QImage::Format_RGBA8888);
+  img.fill(QColor(28, 32, 44, 200));
+  if (status.isEmpty()) return img;
+  QPainter p(&img);
+  p.setRenderHint(QPainter::Antialiasing, true);
+  // Spinner at center (offset -18); text under it. font 22 on 1080p ≈ half-size look, sharp.
+  constexpr int kSpin = kLiveBusySpinnerH;
+  constexpr int kOy = (kLiveBusyPanelH - kSpin) / 2 - 18;
+  QFont font = deUiFont(22, QFont::DemiBold);
+  p.setFont(font);
+  p.setPen(QColor(230, 240, 255, 240));
+  const QRect tr(0, kOy + kSpin + 2, w, 40);
+  p.drawText(tr, Qt::AlignHCenter | Qt::AlignTop, status);
+  return img;
+}
+
+QImage paint_live_busy(int width, int height, float phase, const QString& status) {
+  QImage img = paint_live_busy_panel(width, height, status);
+  const QImage spin = paint_live_busy_spinner(phase);
+  QPainter p(&img);
+  const int ox = (img.width() - spin.width()) / 2;
+  const int oy = (img.height() - spin.height()) / 2 - 18;
+  p.drawImage(ox, oy, spin);
+  return img;
+}
+
+QVector<QImage> paint_live_busy_spinner_atlas() {
+  QVector<QImage> out;
+  out.reserve(kLiveBusyFrames);
+  for (int i = 0; i < kLiveBusyFrames; ++i) {
+    const float phase =
+        kLiveBusyPeriod * static_cast<float>(i) / static_cast<float>(kLiveBusyFrames);
+    out.push_back(paint_live_busy_spinner(phase, true));
+  }
+  return out;
+}
+
+const QImage& live_busy_spinner_hud_frame(int index) {
+  static QVector<QImage> frames;
+  if (frames.size() != kLiveBusyFrames) {
+    frames.clear();
+    frames.reserve(kLiveBusyFrames);
+    for (int i = 0; i < kLiveBusyFrames; ++i) {
+      const float phase =
+          kLiveBusyPeriod * static_cast<float>(i) / static_cast<float>(kLiveBusyFrames);
+      frames.push_back(paint_live_busy_spinner(phase, false));
+    }
+  }
+  const int i = std::clamp(index, 0, kLiveBusyFrames - 1);
+  return frames[i];
 }
 
 HudPaintResult paint_hud_toast(const QString& text, int width, int height) {

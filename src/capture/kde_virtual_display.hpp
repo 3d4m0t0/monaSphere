@@ -52,13 +52,14 @@ class KdeVirtualDisplay : public QObject {
   static QString detectBinary();
   static bool waylandSession();
   /**
-   * Per-span krfb --name so ScreenCast Remember tokens stay independent.
-   * Same name for all spans made the portal keep only the last-auth'd grant.
+   * krfb --name for Live Virtual. Span only changes resolution (see Host
+   * virtualSizeForSpan); ScreenCast Remember is keyed by this fixed name, so
+   * one restore token covers x1–x3.
    */
-  static QString nameForSpan(int span);
-  /** Virtual-<nameForSpan> */
-  static QString outputNameForSpan(int span);
-  /** Legacy + x1–x3 names we may have created. */
+  static QString nameForSpan(int span = 1);
+  /** Always Virtual-monaSphere (span ignored). */
+  static QString outputNameForSpan(int span = 1);
+  /** Canonical + legacy x1–x3 / YT names we may have created (for kill orphans). */
   static QStringList allManagedNames();
   /** Kill leftover krfb-virtualmonitor processes for this name (crash orphans). */
   static int killOrphans(const QString& name);

@@ -6,7 +6,10 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform blit_params {
   uint width;
   uint height;
-  uint nv12;       // 0=RGBA, 1=limited, 2=full
+  // 0=RGBA from VK_SRGB (sampled linear → encode to gamma for FSR)
+  // 1=NV12 limited  2=NV12 full
+  // 3=RGBA already gamma (UNORM ScreenCast / Live DMA) — copy as-is
+  uint nv12;
   uint _pad;
 };
 
@@ -72,11 +75,14 @@ void main() {
   if (p.x >= int(width) || p.y >= int(height)) return;
   vec2 uv = (vec2(p) + 0.5) / vec2(float(width), float(height));
   vec3 rgb;
-  if (nv12 != 0u) {
+  if (nv12 == 1u || nv12 == 2u) {
     float y = texture(srcY, uv).r;
     vec2 chroma = sample_chroma(srcUV, uv);
     rgb = (nv12 == 2u) ? yuv_to_rgb_full(y, chroma.r, chroma.g)
                        : yuv_to_rgb_limited(y, chroma.r, chroma.g);
+  } else if (nv12 == 3u) {
+    // Live DMA etc.: UNORM holds gamma bytes already — do not linear_to_srgb.
+    rgb = texture(srcY, uv).rgb;
   } else {
     rgb = linear_to_srgb(texture(srcY, uv).rgb);
   }

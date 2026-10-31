@@ -19,6 +19,13 @@ namespace vrp {
  * try_import; XR thread only poll_present + view/sampler. On modifier or
  * format failure, try_import returns false and the host keeps CPU RGBA.
  *
+ * Slot reuse (lightening 6): PipeWire recycles a small dma-buf pool. Matching
+ * (st_dev, st_ino) reuses the existing VkImage / memory / view — no per-frame
+ * CreateImage. New inodes still import into a free ping-pong slot.
+ * Acquire skip (lightening 7): reuse flips display_slot only — no QueueSubmit
+ * / fence. Layout stays SHADER_READ_ONLY from the first import; dma-buf implicit
+ * sync covers producer writes. First import still transitions + waits.
+ *
  * NVIDIA experimental notes (discard if unstable):
  *  - Probe OPAQUE_FD then DMA_BUF (or reverse) before vkAllocateMemory.
  *  - Always use VkImageDrmFormatModifierExplicitCreateInfoEXT with the
@@ -70,6 +77,8 @@ class PipewireDmaTexture {
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    /** fstat identity of imported dma-buf; 0 = unknown / not reusable. */
+    uint64_t buf_key = 0;
   };
 
   bool enabled_ = false;
@@ -119,9 +128,11 @@ class PipewireDmaTexture {
   bool import_image(Slot& slot, int fd, uint64_t modifier, int width, int height, VkFormat format,
                     bool force_opaque_alpha, VkDeviceSize offset, VkDeviceSize row_pitch,
                     VkDeviceSize size);
+  /** First-time layout: UNDEFINED → SHADER_READ_ONLY. */
   bool transition_slot(const Slot& slot);
   /** @param force_opaque_alpha XRGB/XBGR → ImageView A=ONE (Flat uses SRC_ALPHA blend). */
   static bool map_drm_to_vk(uint32_t drm_fourcc, VkFormat& out_format, bool& force_opaque_alpha);
+  static bool dma_buf_key(int fd, uint64_t* out_key);
 };
 
 }  // namespace vrp

@@ -43,6 +43,16 @@ Api& api() {
     load_sym(x.lib, x.cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync_v2");
     if (!x.cuMemcpyDtoDAsync) load_sym(x.lib, x.cuMemcpyDtoDAsync, "cuMemcpyDtoDAsync");
     ok &= load_sym(x.lib, x.cuStreamSynchronize, "cuStreamSynchronize");
+    if (!load_sym(x.lib, x.cuStreamCreate, "cuStreamCreate"))
+      load_sym(x.lib, x.cuStreamCreate, "cuStreamCreate_ptsz");
+    if (!load_sym(x.lib, x.cuStreamDestroy, "cuStreamDestroy_v2"))
+      load_sym(x.lib, x.cuStreamDestroy, "cuStreamDestroy");
+    // Events optional — CudaNv12 falls back to sync memcpy if missing.
+    load_sym(x.lib, x.cuEventCreate, "cuEventCreate");
+    if (!load_sym(x.lib, x.cuEventDestroy, "cuEventDestroy_v2"))
+      load_sym(x.lib, x.cuEventDestroy, "cuEventDestroy");
+    load_sym(x.lib, x.cuEventRecord, "cuEventRecord");
+    load_sym(x.lib, x.cuEventSynchronize, "cuEventSynchronize");
     load_sym(x.lib, x.cuPointerGetAttribute, "cuPointerGetAttribute");
     load_sym(x.lib, x.cuGetErrorName, "cuGetErrorName");
     load_sym(x.lib, x.cuGetErrorString, "cuGetErrorString");

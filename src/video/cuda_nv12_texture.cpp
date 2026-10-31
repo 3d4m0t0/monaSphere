@@ -112,15 +112,100 @@ bool CudaNv12Texture::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue
 
   enabled_ = true;
   set_error("ok");
+  async_copy_ = false;
   VRP_LOG("CudaNv12Texture: LINEAR NV12 CUDA path enabled (no per-frame Vk copy), device %d", cuda_dev_);
   return true;
 }
 
-void CudaNv12Texture::drain_copies() {
+bool CudaNv12Texture::ensure_async_copy_path() {
+  // Sync cuMemcpy2D only for now: async + media switch left a dead CUstream across
+  // reset_slots and SEGV'd in cuMemcpy2DAsync on the 2nd+ file. Re-enable after the
+  // stream lifecycle is tied to CUcontext open/close explicitly.
+  async_copy_ = false;
+  return false;
+}
+
+void CudaNv12Texture::destroy_async_copy_path() {
+  auto& cu = cuda::api();
+  for (void*& e : copy_event_) {
+    if (e && cu.ok && cu.cuEventDestroy) {
+      (void)cu.cuEventDestroy(reinterpret_cast<cuda::CUevent>(e));
+    }
+    e = nullptr;
+  }
+  if (copy_stream_ && cu.ok && cu.cuStreamDestroy) {
+    (void)cu.cuStreamDestroy(reinterpret_cast<cuda::CUstream>(copy_stream_));
+  }
+  copy_stream_ = nullptr;
+  async_copy_ = false;
+}
+
+bool CudaNv12Texture::retire_pending_copy() {
+  if (pending_slot_ < 0) return true;
+  auto& cu = cuda::api();
+  if (async_copy_ && copy_event_[pending_slot_] && cu.cuEventSynchronize) {
+    if (cu.cuEventSynchronize(reinterpret_cast<cuda::CUevent>(copy_event_[pending_slot_])) !=
+        cuda::CUDA_SUCCESS) {
+      set_error("cuEventSynchronize pending");
+      pending_slot_ = -1;
+      return false;
+    }
+  }
+  display_slot_.store(pending_slot_, std::memory_order_release);
+  full_range_.store(pending_full_range_, std::memory_order_release);
+  valid_.store(true, std::memory_order_release);
+  present_gen_.fetch_add(1, std::memory_order_release);
+  pending_slot_ = -1;
+  return true;
+}
+
+void CudaNv12Texture::drain_copies(void* cu_context) {
   for (int i = 0; i < 200 && copy_active_.load(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
+  // Async path clears copy_active_ before the memcpy finishes — sync on the same
+  // CUcontext that owns copy_stream_ (NVDEC), not the primary context.
+  {
+    std::lock_guard<std::mutex> lock(slots_mu_);
+    CtxScope scope;
+    if (push_cuda_ctx(scope, cu_context)) {
+      (void)retire_pending_copy();
+      auto& cu = cuda::api();
+      if (copy_stream_ && cu.cuStreamSynchronize) {
+        (void)cu.cuStreamSynchronize(reinterpret_cast<cuda::CUstream>(copy_stream_));
+      }
+      if (cu.cuCtxSynchronize) (void)cu.cuCtxSynchronize();
+      pop_cuda_ctx(scope);
+    }
+  }
   (void)wait_fence_timeout(kFenceTimeoutNs);
+}
+
+void CudaNv12Texture::retain_display_sample() {
+  std::lock_guard<std::mutex> lock(slots_mu_);
+  if (sample_hold_.load(std::memory_order_relaxed) == 0) {
+    sample_slot_.store(display_slot_.load(std::memory_order_acquire), std::memory_order_release);
+  }
+  sample_hold_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void CudaNv12Texture::release_display_sample() {
+  std::lock_guard<std::mutex> lock(slots_mu_);
+  const int h = sample_hold_.load(std::memory_order_relaxed);
+  if (h <= 0) {
+    sample_hold_.store(0, std::memory_order_release);
+    sample_slot_.store(-1, std::memory_order_release);
+    return;
+  }
+  if (sample_hold_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    sample_slot_.store(-1, std::memory_order_release);
+  }
+}
+
+void CudaNv12Texture::clear_display_sample() {
+  std::lock_guard<std::mutex> lock(slots_mu_);
+  sample_hold_.store(0, std::memory_order_release);
+  sample_slot_.store(-1, std::memory_order_release);
 }
 
 bool CudaNv12Texture::push_cuda_ctx(CtxScope& scope, void* preferred) {
@@ -184,24 +269,36 @@ VkImageView CudaNv12Texture::uv_view() const {
 }
 
 void CudaNv12Texture::reset_slots(void* cu_context) {
-  drain_copies();
+  clear_display_sample();
+  drain_copies(cu_context);
   std::lock_guard<std::mutex> cuda_lock(cuda_decode_mu());
   std::lock_guard<std::mutex> lock(slots_mu_);
-  valid_.store(false);
-  layouts_ready_ = false;
   CtxScope scope;
   const bool ctx = push_cuda_ctx(scope, cu_context);
-  if (ctx && cuda::api().cuCtxSynchronize) {
-    (void)cuda::api().cuCtxSynchronize();
+  if (ctx) {
+    (void)retire_pending_copy();
+    auto& cu = cuda::api();
+    if (copy_stream_ && cu.cuStreamSynchronize) {
+      (void)cu.cuStreamSynchronize(reinterpret_cast<cuda::CUstream>(copy_stream_));
+    }
+    if (cu.cuCtxSynchronize) (void)cu.cuCtxSynchronize();
   }
+  valid_.store(false);
+  layouts_ready_ = false;
+  // Stream/events are tied to the previous CUcontext — must die with the slots or the
+  // next open reuses a dead stream and cuMemcpy2DAsync SEGVs on the 2nd+ file.
+  destroy_async_copy_path();
   destroy_slots();
   if (ctx) pop_cuda_ctx(scope);
   create_failed_ = false;
+  pending_slot_ = -1;
   present_gen_.store(0);
   bound_gen_ = 0;
   display_slot_.store(0);
   width_ = 0;
   height_ = 0;
+  sample_hold_.store(0, std::memory_order_release);
+  sample_slot_.store(-1, std::memory_order_release);
 }
 
 void CudaNv12Texture::prepare_shutdown() {
@@ -245,6 +342,7 @@ void CudaNv12Texture::shutdown() {
     } else {
       destroy_slots();
     }
+    destroy_async_copy_path();
   }
   if (sampler_) vkDestroySampler(device_, sampler_, nullptr);
   sampler_ = VK_NULL_HANDLE;
@@ -318,6 +416,8 @@ void CudaNv12Texture::destroy_slots() {
   }
   display_slot_.store(0);
   write_ = 1;
+  pending_slot_ = -1;
+  pending_full_range_ = false;
   width_ = 0;
   height_ = 0;
   valid_.store(false);
@@ -520,6 +620,7 @@ bool CudaNv12Texture::ensure_size(int width, int height) {
   if (create_failed_) return false;
 
   VRP_LOG("CudaNv12Texture: ensure_size %dx%d → %dx%d", width_, height_, width, height);
+  (void)retire_pending_copy();
   valid_.store(false, std::memory_order_release);
   layouts_ready_ = false;
   // Finish any prior layout submit before tearing down images.
@@ -637,18 +738,29 @@ bool CudaNv12Texture::try_copy_from_cuda(const AVFrame* cuda_frame, void* cu_con
     return fail(last_error().empty() ? "cuda import" : last_error().c_str());
   }
 
+  // Publish the previous async copy (usually already done → cheap EventSynchronize).
+  if (!retire_pending_copy()) {
+    copy_fail_.fetch_add(1);
+    return false;
+  }
+
+  (void)ensure_async_copy_path();
   write_ = 1 - display_slot_.load(std::memory_order_relaxed);
   Slot& slot = slots_[write_];
+  if (!slot.y.cuda_ptr || !slot.uv.cuda_ptr) {
+    return fail("null cuda import");
+  }
+  auto* copy_st = reinterpret_cast<cuda::CUstream>(copy_stream_);
 
-  auto memcpy_plane = [&](const Plane& plane, const uint8_t* src, int src_pitch, int width_bytes, int rows,
-                          const char* name) -> bool {
+  auto fill_memcpy = [&](cuda::CUDA_MEMCPY2D& m, const Plane& plane, const uint8_t* src, int src_pitch,
+                         int width_bytes, int rows) -> bool {
     int pitch = src_pitch < 0 ? -src_pitch : src_pitch;
     if (pitch < width_bytes) pitch = width_bytes;
     if (plane.row_pitch < static_cast<VkDeviceSize>(width_bytes)) {
-      set_error(std::string(name) + " dst pitch too small");
+      set_error("dst pitch too small");
       return false;
     }
-    cuda::CUDA_MEMCPY2D m{};
+    m = {};
     m.srcMemoryType = cuda::CU_MEMORYTYPE_DEVICE;
     m.srcDevice = reinterpret_cast<cuda::CUdeviceptr>(src);
     m.srcPitch = static_cast<size_t>(pitch);
@@ -657,38 +769,94 @@ bool CudaNv12Texture::try_copy_from_cuda(const AVFrame* cuda_frame, void* cu_con
     m.dstPitch = static_cast<size_t>(plane.row_pitch);
     m.WidthInBytes = static_cast<size_t>(width_bytes);
     m.Height = static_cast<size_t>(rows);
-    cuda::CUresult r = cu.cuMemcpy2D(&m);
-    if (r != cuda::CUDA_SUCCESS) {
-      set_error(std::string(name) + " cuMemcpy2D " + cuda::err_name(r));
+    return true;
+  };
+
+  const bool use_async =
+      async_copy_ && copy_st && cu.cuMemcpy2DAsync && copy_event_[write_];
+  auto copy_plane = [&](const Plane& plane, const uint8_t* src, int src_pitch, int width_bytes, int rows,
+                        const char* name) -> bool {
+    cuda::CUDA_MEMCPY2D m{};
+    if (!fill_memcpy(m, plane, src, src_pitch, width_bytes, rows)) {
+      set_error(std::string(name) + " " + last_error());
       return false;
+    }
+    cuda::CUresult r = cuda::CUDA_SUCCESS;
+    if (use_async) {
+      r = cu.cuMemcpy2DAsync(&m, copy_st);
+      if (r != cuda::CUDA_SUCCESS) {
+        set_error(std::string(name) + " cuMemcpy2DAsync " + cuda::err_name(r));
+        return false;
+      }
+    } else {
+      r = cu.cuMemcpy2D ? cu.cuMemcpy2D(&m) : static_cast<cuda::CUresult>(1);
+      if (r != cuda::CUDA_SUCCESS) {
+        set_error(std::string(name) + " cuMemcpy2D " + cuda::err_name(r));
+        return false;
+      }
     }
     return true;
   };
 
-  if (!memcpy_plane(slot.y, cuda_frame->data[0], cuda_frame->linesize[0], w, h, "Y")) {
+  if (!copy_plane(slot.y, cuda_frame->data[0], cuda_frame->linesize[0], w, h, "Y")) {
     copy_fail_.fetch_add(1);
     return false;
   }
-  if (!memcpy_plane(slot.uv, cuda_frame->data[1], cuda_frame->linesize[1], w, h / 2, "UV")) {
+  if (!copy_plane(slot.uv, cuda_frame->data[1], cuda_frame->linesize[1], w, h / 2, "UV")) {
     copy_fail_.fetch_add(1);
     return false;
-  }
-  // Finish CUDA work on the decode thread only — do NOT vkQueueSubmit here.
-  // Per-frame Vulkan barriers on the XR graphics queue caused Monado wait_semaphore timeouts.
-  if (stream) {
-    if (cu.cuStreamSynchronize(stream) != cuda::CUDA_SUCCESS) {
-      if (cu.cuStreamSynchronize(nullptr) != cuda::CUDA_SUCCESS) { /* ignore */ }
-    }
-  } else if (cu.cuStreamSynchronize) {
-    (void)cu.cuStreamSynchronize(nullptr);
   }
 
-  display_slot_.store(write_, std::memory_order_release);
-  full_range_.store(frame_is_full_range(cuda_frame, full_range_hint), std::memory_order_release);
-  valid_.store(true, std::memory_order_release);
-  present_gen_.fetch_add(1, std::memory_order_release);
+  const bool full = frame_is_full_range(cuda_frame, full_range_hint);
+  // Do NOT vkQueueSubmit on the graphics queue (Monado wait_semaphore).
+  if (use_async) {
+    if (cu.cuEventRecord(reinterpret_cast<cuda::CUevent>(copy_event_[write_]), copy_st) !=
+        cuda::CUDA_SUCCESS) {
+      if (cu.cuStreamSynchronize) (void)cu.cuStreamSynchronize(copy_st);
+      display_slot_.store(write_, std::memory_order_release);
+      full_range_.store(full, std::memory_order_release);
+      valid_.store(true, std::memory_order_release);
+      present_gen_.fetch_add(1, std::memory_order_release);
+      pending_slot_ = -1;
+    } else {
+      pending_slot_ = write_;
+      pending_full_range_ = full;
+      // First picture: sync now so XR is not black until frame 2.
+      if (!valid_.load(std::memory_order_relaxed)) {
+        if (!retire_pending_copy()) {
+          copy_fail_.fetch_add(1);
+          return false;
+        }
+      }
+    }
+  } else {
+    // Sync path: wait the producer stream if any, else the context.
+    if (stream && cu.cuStreamSynchronize) {
+      if (cu.cuStreamSynchronize(stream) != cuda::CUDA_SUCCESS) {
+        (void)cu.cuStreamSynchronize(nullptr);
+      }
+    } else if (cu.cuStreamSynchronize) {
+      (void)cu.cuStreamSynchronize(nullptr);
+    }
+    display_slot_.store(write_, std::memory_order_release);
+    full_range_.store(full, std::memory_order_release);
+    valid_.store(true, std::memory_order_release);
+    present_gen_.fetch_add(1, std::memory_order_release);
+    pending_slot_ = -1;
+  }
+
   copy_ok_.fetch_add(1);
   set_error("ok");
+  {
+    static std::atomic<bool> logged{false};
+    if (!logged.exchange(true)) {
+      if (use_async) {
+        VRP_LOG("CudaNv12Texture: async cuMemcpy2D + event (deferred present, own NON_BLOCKING stream)");
+      } else {
+        VRP_LOG("CudaNv12Texture: sync cuMemcpy2D (async unavailable)");
+      }
+    }
+  }
   return true;
 #endif
 }

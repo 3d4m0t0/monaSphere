@@ -32,6 +32,7 @@ int VirtualDisplayManager::spanFromName(const QString& name_or_output) {
                               QRegularExpression::CaseInsensitiveOption);
   const auto m = re.match(name_or_output);
   if (m.hasMatch()) return std::clamp(m.captured(1).toInt(), 1, 3);
+  // Canonical shared name — span comes from caller (resolution), not the name.
   return 1;
 }
 
@@ -74,40 +75,39 @@ int VirtualDisplayManager::height() const { return have_current_ ? current_.heig
 
 float VirtualDisplayManager::scale() const { return have_current_ ? current_.scale : 0.f; }
 
-QString VirtualDisplayManager::token(int span) const {
-  const int s = std::clamp(span, 1, 3);
-  return tokens_.value(s);
+QString VirtualDisplayManager::token(int /*span*/) const {
+  // One Remember grant for Virtual-monaSphere — span only selects resolution.
+  for (int s = 1; s <= 3; ++s) {
+    const QString t = tokens_.value(s);
+    if (!t.isEmpty()) return t;
+  }
+  return {};
 }
 
-void VirtualDisplayManager::loadToken(int span, const QString& token) {
-  const int s = std::clamp(span, 1, 3);
-  if (token.isEmpty()) tokens_.remove(s);
-  else tokens_.insert(s, token);
+void VirtualDisplayManager::loadToken(int /*span*/, const QString& token) {
+  tokens_.clear();
+  if (!token.isEmpty()) tokens_.insert(1, token);
 }
 
-void VirtualDisplayManager::setToken(int span, const QString& token) {
-  const int s = std::clamp(span, 1, 3);
+void VirtualDisplayManager::setToken(int /*span*/, const QString& token) {
   if (token.isEmpty()) {
-    clearToken(s);
+    clearToken(1);
     return;
   }
-  tokens_.insert(s, token);
-  emit logMessage(tr("Virtual: token x%1 saved (%2 chars)").arg(s).arg(token.size()));
-  emit tokenChanged(s, token);
+  tokens_.clear();
+  tokens_.insert(1, token);
+  emit logMessage(tr("Virtual: token saved (%1 chars)").arg(token.size()));
+  emit tokenChanged(1, token);
 }
 
-void VirtualDisplayManager::clearToken(int span) {
-  const int s = std::clamp(span, 1, 3);
-  if (!tokens_.contains(s) || tokens_.value(s).isEmpty()) return;
-  tokens_.remove(s);
-  emit logMessage(tr("Virtual: token x%1 cleared").arg(s));
-  emit tokenChanged(s, QString());
+void VirtualDisplayManager::clearToken(int /*span*/) {
+  if (tokens_.isEmpty()) return;
+  tokens_.clear();
+  emit logMessage(tr("Virtual: token cleared"));
+  emit tokenChanged(1, QString());
 }
 
-void VirtualDisplayManager::clearAllTokens() {
-  const QList<int> keys = tokens_.keys();
-  for (int s : keys) clearToken(s);
-}
+void VirtualDisplayManager::clearAllTokens() { clearToken(1); }
 
 bool VirtualDisplayManager::wait_gone(int timeout_ms) {
   QElapsedTimer t;
@@ -194,12 +194,16 @@ bool VirtualDisplayManager::wait_ready(const Spec& want, QString* matched_out) {
   QElapsedTimer wait;
   wait.start();
   QString matched;
+  // Do NOT call enableOutput every poll tick — each call runs 3× kscreen-doctor and
+  // thrashs KWin/plasmashell (unexisting screen geometry / delayed input).
+  int enable_count = 0;
+  qint64 last_enable_ms = -100000;
   while (wait.elapsed() < 10000) {
-    (void)KdeVirtualDisplay::enableOutput(out, place_x, place_y, want.scale);
     int mw = 0, mh = 0;
     float sc = 1.f;
     QRect r;
     QString m2;
+    const bool listed = KdeVirtualDisplay::outputExists(out);
     const bool have_rect = KdeVirtualDisplay::queryOutputRect(out, &r, &m2) && !r.isEmpty();
     const bool have_good_mode =
         KdeVirtualDisplay::queryOutputMode(out, &mw, &mh, &sc, &matched) &&
@@ -209,6 +213,18 @@ bool VirtualDisplayManager::wait_ready(const Spec& want, QString* matched_out) {
     if (have_good_mode && have_rect) {
       if (matched_out) *matched_out = !matched.isEmpty() ? matched : m2;
       return true;
+    }
+
+    // Place/enable at most twice: once when the output first appears, once if still
+    // missing a good mode after 2s (kscreen sometimes needs a second nudge).
+    const qint64 now = wait.elapsed();
+    const bool want_enable =
+        listed && enable_count < 2 &&
+        (enable_count == 0 || (now - last_enable_ms >= 2000 && !have_good_mode));
+    if (want_enable) {
+      (void)KdeVirtualDisplay::enableOutput(out, place_x, place_y, want.scale);
+      ++enable_count;
+      last_enable_ms = now;
     }
 
     if (vdisp_->matches_launch(want.width, want.height, want.scale) &&
@@ -301,6 +317,8 @@ VirtualDisplayManager::Result VirtualDisplayManager::ensure(const Spec& want_in)
                         .arg(want.width)
                         .arg(want.height)
                         .arg(want.span));
+    // Drop Force-screen rules before the output vanishes (dead index → Plasma thrash).
+    KwinWindowPlacer::clear_live_session_rules();
     vdisp_->stop();
     (void)KdeVirtualDisplay::killAllManaged();
     have_current_ = false;
@@ -309,6 +327,8 @@ VirtualDisplayManager::Result VirtualDisplayManager::ensure(const Spec& want_in)
     if (!wait_gone(8000)) {
       emit logMessage(tr("Virtual: still listed after stop — continuing"));
     }
+    // Let plasmashell finish screenRemoved before a new Virtual appears.
+    QThread::msleep(400);
   }
 
   emit busyStatus(tr("Virtual 作成中"));
@@ -362,12 +382,15 @@ void VirtualDisplayManager::destroy() {
     have_current_ = false;
     output_name_.clear();
     screen_index_ = -1;
+    // Still scrub leftover rules from a prior aborted session.
+    KwinWindowPlacer::clear_live_session_rules();
     emit busyStatus(QString());
     return;
   }
   emit busyStatus(tr("Virtual 削除中"));
   VRP_LOG("Virtual: destroy (tokens kept)");
   emit logMessage(tr("Virtual: destroy (tokens kept)"));
+  KwinWindowPlacer::clear_live_session_rules();
   vdisp_->stop();
   (void)KdeVirtualDisplay::killAllManaged();
   have_current_ = false;
@@ -378,6 +401,8 @@ void VirtualDisplayManager::destroy() {
   } else {
     emit logMessage(tr("Virtual: still listed after destroy — continuing"));
   }
+  // Brief settle so plasmashell can drop containments for the gone output.
+  QThread::msleep(400);
   emit busyStatus(QString());
 }
 

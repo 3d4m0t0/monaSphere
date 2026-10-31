@@ -586,10 +586,13 @@ int PulseMonitor::route_browser_to_yt_sink() {
   bool have_sink = false;
   std::string app_name;
   std::string app_bin;
+  // First successful list only — retries used to flood the log.
+  static bool dump_inputs = true;
+  const bool do_dump = dump_inputs;
 
   auto flush = [&] {
     if (cur < 0) return;
-    if (dumped < 12) {
+    if (do_dump && dumped < 12) {
       VRP_LOG("PulseMonitor: sink-input #%d app='%s' bin='%s' sink=%u", cur,
               app_name.empty() ? "?" : app_name.c_str(),
               app_bin.empty() ? "?" : app_bin.c_str(), have_sink ? sink_idx : 0u);
@@ -671,16 +674,22 @@ int PulseMonitor::route_browser_to_yt_sink() {
   }
   flush();
   (void)pclose(list);
+  if (do_dump) dump_inputs = false;
 
   if (moved > 0) {
     VRP_LOG("PulseMonitor: moved %d browser stream(s) → %s (seen=%d)", moved, kYtSinkName,
             browser_seen);
-  } else if (browser_seen == 0) {
-    VRP_LOG("PulseMonitor: no browser sink-input yet (will retry)");
-  } else {
-    VRP_LOG("PulseMonitor: browser already on %s (seen=%d)", kYtSinkName, browser_seen);
+    return moved;
   }
-  return moved;
+  if (browser_seen == 0) {
+    // Throttle: place/route polls used to spam this every 500ms.
+    static int no_browser_logs = 0;
+    if ((no_browser_logs++ % 8) == 0)
+      VRP_LOG("PulseMonitor: no browser sink-input yet (will retry)");
+    return 0;
+  }
+  VRP_LOG("PulseMonitor: browser already on %s (seen=%d)", kYtSinkName, browser_seen);
+  return -browser_seen;
 #endif
 }
 

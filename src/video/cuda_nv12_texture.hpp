@@ -17,6 +17,10 @@ namespace vrp {
  * NV12 ping-pong: CUDA writes directly into exportable LINEAR VkImages (Y R8 + UV R8G8).
  * No vkCmdCopyBufferToImage on the graphics queue — avoids Monado wait_semaphore stalls.
  * Decode thread copies; XR only polls and rebinds descriptors.
+ *
+ * Async path (案A): cuMemcpy2DAsync + CUevent. Present is deferred to the next
+ * try_copy (or drain) so the decode thread is not blocked on the current copy.
+ * One-frame present latency vs the old sync path.
  */
 class CudaNv12Texture {
  public:
@@ -45,9 +49,18 @@ class CudaNv12Texture {
 
   /** Destroy NV12 slots. Pass the FFmpeg/NVDEC CUcontext used for import (before decoder.close). */
   void reset_slots(void* cu_context = nullptr);
-  /** Wait until in-flight CUDA copies finish (call before reset_slots / reopen). */
-  void drain_copies();
+  /** Wait until in-flight CUDA copies finish (call before reset_slots / reopen). Prefer NVDEC ctx. */
+  void drain_copies(void* cu_context = nullptr);
   void prepare_shutdown();
+
+  /**
+   * Pin the current display slot so try_copy will not async-write over it while the
+   * eye pass / FSR compute still samples those VkImageViews (cuMemcpy2DAsync SEGV).
+   * retain/release are refcounted; clear_display_sample() forces unlock (media switch).
+   */
+  void retain_display_sample();
+  void release_display_sample();
+  void clear_display_sample();
 
  private:
   struct Plane {
@@ -85,6 +98,12 @@ class CudaNv12Texture {
   int write_ = 1;
   int width_ = 0;
   int height_ = 0;
+  /** Slot with in-flight async copy; published on next try_copy / flush. -1 = none. */
+  int pending_slot_ = -1;
+  bool pending_full_range_ = false;
+  void* copy_event_[2]{nullptr, nullptr};  // CUevent
+  void* copy_stream_ = nullptr;            // CUstream (NON_BLOCKING; never NULL/legacy)
+  bool async_copy_ = false;
 
   bool enabled_ = false;
   std::atomic<bool> valid_{false};
@@ -98,6 +117,10 @@ class CudaNv12Texture {
   std::atomic<uint64_t> present_flips_{0};
   std::atomic<uint64_t> present_gen_{0};
   uint64_t bound_gen_ = 0;
+
+  /** GPU (eye/FSR) is sampling this slot; decode must not write it. -1 = none. */
+  std::atomic<int> sample_slot_{-1};
+  std::atomic<int> sample_hold_{0};
 
   mutable std::mutex err_mu_;
   std::string last_error_;
@@ -128,5 +151,9 @@ class CudaNv12Texture {
   bool transition_all_to_shader_read();
   bool fence_ready() const;
   bool wait_fence_timeout(uint64_t ns);
+  bool ensure_async_copy_path();
+  void destroy_async_copy_path();
+  /** CUDA ctx current. Sync pending async copy and flip display_slot. */
+  bool retire_pending_copy();
 };
 }  // namespace vrp

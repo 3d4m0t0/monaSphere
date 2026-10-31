@@ -39,6 +39,10 @@ class HudCanvas {
   HudPaintResult take();
   /** Pixel clip for subsequent quads. An empty rect clears it. */
   void set_clip(const QRect& clip);
+  /** Copy current quads (e.g. freeze chrome before a spin-only tick). */
+  std::vector<HudVertex> copy_verts() const { return verts_; }
+  /** Replace quads without touching the atlas (spin-only HUD updates). */
+  void set_verts(std::vector<HudVertex> verts) { verts_ = std::move(verts); }
 
   void fill(const QRect& r, const QColor& color);
   /** Horizontal 3-slice so a changing width does not rasterize again. */

@@ -569,6 +569,7 @@ GamepadInput::State GamepadInput::poll() {
 
   const bool a = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A) != 0;
   const bool b = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B) != 0;
+  const bool x = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_X) != 0;
   const bool y = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_Y) != 0;
   const bool l3 = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK) != 0;
   const bool r3 = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
@@ -582,6 +583,7 @@ GamepadInput::State GamepadInput::poll() {
   st.confirm_held = a;
   st.back = edge(b, prev_b_);
   st.back_held = b;
+  st.face_x = edge(x, prev_x_);
   st.face_y = edge(y, prev_y_);
   // R3 alone resets view look; L3+R3 is recenter (handled below).
   st.view_reset = edge(r3 && !l3, prev_r3_);

@@ -24,6 +24,8 @@ class SceneRenderer {
   void set_view_offset(float yaw_rad, float pitch_rad);
   /** Latitude/longitude cage locked to the picture, drawn while the stick is turning the view. */
   void set_comfort_grid(bool on);
+  /** When false, skip Flat/VR content panel (idle sky-only). HUD/sky still draw. */
+  void set_content_draw(bool on) { content_draw_ = on; }
   void set_texture(VkImageView view, VkSampler sampler);
   /** RGBA video that is still gamma-encoded (e.g. FSR1 output). Linearized like NV12. */
   void set_texture_gamma(VkImageView view, VkSampler sampler);
@@ -106,6 +108,7 @@ class SceneRenderer {
   float look_yaw_ = 0.f;
   float look_pitch_ = 0.f;
   bool comfort_grid_ = false;
+  bool content_draw_ = true;
   bool content_cursor_on_ = false;
   float content_cursor_u_ = 0.5f;
   float content_cursor_v_ = 0.5f;

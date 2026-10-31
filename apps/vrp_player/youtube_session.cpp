@@ -835,9 +835,13 @@ void YouTubeSession::pollPlace() {
     return;
   }
 
-  (void)x11_.prepare_window(place_w_, place_h_, /*hide_host=*/false, /*move=*/false);
-  if (!x11_.bind_output_by_name(output_name_.toStdString(), place_w_, place_h_)) {
-    x11_.set_screen_rect(place_x_, place_y_, place_w_, place_h_);
+  // X11 tree walk + Xrandr: first tick and every 3rd — KWin script is the fast path.
+  const bool x11_tick = (place_tries_ == 0 || (place_tries_ % 3) == 0);
+  if (x11_tick) {
+    (void)x11_.prepare_window(place_w_, place_h_, /*hide_host=*/false, /*move=*/false);
+    if (!x11_.bind_output_by_name(output_name_.toStdString(), place_w_, place_h_)) {
+      x11_.set_screen_rect(place_x_, place_y_, place_w_, place_h_);
+    }
   }
 
   QString wid;
@@ -882,9 +886,12 @@ void YouTubeSession::pollPlace() {
 void YouTubeSession::pollPlaceGnome() {
   if (state_ != State::Placing) return;
 
-  (void)x11_.prepare_window(place_w_, place_h_, /*hide_host=*/false, /*move=*/true);
-  if (!x11_.bind_output_by_name(output_name_.toStdString(), place_w_, place_h_)) {
-    x11_.set_screen_rect(place_x_, place_y_, place_w_, place_h_);
+  const bool x11_tick = (place_tries_ == 0 || (place_tries_ % 3) == 0);
+  if (x11_tick) {
+    (void)x11_.prepare_window(place_w_, place_h_, /*hide_host=*/false, /*move=*/true);
+    if (!x11_.bind_output_by_name(output_name_.toStdString(), place_w_, place_h_)) {
+      x11_.set_screen_rect(place_x_, place_y_, place_w_, place_h_);
+    }
   }
 
   if (x11_.have_window()) {
