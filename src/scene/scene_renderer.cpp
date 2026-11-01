@@ -89,13 +89,9 @@ Mat4 invert_rigid(const Mat4& m) {
   return r;
 }
 
-Mat4 projection_fov(const XrFovf& fov, float near_z, float far_z) {
-  // OpenXR FOV → Vulkan clip space (Y down, Z in [0, 1]).
+Mat4 projection_fov_tans(float l, float r, float u, float d, float near_z, float far_z) {
+  // OpenXR FOV tans → Vulkan clip space (Y down, Z in [0, 1]).
   // Matching Khronos xr_linear.h GRAPHICS_VULKAN.
-  const float l = std::tan(fov.angleLeft);
-  const float r = std::tan(fov.angleRight);
-  const float u = std::tan(fov.angleUp);
-  const float d = std::tan(fov.angleDown);
   const float w = r - l;
   const float h = u - d;
   Mat4 m{};
@@ -107,6 +103,18 @@ Mat4 projection_fov(const XrFovf& fov, float near_z, float far_z) {
   m.m[11] = -1.f;
   m.m[14] = (far_z * near_z) / (near_z - far_z);
   return m;
+}
+
+Mat4 projection_fov(const XrFovf& fov, float near_z, float far_z) {
+  return projection_fov_tans(std::tan(fov.angleLeft), std::tan(fov.angleRight),
+                             std::tan(fov.angleUp), std::tan(fov.angleDown), near_z, far_z);
+}
+
+void fov_tans(const XrFovf& fov, float out[4]) {
+  out[0] = std::tan(fov.angleLeft);
+  out[1] = std::tan(fov.angleRight);
+  out[2] = std::tan(fov.angleUp);
+  out[3] = std::tan(fov.angleDown);
 }
 
 struct PushConstants {
@@ -405,11 +413,11 @@ void SceneRenderer::init(XrVulkanApp& app, const std::string& shader_dir) {
   if (!app.swapchains().empty()) {
     create_pipelines(app.swapchains()[0].format);
   }
-  cmds_.resize(2);
+  cmds_.resize(3);
   VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
   ai.commandPool = app.command_pool();
   ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  ai.commandBufferCount = 2;
+  ai.commandBufferCount = 3;
   VRP_CHECK(vkAllocateCommandBuffers(device_, &ai, cmds_.data()) == VK_SUCCESS, "scene cmds");
 
   VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -433,10 +441,33 @@ void SceneRenderer::shutdown() {
   if (moon_pipeline_) vkDestroyPipeline(device_, moon_pipeline_, nullptr);
   if (sun_pipeline_) vkDestroyPipeline(device_, sun_pipeline_, nullptr);
   if (milkyway_pipeline_) vkDestroyPipeline(device_, milkyway_pipeline_, nullptr);
+  if (sky_blit_pipeline_) vkDestroyPipeline(device_, sky_blit_pipeline_, nullptr);
   if (layout_) vkDestroyPipelineLayout(device_, layout_, nullptr);
   if (grid_layout_) vkDestroyPipelineLayout(device_, grid_layout_, nullptr);
   if (milkyway_layout_) vkDestroyPipelineLayout(device_, milkyway_layout_, nullptr);
   if (moon_layout_) vkDestroyPipelineLayout(device_, moon_layout_, nullptr);
+  if (sky_blit_layout_) vkDestroyPipelineLayout(device_, sky_blit_layout_, nullptr);
+  destroy_sky_mono();
+  if (sky_blit_pool_) {
+    vkDestroyDescriptorPool(device_, sky_blit_pool_, nullptr);
+    sky_blit_pool_ = VK_NULL_HANDLE;
+    sky_blit_dset_ = VK_NULL_HANDLE;
+  }
+  if (sky_blit_dsl_) {
+    vkDestroyDescriptorSetLayout(device_, sky_blit_dsl_, nullptr);
+    sky_blit_dsl_ = VK_NULL_HANDLE;
+  }
+  if (sky_mono_samp_) {
+    vkDestroySampler(device_, sky_mono_samp_, nullptr);
+    sky_mono_samp_ = VK_NULL_HANDLE;
+  }
+  if (sky_mono_pass_) {
+    vkDestroyRenderPass(device_, sky_mono_pass_, nullptr);
+    sky_mono_pass_ = VK_NULL_HANDLE;
+  }
+  if (sky_blit_vert_) vkDestroyShaderModule(device_, sky_blit_vert_, nullptr);
+  if (sky_blit_frag_) vkDestroyShaderModule(device_, sky_blit_frag_, nullptr);
+  sky_blit_vert_ = sky_blit_frag_ = VK_NULL_HANDLE;
   if (milkyway_pool_) {
     vkDestroyDescriptorPool(device_, milkyway_pool_, nullptr);
     milkyway_pool_ = VK_NULL_HANDLE;
@@ -509,10 +540,106 @@ void SceneRenderer::shutdown() {
   moon_pipeline_ = VK_NULL_HANDLE;
   sun_pipeline_ = VK_NULL_HANDLE;
   milkyway_pipeline_ = VK_NULL_HANDLE;
+  sky_blit_pipeline_ = VK_NULL_HANDLE;
   layout_ = VK_NULL_HANDLE;
   grid_layout_ = VK_NULL_HANDLE;
   milkyway_layout_ = VK_NULL_HANDLE;
   moon_layout_ = VK_NULL_HANDLE;
+  sky_blit_layout_ = VK_NULL_HANDLE;
+}
+
+void SceneRenderer::destroy_sky_mono() {
+  sky_mono_ready_ = false;
+  if (!device_) return;
+  if (sky_mono_fb_) {
+    vkDestroyFramebuffer(device_, sky_mono_fb_, nullptr);
+    sky_mono_fb_ = VK_NULL_HANDLE;
+  }
+  if (sky_mono_view_) {
+    vkDestroyImageView(device_, sky_mono_view_, nullptr);
+    sky_mono_view_ = VK_NULL_HANDLE;
+  }
+  if (sky_mono_img_) {
+    vkDestroyImage(device_, sky_mono_img_, nullptr);
+    sky_mono_img_ = VK_NULL_HANDLE;
+  }
+  if (sky_mono_mem_) {
+    vkFreeMemory(device_, sky_mono_mem_, nullptr);
+    sky_mono_mem_ = VK_NULL_HANDLE;
+  }
+  sky_mono_w_ = sky_mono_h_ = 0;
+}
+
+bool SceneRenderer::ensure_sky_mono(VkFormat format, uint32_t w, uint32_t h) {
+  if (!device_ || !sky_mono_pass_ || w < 8 || h < 8) return false;
+  if (sky_mono_img_ && sky_mono_w_ == w && sky_mono_h_ == h && sky_mono_format_ == format) {
+    return sky_mono_fb_ != VK_NULL_HANDLE && sky_blit_dset_ != VK_NULL_HANDLE;
+  }
+  destroy_sky_mono();
+  sky_mono_format_ = format;
+
+  VkImageCreateInfo ici{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ici.imageType = VK_IMAGE_TYPE_2D;
+  ici.format = format;
+  ici.extent = {w, h, 1};
+  ici.mipLevels = 1;
+  ici.arrayLayers = 1;
+  ici.samples = VK_SAMPLE_COUNT_1_BIT;
+  ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+  ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(device_, &ici, nullptr, &sky_mono_img_) != VK_SUCCESS) return false;
+  VkMemoryRequirements req{};
+  vkGetImageMemoryRequirements(device_, sky_mono_img_, &req);
+  VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  mai.allocationSize = req.size;
+  mai.memoryTypeIndex = find_memory(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (vkAllocateMemory(device_, &mai, nullptr, &sky_mono_mem_) != VK_SUCCESS) {
+    destroy_sky_mono();
+    return false;
+  }
+  vkBindImageMemory(device_, sky_mono_img_, sky_mono_mem_, 0);
+
+  VkImageViewCreateInfo ivci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  ivci.image = sky_mono_img_;
+  ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  ivci.format = format;
+  ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  ivci.subresourceRange.levelCount = 1;
+  ivci.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(device_, &ivci, nullptr, &sky_mono_view_) != VK_SUCCESS) {
+    destroy_sky_mono();
+    return false;
+  }
+
+  VkFramebufferCreateInfo fbci{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+  fbci.renderPass = sky_mono_pass_;
+  fbci.attachmentCount = 1;
+  fbci.pAttachments = &sky_mono_view_;
+  fbci.width = w;
+  fbci.height = h;
+  fbci.layers = 1;
+  if (vkCreateFramebuffer(device_, &fbci, nullptr, &sky_mono_fb_) != VK_SUCCESS) {
+    destroy_sky_mono();
+    return false;
+  }
+
+  VkDescriptorImageInfo ii{};
+  ii.sampler = sky_mono_samp_;
+  ii.imageView = sky_mono_view_;
+  ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+  write.dstSet = sky_blit_dset_;
+  write.dstBinding = 0;
+  write.descriptorCount = 1;
+  write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+  write.pImageInfo = &ii;
+  vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+
+  sky_mono_w_ = w;
+  sky_mono_h_ = h;
+  VRP_LOG("sky mono RT %ux%u format=%d (union FOV full-sky)", w, h, static_cast<int>(format));
+  return true;
 }
 
 void SceneRenderer::set_milkyway_gain(float gain_mul) {
@@ -1133,7 +1260,7 @@ void SceneRenderer::build_meshes() {
   upload(moon_quad, sizeof(moon_quad), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vbo_moon_, vbo_moon_mem_);
 }
 
-void SceneRenderer::create_pipelines(VkFormat /*format*/) {
+void SceneRenderer::create_pipelines(VkFormat format) {
   vert_ = load_shader(shader_dir_ + "/scene.vert.spv");
   frag_ = load_shader(shader_dir_ + "/scene.frag.spv");
 
@@ -1545,6 +1672,343 @@ void SceneRenderer::create_pipelines(VkFormat /*format*/) {
   sun_gp.pColorBlendState = &star_cb;  // additive glow
   VRP_CHECK(vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &sun_gp, nullptr, &sun_pipeline_) == VK_SUCCESS,
             "sun pipeline");
+
+  // Full-sky mono RT (compatible with color_pass format) + per-eye blit.
+  {
+    VkAttachmentDescription color{};
+    color.format = format;
+    color.samples = VK_SAMPLE_COUNT_1_BIT;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    color.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkAttachmentReference cref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+    VkSubpassDescription sub{};
+    sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+    sub.colorAttachmentCount = 1;
+    sub.pColorAttachments = &cref;
+    VkSubpassDependency dep{};
+    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    dep.dstSubpass = 0;
+    dep.srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    VkSubpassDependency dep_out{};
+    dep_out.srcSubpass = 0;
+    dep_out.dstSubpass = VK_SUBPASS_EXTERNAL;
+    dep_out.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep_out.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    dep_out.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    dep_out.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    VkSubpassDependency deps[2] = {dep, dep_out};
+    VkRenderPassCreateInfo rpci{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+    rpci.attachmentCount = 1;
+    rpci.pAttachments = &color;
+    rpci.subpassCount = 1;
+    rpci.pSubpasses = &sub;
+    rpci.dependencyCount = 2;
+    rpci.pDependencies = deps;
+    VRP_CHECK(vkCreateRenderPass(device_, &rpci, nullptr, &sky_mono_pass_) == VK_SUCCESS, "sky mono pass");
+  }
+
+  {
+    VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sci.magFilter = VK_FILTER_LINEAR;
+    sci.minFilter = VK_FILTER_LINEAR;
+    sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    VRP_CHECK(vkCreateSampler(device_, &sci, nullptr, &sky_mono_samp_) == VK_SUCCESS, "sky mono samp");
+
+    VkDescriptorSetLayoutBinding bind{};
+    bind.binding = 0;
+    bind.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bind.descriptorCount = 1;
+    bind.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    VkDescriptorSetLayoutCreateInfo lci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    lci.bindingCount = 1;
+    lci.pBindings = &bind;
+    VRP_CHECK(vkCreateDescriptorSetLayout(device_, &lci, nullptr, &sky_blit_dsl_) == VK_SUCCESS,
+              "sky blit dsl");
+    VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+    VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pci.maxSets = 1;
+    pci.poolSizeCount = 1;
+    pci.pPoolSizes = &ps;
+    VRP_CHECK(vkCreateDescriptorPool(device_, &pci, nullptr, &sky_blit_pool_) == VK_SUCCESS,
+              "sky blit pool");
+    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    ai.descriptorPool = sky_blit_pool_;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &sky_blit_dsl_;
+    VRP_CHECK(vkAllocateDescriptorSets(device_, &ai, &sky_blit_dset_) == VK_SUCCESS, "sky blit dset");
+
+    struct SkyBlitPush {
+      float eye_tan[4];
+      float mono_tan[4];
+    };
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pcr.size = sizeof(SkyBlitPush);
+    VkPipelineLayoutCreateInfo plci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &sky_blit_dsl_;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pcr;
+    VRP_CHECK(vkCreatePipelineLayout(device_, &plci, nullptr, &sky_blit_layout_) == VK_SUCCESS,
+              "sky blit layout");
+
+    sky_blit_vert_ = load_shader(shader_dir_ + "/sky_blit.vert.spv");
+    sky_blit_frag_ = load_shader(shader_dir_ + "/sky_blit.frag.spv");
+    VkPipelineShaderStageCreateInfo blit_stages[2]{};
+    blit_stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    blit_stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    blit_stages[0].module = sky_blit_vert_;
+    blit_stages[0].pName = "main";
+    blit_stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    blit_stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    blit_stages[1].module = sky_blit_frag_;
+    blit_stages[1].pName = "main";
+
+    VkPipelineVertexInputStateCreateInfo empty_vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo blit_ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    blit_ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineColorBlendAttachmentState blit_blend{};
+    blit_blend.blendEnable = VK_FALSE;
+    blit_blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo blit_cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    blit_cb.attachmentCount = 1;
+    blit_cb.pAttachments = &blit_blend;
+
+    VkGraphicsPipelineCreateInfo blit_gp{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    blit_gp.stageCount = 2;
+    blit_gp.pStages = blit_stages;
+    blit_gp.pVertexInputState = &empty_vi;
+    blit_gp.pInputAssemblyState = &blit_ia;
+    blit_gp.pViewportState = &vp;
+    blit_gp.pRasterizationState = &grid_rs;
+    blit_gp.pMultisampleState = &ms;
+    blit_gp.pColorBlendState = &blit_cb;
+    blit_gp.pDynamicState = &dyn;
+    blit_gp.layout = sky_blit_layout_;
+    blit_gp.renderPass = app_->color_pass();
+    blit_gp.subpass = 0;
+    VRP_CHECK(
+        vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &blit_gp, nullptr, &sky_blit_pipeline_) ==
+            VK_SUCCESS,
+        "sky blit pipeline");
+  }
+}
+
+void SceneRenderer::draw_celestial(VkCommandBuffer cmd, const float* sky_mvp16, std::int64_t unix_sec) {
+  if (milkyway_sky_ok_ && milkyway_pipeline_ && milkyway_layout_ && milkyway_dset_ && vbo_milkyway_ &&
+      ibo_milkyway_ && milkyway_index_count_ >= 3) {
+    struct MilkywayPush {
+      float mvp[16];
+      float gain_mul;
+      uint32_t pad[3];
+    } mw_pc{};
+    std::memcpy(mw_pc.mvp, sky_mvp16, sizeof(mw_pc.mvp));
+    mw_pc.gain_mul = milkyway_gain_mul_;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, milkyway_pipeline_);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, milkyway_layout_, 0, 1, &milkyway_dset_, 0,
+                            nullptr);
+    vkCmdPushConstants(cmd, milkyway_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       sizeof(mw_pc), &mw_pc);
+    VkDeviceSize mw_off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_milkyway_, &mw_off);
+    vkCmdBindIndexBuffer(cmd, ibo_milkyway_, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdDrawIndexed(cmd, milkyway_index_count_, 1, 0, 0, 0);
+  }
+  if (nebula_pipeline_ && vbo_nebulae_ && nebula_vert_count_ >= 6) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, nebula_pipeline_);
+    vkCmdPushConstants(cmd, grid_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                       64, sky_mvp16);
+    VkDeviceSize neb_off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_nebulae_, &neb_off);
+    vkCmdDraw(cmd, nebula_vert_count_, 1, 0, 0);
+  }
+  if (star_pipeline_ && vbo_stars_ && star_vert_count_ >= 6) {
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, star_pipeline_);
+    vkCmdPushConstants(cmd, grid_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64,
+                       sky_mvp16);
+    VkDeviceSize star_off = 0;
+    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_stars_, &star_off);
+    vkCmdDraw(cmd, star_vert_count_, 1, 0, 0);
+  }
+  if ((moon_pipeline_ || sun_pipeline_) && moon_layout_ && vbo_moon_) {
+    const starfield::MoonState moon = starfield::moon_at_unix(unix_sec);
+    struct MoonPush {
+      float mvp[16];
+      float body_dir[4];
+      float sun_dir[4];
+    };
+
+    if (sun_pipeline_) {
+      constexpr float kSunAngDeg = 0.53f;
+      const float half_ang = 0.5f * kSunAngDeg * 2.8f * static_cast<float>(M_PI) / 180.f;
+      const float half_size = 93.f * std::tan(half_ang);
+      MoonPush sun_pc{};
+      std::memcpy(sun_pc.mvp, sky_mvp16, sizeof(sun_pc.mvp));
+      sun_pc.body_dir[0] = moon.sun_x;
+      sun_pc.body_dir[1] = moon.sun_y;
+      sun_pc.body_dir[2] = moon.sun_z;
+      sun_pc.body_dir[3] = half_size;
+      sun_pc.sun_dir[0] = sun_pc.sun_dir[1] = sun_pc.sun_dir[2] = sun_pc.sun_dir[3] = 0.f;
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sun_pipeline_);
+      vkCmdPushConstants(cmd, moon_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                         sizeof(sun_pc), &sun_pc);
+      VkDeviceSize sun_off = 0;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_moon_, &sun_off);
+      vkCmdDraw(cmd, 6, 1, 0, 0);
+    }
+
+    if (moon_pipeline_) {
+      const float half_ang = 0.5f * moon.ang_diam_deg * 1.55f * static_cast<float>(M_PI) / 180.f;
+      const float half_size = 92.f * std::tan(half_ang);
+      MoonPush moon_pc{};
+      std::memcpy(moon_pc.mvp, sky_mvp16, sizeof(moon_pc.mvp));
+      moon_pc.body_dir[0] = moon.x;
+      moon_pc.body_dir[1] = moon.y;
+      moon_pc.body_dir[2] = moon.z;
+      moon_pc.body_dir[3] = half_size;
+      moon_pc.sun_dir[0] = moon.sun_x;
+      moon_pc.sun_dir[1] = moon.sun_y;
+      moon_pc.sun_dir[2] = moon.sun_z;
+      moon_pc.sun_dir[3] = 0.f;
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, moon_pipeline_);
+      vkCmdPushConstants(cmd, moon_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                         sizeof(moon_pc), &moon_pc);
+      VkDeviceSize moon_off = 0;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_moon_, &moon_off);
+      vkCmdDraw(cmd, 6, 1, 0, 0);
+    }
+  }
+}
+
+void SceneRenderer::draw_sky_mono(VkCommandBuffer cmd, const XrVulkanApp::FrameInfo& frame) {
+  sky_mono_ready_ = false;
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &bi);
+
+  if (frame.view_count < 2 || !sky_mono_pass_ || !sky_blit_pipeline_ || !app_ ||
+      app_->swapchains().empty()) {
+    vkEndCommandBuffer(cmd);
+    return;
+  }
+
+  const auto& v0 = frame.views[0];
+  const auto& v1 = frame.views[1];
+  float t0[4], t1[4];
+  fov_tans(v0.fov, t0);
+  fov_tans(v1.fov, t1);
+  float L = std::min(t0[0], t1[0]);
+  float R = std::max(t0[1], t1[1]);
+  float U = std::max(t0[2], t1[2]);
+  float D = std::min(t0[3], t1[3]);
+  // ~5% margin so remap does not clip at the union edge.
+  {
+    const float cx = 0.5f * (L + R);
+    const float cy = 0.5f * (U + D);
+    const float hx = 0.5f * (R - L) * 1.05f;
+    const float hy = 0.5f * (U - D) * 1.05f;
+    L = cx - hx;
+    R = cx + hx;
+    U = cy + hy;
+    D = cy - hy;
+  }
+  sky_mono_tan_[0] = L;
+  sky_mono_tan_[1] = R;
+  sky_mono_tan_[2] = U;
+  sky_mono_tan_[3] = D;
+
+  const auto& sc0 = app_->swapchains()[0];
+  const float eye_span_x = std::max(1e-4f, t0[1] - t0[0]);
+  const float eye_span_y = std::max(1e-4f, t0[2] - t0[3]);
+  const float mono_span_x = std::max(1e-4f, R - L);
+  const float mono_span_y = std::max(1e-4f, U - D);
+  uint32_t mw = static_cast<uint32_t>(
+      std::clamp(std::lround(static_cast<double>(sc0.width) * (mono_span_x / eye_span_x)), 64L, 8192L));
+  uint32_t mh = static_cast<uint32_t>(
+      std::clamp(std::lround(static_cast<double>(sc0.height) * (mono_span_y / eye_span_y)), 64L, 8192L));
+  if (!ensure_sky_mono(sc0.format, mw, mh) || !sky_mono_fb_) {
+    vkEndCommandBuffer(cmd);
+    return;
+  }
+
+  // Head midpoint + left orientation (IPD ignored for infinite sky).
+  XrPosef mid = v0.pose;
+  mid.position.x = 0.5f * (v0.pose.position.x + v1.pose.position.x);
+  mid.position.y = 0.5f * (v0.pose.position.y + v1.pose.position.y);
+  mid.position.z = 0.5f * (v0.pose.position.z + v1.pose.position.z);
+
+  const Mat4 head = pose_to_matrix(mid);
+  Mat4 content_view = invert_rigid(head);
+  if (look_yaw_ != 0.f || look_pitch_ != 0.f) {
+    Mat4 turned = Mat4::mul(Mat4::mul(rot_y(look_yaw_), rot_x(look_pitch_)), head);
+    turned.m[12] = head.m[12];
+    turned.m[13] = head.m[13];
+    turned.m[14] = head.m[14];
+    content_view = invert_rigid(turned);
+  }
+  const Mat4 proj = projection_fov_tans(L, R, U, D, 0.05f, 100.f);
+  const auto unix_sec =
+      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+          .count();
+  Mat4 sky_rot = Mat4::identity();
+  starfield::earth_sky_matrix(static_cast<std::int64_t>(unix_sec), sky_lat_deg_, sky_lon_deg_, sky_rot.m);
+  Mat4 sky_trans = Mat4::identity();
+  sky_trans.m[12] = head.m[12];
+  sky_trans.m[13] = head.m[13];
+  sky_trans.m[14] = head.m[14];
+  const Mat4 sky_mvp = Mat4::mul(proj, Mat4::mul(content_view, Mat4::mul(sky_trans, sky_rot)));
+
+  VkClearValue clear{};
+  clear.color = {{0.f, 0.f, 0.f, 1.f}};
+  VkRenderPassBeginInfo rp{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+  rp.renderPass = sky_mono_pass_;
+  rp.framebuffer = sky_mono_fb_;
+  rp.renderArea.extent = {sky_mono_w_, sky_mono_h_};
+  rp.clearValueCount = 1;
+  rp.pClearValues = &clear;
+  vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
+
+  VkViewport viewport{};
+  viewport.width = static_cast<float>(sky_mono_w_);
+  viewport.height = static_cast<float>(sky_mono_h_);
+  viewport.maxDepth = 1.f;
+  VkRect2D scissor{};
+  scissor.extent = rp.renderArea.extent;
+  vkCmdSetViewport(cmd, 0, 1, &viewport);
+  vkCmdSetScissor(cmd, 0, 1, &scissor);
+
+  // Pipelines were created for color_pass_; sky_mono_pass_ is format-compatible.
+  draw_celestial(cmd, sky_mvp.m, static_cast<std::int64_t>(unix_sec));
+
+  vkCmdEndRenderPass(cmd);
+  vkEndCommandBuffer(cmd);
+  sky_mono_ready_ = true;
+}
+
+void SceneRenderer::blit_sky_mono(VkCommandBuffer cmd, const XrView& view) {
+  if (!sky_mono_ready_ || !sky_blit_pipeline_ || !sky_blit_layout_ || !sky_blit_dset_) return;
+  float eye[4];
+  fov_tans(view.fov, eye);
+  struct SkyBlitPush {
+    float eye_tan[4];
+    float mono_tan[4];
+  } pc{};
+  std::memcpy(pc.eye_tan, eye, sizeof(eye));
+  std::memcpy(pc.mono_tan, sky_mono_tan_, sizeof(sky_mono_tan_));
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_blit_pipeline_);
+  vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sky_blit_layout_, 0, 1, &sky_blit_dset_, 0,
+                          nullptr);
+  vkCmdPushConstants(cmd, sky_blit_layout_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+  vkCmdDraw(cmd, 3, 1, 0, 0);
 }
 
 void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapchain& sc,
@@ -1587,101 +2051,21 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   }
   Mat4 proj = projection_fov(view.fov, 0.05f, 100.f);
 
-  // Celestial background: Earth-horizon frame (LST + latitude), then content look.
-  const auto unix_sec =
-      std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
-          .count();
-  Mat4 sky_rot = Mat4::identity();
-  starfield::earth_sky_matrix(static_cast<std::int64_t>(unix_sec), sky_lat_deg_, sky_lon_deg_, sky_rot.m);
-  Mat4 sky_trans = Mat4::identity();
-  sky_trans.m[12] = head.m[12];
-  sky_trans.m[13] = head.m[13];
-  sky_trans.m[14] = head.m[14];
-  const Mat4 sky_model = Mat4::mul(sky_trans, sky_rot);
-  const Mat4 sky_mvp = Mat4::mul(proj, Mat4::mul(content_view, sky_model));
-  if (milkyway_sky_ok_ && milkyway_pipeline_ && milkyway_layout_ && milkyway_dset_ && vbo_milkyway_ &&
-      ibo_milkyway_ && milkyway_index_count_ >= 3) {
-    struct MilkywayPush {
-      float mvp[16];
-      float gain_mul;
-      uint32_t pad[3];
-    } mw_pc{};
-    std::memcpy(mw_pc.mvp, &sky_mvp, sizeof(mw_pc.mvp));
-    mw_pc.gain_mul = milkyway_gain_mul_;
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, milkyway_pipeline_);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, milkyway_layout_, 0, 1, &milkyway_dset_, 0,
-                            nullptr);
-    vkCmdPushConstants(cmd, milkyway_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(mw_pc), &mw_pc);
-    VkDeviceSize mw_off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_milkyway_, &mw_off);
-    vkCmdBindIndexBuffer(cmd, ibo_milkyway_, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdDrawIndexed(cmd, milkyway_index_count_, 1, 0, 0, 0);
-  }
-  if (nebula_pipeline_ && vbo_nebulae_ && nebula_vert_count_ >= 6) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, nebula_pipeline_);
-    vkCmdPushConstants(cmd, grid_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(sky_mvp), &sky_mvp);
-    VkDeviceSize neb_off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_nebulae_, &neb_off);
-    vkCmdDraw(cmd, nebula_vert_count_, 1, 0, 0);
-  }
-  if (star_pipeline_ && vbo_stars_ && star_vert_count_ >= 6) {
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, star_pipeline_);
-    vkCmdPushConstants(cmd, grid_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(sky_mvp), &sky_mvp);
-    VkDeviceSize star_off = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_stars_, &star_off);
-    vkCmdDraw(cmd, star_vert_count_, 1, 0, 0);
-  }
-  if ((moon_pipeline_ || sun_pipeline_) && moon_layout_ && vbo_moon_) {
-    const starfield::MoonState moon = starfield::moon_at_unix(static_cast<std::int64_t>(unix_sec));
-    struct MoonPush {
-      float mvp[16];
-      float body_dir[4];
-      float sun_dir[4];
-    };
-
-    // Always draw (including below local horizon) so ephemeris / polarity can be checked.
-    if (sun_pipeline_) {
-      constexpr float kSunAngDeg = 0.53f;
-      const float half_ang = 0.5f * kSunAngDeg * 2.8f * static_cast<float>(M_PI) / 180.f;  // room for soft halo
-      const float half_size = 93.f * std::tan(half_ang);
-      MoonPush sun_pc{};
-      std::memcpy(sun_pc.mvp, &sky_mvp, sizeof(sun_pc.mvp));
-      sun_pc.body_dir[0] = moon.sun_x;
-      sun_pc.body_dir[1] = moon.sun_y;
-      sun_pc.body_dir[2] = moon.sun_z;
-      sun_pc.body_dir[3] = half_size;
-      sun_pc.sun_dir[0] = sun_pc.sun_dir[1] = sun_pc.sun_dir[2] = sun_pc.sun_dir[3] = 0.f;
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, sun_pipeline_);
-      vkCmdPushConstants(cmd, moon_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                         sizeof(sun_pc), &sun_pc);
-      VkDeviceSize sun_off = 0;
-      vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_moon_, &sun_off);
-      vkCmdDraw(cmd, 6, 1, 0, 0);
-    }
-
-    if (moon_pipeline_) {
-      const float half_ang = 0.5f * moon.ang_diam_deg * 1.55f * static_cast<float>(M_PI) / 180.f;
-      const float half_size = 92.f * std::tan(half_ang);
-      MoonPush moon_pc{};
-      std::memcpy(moon_pc.mvp, &sky_mvp, sizeof(moon_pc.mvp));
-      moon_pc.body_dir[0] = moon.x;
-      moon_pc.body_dir[1] = moon.y;
-      moon_pc.body_dir[2] = moon.z;
-      moon_pc.body_dir[3] = half_size;
-      moon_pc.sun_dir[0] = moon.sun_x;
-      moon_pc.sun_dir[1] = moon.sun_y;
-      moon_pc.sun_dir[2] = moon.sun_z;
-      moon_pc.sun_dir[3] = 0.f;
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, moon_pipeline_);
-      vkCmdPushConstants(cmd, moon_layout_, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                         sizeof(moon_pc), &moon_pc);
-      VkDeviceSize moon_off = 0;
-      vkCmdBindVertexBuffers(cmd, 0, 1, &vbo_moon_, &moon_off);
-      vkCmdDraw(cmd, 6, 1, 0, 0);
-    }
+  // Full sky: prefer shared mono RT (drawn once for both eyes). Fallback = per-eye.
+  if (sky_mono_ready_) {
+    blit_sky_mono(cmd, view);
+  } else {
+    const auto unix_sec =
+        std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    Mat4 sky_rot = Mat4::identity();
+    starfield::earth_sky_matrix(static_cast<std::int64_t>(unix_sec), sky_lat_deg_, sky_lon_deg_, sky_rot.m);
+    Mat4 sky_trans = Mat4::identity();
+    sky_trans.m[12] = head.m[12];
+    sky_trans.m[13] = head.m[13];
+    sky_trans.m[14] = head.m[14];
+    const Mat4 sky_mvp = Mat4::mul(proj, Mat4::mul(content_view, Mat4::mul(sky_trans, sky_rot)));
+    draw_celestial(cmd, sky_mvp.m, static_cast<std::int64_t>(unix_sec));
   }
 
   // Idle / clear_only: sky only — skip translucent content panel fill cost.
@@ -1882,15 +2266,29 @@ void SceneRenderer::render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo&
     VRP_CHECK(XR_SUCCEEDED(xrWaitSwapchainImage(sc.handle, &wi)), "wait");
   }
 
-  for (uint32_t i = 0; i < frame.view_count; ++i) {
-    draw_view(i, frame.views[i], swapchains[i], image_indices[i], cmds_[i]);
+  // cmds_[0] = full-sky mono (union FOV); cmds_[1..] = eyes sampling it.
+  if (cmds_.size() >= 3) {
+    draw_sky_mono(cmds_[0], frame);
+    for (uint32_t i = 0; i < frame.view_count; ++i) {
+      draw_view(i, frame.views[i], swapchains[i], image_indices[i], cmds_[1 + i]);
+    }
+  } else {
+    sky_mono_ready_ = false;
+    for (uint32_t i = 0; i < frame.view_count; ++i) {
+      draw_view(i, frame.views[i], swapchains[i], image_indices[i], cmds_[i]);
+    }
   }
 
-  // One submit for both eyes. Do NOT vkQueueWaitIdle here — that misses HMD
+  // One submit: sky mono then both eyes. Do NOT vkQueueWaitIdle here — that misses HMD
   // predictedDisplayTime and causes mid-frame tearing / reprojection artifacts.
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-  si.commandBufferCount = frame.view_count;
-  si.pCommandBuffers = cmds_.data();
+  if (cmds_.size() >= 3 && frame.view_count >= 2) {
+    si.commandBufferCount = 3;
+    si.pCommandBuffers = cmds_.data();
+  } else {
+    si.commandBufferCount = frame.view_count;
+    si.pCommandBuffers = cmds_.data();
+  }
   {
     std::lock_guard<std::mutex> qlock(app.queue_mutex());
     VRP_CHECK(vkQueueSubmit(app.queue(), 1, &si, submit_fence_) == VK_SUCCESS, "eye submit");

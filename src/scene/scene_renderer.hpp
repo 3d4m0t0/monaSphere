@@ -8,6 +8,7 @@
 #include <vulkan/vulkan.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace vrp {
@@ -67,7 +68,7 @@ class SceneRenderer {
   /** Wait for previous eye submit. Returns false on timeout (do not rewrite descriptors). */
   bool wait_previous_submit(uint64_t timeout_ns = 8'000'000ull);
 
-  /** Milky Way intensity multiplier (□ / X cycles). Sky comes from Gaia equirect JPEG. */
+  /** Milky Way intensity multiplier. Sky comes from Gaia equirect JPEG. */
   void set_milkyway_gain(float gain_mul);
   float milkyway_gain() const;
 
@@ -93,6 +94,12 @@ class SceneRenderer {
   void flush_queued_texture();
   uint32_t find_memory(uint32_t bits, VkMemoryPropertyFlags flags) const;
   VkShaderModule load_shader(const std::string& path);
+  void destroy_sky_mono();
+  bool ensure_sky_mono(VkFormat format, uint32_t w, uint32_t h);
+  /** All celestial into mono RT (or per-eye fallback). sky_mvp = proj * view * model. */
+  void draw_celestial(VkCommandBuffer cmd, const float* sky_mvp16, std::int64_t unix_sec);
+  void draw_sky_mono(VkCommandBuffer cmd, const XrVulkanApp::FrameInfo& frame);
+  void blit_sky_mono(VkCommandBuffer cmd, const XrView& view);
   void draw_view(uint32_t view_index, const XrView& view, ViewSwapchain& sc, uint32_t image_index,
                  VkCommandBuffer cmd);
 
@@ -167,6 +174,29 @@ class SceneRenderer {
   VkSampler milkyway_samp_ = VK_NULL_HANDLE;
   void load_milkyway_sky_texture();
 
+  /**
+   * Shared full-sky RT: milkyway + nebulae + stars + sun/moon once per frame at the
+   * union of both eye FOVs (no stereo parallax). Each eye samples with tan remap.
+   */
+  VkRenderPass sky_mono_pass_ = VK_NULL_HANDLE;
+  VkImage sky_mono_img_ = VK_NULL_HANDLE;
+  VkDeviceMemory sky_mono_mem_ = VK_NULL_HANDLE;
+  VkImageView sky_mono_view_ = VK_NULL_HANDLE;
+  VkFramebuffer sky_mono_fb_ = VK_NULL_HANDLE;
+  VkSampler sky_mono_samp_ = VK_NULL_HANDLE;
+  VkDescriptorSetLayout sky_blit_dsl_ = VK_NULL_HANDLE;
+  VkDescriptorPool sky_blit_pool_ = VK_NULL_HANDLE;
+  VkDescriptorSet sky_blit_dset_ = VK_NULL_HANDLE;
+  VkPipelineLayout sky_blit_layout_ = VK_NULL_HANDLE;
+  VkPipeline sky_blit_pipeline_ = VK_NULL_HANDLE;
+  VkShaderModule sky_blit_vert_ = VK_NULL_HANDLE;
+  VkShaderModule sky_blit_frag_ = VK_NULL_HANDLE;
+  VkFormat sky_mono_format_ = VK_FORMAT_UNDEFINED;
+  uint32_t sky_mono_w_ = 0;
+  uint32_t sky_mono_h_ = 0;
+  float sky_mono_tan_[4]{};  // L R U D
+  bool sky_mono_ready_ = false;
+
   VkDescriptorSetLayout dsl_ = VK_NULL_HANDLE;
   VkDescriptorPool pool_ = VK_NULL_HANDLE;
   VkDescriptorSet dset_ = VK_NULL_HANDLE;
@@ -192,6 +222,7 @@ class SceneRenderer {
   VkDeviceMemory ibo_sphere_mem_ = VK_NULL_HANDLE;
   uint32_t sphere_index_count_ = 0;
 
+  /** [0]=sky mono, [1]=left eye, [2]=right eye (legacy: 2 eye-only if mono unavailable). */
   std::vector<VkCommandBuffer> cmds_;
   std::string shader_dir_;
   bool nv12_ = false;
