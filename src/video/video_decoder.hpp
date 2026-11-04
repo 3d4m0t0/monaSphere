@@ -16,9 +16,12 @@
 #include <thread>
 #include <vector>
 
+struct AVBufferRef;
+
 namespace vrp {
 
 class CudaNv12Texture;
+class VulkanVideoTexture;
 
 /** Playback NVDEC and thumbnail NVDEC must not enter CUDA at the same time. */
 std::mutex& cuda_decode_mu();
@@ -129,6 +132,11 @@ class VideoDecoder {
   void close();
   /** Pause and join decode thread; keep demuxer/hwaccel alive (for CUDA interop teardown). */
   void halt_decode();
+  /**
+   * UI/close: trip stop flags without joining. Unwedges FFmpeg lock_queue(queue_mu)
+   * so XR end_frame can finish; XR thread still calls halt_decode() later.
+   */
+  void abort_decode_async();
   /** NVDEC CUcontext while open, else nullptr. Valid until close(). */
   void* cuda_context() const;
 
@@ -150,6 +158,8 @@ class VideoDecoder {
                              int max_thumbs = kSeekThumbCount, int thumb_w = 0, int thumb_h = 0,
                              SeekThumbRawStep on_raw = {}, int max_edge = kSeekThumbMaxEdge,
                              bool allow_hwaccel = true);
+  /** No prebuilt strip — scrub/seek preview uses decoder.seek_to frames. */
+  void disable_thumbnail_strip();
   bool thumbnails_ready() const { return thumbs_ready_.load(); }
   /** The worker for the current build has finished, success or failure. */
   bool thumbnails_finished() const {
@@ -168,8 +178,19 @@ class VideoDecoder {
   /** Attach CUDA↔Vulkan target before open(). nullptr = CPU RGBA path. */
   void set_cuda_texture(CudaNv12Texture* tex) { cuda_tex_ = tex; }
   void set_vaapi_texture(VaapiNv12Texture* tex) { vaapi_tex_ = tex; }
+  void set_vulkan_texture(VulkanVideoTexture* tex);
+  /**
+   * Borrowed AVHWDeviceContext (VULKAN) from FfmpegVulkanDevice. Not owned.
+   * Used only when set_prefer_vulkan_video(true) (conf `vulkan_video=1`).
+   */
+  void set_vulkan_hw_device(AVBufferRef* device_ref) { vulkan_hw_device_ = device_ref; }
+  /** Prefer FFmpeg Vulkan Video over CUDA/NVDEC. Default false (NVIDIA CUDA path). */
+  void set_prefer_vulkan_video(bool prefer) { prefer_vulkan_video_ = prefer; }
+  bool prefer_vulkan_video() const { return prefer_vulkan_video_; }
   /** NVDEC → Vulkan NV12 is the active display path. */
   bool gpu_path_active() const;
+  /** FFmpeg Vulkan Video → AVVkFrame sampling is active. */
+  bool vulkan_path_active() const;
   /** VA-API dma-buf import has produced a frame the XR thread can sample. */
   bool vaapi_path_active() const;
 
@@ -189,10 +210,27 @@ class VideoDecoder {
   bool consume_av_resync();
   /** True until that post-seek frame is decoded. Playback must not start before then. */
   bool seek_in_flight() const { return seek_busy_.load(); }
+  /** Host recovery when land never arrives — allow presentation to restart. */
+  void clear_seek_in_flight();
+  /**
+   * TIMEOUT/recovery: skip priming and mark playback ready so the host can
+   * arm audio + start_presentation even if demux is wedged behind ff_mu_.
+   */
+  void force_resume_after_seek();
+  /** Decode-thread flag: host asked to abandon an in-flight post-seek wait. */
+  bool consume_seek_abandon();
   /** True once when priming finished filling and playback started. */
   bool consume_playback_started();
   /** True once after an end-of-stream auto-loop (seek to 0). Clears on read. */
   bool consume_looped();
+  /**
+   * Seek hang diagnostics — where the decode thread is, issue/apply gens, queue.
+   * Always safe to call from the XR/UI thread.
+   */
+  std::string seek_debug_state() const;
+  const char* decode_phase() const { return decode_phase_.load(std::memory_order_acquire); }
+  uint64_t seek_issue_gen() const { return seek_issue_gen_.load(std::memory_order_acquire); }
+  uint64_t seek_apply_gen() const { return seek_apply_gen_.load(std::memory_order_acquire); }
 
   /** Playback rate 0.5 .. 20 (1 = normal). Affects decode pacing. */
   void set_rate(float rate);
@@ -204,6 +242,8 @@ class VideoDecoder {
   uint64_t frame_seq();
   /** Like update(), but also while paused. Used to show the frame a seek landed on. */
   bool take_latest(VideoFrame& out_frame);
+  /** Packet read-ahead depth (slow-storage / stall diagnostics). */
+  void packet_queue_stats(size_t& packets, size_t& bytes) const;
 
  private:
   std::atomic<bool> open_{false};
@@ -221,6 +261,9 @@ class VideoDecoder {
   VideoInfo info_;
   CudaNv12Texture* cuda_tex_ = nullptr;
   VaapiNv12Texture* vaapi_tex_ = nullptr;
+  VulkanVideoTexture* vulkan_tex_ = nullptr;
+  AVBufferRef* vulkan_hw_device_ = nullptr;  // borrowed, not owned
+  bool prefer_vulkan_video_ = false;
 
   struct FFmpegState;
   std::unique_ptr<FFmpegState> ff_;
@@ -241,12 +284,21 @@ class VideoDecoder {
   std::atomic<size_t> priming_need_bytes_{0};  // threshold for current priming
   bool awaiting_frame_after_seek_ = false;  // decode thread only
   std::atomic<bool> seek_busy_{false};
+  std::atomic<bool> seek_abandon_{false};
+  /** Decode-thread progress label for seek hang diagnosis (string literal only). */
+  std::atomic<const char*> decode_phase_{"idle"};
+  std::atomic<uint64_t> seek_issue_gen_{0};
+  std::atomic<uint64_t> seek_apply_gen_{0};
+  std::atomic<int64_t> last_progress_ms_{0};
+  void set_decode_phase(const char* phase);
 
   // Packet read-ahead: max ~2s; seek / scrub-end resume at ~1s.
   std::thread demux_thread_;
   std::atomic<bool> demux_stop_{false};
   std::atomic<bool> demux_pause_{false};
   std::atomic<bool> demux_eof_{false};
+  /** Abort blocking FFmpeg IO (open / read) so XR halt cannot hang on USB. */
+  std::atomic<bool> io_abort_{false};
   std::atomic<bool> seek_scrubbing_{false};
   std::atomic<uint64_t> seek_serial_{0};
   mutable std::mutex pkt_mu_;
@@ -268,6 +320,8 @@ class VideoDecoder {
 
   /** present_after_sec >= 0 drops a frame that is still before that time (no pixels). */
   bool decode_next(VideoFrame& out, bool convert_rgba, double present_after_sec = -1.0);
+  /** After a wedged Vulkan flush path: free+reopen codec keeping the same hwctx. */
+  bool reopen_vulkan_codec_keep_hw();
   void fail_open(const std::string& path, const std::string& reason);
   void start_decode_thread();
   void stop_decode_thread();
@@ -279,6 +333,8 @@ class VideoDecoder {
   bool prefetch_enough(size_t need_bytes) const;
   void begin_priming(size_t need_bytes);
   static size_t prefetch_bytes_for_seconds(double sec, int64_t bitrate);
+  void install_io_interrupt();
+  static int ffmpeg_io_interrupt(void* opaque);
 };
 
 /** Dual RGBA textures: upload to the idle slot without blocking the XR loop. */

@@ -1,5 +1,7 @@
 #include "xr/xr_vulkan_app.hpp"
 
+#include "common/crash_guard.hpp"
+
 #include <atomic>
 #include <algorithm>
 #include <cmath>
@@ -9,6 +11,7 @@
 #include <functional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace vrp {
@@ -33,15 +36,119 @@ PFN_xrVoidFunction try_load_xr(XrInstance instance, const char* name) {
 const char* xr_result_string(XrResult r) {
   switch (r) {
     case XR_SUCCESS: return "XR_SUCCESS";
-    case XR_ERROR_FORM_FACTOR_UNAVAILABLE: return "XR_ERROR_FORM_FACTOR_UNAVAILABLE";
+    case XR_TIMEOUT_EXPIRED: return "XR_TIMEOUT_EXPIRED";
+    case XR_SESSION_LOSS_PENDING: return "XR_SESSION_LOSS_PENDING";
+    case XR_EVENT_UNAVAILABLE: return "XR_EVENT_UNAVAILABLE";
+    case XR_SPACE_BOUNDS_UNAVAILABLE: return "XR_SPACE_BOUNDS_UNAVAILABLE";
+    case XR_SESSION_NOT_FOCUSED: return "XR_SESSION_NOT_FOCUSED";
+    case XR_FRAME_DISCARDED: return "XR_FRAME_DISCARDED";
     case XR_ERROR_VALIDATION_FAILURE: return "XR_ERROR_VALIDATION_FAILURE";
-    default: return "XR_ERROR";
+    case XR_ERROR_RUNTIME_FAILURE: return "XR_ERROR_RUNTIME_FAILURE";
+    case XR_ERROR_OUT_OF_MEMORY: return "XR_ERROR_OUT_OF_MEMORY";
+    case XR_ERROR_API_VERSION_UNSUPPORTED: return "XR_ERROR_API_VERSION_UNSUPPORTED";
+    case XR_ERROR_INITIALIZATION_FAILED: return "XR_ERROR_INITIALIZATION_FAILED";
+    case XR_ERROR_FUNCTION_UNSUPPORTED: return "XR_ERROR_FUNCTION_UNSUPPORTED";
+    case XR_ERROR_FEATURE_UNSUPPORTED: return "XR_ERROR_FEATURE_UNSUPPORTED";
+    case XR_ERROR_EXTENSION_NOT_PRESENT: return "XR_ERROR_EXTENSION_NOT_PRESENT";
+    case XR_ERROR_LIMIT_REACHED: return "XR_ERROR_LIMIT_REACHED";
+    case XR_ERROR_SIZE_INSUFFICIENT: return "XR_ERROR_SIZE_INSUFFICIENT";
+    case XR_ERROR_HANDLE_INVALID: return "XR_ERROR_HANDLE_INVALID";
+    case XR_ERROR_INSTANCE_LOST: return "XR_ERROR_INSTANCE_LOST";
+    case XR_ERROR_SESSION_RUNNING: return "XR_ERROR_SESSION_RUNNING";
+    case XR_ERROR_SESSION_NOT_RUNNING: return "XR_ERROR_SESSION_NOT_RUNNING";
+    case XR_ERROR_SESSION_LOST: return "XR_ERROR_SESSION_LOST";
+    case XR_ERROR_SYSTEM_INVALID: return "XR_ERROR_SYSTEM_INVALID";
+    case XR_ERROR_PATH_INVALID: return "XR_ERROR_PATH_INVALID";
+    case XR_ERROR_PATH_COUNT_EXCEEDED: return "XR_ERROR_PATH_COUNT_EXCEEDED";
+    case XR_ERROR_PATH_FORMAT_INVALID: return "XR_ERROR_PATH_FORMAT_INVALID";
+    case XR_ERROR_PATH_UNSUPPORTED: return "XR_ERROR_PATH_UNSUPPORTED";
+    case XR_ERROR_LAYER_INVALID: return "XR_ERROR_LAYER_INVALID";
+    case XR_ERROR_LAYER_LIMIT_EXCEEDED: return "XR_ERROR_LAYER_LIMIT_EXCEEDED";
+    case XR_ERROR_SWAPCHAIN_RECT_INVALID: return "XR_ERROR_SWAPCHAIN_RECT_INVALID";
+    case XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED: return "XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED";
+    case XR_ERROR_ACTION_TYPE_MISMATCH: return "XR_ERROR_ACTION_TYPE_MISMATCH";
+    case XR_ERROR_SESSION_NOT_READY: return "XR_ERROR_SESSION_NOT_READY";
+    case XR_ERROR_SESSION_NOT_STOPPING: return "XR_ERROR_SESSION_NOT_STOPPING";
+    case XR_ERROR_TIME_INVALID: return "XR_ERROR_TIME_INVALID";
+    case XR_ERROR_REFERENCE_SPACE_UNSUPPORTED: return "XR_ERROR_REFERENCE_SPACE_UNSUPPORTED";
+    case XR_ERROR_FILE_ACCESS_ERROR: return "XR_ERROR_FILE_ACCESS_ERROR";
+    case XR_ERROR_FILE_CONTENTS_INVALID: return "XR_ERROR_FILE_CONTENTS_INVALID";
+    case XR_ERROR_FORM_FACTOR_UNSUPPORTED: return "XR_ERROR_FORM_FACTOR_UNSUPPORTED";
+    case XR_ERROR_FORM_FACTOR_UNAVAILABLE: return "XR_ERROR_FORM_FACTOR_UNAVAILABLE";
+    case XR_ERROR_API_LAYER_NOT_PRESENT: return "XR_ERROR_API_LAYER_NOT_PRESENT";
+    case XR_ERROR_CALL_ORDER_INVALID: return "XR_ERROR_CALL_ORDER_INVALID";
+    case XR_ERROR_GRAPHICS_DEVICE_INVALID: return "XR_ERROR_GRAPHICS_DEVICE_INVALID";
+    case XR_ERROR_POSE_INVALID: return "XR_ERROR_POSE_INVALID";
+    case XR_ERROR_INDEX_OUT_OF_RANGE: return "XR_ERROR_INDEX_OUT_OF_RANGE";
+    case XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED:
+      return "XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED";
+    case XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED:
+      return "XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED";
+    case XR_ERROR_NAME_DUPLICATED: return "XR_ERROR_NAME_DUPLICATED";
+    case XR_ERROR_NAME_INVALID: return "XR_ERROR_NAME_INVALID";
+    case XR_ERROR_ACTIONSET_NOT_ATTACHED: return "XR_ERROR_ACTIONSET_NOT_ATTACHED";
+    case XR_ERROR_ACTIONSETS_ALREADY_ATTACHED: return "XR_ERROR_ACTIONSETS_ALREADY_ATTACHED";
+    case XR_ERROR_LOCALIZED_NAME_DUPLICATED: return "XR_ERROR_LOCALIZED_NAME_DUPLICATED";
+    case XR_ERROR_LOCALIZED_NAME_INVALID: return "XR_ERROR_LOCALIZED_NAME_INVALID";
+    case XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING:
+      return "XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING";
+    case XR_ERROR_RUNTIME_UNAVAILABLE: return "XR_ERROR_RUNTIME_UNAVAILABLE";
+    default: return "XR_ERROR_UNKNOWN";
   }
+}
+
+const char* vk_result_string(VkResult r) {
+  switch (r) {
+    case VK_SUCCESS: return "VK_SUCCESS";
+    case VK_NOT_READY: return "VK_NOT_READY";
+    case VK_TIMEOUT: return "VK_TIMEOUT";
+    case VK_EVENT_SET: return "VK_EVENT_SET";
+    case VK_EVENT_RESET: return "VK_EVENT_RESET";
+    case VK_INCOMPLETE: return "VK_INCOMPLETE";
+    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+    case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+    case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+    case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
+    case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+    case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+    case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
+    case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
+    case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
+    case VK_ERROR_FRAGMENTED_POOL: return "VK_ERROR_FRAGMENTED_POOL";
+    case VK_ERROR_UNKNOWN: return "VK_ERROR_UNKNOWN";
+    case VK_ERROR_OUT_OF_POOL_MEMORY: return "VK_ERROR_OUT_OF_POOL_MEMORY";
+    case VK_ERROR_INVALID_EXTERNAL_HANDLE: return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
+    case VK_ERROR_FRAGMENTATION: return "VK_ERROR_FRAGMENTATION";
+    case VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS: return "VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS";
+    case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
+    case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
+    case VK_ERROR_VALIDATION_FAILED_EXT: return "VK_ERROR_VALIDATION_FAILED_EXT";
+    default: return "VK_RESULT_UNKNOWN";
+  }
+}
+
+std::string vk_api_version_string(uint32_t v) {
+  return std::to_string(VK_API_VERSION_MAJOR(v)) + "." + std::to_string(VK_API_VERSION_MINOR(v)) +
+         "." + std::to_string(VK_API_VERSION_PATCH(v));
+}
+
+/** OpenXR stores Vulkan apiVersion fields as XrVersion (48/32/0 packing), not VkApiVersion. */
+std::string xr_packed_vk_version_string(XrVersion v) {
+  return std::to_string(XR_VERSION_MAJOR(v)) + "." + std::to_string(XR_VERSION_MINOR(v)) + "." +
+         std::to_string(XR_VERSION_PATCH(v));
+}
+
+std::string format_xr_vk_fail(const char* what, XrResult xr, VkResult vk) {
+  return std::string(what) + " failed: xr=" + xr_result_string(xr) + "(" + std::to_string(static_cast<int>(xr)) +
+         ") vk=" + vk_result_string(vk) + "(" + std::to_string(static_cast<int>(vk)) + ")";
 }
 
 void check_xr(XrResult r, const char* what) {
   if (XR_FAILED(r)) {
-    vrp_fatal(std::string(what) + " failed: " + xr_result_string(r) + " (" + std::to_string(r) + ")");
+    vrp_fatal(std::string(what) + " failed: " + xr_result_string(r) + " (" + std::to_string(static_cast<int>(r)) +
+              ")");
   }
 }
 
@@ -90,15 +197,71 @@ void XrVulkanApp::init(std::atomic<bool>* cancel, const std::function<void(const
   create_actions();
   note("OpenXR + Vulkan ready");
   VRP_LOG("OpenXR + Vulkan session ready");
+  // Cookie so the next launch can restart Monado after SEGV / hard kill.
+  crash_guard::mark_session_active();
 }
 
 void XrVulkanApp::request_exit() {
   // Safe to call from the UI thread while the XR thread blocks in xrWaitFrame.
+  exit_requested_.store(true, std::memory_order_release);
   if (!session_) return;
   const XrResult r = xrRequestExitSession(session_);
+  // Already STOPPING from a prior request — Monado warns; treat as ok.
   if (XR_FAILED(r) && r != XR_ERROR_SESSION_NOT_RUNNING && r != XR_ERROR_SESSION_LOST) {
     VRP_ERR("xrRequestExitSession failed (%d)", static_cast<int>(r));
   }
+}
+
+void XrVulkanApp::finish_exit() {
+  exit_requested_.store(true, std::memory_order_release);
+  if (!session_) {
+    session_running_ = false;
+    return;
+  }
+  if (session_running_) {
+    request_exit();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (session_running_ && std::chrono::steady_clock::now() < deadline) {
+      if (!pump_events()) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    if (session_running_) {
+      // STOPPING event missed (blocked in WaitFrame earlier) — EndSession best-effort.
+      const XrResult er = xrEndSession(session_);
+      if (XR_FAILED(er) && er != XR_ERROR_SESSION_NOT_STOPPING &&
+          er != XR_ERROR_SESSION_NOT_RUNNING) {
+        VRP_ERR("finish_exit: xrEndSession (%d)", static_cast<int>(er));
+      }
+      session_running_ = false;
+    }
+  }
+}
+
+void XrVulkanApp::report_if_device_lost(VkResult result) const {
+  if (result != VK_ERROR_DEVICE_LOST) return;
+  VRP_ERR("VK_ERROR_DEVICE_LOST — GPU/context gone (restart Monado if Connect hangs)");
+#if defined(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
+  if (!device_fault_ext_ || !pfn_get_device_fault_ || !device_) return;
+  VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+  if (pfn_get_device_fault_(device_, &counts, nullptr) != VK_SUCCESS) return;
+  std::vector<VkDeviceFaultAddressInfoEXT> addrs(counts.addressInfoCount);
+  std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+  std::vector<std::uint8_t> binary(static_cast<size_t>(counts.vendorBinarySize));
+  VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+  info.pAddressInfos = addrs.empty() ? nullptr : addrs.data();
+  info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+  info.pVendorBinaryData = binary.empty() ? nullptr : binary.data();
+  if (pfn_get_device_fault_(device_, &counts, &info) != VK_SUCCESS) return;
+  if (info.description[0]) {
+    VRP_ERR("device_fault: %s (addr=%u vendor=%u)", info.description, counts.addressInfoCount,
+            counts.vendorInfoCount);
+  } else {
+    VRP_ERR("device_fault: (no description) addr=%u vendor=%u", counts.addressInfoCount,
+            counts.vendorInfoCount);
+  }
+#else
+  (void)0;
+#endif
 }
 
 void XrVulkanApp::shutdown() {
@@ -149,11 +312,23 @@ void XrVulkanApp::shutdown() {
     session_ = XR_NULL_HANDLE;
   }
 
+  // Drop FFmpeg hwctx before DestroyDevice (inject does not own the VkDevice).
+  ffmpeg_vulkan_.reset();
+  video_decode_ready_ = false;
+  video_decode_queue_ = VK_NULL_HANDLE;
+  video_decode_queue_family_ = UINT32_MAX;
+  device_fault_ext_ = false;
+  pfn_get_device_fault_ = nullptr;
+  enabled_dev_exts_.clear();
+
   if (device_ != VK_NULL_HANDLE) {
-    // HMD unplug can wedge the GPU/compositor path; never block forever here.
+    // HMD unplug / wedged decode CB can block forever. Never DestroyDevice while
+    // WaitIdle is still running — that wedges NVIDIA so the next process cannot
+    // create a Vulkan instance.
     std::atomic<bool> idle_done{false};
-    std::thread idle_thr([this, &idle_done] {
-      (void)vkDeviceWaitIdle(device_);
+    const VkDevice idle_dev = device_;
+    std::thread idle_thr([idle_dev, &idle_done] {
+      (void)vkDeviceWaitIdle(idle_dev);
       idle_done.store(true, std::memory_order_release);
     });
     const auto idle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -161,28 +336,47 @@ void XrVulkanApp::shutdown() {
            std::chrono::steady_clock::now() < idle_deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (idle_done.load(std::memory_order_acquire)) {
+    const bool idle_ok = idle_done.load(std::memory_order_acquire);
+    if (idle_ok) {
       idle_thr.join();
     } else {
-      VRP_ERR("vkDeviceWaitIdle timed out during XR shutdown — destroying device anyway");
+      VRP_ERR("vkDeviceWaitIdle timed out during XR shutdown — leak device/instance "
+              "(skip Destroy*; process exit cleans up; avoids next-launch wedge)");
       idle_thr.detach();
     }
-    if (command_pool_) {
-      vkDestroyCommandPool(device_, command_pool_, nullptr);
+    if (idle_ok) {
+      if (command_pool_) {
+        vkDestroyCommandPool(device_, command_pool_, nullptr);
+        command_pool_ = VK_NULL_HANDLE;
+      }
+      if (color_pass_) {
+        vkDestroyRenderPass(device_, color_pass_, nullptr);
+        color_pass_ = VK_NULL_HANDLE;
+      }
+      vkDestroyDevice(device_, nullptr);
+      device_ = VK_NULL_HANDLE;
+      queue_ = VK_NULL_HANDLE;
+      physical_device_ = VK_NULL_HANDLE;
+      if (vk_instance_) {
+        vkDestroyInstance(vk_instance_, nullptr);
+        vk_instance_ = VK_NULL_HANDLE;
+      }
+    } else {
+      // Leak Vulkan handles; clear locals so we do not double-destroy on ~.
       command_pool_ = VK_NULL_HANDLE;
-    }
-    if (color_pass_) {
-      vkDestroyRenderPass(device_, color_pass_, nullptr);
       color_pass_ = VK_NULL_HANDLE;
+      device_ = VK_NULL_HANDLE;
+      queue_ = VK_NULL_HANDLE;
+      physical_device_ = VK_NULL_HANDLE;
+      vk_instance_ = VK_NULL_HANDLE;
     }
-    vkDestroyDevice(device_, nullptr);
-    device_ = VK_NULL_HANDLE;
-  }
-  queue_ = VK_NULL_HANDLE;
-  physical_device_ = VK_NULL_HANDLE;
-  if (vk_instance_) {
-    vkDestroyInstance(vk_instance_, nullptr);
-    vk_instance_ = VK_NULL_HANDLE;
+  } else {
+    queue_ = VK_NULL_HANDLE;
+    physical_device_ = VK_NULL_HANDLE;
+    if (vk_instance_) {
+      vkDestroyInstance(vk_instance_, nullptr);
+      vk_instance_ = VK_NULL_HANDLE;
+    }
   }
 
   if (instance_) {
@@ -192,6 +386,7 @@ void XrVulkanApp::shutdown() {
   session_focused_ = false;
   tracking_valid_ = false;
   last_display_time_ = 0;
+  crash_guard::clear_session_cookie();
 }
 
 void XrVulkanApp::create_instance() { create_instance(nullptr, {}); }
@@ -292,6 +487,9 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   check_cancel();
   XrGraphicsRequirementsVulkan2KHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
   check_xr(xrGetVulkanGraphicsRequirements2KHR(instance_, system_, &req), "graphics requirements");
+  const std::string req_min = xr_packed_vk_version_string(req.minApiVersionSupported);
+  const std::string req_max = xr_packed_vk_version_string(req.maxApiVersionSupported);
+  VRP_LOG("Vulkan graphics requirements: min=%s max=%s", req_min.c_str(), req_max.c_str());
 
   VkApplicationInfo app_info{};
   app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -299,7 +497,8 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   app_info.applicationVersion = 1;
   app_info.pEngineName = "VRP";
   app_info.engineVersion = 1;
-  app_info.apiVersion = VK_API_VERSION_1_1;
+  // FFmpeg AVVulkanDeviceContext wants ≥1.3; fall back to 1.1 if the runtime refuses.
+  app_info.apiVersion = VK_API_VERSION_1_3;
 
   VkInstanceCreateInfo vici{};
   vici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -313,21 +512,80 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   xvici.vulkanCreateInfo = &vici;
   xvici.vulkanAllocator = nullptr;
 
-  note("Vulkan: creating instance…");
-  check_cancel();
-  VkResult vk_r = VK_SUCCESS;
-  check_xr(xrCreateVulkanInstanceKHR(instance_, &xvici, &vk_instance_, &vk_r),
-           "xrCreateVulkanInstanceKHR");
-  VRP_CHECK(vk_r == VK_SUCCESS, "Vulkan instance create failed");
+  auto create_vk_instance = [&](uint32_t api, const char* label) -> std::pair<XrResult, VkResult> {
+    app_info.apiVersion = api;
+    vk_instance_ = VK_NULL_HANDLE;
+    VkResult vk_out = VK_SUCCESS;
+    note(std::string("Vulkan: creating instance (") + label + " " + vk_api_version_string(api) +
+         ", req " + req_min + ".." + req_max + ")…");
+    check_cancel();
+    // Monado compositor IPC can block forever here after a prior Broken pipe.
+    std::atomic<bool> creating{true};
+    std::thread watchdog([&] {
+      for (int sec = 0; creating.load(std::memory_order_acquire); ++sec) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (!creating.load(std::memory_order_acquire)) return;
+        if (sec > 0 && (sec % 5) == 0) {
+          const std::string stall = std::string("Vulkan instance create blocked (") +
+                                    std::to_string(sec) + "s, " + label +
+                                    ") — Monado compositor may be wedged";
+          VRP_ERR("%s", stall.c_str());
+          if (progress) progress(stall);
+        }
+        if (cancel && cancel->load(std::memory_order_acquire)) {
+          VRP_ERR("Vulkan instance create: cancel requested while blocked (%s)", label);
+        }
+      }
+    });
+    const XrResult xr_out = xrCreateVulkanInstanceKHR(instance_, &xvici, &vk_instance_, &vk_out);
+    creating.store(false, std::memory_order_release);
+    watchdog.join();
+    return {xr_out, vk_out};
+  };
+
+  auto [xr_inst, vk_r] = create_vk_instance(VK_API_VERSION_1_3, "api=1.3");
+  if (XR_FAILED(xr_inst) || vk_r != VK_SUCCESS || !vk_instance_) {
+    const std::string fail13 = format_xr_vk_fail("xrCreateVulkanInstanceKHR(api=1.3)", xr_inst, vk_r);
+    VRP_ERR("%s — retrying apiVersion 1.1 (req %s..%s)", fail13.c_str(), req_min.c_str(),
+            req_max.c_str());
+    if (progress) progress(fail13 + " — retry 1.1");
+
+    auto [xr11, vk11] = create_vk_instance(VK_API_VERSION_1_1, "api=1.1");
+    xr_inst = xr11;
+    vk_r = vk11;
+    if (XR_FAILED(xr_inst) || vk_r != VK_SUCCESS || !vk_instance_) {
+      const std::string fail11 =
+          format_xr_vk_fail("xrCreateVulkanInstanceKHR(api=1.1)", xr_inst, vk_r);
+      VRP_ERR("%s (after 1.3 also failed). Restart monado-service / Connect again.", fail11.c_str());
+      vrp_fatal(fail11 + " | earlier: " + fail13 + " | req " + req_min + ".." + req_max);
+    }
+    VRP_LOG("Vulkan instance apiVersion 1.1 (1.3 unavailable)");
+  } else {
+    VRP_LOG("Vulkan instance apiVersion 1.3");
+  }
 
   note("Vulkan: picking GPU…");
   check_cancel();
   XrVulkanGraphicsDeviceGetInfoKHR gdgi{XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
   gdgi.systemId = system_;
   gdgi.vulkanInstance = vk_instance_;
-  check_xr(xrGetVulkanGraphicsDevice2KHR(instance_, &gdgi, &physical_device_), "get graphics device");
+  physical_device_ = VK_NULL_HANDLE;
+  {
+    const XrResult gd = xrGetVulkanGraphicsDevice2KHR(instance_, &gdgi, &physical_device_);
+    if (XR_FAILED(gd) || !physical_device_) {
+      const std::string detail =
+          std::string("xrGetVulkanGraphicsDevice2KHR failed: ") + xr_result_string(gd) + " (" +
+          std::to_string(static_cast<int>(gd)) +
+          "). Often Monado compositor IPC died (Broken pipe) — restart monado-service.";
+      VRP_ERR("%s", detail.c_str());
+      vrp_fatal(detail);
+    }
+  }
 
-  // Find a graphics queue.
+  // Phase 0: log FFmpeg Vulkan Video zero-copy feasibility (does not change decode path).
+  vulkan_video_probe_ = probe_vulkan_video(physical_device_);
+
+  // Find a graphics queue (+ optional video decode family from Phase 0 probe).
   uint32_t qcount = 0;
   vkGetPhysicalDeviceQueueFamilyProperties(physical_device_, &qcount, nullptr);
   std::vector<VkQueueFamilyProperties> qprops(qcount);
@@ -345,13 +603,10 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   const bool split_compute = family_queues >= 2 &&
                              (qprops[queue_family_index_].queueFlags & VK_QUEUE_COMPUTE_BIT);
   float priorities[2] = {1.f, 0.5f};
-  VkDeviceQueueCreateInfo qci{};
-  qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-  qci.queueFamilyIndex = queue_family_index_;
-  qci.queueCount = split_compute ? 2u : 1u;
-  qci.pQueuePriorities = priorities;
+  float decode_priority = 0.5f;
+  video_decode_queue_family_ = vulkan_video_probe_.decode_queue_family;
 
-  // Optional extensions for CUDA↔Vulkan zero-copy (opaque FD).
+  // Optional extensions for CUDA↔Vulkan zero-copy (opaque FD) + optional Video Decode.
   uint32_t ext_count = 0;
   vkEnumerateDeviceExtensionProperties(physical_device_, nullptr, &ext_count, nullptr);
   std::vector<VkExtensionProperties> avail(ext_count);
@@ -362,47 +617,179 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     }
     return false;
   };
-  std::vector<const char*> dev_exts;
-  if (has_ext(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME)) {
-    dev_exts.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
-  }
-  if (has_ext(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
-    dev_exts.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
-    external_memory_fd_ = true;
-  }
-  const bool dma_buf = has_ext(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-  const bool drm_mod = has_ext(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
-  if (dma_buf && drm_mod && external_memory_fd_) {
-    dev_exts.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-    dev_exts.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
-    dma_buf_import_ = true;
-  }
 
   VkPhysicalDeviceFeatures gpu_features{};
   vkGetPhysicalDeviceFeatures(physical_device_, &gpu_features);
   VkPhysicalDeviceFeatures enabled_features{};
   if (gpu_features.textureCompressionBC) enabled_features.textureCompressionBC = VK_TRUE;
 
-  VkDeviceCreateInfo dci{};
-  dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  dci.queueCreateInfoCount = 1;
-  dci.pQueueCreateInfos = &qci;
-  dci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
-  dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
-  dci.pEnabledFeatures = &enabled_features;
+  const bool want_video = vulkan_video_probe_.candidate && app_info.apiVersion >= VK_API_VERSION_1_3 &&
+                          video_decode_queue_family_ != UINT32_MAX;
 
-  XrVulkanDeviceCreateInfoKHR xvdci{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
-  xvdci.systemId = system_;
-  xvdci.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
-  xvdci.vulkanPhysicalDevice = physical_device_;
-  xvdci.vulkanCreateInfo = &dci;
-  xvdci.vulkanAllocator = nullptr;
+  auto build_exts = [&](bool with_video, std::vector<const char*>* out, bool* out_ext_fd,
+                        bool* out_dma, bool* out_fault) {
+    out->clear();
+    *out_ext_fd = false;
+    *out_dma = false;
+    *out_fault = false;
+    if (has_ext(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME)) {
+      out->push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+    }
+    if (has_ext(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+      out->push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+      *out_ext_fd = true;
+    }
+    const bool dma_buf = has_ext(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    const bool drm_mod = has_ext(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+    if (dma_buf && drm_mod && *out_ext_fd) {
+      out->push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+      out->push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+      *out_dma = true;
+    }
+#if defined(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
+    if (has_ext(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+      out->push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+      *out_fault = true;
+    }
+#endif
+    if (with_video) {
+      auto add = [&](const char* n) {
+        if (has_ext(n)) out->push_back(n);
+      };
+      add(VK_KHR_VIDEO_QUEUE_EXTENSION_NAME);
+      add(VK_KHR_VIDEO_DECODE_QUEUE_EXTENSION_NAME);
+#if defined(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME)
+      add(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME)
+      add(VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME);
+#endif
+#if defined(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)
+      add(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME);
+#endif
+      // Core in 1.2/1.3 but still listed by some stacks as device exts — add if advertised.
+      add(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+      add(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
+    }
+  };
+
+  auto try_create_device = [&](bool with_video) -> bool {
+    std::vector<const char*> dev_exts;
+    bool ext_fd = false;
+    bool dma = false;
+    bool fault = false;
+    build_exts(with_video, &dev_exts, &ext_fd, &dma, &fault);
+
+    std::vector<VkDeviceQueueCreateInfo> qcis;
+    VkDeviceQueueCreateInfo gq{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    gq.queueFamilyIndex = queue_family_index_;
+    gq.queueCount = split_compute ? 2u : 1u;
+    gq.pQueuePriorities = priorities;
+    qcis.push_back(gq);
+    if (with_video && video_decode_queue_family_ != UINT32_MAX &&
+        video_decode_queue_family_ != queue_family_index_) {
+      VkDeviceQueueCreateInfo dq{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+      dq.queueFamilyIndex = video_decode_queue_family_;
+      dq.queueCount = 1;
+      dq.pQueuePriorities = &decode_priority;
+      qcis.push_back(dq);
+    }
+
+    VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    v13.synchronization2 = VK_TRUE;
+    VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    v12.timelineSemaphore = VK_TRUE;
+    v12.pNext = with_video ? &v13 : nullptr;
+#if defined(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
+    VkPhysicalDeviceFaultFeaturesEXT fault_feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    fault_feat.deviceFault = fault ? VK_TRUE : VK_FALSE;
+    fault_feat.deviceFaultVendorBinary = VK_FALSE;
+#endif
+    VkPhysicalDeviceFeatures2 feats2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    feats2.features = enabled_features;
+    if (with_video) {
+#if defined(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
+      if (fault) {
+        fault_feat.pNext = &v12;
+        feats2.pNext = &fault_feat;
+      } else
+#endif
+      {
+        feats2.pNext = &v12;
+      }
+    } else {
+#if defined(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
+      feats2.pNext = fault ? &fault_feat : nullptr;
+#else
+      feats2.pNext = nullptr;
+#endif
+    }
+
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.queueCreateInfoCount = static_cast<uint32_t>(qcis.size());
+    dci.pQueueCreateInfos = qcis.data();
+    dci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
+    dci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
+    if (with_video || fault) {
+      dci.pNext = &feats2;
+      dci.pEnabledFeatures = nullptr;
+    } else {
+      dci.pEnabledFeatures = &enabled_features;
+    }
+
+    XrVulkanDeviceCreateInfoKHR xvdci{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
+    xvdci.systemId = system_;
+    xvdci.pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+    xvdci.vulkanPhysicalDevice = physical_device_;
+    xvdci.vulkanCreateInfo = &dci;
+    xvdci.vulkanAllocator = nullptr;
+
+    device_ = VK_NULL_HANDLE;
+    vk_r = VK_SUCCESS;
+    const XrResult xr_dev = xrCreateVulkanDeviceKHR(instance_, &xvdci, &device_, &vk_r);
+    if (XR_FAILED(xr_dev) || vk_r != VK_SUCCESS || !device_) {
+      VRP_ERR("%s", format_xr_vk_fail(with_video ? "xrCreateVulkanDeviceKHR(video)"
+                                                 : "xrCreateVulkanDeviceKHR(baseline)",
+                                      xr_dev, vk_r)
+                        .c_str());
+      device_ = VK_NULL_HANDLE;
+      return false;
+    }
+    external_memory_fd_ = ext_fd;
+    dma_buf_import_ = dma;
+    device_fault_ext_ = fault;
+    pfn_get_device_fault_ = nullptr;
+#if defined(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
+    if (fault) {
+      pfn_get_device_fault_ = reinterpret_cast<PFN_vkGetDeviceFaultInfoEXT>(
+          vkGetDeviceProcAddr(device_, "vkGetDeviceFaultInfoEXT"));
+      VRP_LOG("Vulkan VK_EXT_device_fault: %s", pfn_get_device_fault_ ? "enabled" : "ext without entry");
+    }
+#endif
+    enabled_dev_exts_.clear();
+    enabled_dev_exts_.reserve(dev_exts.size());
+    for (const char* e : dev_exts) enabled_dev_exts_.emplace_back(e);
+    return true;
+  };
 
   note("Vulkan: creating device…");
   check_cancel();
-  vk_r = VK_SUCCESS;
-  check_xr(xrCreateVulkanDeviceKHR(instance_, &xvdci, &device_, &vk_r), "xrCreateVulkanDeviceKHR");
-  VRP_CHECK(vk_r == VK_SUCCESS, "Vulkan device create failed");
+  video_decode_ready_ = false;
+  video_decode_queue_ = VK_NULL_HANDLE;
+  if (want_video) {
+    if (try_create_device(true)) {
+      video_decode_ready_ = true;
+    } else {
+      VRP_LOG("Vulkan Video: falling back to baseline device (CUDA path unchanged)");
+      if (!try_create_device(false)) {
+        vrp_fatal("Vulkan device create failed (baseline after video). "
+                  "See xr=/vk= lines above; Monado Broken pipe → restart monado-service.");
+      }
+    }
+  } else if (!try_create_device(false)) {
+    vrp_fatal("Vulkan device create failed (baseline). "
+              "See xr=/vk= lines above; Monado Broken pipe → restart monado-service.");
+  }
 
   vkGetDeviceQueue(device_, queue_family_index_, 0, &queue_);
   if (split_compute) {
@@ -410,6 +797,30 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     note("Vulkan compute queue: index 1");
   } else {
     note("Vulkan compute queue: sharing the frame queue");
+  }
+  if (video_decode_ready_ && video_decode_queue_family_ != UINT32_MAX) {
+    vkGetDeviceQueue(device_, video_decode_queue_family_, 0, &video_decode_queue_);
+    vulkan_video_probe_.enabled_on_device = true;
+    VRP_LOG("Vulkan Video: enabled on XR device (decode_qf=%u)", video_decode_queue_family_);
+
+    // Phase 2: inject XR device into FFmpeg AVVulkanDeviceContext (playback still CUDA).
+    std::vector<const char*> ext_ptrs;
+    ext_ptrs.reserve(enabled_dev_exts_.size());
+    for (const auto& s : enabled_dev_exts_) ext_ptrs.push_back(s.c_str());
+    const uint32_t gq_count = split_compute ? 2u : 1u;
+    ffmpeg_vulkan_ = std::make_unique<FfmpegVulkanDevice>();
+    if (!ffmpeg_vulkan_->init(vk_instance_, physical_device_, device_, queue_family_index_, gq_count,
+                              video_decode_queue_family_, 1u, &queue_mu_, ext_ptrs)) {
+      VRP_LOG("FFmpeg Vulkan hwctx inject failed: %s — keep CUDA path",
+              ffmpeg_vulkan_->last_error().c_str());
+      ffmpeg_vulkan_.reset();
+    } else {
+      VRP_LOG("FFmpeg Vulkan hwctx: ready (decode still CUDA until Phase 3 bind)");
+    }
+  } else {
+    vulkan_video_probe_.enabled_on_device = false;
+    video_decode_queue_family_ = UINT32_MAX;
+    ffmpeg_vulkan_.reset();
   }
   if (external_memory_fd_) {
     VRP_LOG("Vulkan external memory FD: yes (NVIDIA CUDA zero-copy)");
@@ -419,6 +830,8 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   if (dma_buf_import_) {
     VRP_LOG("Vulkan dma-buf import: enabled (VA-API NV12)");
   } else {
+    const bool dma_buf = has_ext(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+    const bool drm_mod = has_ext(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
     VRP_LOG("Vulkan dma-buf import: %s%s", dma_buf ? "available" : "missing",
             dma_buf && drm_mod ? " (+DRM modifiers, not enabled)" : "");
   }
@@ -829,6 +1242,9 @@ bool XrVulkanApp::pump_events() {
 bool XrVulkanApp::begin_frame(FrameInfo& out) {
   out = {};
   if (!session_running_) return false;
+  // Never enter xrWaitFrame during close — it can block until Monado is killed
+  // (Broken pipe) when the previous EndFrame is stuck on queue_mu_ / GPU.
+  if (exit_requested_.load(std::memory_order_acquire)) return false;
 
   // Soften waitFrame errors after exit request — session may already be gone.
   XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
@@ -840,6 +1256,15 @@ bool XrVulkanApp::begin_frame(FrameInfo& out) {
       session_running_ = false;
       return false;
     }
+  }
+  if (exit_requested_.load(std::memory_order_acquire)) {
+    // Began wait before exit — discard without rendering.
+    XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+    ei.displayTime = fs.predictedDisplayTime;
+    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    std::unique_lock<std::mutex> qlock(queue_mu_, std::try_to_lock);
+    (void)xrEndFrame(session_, &ei);
+    return false;
   }
   out.display_time = fs.predictedDisplayTime;
   out.display_period = fs.predictedDisplayPeriod;
@@ -966,6 +1391,23 @@ void XrVulkanApp::end_frame(const FrameInfo& info, const std::vector<XrCompositi
   // Monado's compositor submits on the same VkQueue during xrEndFrame. Serialize with
   // CudaNv12Texture / VideoTexture / eye submits that also use queue_mu_ — otherwise the
   // NVIDIA driver can SEGV when decode ensure_size transitions while end_frame runs.
+  // On exit, decode may hold queue_mu_ inside WaitForFences for seconds — never block
+  // EndFrame forever or the next WaitFrame / UI join hangs until Monado is killed.
+  if (exit_requested_.load(std::memory_order_acquire)) {
+    std::unique_lock<std::mutex> qlock(queue_mu_, std::defer_lock);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+    while (!qlock.try_lock()) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        VRP_LOG("end_frame: exit — EndFrame without queue_mu (decode holds it)");
+        (void)xrEndFrame(session_, &ei);
+        return;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    (void)xrEndFrame(session_, &ei);
+    return;
+  }
   std::lock_guard<std::mutex> qlock(queue_mu_);
   check_xr(xrEndFrame(session_, &ei), "xrEndFrame");
 }

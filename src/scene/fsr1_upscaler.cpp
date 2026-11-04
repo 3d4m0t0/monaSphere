@@ -16,7 +16,8 @@
 namespace vrp {
 namespace {
 
-constexpr int kMaxEdge = 7680;
+/** Output long-edge cap. 7680 let 4K×2 → 8K and wedged the shared XR graphics queue. */
+constexpr int kMaxEdge = 4096;
 
 struct BlitUbo {
   uint32_t width;
@@ -96,7 +97,19 @@ void Fsr1Upscaler::init(VkPhysicalDevice phys, VkDevice device, VkQueue queue, u
 
 void Fsr1Upscaler::shutdown() {
   if (!device_) return;
-  vkDeviceWaitIdle(device_);
+  // Never block forever — a wedged FSR fence previously hung XR teardown (join timeout,
+  // zombie process after window close).
+  bool can_device_wait = true;
+  if (fence_ && in_flight_) {
+    if (vkWaitForFences(device_, 1, &fence_, VK_TRUE, 100'000'000ull) != VK_SUCCESS) {
+      VRP_ERR("fsr.shutdown: fence timeout — destroying without device wait");
+      can_device_wait = false;
+    }
+    in_flight_ = false;
+  }
+  // Never vkDeviceWaitIdle here — shared XR queue hang left zombie processes after
+  // FSR/eye sampled an un-acquired AVVkFrame. Fence wait above is enough.
+  (void)can_device_wait;
   destroy_pipelines();
   destroy_rt(src_rt_);
   destroy_rt(easu_rt_);
@@ -322,7 +335,8 @@ void Fsr1Upscaler::destroy_pipelines() {
   blit_set_ = easu_set_ = rcas_set_ = VK_NULL_HANDLE;
 }
 
-void Fsr1Upscaler::update_blit_set(VkImageView y, VkImageView uv, VkSampler samp, int nv12) {
+void Fsr1Upscaler::update_blit_set(VkImageView y, VkImageView uv, VkSampler samp,
+                                   VkImageLayout src_layout) {
   VkDescriptorBufferInfo bi{};
   bi.buffer = blit_ubo_;
   bi.range = sizeof(BlitUbo);
@@ -330,10 +344,10 @@ void Fsr1Upscaler::update_blit_set(VkImageView y, VkImageView uv, VkSampler samp
   VkDescriptorImageInfo yi{};
   yi.sampler = samp;
   yi.imageView = y;
-  yi.imageLayout = (nv12 != 0) ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  yi.imageLayout = src_layout;
 
   VkDescriptorImageInfo uvi = yi;
-  uvi.imageView = (nv12 != 0 && uv) ? uv : y;
+  uvi.imageView = uv ? uv : y;
 
   VkDescriptorImageInfo di{};
   di.imageView = src_rt_.view;
@@ -423,11 +437,24 @@ bool Fsr1Upscaler::poll() {
   return published_epoch_ == epoch_;
 }
 
+void Fsr1Upscaler::drain() {
+  if (!device_ || !fence_ || !in_flight_) return;
+  const VkResult wr = vkWaitForFences(device_, 1, &fence_, VK_TRUE, 2'000'000'000ull);
+  if (wr != VK_SUCCESS) {
+    VRP_ERR("fsr.drain: fence wait failed (%d) — drop in-flight", static_cast<int>(wr));
+    in_flight_ = false;
+    return;
+  }
+  (void)poll();
+}
+
 void Fsr1Upscaler::invalidate() {
   // Finish any in-flight pass but do not publish it — caller is switching media/mode
   // and must not sample a front from the previous source.
   if (device_ && fence_ && in_flight_) {
-    (void)vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+    if (vkWaitForFences(device_, 1, &fence_, VK_TRUE, 100'000'000ull) != VK_SUCCESS) {
+      VRP_ERR("fsr.invalidate: fence timeout — drop in-flight");
+    }
     in_flight_ = false;
   }
   ++epoch_;
@@ -439,8 +466,10 @@ void Fsr1Upscaler::invalidate() {
 }
 
 bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_sampler, int src_w,
-                           int src_h, int nv12) {
+                           int src_h, int nv12, VkImageLayout src_layout) {
   if (!enabled() || !device_ || !src_y || !src_sampler || src_w < 16 || src_h < 16) return false;
+  if (src_layout == VK_IMAGE_LAYOUT_UNDEFINED || src_layout == VK_IMAGE_LAYOUT_PREINITIALIZED)
+    src_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
   // Finish prior async pass first; never start a second submit on the same fence/cmd.
   bool published = poll();
@@ -464,23 +493,35 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
   dst_w &= ~1;
   dst_h &= ~1;
 
+  // Near-1× after cap (typical 4K + Performance): skip EASU, blit+RCAS at source size.
+  // Full 4K→8K EASU previously starved the shared XR graphics queue.
+  const float out_scale =
+      static_cast<float>(std::max(dst_w, dst_h)) / static_cast<float>(std::max(src_w, src_h));
+  const bool rcas_only = out_scale < 1.15f;
+  if (rcas_only) {
+    dst_w = src_w & ~1;
+    dst_h = src_h & ~1;
+  }
+
   out_back_ = 1 - out_front_;
   const VkImageUsageFlags usage =
       VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
   ensure_rt(src_rt_, src_w, src_h, usage);
-  ensure_rt(easu_rt_, dst_w, dst_h, usage);
+  if (!rcas_only) ensure_rt(easu_rt_, dst_w, dst_h, usage);
   ensure_rt(out_rt_[out_back_], dst_w, dst_h, usage);
 
   BlitUbo blit{static_cast<uint32_t>(src_w), static_cast<uint32_t>(src_h),
                static_cast<uint32_t>(nv12), 0};
   std::memcpy(blit_ubo_map_, &blit, sizeof(blit));
 
-  FsrConsts easu{};
-  FsrEasuCon(easu.const0, easu.const1, easu.const2, easu.const3, static_cast<AF1>(src_w),
-             static_cast<AF1>(src_h), static_cast<AF1>(src_w), static_cast<AF1>(src_h),
-             static_cast<AF1>(dst_w), static_cast<AF1>(dst_h));
-  easu.sample[0] = 0;
-  std::memcpy(easu_ubo_map_, &easu, sizeof(easu));
+  if (!rcas_only) {
+    FsrConsts easu{};
+    FsrEasuCon(easu.const0, easu.const1, easu.const2, easu.const3, static_cast<AF1>(src_w),
+               static_cast<AF1>(src_h), static_cast<AF1>(src_w), static_cast<AF1>(src_h),
+               static_cast<AF1>(dst_w), static_cast<AF1>(dst_h));
+    easu.sample[0] = 0;
+    std::memcpy(easu_ubo_map_, &easu, sizeof(easu));
+  }
 
   FsrConsts rcas{};
   FsrRcasCon(rcas.const0, rcas_sharpness_for_mode(mode_));
@@ -489,20 +530,22 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
 
   static FsrMode last_logged_mode = FsrMode::Off;
   static int last_logged_sw = 0, last_logged_sh = 0, last_logged_dw = 0, last_logged_dh = 0;
+  static bool last_rcas_only = false;
   if (mode_ != last_logged_mode || src_w != last_logged_sw || src_h != last_logged_sh ||
-      dst_w != last_logged_dw || dst_h != last_logged_dh) {
-    VRP_LOG("FSR1 %s: %dx%d → %dx%d (scale %.2f)", fsr_mode_name(mode_), src_w, src_h, dst_w, dst_h,
-            scale);
+      dst_w != last_logged_dw || dst_h != last_logged_dh || rcas_only != last_rcas_only) {
+    VRP_LOG("FSR1 %s: %dx%d → %dx%d (scale %.2f%s)", fsr_mode_name(mode_), src_w, src_h, dst_w, dst_h,
+            scale, rcas_only ? ", rcas-only" : "");
     last_logged_mode = mode_;
     last_logged_sw = src_w;
     last_logged_sh = src_h;
     last_logged_dw = dst_w;
     last_logged_dh = dst_h;
+    last_rcas_only = rcas_only;
   }
 
-  update_blit_set(src_y, src_uv, src_sampler, nv12);
-  update_fsr_set(easu_set_, easu_ubo_, src_rt_.view, easu_rt_.view);
-  update_fsr_set(rcas_set_, rcas_ubo_, easu_rt_.view, out_rt_[out_back_].view);
+  update_blit_set(src_y, src_uv, src_sampler, src_layout);
+  if (!rcas_only) update_fsr_set(easu_set_, easu_ubo_, src_rt_.view, easu_rt_.view);
+  update_fsr_set(rcas_set_, rcas_ubo_, rcas_only ? src_rt_.view : easu_rt_.view, out_rt_[out_back_].view);
 
   vkResetFences(device_, 1, &fence_);
   vkResetCommandBuffer(cmd_, 0);
@@ -527,13 +570,14 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
     vkCmdPipelineBarrier(cmd_, src_s, dst_s, 0, 0, nullptr, 0, nullptr, 1, &b);
   };
 
-  // Undefined → GENERAL for storage targets (back buffer only for output).
   transition(src_rt_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
              VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-  transition(easu_rt_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
-             VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  if (!rcas_only) {
+    transition(easu_rt_.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
+               VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  }
   transition(out_rt_[out_back_].image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, 0,
              VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
@@ -548,17 +592,20 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
              VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 
-  // 2) EASU
-  vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, easu_pipe_);
-  vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_layout_, 0, 1, &easu_set_, 0,
-                          nullptr);
   const int groups_x = (dst_w + 15) / 16;
   const int groups_y = (dst_h + 15) / 16;
-  vkCmdDispatch(cmd_, groups_x, groups_y, 1);
 
-  transition(easu_rt_.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-             VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
-             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  if (!rcas_only) {
+    // 2) EASU
+    vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, easu_pipe_);
+    vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_layout_, 0, 1, &easu_set_, 0,
+                            nullptr);
+    vkCmdDispatch(cmd_, groups_x, groups_y, 1);
+
+    transition(easu_rt_.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+  }
 
   // 3) RCAS → back buffer (front stays stable for the eye pass).
   vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, rcas_pipe_);

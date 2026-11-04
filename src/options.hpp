@@ -51,8 +51,9 @@ inline FsrMode next_fsr_mode(FsrMode m) {
 }
 
 /**
- * FSR1 output long-edge is capped at ~7680; on 8K sources the upscale is effectively
- * a no-op while blit+EASU+RCAS still cost GPU — force Off and lock the UI.
+ * FSR1 output long-edge is capped (~4096). On 8K sources the upscale is a no-op
+ * while blit+EASU+RCAS still cost GPU — force Off and lock the UI.
+ * (4K uses a cheap RCAS-only path when the capped scale is ~1×.)
  */
 inline bool fsr_locked_for_resolution(int w, int h) {
   return std::max(w, h) >= 7680;

@@ -199,10 +199,14 @@ target_include_directories(vrp_starfield PUBLIC ${CMAKE_SOURCE_DIR}/src)
 # STATIC: the SUSE cmake macro sets BUILD_SHARED_LIBS=ON, which would
 # otherwise emit an unpackaged libvrp_core.so that the player requires.
 add_library(vrp_core STATIC
+  src/common/crash_guard.cpp
   src/xr/xr_vulkan_app.cpp
   src/video/video_decoder.cpp
   src/video/cuda_minimal.cpp
   src/video/cuda_nv12_texture.cpp
+  src/video/vulkan_video_probe.cpp
+  src/video/ffmpeg_vulkan_device.cpp
+  src/video/vulkan_video_texture.cpp
   src/video/bc7_thumbs.cpp
   src/video/vaapi_nv12_texture.cpp
   src/audio/audio_player.cpp

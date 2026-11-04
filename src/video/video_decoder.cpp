@@ -3,10 +3,12 @@
 #include "options.hpp"
 #include "video/cuda_nv12_texture.hpp"
 #include "video/vaapi_nv12_texture.hpp"
+#include "video/vulkan_video_texture.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <vector>
 
 #if defined(VRP_HAS_FFMPEG)
 extern "C" {
@@ -44,6 +47,44 @@ std::mutex& ffmpeg_offline_mu() {
 namespace {
 
 #if defined(VRP_HAS_FFMPEG)
+/** Leak an AVFrame (and its AVVkFrame) instead of unref while GPU may still use it. */
+void leak_avframe(AVFrame* f) {
+  if (!f) return;
+  static std::mutex mu;
+  static std::vector<AVFrame*> leaks;
+  std::lock_guard<std::mutex> lock(mu);
+  leaks.push_back(f);
+}
+
+/**
+ * avcodec_send_packet can block forever in Vulkan WaitForFences when a prior
+ * decode CB is wedged. Run it on a side thread with a deadline so seek_req can run.
+ * On timeout the caller must abandon `codec` (leak) — the worker may still be inside it.
+ */
+int send_packet_timed(AVCodecContext* codec, AVPacket* pkt, int timeout_ms) {
+  if (!codec) return AVERROR(EINVAL);
+  std::atomic<int> serr{INT_MIN};
+  std::atomic<bool> done{false};
+  std::thread worker([&]() {
+    const int r = avcodec_send_packet(codec, pkt);
+    serr.store(r, std::memory_order_release);
+    done.store(true, std::memory_order_release);
+  });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (!done.load(std::memory_order_acquire) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  if (done.load(std::memory_order_acquire)) {
+    worker.join();
+    return serr.load(std::memory_order_acquire);
+  }
+  VRP_ERR("seekdbg: avcodec_send_packet timed out after %dms — abandon codec", timeout_ms);
+  worker.detach();
+  return AVERROR_EXTERNAL;
+}
+
 std::string av_err(int err) {
   char buf[AV_ERROR_MAX_STRING_SIZE] = {};
   av_strerror(err, buf, sizeof(buf));
@@ -145,6 +186,17 @@ enum AVPixelFormat get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* 
   if (!hw) return AV_PIX_FMT_NONE;
   for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
     if (*p == hw->hw_pix_fmt) return *p;
+  }
+  // Vulkan/CUDA hwaccel init can fail after open2 ("Failed setup for format …").
+  // Returning NONE yields "no frame!"; pick a software format so the caller can
+  // detect non-hw frames and fall back instead of stalling the stream.
+  for (const enum AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+    if (*p != hw->hw_pix_fmt) {
+      VRP_ERR("get_hw_format: %s unavailable — falling back to pix_fmt=%d",
+              av_get_pix_fmt_name(hw->hw_pix_fmt) ? av_get_pix_fmt_name(hw->hw_pix_fmt) : "?",
+              static_cast<int>(*p));
+      return *p;
+    }
   }
   return AV_PIX_FMT_NONE;
 }
@@ -594,6 +646,11 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
       std::memset(packed.data(), 0, thumb_bytes);
       if (store(t)) ++made;
     }
+    // Software strip seeks the same file Vulkan Video is demuxing (often USB).
+    // Yield so playback read-ahead / decode timelines keep moving.
+    if (!nvdec && !stop) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
   }
 
   strip.count = made;
@@ -833,6 +890,19 @@ bool VideoDecoder::gpu_path_active() const {
          info_.hwaccel.find("cuda") != std::string::npos;
 }
 
+void VideoDecoder::set_vulkan_texture(VulkanVideoTexture* tex) {
+  if (vulkan_tex_ && vulkan_tex_ != tex) vulkan_tex_->set_seek_interrupt(nullptr);
+  vulkan_tex_ = tex;
+  if (tex) tex->set_seek_interrupt(&seek_req_);
+}
+
+bool VideoDecoder::vulkan_path_active() const {
+  // Do NOT require has_valid_frame() — release_held() clears it during scrub/seek and
+  // the host would leave the Vulkan path (vulkan=0) until a present succeeds.
+  return vulkan_tex_ && vulkan_tex_->enabled() && info_.hwaccel_active &&
+         info_.hwaccel.find("vulkan") != std::string::npos;
+}
+
 bool VideoDecoder::vaapi_path_active() const {
   return vaapi_tex_ && vaapi_tex_->has_valid_frame() && info_.hwaccel_active &&
          info_.hwaccel.find("vaapi") != std::string::npos;
@@ -842,7 +912,14 @@ void VideoDecoder::choose_display_size() {
   display_w_ = width_;
   display_h_ = height_;
   info_.display_note.clear();
-  // Native resolution when CUDA↔Vulkan NV12 is available; otherwise cap for CPU RGBA.
+  // Native resolution when GPU NV12 / AVVkFrame path is available; otherwise cap for CPU RGBA.
+  if (vulkan_tex_ && vulkan_tex_->enabled() && info_.hwaccel.find("vulkan") != std::string::npos) {
+    info_.display_note = "FFmpeg Vulkan Video zero-copy (AVVkFrame)";
+    info_.display_width = display_w_;
+    info_.display_height = display_h_;
+    VRP_LOG("display path: Vulkan Video → AVVkFrame zero-copy %dx%d", display_w_, display_h_);
+    return;
+  }
   if (cuda_tex_ && cuda_tex_->enabled() && info_.hwaccel.find("cuda") != std::string::npos) {
     info_.display_note = "Vulkan NV12 zero-copy (native)";
     info_.display_width = display_w_;
@@ -956,7 +1033,9 @@ void VideoDecoder::stop_decode_thread() {
   decode_stop_.store(true);
   demux_stop_.store(true);
   demux_pause_.store(true);
+  io_abort_.store(true);
   pkt_cv_.notify_all();
+  if (vulkan_tex_) vulkan_tex_->set_present_abort(true);
   {
     std::lock_guard<std::mutex> fl(frame_mu_);
     consumed_seq_ = latest_seq_;
@@ -967,6 +1046,22 @@ void VideoDecoder::stop_decode_thread() {
   decode_stop_.store(false);
   demux_stop_.store(false);
   demux_pause_.store(false);
+  io_abort_.store(false);
+  if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
+}
+
+int VideoDecoder::ffmpeg_io_interrupt(void* opaque) {
+  auto* self = static_cast<VideoDecoder*>(opaque);
+  if (!self) return 1;
+  return (self->demux_stop_.load() || self->decode_stop_.load() || self->io_abort_.load()) ? 1 : 0;
+}
+
+void VideoDecoder::install_io_interrupt() {
+#if defined(VRP_HAS_FFMPEG)
+  if (!ff_ || !ff_->fmt) return;
+  ff_->fmt->interrupt_callback.callback = &VideoDecoder::ffmpeg_io_interrupt;
+  ff_->fmt->interrupt_callback.opaque = this;
+#endif
 }
 
 void VideoDecoder::demux_loop() {
@@ -988,7 +1083,9 @@ void VideoDecoder::demux_loop() {
       continue;
     }
 
-    const bool hold = seek_scrubbing_.load();
+    // Cap prefetch while scrubbing or any seek is in flight (avoid q=400 during
+    // wait_avframe stalls that block apply).
+    const bool hold = seek_scrubbing_.load() || seek_busy_.load() || seek_req_.load();
     const size_t target_bytes = hold ? kHoldMaxBytes : prefetch_target_bytes_;
     const size_t max_pkts = hold ? kHoldMaxPackets : kMaxPackets;
 
@@ -1016,6 +1113,7 @@ void VideoDecoder::demux_loop() {
     }
 
     int r = -1;
+    const auto read_t0 = std::chrono::steady_clock::now();
     {
       std::lock_guard<std::mutex> lock(ff_mu_);
       if (demux_stop_.load() || demux_pause_.load() || !ff_ || !ff_->fmt) {
@@ -1023,6 +1121,28 @@ void VideoDecoder::demux_loop() {
         continue;
       }
       r = av_read_frame(ff_->fmt, pkt);
+    }
+    {
+      const auto read_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now() - read_t0)
+                               .count();
+      // USB / network storage often stalls here — log without VRP_DEBUG so freezes are traceable.
+      if (read_ms >= 40) {
+        static std::atomic<int> slow_n{0};
+        const int n = slow_n.fetch_add(1) + 1;
+        if (n <= 8 || (n % 30) == 0) {
+          size_t qn = 0, qb = 0;
+          {
+            std::lock_guard<std::mutex> lk(pkt_mu_);
+            qn = pkt_q_.size();
+            qb = pkt_bytes_;
+          }
+          VRP_LOG("demux: slow av_read_frame %lld ms (#%d) q=%zu bytes=%.2fMiB play=%d scrub=%d",
+                  static_cast<long long>(read_ms), n, qn,
+                  static_cast<double>(qb) / (1024.0 * 1024.0), playing_.load() ? 1 : 0,
+                  seek_scrubbing_.load() ? 1 : 0);
+        }
+      }
     }
 
     if (r < 0) {
@@ -1103,9 +1223,24 @@ void VideoDecoder::decode_loop() {
       continue;
     }
 
+    if (consume_seek_abandon()) {
+      VRP_LOG("seek: decode abandon awaiting (host timeout/clear)");
+      awaiting_frame_after_seek_ = false;
+      seek_skips = 0;
+      if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
+    }
+
     if (seek_req_.exchange(false)) {
       seek_skips = 0;
+      seek_abandon_.store(false);
+      if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
       const double t = seek_target_.load();
+      const uint64_t issue = seek_issue_gen_.load(std::memory_order_acquire);
+      seek_apply_gen_.store(issue, std::memory_order_release);
+      set_decode_phase("seek_apply");
+      VRP_LOG("seek: decode seek_req target=%.3f scrub=%d play=%d issue=%llu", t,
+              seek_scrubbing_.load() ? 1 : 0, playing_.load() ? 1 : 0,
+              static_cast<unsigned long long>(issue));
       demux_pause_.store(true);
       seek_serial_.fetch_add(1);
       pkt_cv_.notify_all();
@@ -1113,16 +1248,115 @@ void VideoDecoder::decode_loop() {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
       clear_packet_queue();
       demux_eof_.store(false);
+#if defined(VRP_HAS_FFMPEG)
+      // Finish in-flight Vulkan decode and return EVERY mailbox ref BEFORE flush.
+      // Do not use release_held() here — it may defer front for stereo.
+      bool flush_unsafe = false;
+      bool superseded = false;
+      if (vulkan_tex_ && vulkan_tex_->enabled()) {
+        vulkan_tex_->release_all_for_flush();
+        if (ff_ && ff_->frame && ff_->frame->format == AV_PIX_FMT_VULKAN &&
+            ff_->frame->data[0]) {
+          set_decode_phase("seek_pre_flush_wait");
+          const char* why = "ok";
+          const auto wt0 = clock::now();
+          // PowerMizer AUTO: kick_gpu during wait raises clocks. Keep a short
+          // last-resort timeout — do NOT host-signal need (wedges later send).
+          constexpr uint64_t kPreFlushWaitNs = 2'000'000'000ull;
+          bool ok = vulkan_tex_->recycle_frame(ff_->frame, kPreFlushWaitNs, &why);
+          const double wms =
+              std::chrono::duration<double, std::milli>(clock::now() - wt0).count();
+          if (!ok || wms >= 20.0) {
+            VRP_LOG("seekdbg: pre_flush recycle ok=%d why=%s %.1fms | %s", ok ? 1 : 0,
+                    why ? why : "?", wms, vulkan_tex_->debug_state().c_str());
+          }
+          if (!ok && why && std::strcmp(why, "seek_intr") == 0) {
+            // Newer seek while we waited — do not av_seek/flush/reopen for this stale issue.
+            superseded = true;
+            VRP_LOG("seekdbg: pre_flush superseded by newer seek_req — requeue");
+          } else if (!ok) {
+            // Orphan the in-flight AVVkFrame (no unref / no host need-signal) and reopen.
+            leak_avframe(ff_->frame);
+            ff_->frame = av_frame_alloc();
+            flush_unsafe = true;
+            VRP_ERR("seekdbg: pre_flush timeout — orphan frame, reopen codec (no force)");
+          }
+        }
+      }
+      if (superseded) {
+        // Keep demux paused only briefly; re-arm seek_req so the loop applies latest.
+        seek_req_.store(true, std::memory_order_release);
+        demux_pause_.store(false);
+        pkt_cv_.notify_all();
+        set_decode_phase("seek_superseded");
+        continue;
+      }
+#endif
       {
         std::lock_guard<std::mutex> lock(ff_mu_);
 #if defined(VRP_HAS_FFMPEG)
         if (ff_ && ff_->fmt && ff_->video_stream >= 0) {
+          // Prefer latest target if host scrubbed during pre_flush.
+          const uint64_t latest_issue = seek_issue_gen_.load(std::memory_order_acquire);
+          const double t_apply =
+              (latest_issue != issue) ? seek_target_.load(std::memory_order_acquire) : t;
+          if (latest_issue != issue) {
+            seek_apply_gen_.store(latest_issue, std::memory_order_release);
+            seek_req_.store(false, std::memory_order_release);
+            VRP_LOG("seekdbg: apply coalesced issue %llu→%llu target=%.3f",
+                    static_cast<unsigned long long>(issue),
+                    static_cast<unsigned long long>(latest_issue), t_apply);
+          }
+          // Drop our ref before flush so the pool is not waiting on ff_->frame.
+          if (ff_->frame) av_frame_unref(ff_->frame);
+          if (ff_->sw_frame) av_frame_unref(ff_->sw_frame);
           AVStream* st = ff_->fmt->streams[ff_->video_stream];
-          const double sec = std::clamp(t, 0.0, duration_sec_ > 0 ? duration_sec_ : t);
+          const double sec =
+              std::clamp(t_apply, 0.0, duration_sec_ > 0 ? duration_sec_ : t_apply);
           int64_t ts = static_cast<int64_t>(sec / av_q2d(st->time_base));
+          const auto seek_t0 = clock::now();
+          set_decode_phase("seek_av_seek");
           av_seek_frame(ff_->fmt, ff_->video_stream, ts, AVSEEK_FLAG_BACKWARD);
-          avcodec_flush_buffers(ff_->codec);
+          const double seek_ms =
+              std::chrono::duration<double, std::milli>(clock::now() - seek_t0).count();
+          set_decode_phase("seek_flush");
+          const uint64_t applied = seek_apply_gen_.load(std::memory_order_acquire);
+          VRP_LOG("seekdbg: enter flush target=%.3f issue=%llu unsafe=%d | %s", sec,
+                  static_cast<unsigned long long>(applied), flush_unsafe ? 1 : 0,
+                  vulkan_tex_ && vulkan_tex_->enabled() ? vulkan_tex_->debug_state().c_str()
+                                                         : "novk");
+          const auto flush_t0 = clock::now();
+          double flush_ms = 0.0;
+          if (flush_unsafe && vulkan_tex_ && vulkan_tex_->enabled() &&
+              info_.hwaccel.find("vulkan") != std::string::npos) {
+            // Last resort: force-recycle may have failed; still try to close epoch first.
+            vulkan_tex_->sync_gpu_for_seek_reset();
+            if (reopen_vulkan_codec_keep_hw()) {
+              flush_ms =
+                  std::chrono::duration<double, std::milli>(clock::now() - flush_t0).count();
+              VRP_LOG("seekdbg: reopen codec (skip flush) %.1fms target=%.3f", flush_ms, sec);
+            } else {
+              VRP_ERR("seekdbg: reopen failed — attempting flush anyway");
+              avcodec_flush_buffers(ff_->codec);
+              flush_ms =
+                  std::chrono::duration<double, std::milli>(clock::now() - flush_t0).count();
+            }
+          } else {
+            avcodec_flush_buffers(ff_->codec);
+            flush_ms =
+                std::chrono::duration<double, std::milli>(clock::now() - flush_t0).count();
+            if (seek_ms >= 20.0 || flush_ms >= 20.0) {
+              VRP_LOG("seekdbg: av_seek_frame %.1fms flush %.1fms target=%.3f", seek_ms, flush_ms,
+                      sec);
+            } else {
+              VRP_LOG("seekdbg: flush done %.1fms target=%.3f", flush_ms, sec);
+            }
+          }
           position_sec_.store(sec);
+          if (flush_unsafe && (seek_ms >= 20.0 || flush_ms >= 20.0)) {
+            VRP_LOG("seekdbg: av_seek_frame %.1fms recovery %.1fms target=%.3f", seek_ms, flush_ms,
+                    sec);
+          }
         }
 #endif
       }
@@ -1130,6 +1364,7 @@ void VideoDecoder::decode_loop() {
       pkt_cv_.notify_all();
       next_deadline = clock::now();
       awaiting_frame_after_seek_ = true;
+      set_decode_phase("seek_await");
       {
         std::lock_guard<std::mutex> fl(frame_mu_);
         consumed_seq_ = latest_seq_;
@@ -1164,24 +1399,66 @@ void VideoDecoder::decode_loop() {
     }
 
     bool got = false;
+    const bool scrub_preview = seek_scrubbing_.load();
+    // Never start another decode/present while a newer seek is already armed —
+    // return to loop top and consume seek_req first.
+    if (seek_req_.load()) {
+      next_deadline = clock::now();
+      continue;
+    }
     if (open_.load() && (playing_.load() || awaiting_frame_after_seek_)) {
-      // After a seek, discard frames until the requested time. The keyframe is earlier.
+      // Stop-seek: discard until the bar PTS. Scrub: publish intermediates.
       const double present_after =
-          (awaiting_frame_after_seek_ && seek_skips < 300) ? seek_target_.load() : -1.0;
-      got = decode_next(scratch, true, present_after);
+          (awaiting_frame_after_seek_ && seek_skips < 300 && !scrub_preview)
+              ? seek_target_.load()
+              : -1.0;
+      // Scrub: present every approach frame so the panel tracks the bar.
+      // Discard (present_after / seek bail) uses recycle_frame (wait + consumer +1).
+      got = decode_next(scratch, /*convert_rgba=*/true, present_after);
     }
     if (got && awaiting_frame_after_seek_ && scratch.width == 0) {
       ++seek_skips;
       continue;
     }
     if (got) {
-      seek_skips = 0;
+      // Newer seek armed while this frame was in flight — do not land on it.
+      if (awaiting_frame_after_seek_ && seek_req_.load()) {
+        next_deadline = clock::now();
+        continue;
+      }
       {
         std::lock_guard<std::mutex> fl(frame_mu_);
         latest_ = std::move(scratch);
         ++latest_seq_;
       }
       if (awaiting_frame_after_seek_) {
+        const double target = seek_target_.load();
+        // Rewind used to use (pts >= target) which instantly "lands" on the old
+        // forward frame (e.g. pts=315 target=307) and clears seek_busy early.
+        const bool near =
+            std::fabs(latest_.pts_sec - target) <= 0.08 || seek_skips >= 300;
+        // Vulkan scrub must land a gpu frame — gpu=0 must not clear seek_busy.
+        const bool scrub_needs_picture =
+            scrub_preview && vulkan_tex_ && vulkan_tex_->enabled();
+        if (scrub_preview && (!near || (scrub_needs_picture && !latest_.gpu && seek_skips < 300))) {
+          ++seek_skips;
+          if ((seek_skips % 30) == 1 || (near && !latest_.gpu)) {
+            VRP_LOG("seek: scrub approach pts=%.3f target=%.3f skips=%d gpu=%d near=%d",
+                    latest_.pts_sec, target, seek_skips, latest_.gpu ? 1 : 0, near ? 1 : 0);
+          }
+          next_deadline = clock::now();
+          continue;
+        }
+        // Stop-seek: also require proximity (same fabs rule).
+        if (!scrub_preview && !near && seek_skips < 300) {
+          ++seek_skips;
+          next_deadline = clock::now();
+          continue;
+        }
+        VRP_LOG("seek: decode landed pts=%.3f target=%.3f scrub=%d gpu=%d skips=%d",
+                latest_.pts_sec, target, scrub_preview ? 1 : 0, latest_.gpu ? 1 : 0,
+                seek_skips);
+        seek_skips = 0;
         awaiting_frame_after_seek_ = false;
         seek_busy_.store(false);
         av_resync_.store(true);
@@ -1189,6 +1466,7 @@ void VideoDecoder::decode_loop() {
         next_deadline = clock::now() + std::chrono::duration_cast<clock::duration>(
                                            std::chrono::duration<double>(step));
       } else {
+        seek_skips = 0;
         next_deadline += std::chrono::duration_cast<clock::duration>(
             std::chrono::duration<double>(step));
       }
@@ -1220,6 +1498,24 @@ void VideoDecoder::stop_thumbnail_build() {
   // Join so a cancelled NVDEC thumb worker cannot hold cuda_decode_mu across an
   // Hz reconnect (detached workers made the next open_media look "not ready").
   if (thumbs_thread_.joinable()) thumbs_thread_.join();
+}
+
+void VideoDecoder::disable_thumbnail_strip() {
+  stop_thumbnail_build();
+  const uint64_t epoch = thumbs_epoch_.fetch_add(1) + 1;
+  {
+    std::lock_guard<std::mutex> lock(thumbs_mu_);
+    thumbs_ = {};
+    thumbs_.status = "-";
+    info_.thumb_count = 0;
+    info_.thumb_status = "-";
+  }
+  thumbs_ready_.store(false);
+  // Full timeline seekable — no cover ramp from a strip worker.
+  thumb_cover_sec_.store(duration_sec_ > 0.0 ? duration_sec_ : 1.0e9);
+  uint64_t seen = thumbs_done_epoch_.load();
+  while (seen < epoch && !thumbs_done_epoch_.compare_exchange_weak(seen, epoch)) {
+  }
 }
 
 void VideoDecoder::start_thumbnail_build(std::function<void(ThumbnailStrip)> on_done, int max_thumbs,
@@ -1361,11 +1657,15 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
   return false;
 #else
   int err = 0;
+  io_abort_.store(false);
+  VRP_LOG("decoder.open: begin %s", path.c_str());
   {
     // Cap probe so switching high-bitrate files does not stall the XR thread for seconds.
     AVDictionary* open_opts = nullptr;
     av_dict_set(&open_opts, "probesize", "262144", 0);            // 256 KiB
     av_dict_set(&open_opts, "analyzeduration", "500000", 0);      // 0.5s
+    // Local USB can block forever without rw_timeout; keep it modest for XR.
+    av_dict_set(&open_opts, "rw_timeout", "5000000", 0);  // 5s µs
     if (path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0) {
       av_dict_set(&open_opts, "rw_timeout", "8000000", 0);  // 8s µs
       av_dict_set(&open_opts, "reconnect", "1", 0);
@@ -1375,6 +1675,14 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
       av_dict_set(&open_opts, "analyzeduration", "2000000", 0);
       av_dict_set(&open_opts, "probesize", "1048576", 0);
     }
+    // Install interrupt before open_input so USB stalls are abortable.
+    ff_->fmt = avformat_alloc_context();
+    if (!ff_->fmt) {
+      av_dict_free(&open_opts);
+      fail_open(path, "AVFormatContext を確保できません");
+      return false;
+    }
+    install_io_interrupt();
     err = avformat_open_input(&ff_->fmt, path.c_str(), nullptr, &open_opts);
     av_dict_free(&open_opts);
   }
@@ -1382,6 +1690,8 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
     fail_open(path, "ファイルを開けません: " + av_err(err));
     return false;
   }
+  install_io_interrupt();
+  VRP_LOG("decoder.open: demux opened, find_stream_info…");
   ff_->fmt->probesize = 256 * 1024;
   ff_->fmt->max_analyze_duration = 500 * 1000;  // microseconds
   err = avformat_find_stream_info(ff_->fmt, nullptr);
@@ -1417,12 +1727,24 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
     return false;
   }
 
-  // Prefer NVDEC (cuda) then VAAPI. VA-API frames try dma-buf import; otherwise CPU RGBA.
+  // Default: CUDA/NVDEC (NVIDIA standard). Opt-in Vulkan Video via prefer_vulkan_video_
+  // (monasphere.conf vulkan_video=1). H.264 still preflight-skips >4096 / level>52.
   bool hw_ok = false;
-  const AVHWDeviceType try_types[] = {AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VAAPI, AV_HWDEVICE_TYPE_VDPAU,
-                                      AV_HWDEVICE_TYPE_NONE};
-  for (int ti = 0; allow_hwaccel && try_types[ti] != AV_HWDEVICE_TYPE_NONE; ++ti) {
-    const AVHWDeviceType type = try_types[ti];
+  AVHWDeviceType try_types_buf[5];
+  int n_try = 0;
+  const bool vulkan_ok =
+      prefer_vulkan_video_ && vulkan_hw_device_ && vulkan_tex_ && vulkan_tex_->enabled();
+  if (vulkan_ok) {
+    try_types_buf[n_try++] = AV_HWDEVICE_TYPE_VULKAN;
+    try_types_buf[n_try++] = AV_HWDEVICE_TYPE_CUDA;
+  } else {
+    try_types_buf[n_try++] = AV_HWDEVICE_TYPE_CUDA;
+  }
+  try_types_buf[n_try++] = AV_HWDEVICE_TYPE_VAAPI;
+  try_types_buf[n_try++] = AV_HWDEVICE_TYPE_VDPAU;
+  try_types_buf[n_try++] = AV_HWDEVICE_TYPE_NONE;
+  for (int ti = 0; allow_hwaccel && try_types_buf[ti] != AV_HWDEVICE_TYPE_NONE; ++ti) {
+    const AVHWDeviceType type = try_types_buf[ti];
     AVPixelFormat hw_pix = AV_PIX_FMT_NONE;
     for (int i = 0;; ++i) {
       const AVCodecHWConfig* cfg = avcodec_get_hw_config(dec, i);
@@ -1437,10 +1759,32 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
       continue;
     }
 
+    // Preflight: NVIDIA Vulkan Video H.264 maxCodedExtent is 4096², maxLevel 5.2.
+    // (Confirmed via ffmpeg -v verbose on RTX 5060 Ti.) Skip before open2 so we do not
+    // claim hw=vulkan and then decode software YUV.
+    if (type == AV_HWDEVICE_TYPE_VULKAN && dec->id == AV_CODEC_ID_H264) {
+      const int w = ff_->codec->width > 0 ? ff_->codec->width : st->codecpar->width;
+      const int h = ff_->codec->height > 0 ? ff_->codec->height : st->codecpar->height;
+      const int level = ff_->codec->level > 0 ? ff_->codec->level : st->codecpar->level;
+      if (w > 4096 || h > 4096 || level > 52) {
+        VRP_LOG("hwaccel skip vulkan: H.264 %dx%d level=%d outside Vulkan Video caps "
+                "(NVIDIA H.264 ≤4096 / level 52; use CUDA) — not an inject bug",
+                w, h, level);
+        continue;
+      }
+    }
+
     AVBufferRef* ctx = nullptr;
     std::unique_lock<std::mutex> cuda_lock(cuda_decode_mu(), std::defer_lock);
     if (type == AV_HWDEVICE_TYPE_CUDA) cuda_lock.lock();
-    if (av_hwdevice_ctx_create(&ctx, type, nullptr, nullptr, 0) < 0) {
+    if (type == AV_HWDEVICE_TYPE_VULKAN) {
+      if (!vulkan_hw_device_) continue;
+      ctx = av_buffer_ref(vulkan_hw_device_);
+      if (!ctx) {
+        VRP_DBG("hwaccel skip vulkan: av_buffer_ref failed");
+        continue;
+      }
+    } else if (av_hwdevice_ctx_create(&ctx, type, nullptr, nullptr, 0) < 0) {
       VRP_DBG("hwaccel skip %s: av_hwdevice_ctx_create failed", av_hwdevice_get_type_name(type));
       continue;
     }
@@ -1452,6 +1796,9 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
     ff_->hw_device_ctx = ctx;
 
     ff_->codec->thread_count = 1;  // safer with hwaccel
+    // Vulkan Video DPB is small by default; mailbox front+back plus references
+    // can block avcodec_receive_frame (and thus seek_req) without spare slots.
+    if (type == AV_HWDEVICE_TYPE_VULKAN) ff_->codec->extra_hw_frames = 32;
     err = avcodec_open2(ff_->codec, dec, nullptr);
     if (err < 0) {
       VRP_DBG("hwaccel skip %s: avcodec_open2 failed (%s)", av_hwdevice_get_type_name(type),
@@ -1470,6 +1817,9 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
     VRP_LOG("Video hwaccel: %s (pix_fmt=%d)", info_.hwaccel.c_str(), static_cast<int>(hw_pix));
     if (type == AV_HWDEVICE_TYPE_VAAPI && vaapi_tex_ && vaapi_tex_->enabled()) {
       VRP_LOG("VA-API: dma-buf import armed (CPU RGBA if the modifier cannot be sampled)");
+    }
+    if (type == AV_HWDEVICE_TYPE_VULKAN) {
+      VRP_LOG("Vulkan Video: decoder open with injected XR hwctx");
     }
     break;
   }
@@ -1524,8 +1874,11 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
     return false;
   }
   int buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, display_w_, display_h_, 1);
-  // GPU NV12 path never fills this; keep a tiny stub so open still succeeds at 8K.
-  if (cuda_tex_ && cuda_tex_->enabled() && info_.hwaccel.find("cuda") != std::string::npos) {
+  // GPU NV12 / AVVkFrame paths never fill this; tiny stub so 8K open does not OOM.
+  const bool gpu_display =
+      (cuda_tex_ && cuda_tex_->enabled() && info_.hwaccel.find("cuda") != std::string::npos) ||
+      (vulkan_tex_ && vulkan_tex_->enabled() && info_.hwaccel.find("vulkan") != std::string::npos);
+  if (gpu_display) {
     buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, 2, 2, 1);
   }
   auto* buf = static_cast<uint8_t*>(av_malloc(buf_size));
@@ -1534,12 +1887,8 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
     close();
     return false;
   }
-  const int rgba_w = (cuda_tex_ && cuda_tex_->enabled() && info_.hwaccel.find("cuda") != std::string::npos)
-                         ? 2
-                         : display_w_;
-  const int rgba_h = (cuda_tex_ && cuda_tex_->enabled() && info_.hwaccel.find("cuda") != std::string::npos)
-                         ? 2
-                         : display_h_;
+  const int rgba_w = gpu_display ? 2 : display_w_;
+  const int rgba_h = gpu_display ? 2 : display_h_;
   av_image_fill_arrays(ff_->rgba->data, ff_->rgba->linesize, buf, AV_PIX_FMT_RGBA, rgba_w, rgba_h, 1);
 
   info_.path = path;
@@ -1626,6 +1975,76 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
   start_decode_thread();
   return true;
 #endif
+}
+
+bool VideoDecoder::reopen_vulkan_codec_keep_hw() {
+#if defined(VRP_HAS_FFMPEG)
+  if (!ff_ || !ff_->fmt || ff_->video_stream < 0) return false;
+  if (!vulkan_hw_device_ && !ff_->hw_device_ctx) return false;
+  if (info_.hwaccel.find("vulkan") == std::string::npos) return false;
+
+  AVStream* st = ff_->fmt->streams[ff_->video_stream];
+  const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
+  if (!dec) return false;
+
+  AVPixelFormat hw_pix = ff_->hw_opaque.hw_pix_fmt;
+  if (hw_pix == AV_PIX_FMT_NONE) hw_pix = AV_PIX_FMT_VULKAN;
+
+  AVBufferRef* device = nullptr;
+  if (ff_->hw_device_ctx) device = av_buffer_ref(ff_->hw_device_ctx);
+  else if (vulkan_hw_device_) device = av_buffer_ref(vulkan_hw_device_);
+  if (!device) return false;
+
+  AVCodecContext* old = ff_->codec;
+  ff_->codec = nullptr;
+  if (old) {
+    // free_context → exec_pool_free → WaitForFences + lock_queue(queue_mu_).
+    // If the decode CB is wedged, free never returns; a timed detach would leave
+    // queue_mu_ held forever and freeze XR + the new codec. Intentional leak.
+    VRP_ERR("seekdbg: leaking old Vulkan codec (skip free_context — avoids queue_mu deadlock)");
+    (void)old;
+  }
+
+  ff_->codec = avcodec_alloc_context3(dec);
+  if (!ff_->codec) {
+    av_buffer_unref(&device);
+    return false;
+  }
+  if (avcodec_parameters_to_context(ff_->codec, st->codecpar) < 0) {
+    avcodec_free_context(&ff_->codec);
+    av_buffer_unref(&device);
+    return false;
+  }
+  ff_->hw_opaque.hw_pix_fmt = hw_pix;
+  ff_->codec->opaque = &ff_->hw_opaque;
+  ff_->codec->get_format = get_hw_format;
+  ff_->codec->hw_device_ctx = av_buffer_ref(device);
+  ff_->codec->thread_count = 1;
+  ff_->codec->extra_hw_frames = 32;
+  const int err = avcodec_open2(ff_->codec, dec, nullptr);
+  av_buffer_unref(&device);
+  if (err < 0) {
+    VRP_ERR("seekdbg: reopen vulkan codec open2 failed: %s", av_err(err).c_str());
+    avcodec_free_context(&ff_->codec);
+    return false;
+  }
+  VRP_LOG("seekdbg: vulkan codec reopened (hwctx kept)");
+  return true;
+#else
+  return false;
+#endif
+}
+
+void VideoDecoder::abort_decode_async() {
+  decode_stop_.store(true);
+  demux_stop_.store(true);
+  io_abort_.store(true);
+  demux_pause_.store(true);
+  seek_req_.store(false);
+  playing_.store(false);
+  priming_.store(false);
+  pkt_cv_.notify_all();
+  if (vulkan_tex_) vulkan_tex_->set_present_abort(true);
 }
 
 void VideoDecoder::halt_decode() {
@@ -1741,6 +2160,44 @@ void VideoDecoder::set_rate(float rate) {
 
 void VideoDecoder::seek_relative(double delta_sec) { seek_to(position_sec_.load() + delta_sec); }
 
+void VideoDecoder::set_decode_phase(const char* phase) {
+  decode_phase_.store(phase, std::memory_order_release);
+  last_progress_ms_.store(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count(),
+      std::memory_order_release);
+}
+
+std::string VideoDecoder::seek_debug_state() const {
+  size_t qn = 0, qb = 0;
+  packet_queue_stats(qn, qb);
+  const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  const int64_t last = last_progress_ms_.load(std::memory_order_acquire);
+  const int64_t stale = last > 0 ? (now_ms - last) : -1;
+  const char* phase = decode_phase_.load(std::memory_order_acquire);
+  std::ostringstream os;
+  os << "phase=" << (phase ? phase : "?")
+     << " stale_ms=" << stale
+     << " issue=" << seek_issue_gen_.load(std::memory_order_acquire)
+     << " apply=" << seek_apply_gen_.load(std::memory_order_acquire)
+     << " req=" << (seek_req_.load() ? 1 : 0)
+     << " busy=" << (seek_busy_.load() ? 1 : 0)
+     << " scrub=" << (seek_scrubbing_.load() ? 1 : 0)
+     << " play=" << (playing_.load() ? 1 : 0)
+     << " prime=" << (priming_.load() ? 1 : 0)
+     << " demux_pause=" << (demux_pause_.load() ? 1 : 0)
+     << " eof=" << (demux_eof_.load() ? 1 : 0)
+     << " target=" << seek_target_.load()
+     << " pos=" << position_sec_.load()
+     << " seq=" << latest_seq_  // unlocked; debug snapshot only
+     << " q=" << qn << "/" << (qb / 1024) << "KiB";
+  if (vulkan_tex_) os << " | " << vulkan_tex_->debug_state();
+  return os.str();
+}
+
 void VideoDecoder::seek_to(double sec) {
   if (!open_.load()) return;
   if (duration_sec_ > 0) sec = std::clamp(sec, 0.0, duration_sec_);
@@ -1753,9 +2210,42 @@ void VideoDecoder::seek_to(double sec) {
   seek_busy_.store(true);
   seek_target_.store(sec);
   position_sec_.store(sec);
+  const uint64_t issue = seek_issue_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
   seek_req_.store(true);
   av_resync_.store(false);
+  VRP_LOG("seekdbg: host seek_to sec=%.3f issue=%llu apply=%llu phase=%s req=1 busy=1 scrub=%d",
+          sec, static_cast<unsigned long long>(issue),
+          static_cast<unsigned long long>(seek_apply_gen_.load(std::memory_order_acquire)),
+          decode_phase_.load(std::memory_order_acquire)
+              ? decode_phase_.load(std::memory_order_acquire)
+              : "?",
+          seek_scrubbing_.load() ? 1 : 0);
 }
+
+void VideoDecoder::clear_seek_in_flight() {
+  seek_req_.store(false);
+  seek_busy_.store(false);
+  seek_abandon_.store(true);
+  if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
+  VRP_LOG("seekdbg: clear_seek_in_flight | %s", seek_debug_state().c_str());
+}
+
+void VideoDecoder::force_resume_after_seek() {
+  seek_req_.store(false);
+  seek_busy_.store(false);
+  seek_abandon_.store(true);
+  seek_scrubbing_.store(false);
+  priming_.store(false);
+  playback_started_.store(true);
+  // If decode wedged inside seek_av_seek/flush, demux_pause would otherwise stick
+  // and starve the pipeline forever after host TIMEOUT.
+  demux_pause_.store(false);
+  pkt_cv_.notify_all();
+  if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
+  VRP_LOG("seekdbg: force_resume_after_seek | %s", seek_debug_state().c_str());
+}
+
+bool VideoDecoder::consume_seek_abandon() { return seek_abandon_.exchange(false); }
 
 bool VideoDecoder::consume_av_resync() { return av_resync_.exchange(false); }
 
@@ -1782,6 +2272,16 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
 #else
   if (!ff_ || !ff_->fmt) return false;
   while (!decode_stop_.load() && !demux_pause_.load()) {
+    // Host armed a newer seek — return to decode_loop to consume seek_req
+    // instead of waiting on the previous frame's GPU semaphore.
+    if (seek_req_.load()) {
+      set_decode_phase("decode_next_bail_req");
+      out = {};
+      out.width = 0;
+      out.height = 0;
+      return true;
+    }
+    set_decode_phase("pop_packet");
     if (!pop_video_packet()) {
       if (demux_eof_.load()) {
         playing_.store(false);
@@ -1789,141 +2289,375 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
         seek_target_.store(0);
         seek_req_.store(true);
         looped_.store(true);
+      } else if (playing_.load()) {
+        static std::atomic<int> starve_n{0};
+        const int n = starve_n.fetch_add(1) + 1;
+        if (n <= 6 || (n % 60) == 0) {
+          size_t qn = 0, qb = 0;
+          packet_queue_stats(qn, qb);
+          VRP_LOG("decode: packet starve #%d q=%zu bytes=%.2fMiB eof=%d demux_pause=%d pos=%.3f",
+                  n, qn, static_cast<double>(qb) / (1024.0 * 1024.0), demux_eof_.load() ? 1 : 0,
+                  demux_pause_.load() ? 1 : 0, position_sec_.load());
+        }
       }
+      set_decode_phase("pop_empty");
       return false;
     }
-    std::lock_guard<std::mutex> lock(ff_mu_);
+    set_decode_phase("ff_mu_lock");
+    std::unique_lock<std::mutex> lock(ff_mu_);
     if (!ff_->codec) return false;
     std::unique_lock<std::mutex> cuda_lock(cuda_decode_mu(), std::defer_lock);
     if (ff_->hw_device_ctx) {
       auto* hw = reinterpret_cast<AVHWDeviceContext*>(ff_->hw_device_ctx->data);
       if (hw && hw->type == AV_HWDEVICE_TYPE_CUDA) cuda_lock.lock();
     }
-    if (avcodec_send_packet(ff_->codec, ff_->packet) < 0) {
-      av_packet_unref(ff_->packet);
-      continue;
-    }
-    av_packet_unref(ff_->packet);
-    while (avcodec_receive_frame(ff_->codec, ff_->frame) == 0) {
-      AVStream* st = ff_->fmt->streams[ff_->video_stream];
-      if (ff_->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-        position_sec_.store(ff_->frame->best_effort_timestamp * av_q2d(st->time_base));
-      } else {
-        position_sec_.store(position_sec_.load() + frame_duration_);
-      }
-      out = {};
-      out.pts_sec = position_sec_.load();
-      if (present_after_sec >= 0.0 && out.pts_sec + 0.04 < present_after_sec) {
+
+    // Send/receive with EAGAIN retry. Unlock ff_mu_ around send so demux can read;
+    // seek apply stays on this thread and only runs after decode_next returns.
+    bool packet_sent = false;
+    for (int send_tries = 0; send_tries < 8 && !packet_sent; ++send_tries) {
+      if (seek_req_.load()) {
+        set_decode_phase("send_bail_req");
+        out = {};
         out.width = 0;
         out.height = 0;
         return true;
       }
-      if (!convert_rgba) {
-        out.width = width_;
-        out.height = height_;
+      AVCodecContext* codec = ff_->codec;
+      AVPacket* pkt = ff_->packet;
+      lock.unlock();
+      set_decode_phase("send_packet");
+      // Vulkan: bound send — wedged decode CB can block forever in WaitForFences.
+      const bool vk_send = vulkan_tex_ && vulkan_tex_->enabled() &&
+                           info_.hwaccel.find("vulkan") != std::string::npos;
+      constexpr int kSendTimeoutMs = 3000;
+      const int serr =
+          vk_send ? send_packet_timed(codec, pkt, kSendTimeoutMs) : avcodec_send_packet(codec, pkt);
+      lock.lock();
+      if (vk_send && serr == AVERROR_EXTERNAL) {
+        if (ff_->frame) {
+          leak_avframe(ff_->frame);
+          ff_->frame = av_frame_alloc();
+        }
+        ff_->codec = nullptr;  // abandon; worker holds `codec`
+        (void)codec;
+        av_packet_unref(ff_->packet);
+        lock.unlock();
+        VRP_ERR("seekdbg: send_packet timeout — kick then reopen");
+        for (int i = 0; i < 4 && !decode_stop_.load(); ++i) {
+          if (vulkan_tex_) vulkan_tex_->kick_gpu_activity();
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (decode_stop_.load()) {
+          set_decode_phase("send_timeout_halt");
+          out = {};
+          out.width = 0;
+          out.height = 0;
+          return false;
+        }
+        lock.lock();
+        vulkan_tex_->sync_gpu_for_seek_reset();
+        if (!reopen_vulkan_codec_keep_hw()) {
+          VRP_ERR("seekdbg: send_packet timeout reopen failed");
+          playing_.store(false);
+          seek_busy_.store(false);
+          awaiting_frame_after_seek_ = false;
+          demux_pause_.store(false);
+          pkt_cv_.notify_all();
+          set_decode_phase("send_timeout_reopen_fail");
+          out = {};
+          out.width = 0;
+          out.height = 0;
+          return true;
+        }
+        if (seek_busy_.load()) seek_req_.store(true, std::memory_order_release);
+        set_decode_phase("send_timeout_reopen");
+        out = {};
+        out.width = 0;
+        out.height = 0;
         return true;
       }
-
-      // Prefer CUDA→Vulkan NV12 (decode thread only). Skip CPU transfer when that path is live.
-      out.gpu = false;
-      {
-        static std::atomic<int> fmt_logs{0};
-        const int n = fmt_logs.fetch_add(1);
-        if (n < 6) {
-          VRP_DBG("decode frame#%d fmt=%d (CUDA=%d) hw_pix=%d data0=%p data1=%p %dx%d cuda_tex=%d", n,
-                  ff_->frame->format, static_cast<int>(AV_PIX_FMT_CUDA),
-                  static_cast<int>(ff_->hw_opaque.hw_pix_fmt),
-                  static_cast<void*>(ff_->frame->data[0]), static_cast<void*>(ff_->frame->data[1]),
-                  ff_->frame->width, ff_->frame->height, (cuda_tex_ && cuda_tex_->enabled()) ? 1 : 0);
-        }
-      }
-      if (ff_->hw_device_ctx && ff_->frame->format == AV_PIX_FMT_CUDA && cuda_tex_ && cuda_tex_->enabled()) {
-        struct AvCudaDeviceCtx {
-          void* cuda_ctx = nullptr;
-          void* stream = nullptr;
-          void* internal = nullptr;
-        };
-        auto* hw = reinterpret_cast<AVHWDeviceContext*>(ff_->hw_device_ctx->data);
-        auto* cuc = reinterpret_cast<AvCudaDeviceCtx*>(hw->hwctx);
-        if (!cuc || !cuc->cuda_ctx) {
-          static std::atomic<bool> once{false};
-          if (!once.exchange(true)) VRP_ERR("decode: AVCUDADeviceContext missing cuda_ctx");
-          out.width = width_;
-          out.height = height_;
-          return true;
-        }
-        if (cuda_tex_->try_copy_from_cuda(ff_->frame, cuc->cuda_ctx, cuc->stream,
-                                          ff_->codec && ff_->codec->color_range == AVCOL_RANGE_JPEG)) {
-          out.width = width_;
-          out.height = height_;
-          out.gpu = true;
-          out.full_range = cuda_tex_->full_range();
-          {
-            static std::atomic<bool> range_logged{false};
-            if (!range_logged.exchange(true)) {
-              VRP_LOG("NV12 color_range frame=%d codec=%d → %s",
-                      static_cast<int>(ff_->frame->color_range),
-                      ff_->codec ? static_cast<int>(ff_->codec->color_range) : -1,
-                      out.full_range ? "full" : "limited");
-            }
-          }
-          return true;
-        }
-        // Busy or copy failed — drop frame (do not fall back to 8K CPU RGBA).
-        out.width = width_;
-        out.height = height_;
-        return true;
-      }
-
-      if (ff_->hw_device_ctx && ff_->frame->format == AV_PIX_FMT_VAAPI && vaapi_tex_ && vaapi_tex_->enabled()) {
-        const bool full = ff_->codec && ff_->codec->color_range == AVCOL_RANGE_JPEG;
-        if (vaapi_tex_->try_import(ff_->frame, full)) {
-          out.width = width_;
-          out.height = height_;
-          out.gpu = true;
-          out.full_range = vaapi_tex_->full_range();
-          return true;
-        }
-      }
-
-      AVFrame* src = ff_->frame;
-      if (ff_->hw_device_ctx && ff_->frame->format == ff_->hw_opaque.hw_pix_fmt) {
-        if (av_hwframe_transfer_data(ff_->sw_frame, ff_->frame, 0) < 0) {
-          VRP_ERR("av_hwframe_transfer_data failed");
-          continue;
-        }
-        src = ff_->sw_frame;
-      }
-      const AVPixelFormat src_fmt = static_cast<AVPixelFormat>(src->format);
-      if (!ff_->sws || ff_->sws_src_fmt != src_fmt || src->width != ff_->sws_src_w ||
-          src->height != ff_->sws_src_h) {
-        if (ff_->sws) sws_freeContext(ff_->sws);
-        const bool full = src->color_range == AVCOL_RANGE_JPEG;
-        ff_->sws = sws_make(src->width, src->height, src_fmt, display_w_, display_h_, AV_PIX_FMT_RGBA,
-                            SWS_BILINEAR, full, /*dst_full=*/true);
-        ff_->sws_src_fmt = src_fmt;
-        ff_->sws_src_w = src->width;
-        ff_->sws_src_h = src->height;
-        if (!ff_->sws) {
-          VRP_ERR("sws_getContext failed %dx%d → %dx%d fmt=%d", src->width, src->height, display_w_,
-                  display_h_, static_cast<int>(src_fmt));
-          continue;
-        }
-      }
-      sws_scale(ff_->sws, src->data, src->linesize, 0, src->height, ff_->rgba->data, ff_->rgba->linesize);
-      const size_t need = static_cast<size_t>(display_w_) * static_cast<size_t>(display_h_) * 4;
-      out.width = display_w_;
-      out.height = display_h_;
-      out.rgba.resize(need);
-      if (ff_->rgba->linesize[0] == display_w_ * 4) {
-        std::memcpy(out.rgba.data(), ff_->rgba->data[0], need);
+      if (serr == AVERROR(EAGAIN)) {
+        set_decode_phase("send_eagain");
+        // Must drain output before retrying the same packet.
+      } else if (serr < 0) {
+        av_packet_unref(ff_->packet);
+        packet_sent = true;  // drop; outer loop pops next
+        break;
       } else {
-        for (int y = 0; y < display_h_; ++y) {
-          std::memcpy(out.rgba.data() + static_cast<size_t>(y * display_w_ * 4),
-                      ff_->rgba->data[0] + y * ff_->rgba->linesize[0], static_cast<size_t>(display_w_ * 4));
-        }
+        av_packet_unref(ff_->packet);
+        packet_sent = true;
       }
-      return true;
+
+      set_decode_phase("receive_frame");
+      while (avcodec_receive_frame(ff_->codec, ff_->frame) == 0) {
+        set_decode_phase("got_frame");
+        AVStream* st = ff_->fmt->streams[ff_->video_stream];
+        if (ff_->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
+          position_sec_.store(ff_->frame->best_effort_timestamp * av_q2d(st->time_base));
+        } else {
+          position_sec_.store(position_sec_.load() + frame_duration_);
+        }
+        out = {};
+        out.pts_sec = position_sec_.load();
+        out.gpu = false;
+
+        // Vulkan timeline: every received frame must either enter the mailbox
+        // (consumer +1 on mailbox return) or recycle_frame (+1 here). Wait-only
+        // discard left need=D+2 cur=D and wedged wait_avframe under scrub.
+        if (ff_->hw_device_ctx && ff_->frame->format == AV_PIX_FMT_VULKAN && vulkan_tex_ &&
+            vulkan_tex_->enabled()) {
+          if (vulkan_tex_->present_abort()) {
+            set_decode_phase("present_bail_abort");
+            out.width = 0;
+            out.height = 0;
+            return true;
+          }
+          const bool skip_before =
+              present_after_sec >= 0.0 && out.pts_sec + 0.04 < present_after_sec;
+          const bool drop_for_seek = seek_req_.load();
+          const bool want_mailbox = convert_rgba && !skip_before && !drop_for_seek;
+          // Seek land: kick_gpu during wait; short last-resort if still stalled.
+          const uint64_t wait_ns =
+              seek_busy_.load(std::memory_order_acquire) ? 2'000'000'000ull : 0ull;
+          const char* wait_why = "ok";
+          set_decode_phase("wait_avframe");
+          lock.unlock();
+          auto recover_land_timeout = [&]() {
+            VRP_ERR("seekdbg: land wait timeout — orphan frame, reopen, re-seek (no force)");
+            lock.lock();
+            leak_avframe(ff_->frame);
+            ff_->frame = av_frame_alloc();
+            if (info_.hwaccel.find("vulkan") != std::string::npos) {
+              vulkan_tex_->sync_gpu_for_seek_reset();
+              (void)reopen_vulkan_codec_keep_hw();
+            }
+            // Fresh codec has no DPB at target — re-apply seek.
+            seek_req_.store(true, std::memory_order_release);
+            set_decode_phase("land_reopen_reseek");
+            out.width = 0;
+            out.height = 0;
+          };
+          if (!want_mailbox) {
+            // Seek armed: do not block apply behind recycle wait — seek_req handler
+            // waits for the real GPU timeline in pre_flush, then +1 / flush.
+            if (drop_for_seek) {
+              lock.lock();
+              set_decode_phase("receive_bail_req");
+              out.width = 0;
+              out.height = 0;
+              return true;
+            }
+            const bool recycled = vulkan_tex_->recycle_frame(ff_->frame, wait_ns, &wait_why);
+            if (!recycled && wait_why && std::strcmp(wait_why, "timeout") == 0) {
+              recover_land_timeout();
+              return true;
+            }
+            lock.lock();
+            if (!recycled) {
+              set_decode_phase("present_bail_abort");
+              out.width = 0;
+              out.height = 0;
+              return true;
+            }
+            if (skip_before) {
+              set_decode_phase("present_after_skip");
+              out.width = 0;
+              out.height = 0;
+              return true;
+            }
+            set_decode_phase("receive_bail_req");
+            out.width = 0;
+            out.height = 0;
+            return true;
+          }
+          const bool full = ff_->codec && ff_->codec->color_range == AVCOL_RANGE_JPEG;
+          const bool presented =
+              vulkan_tex_->try_present(ff_->frame, full, wait_ns, &wait_why);
+          if (!presented && wait_why && std::strcmp(wait_why, "timeout") == 0 &&
+              seek_busy_.load()) {
+            recover_land_timeout();
+            return true;
+          }
+          lock.lock();
+          if (presented) {
+            set_decode_phase("presented");
+            out.width = width_;
+            out.height = height_;
+            out.gpu = true;
+            out.full_range = vulkan_tex_->full_range();
+            return true;
+          }
+          // seek_intr: GPU has not reached need yet — defer +1 to seek pre_flush.
+          if (wait_why && std::strcmp(wait_why, "seek_intr") == 0 && seek_req_.load()) {
+            set_decode_phase("present_seek_intr");
+            out.width = 0;
+            out.height = 0;
+            return true;
+          }
+          // Waited but did not park — must consumer-+1 ourselves (ledger-safe).
+          lock.unlock();
+          (void)vulkan_tex_->recycle_frame(ff_->frame, wait_ns, &wait_why);
+          lock.lock();
+          static std::atomic<int> drop_n{0};
+          const int n = drop_n.fetch_add(1) + 1;
+          if (n <= 8 || (n % 30) == 0 || (wait_why && std::strcmp(wait_why, "ok") != 0)) {
+            VRP_LOG("seekdbg: try_present fail #%d why=%s pos=%.3f seek=%d req=%d | %s", n,
+                    wait_why ? wait_why : "?", out.pts_sec, seek_busy_.load() ? 1 : 0,
+                    seek_req_.load() ? 1 : 0, vulkan_tex_->debug_state().c_str());
+          }
+          set_decode_phase("present_fail");
+          if (seek_busy_.load() || seek_req_.load()) {
+            out.width = 0;
+            out.height = 0;
+            return true;
+          }
+          out.width = width_;
+          out.height = height_;
+          return true;
+        }
+
+        if (seek_req_.load()) {
+          set_decode_phase("receive_bail_req");
+          out.width = 0;
+          out.height = 0;
+          return true;
+        }
+        if (present_after_sec >= 0.0 && out.pts_sec + 0.04 < present_after_sec) {
+          set_decode_phase("present_after_skip");
+          out.width = 0;
+          out.height = 0;
+          return true;
+        }
+        if (!convert_rgba) {
+          out.width = width_;
+          out.height = height_;
+          return true;
+        }
+
+        {
+          static std::atomic<int> fmt_logs{0};
+          const int n = fmt_logs.fetch_add(1);
+          if (n < 6) {
+            VRP_DBG("decode frame#%d fmt=%d (CUDA=%d) hw_pix=%d data0=%p data1=%p %dx%d cuda_tex=%d", n,
+                    ff_->frame->format, static_cast<int>(AV_PIX_FMT_CUDA),
+                    static_cast<int>(ff_->hw_opaque.hw_pix_fmt),
+                    static_cast<void*>(ff_->frame->data[0]), static_cast<void*>(ff_->frame->data[1]),
+                    ff_->frame->width, ff_->frame->height, (cuda_tex_ && cuda_tex_->enabled()) ? 1 : 0);
+          }
+        }
+
+        // hw=vulkan/cuda claimed but frame is software — never sws_scale 8K (CPU crawl).
+        if (ff_->hw_device_ctx && info_.hwaccel_active &&
+            (info_.hwaccel.find("vulkan") != std::string::npos ||
+             info_.hwaccel.find("cuda") != std::string::npos) &&
+            ff_->frame->format != AV_PIX_FMT_VULKAN && ff_->frame->format != AV_PIX_FMT_CUDA &&
+            ff_->frame->format != AV_PIX_FMT_VAAPI) {
+          static std::atomic<int> bad_fmt_n{0};
+          const int n = bad_fmt_n.fetch_add(1) + 1;
+          if (n <= 8 || (n % 120) == 0) {
+            VRP_ERR("decode: hw=%s but frame pix_fmt=%d (%s) — drop (no 8K CPU RGBA)",
+                    info_.hwaccel.c_str(), ff_->frame->format,
+                    av_get_pix_fmt_name(static_cast<AVPixelFormat>(ff_->frame->format))
+                        ? av_get_pix_fmt_name(static_cast<AVPixelFormat>(ff_->frame->format))
+                        : "?");
+          }
+          out.width = width_;
+          out.height = height_;
+          return true;
+        }
+
+        if (ff_->hw_device_ctx && ff_->frame->format == AV_PIX_FMT_CUDA && cuda_tex_ &&
+            cuda_tex_->enabled()) {
+          struct AvCudaDeviceCtx {
+            void* cuda_ctx = nullptr;
+            void* stream = nullptr;
+            void* internal = nullptr;
+          };
+          auto* hw = reinterpret_cast<AVHWDeviceContext*>(ff_->hw_device_ctx->data);
+          auto* cuc = reinterpret_cast<AvCudaDeviceCtx*>(hw->hwctx);
+          if (!cuc || !cuc->cuda_ctx) {
+            static std::atomic<bool> once{false};
+            if (!once.exchange(true)) VRP_ERR("decode: AVCUDADeviceContext missing cuda_ctx");
+            out.width = width_;
+            out.height = height_;
+            return true;
+          }
+          if (cuda_tex_->try_copy_from_cuda(ff_->frame, cuc->cuda_ctx, cuc->stream,
+                                            ff_->codec && ff_->codec->color_range == AVCOL_RANGE_JPEG)) {
+            out.width = width_;
+            out.height = height_;
+            out.gpu = true;
+            out.full_range = cuda_tex_->full_range();
+            {
+              static std::atomic<bool> range_logged{false};
+              if (!range_logged.exchange(true)) {
+                VRP_LOG("NV12 color_range frame=%d codec=%d → %s",
+                        static_cast<int>(ff_->frame->color_range),
+                        ff_->codec ? static_cast<int>(ff_->codec->color_range) : -1,
+                        out.full_range ? "full" : "limited");
+              }
+            }
+            return true;
+          }
+          out.width = width_;
+          out.height = height_;
+          return true;
+        }
+
+        if (ff_->hw_device_ctx && ff_->frame->format == AV_PIX_FMT_VAAPI && vaapi_tex_ &&
+            vaapi_tex_->enabled()) {
+          const bool full = ff_->codec && ff_->codec->color_range == AVCOL_RANGE_JPEG;
+          if (vaapi_tex_->try_import(ff_->frame, full)) {
+            out.width = width_;
+            out.height = height_;
+            out.gpu = true;
+            out.full_range = vaapi_tex_->full_range();
+            return true;
+          }
+        }
+
+        AVFrame* src = ff_->frame;
+        if (ff_->hw_device_ctx && ff_->frame->format == ff_->hw_opaque.hw_pix_fmt) {
+          if (av_hwframe_transfer_data(ff_->sw_frame, ff_->frame, 0) < 0) {
+            VRP_ERR("av_hwframe_transfer_data failed");
+            continue;
+          }
+          src = ff_->sw_frame;
+        }
+        const AVPixelFormat src_fmt = static_cast<AVPixelFormat>(src->format);
+        if (!ff_->sws || ff_->sws_src_fmt != src_fmt || src->width != ff_->sws_src_w ||
+            src->height != ff_->sws_src_h) {
+          if (ff_->sws) sws_freeContext(ff_->sws);
+          const bool full = src->color_range == AVCOL_RANGE_JPEG;
+          ff_->sws = sws_make(src->width, src->height, src_fmt, display_w_, display_h_, AV_PIX_FMT_RGBA,
+                              SWS_BILINEAR, full, /*dst_full=*/true);
+          ff_->sws_src_fmt = src_fmt;
+          ff_->sws_src_w = src->width;
+          ff_->sws_src_h = src->height;
+          if (!ff_->sws) {
+            VRP_ERR("sws_getContext failed %dx%d → %dx%d fmt=%d", src->width, src->height, display_w_,
+                    display_h_, static_cast<int>(src_fmt));
+            continue;
+          }
+        }
+        sws_scale(ff_->sws, src->data, src->linesize, 0, src->height, ff_->rgba->data, ff_->rgba->linesize);
+        const size_t need = static_cast<size_t>(display_w_) * static_cast<size_t>(display_h_) * 4;
+        out.width = display_w_;
+        out.height = display_h_;
+        out.rgba.resize(need);
+        if (ff_->rgba->linesize[0] == display_w_ * 4) {
+          std::memcpy(out.rgba.data(), ff_->rgba->data[0], need);
+        } else {
+          for (int y = 0; y < display_h_; ++y) {
+            std::memcpy(out.rgba.data() + static_cast<size_t>(y * display_w_ * 4),
+                        ff_->rgba->data[0] + y * ff_->rgba->linesize[0], static_cast<size_t>(display_w_ * 4));
+          }
+        }
+        return true;
+      }
+      // EAGAIN path: drained; loop to retry send with same packet.
+      if (packet_sent) break;
     }
   }
   return false;
@@ -1948,6 +2682,12 @@ bool VideoDecoder::take_latest(VideoFrame& out_frame) {
   latest_ = {};
   consumed_seq_ = latest_seq_;
   return out_frame.gpu || !out_frame.rgba.empty();
+}
+
+void VideoDecoder::packet_queue_stats(size_t& packets, size_t& bytes) const {
+  std::lock_guard<std::mutex> lk(pkt_mu_);
+  packets = pkt_q_.size();
+  bytes = pkt_bytes_;
 }
 
 

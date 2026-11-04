@@ -32,6 +32,7 @@ live_chrome_scale=1      # Chromium --force-device-scale-factor (keep 1 when Vir
 live_cursor_scale=1      # 1–6 stick cursor gain (exponential curve; lower = slower)
 live_chrome_profile=default  # default = system Chrome logins; isolated = monasphere profile
 # FSR1 for browser Live only (not [アプリ] / not file UI). 0=Off 1=UQ 2=Q 3=P (default).
+# □ / X (menus closed) cycles Off→UQ→Q→P and writes this key. File FSR stays preferred_fsr / UI.
 live_fsr=3
 live_output=             # filled with Virtual-monaSphere on first setup
 # One ScreenCast Remember token for Virtual-monaSphere (x2/x3 sizes reuse it).
@@ -39,18 +40,18 @@ live_restore_token=
 # Tools → Set up uses x1 size once (ignored if missing; setup always auth once at x1).
 live_setup_spans=1
 # HMD Roots menu — indexed slots (Name|URL). Empty slots are ignored; fill the next index to add.
-live_app[0]=YouTube|https://www.youtube.com/
+live_app[0]=Example|https://example.com/
 live_app[1]=
 # HMD [アプリ] — single-window GUI on Virtual-monaSphere (Name|exec[|arg…]).
 # App process exit stops ScreenCast. No seed; leave empty until you add entries.
 live_desktop_app[0]=
 # Titles: Name|x1…x3|arg…  (fixed width from live_virtual_size; height shrinks)
 # e.g. live_virtual_size=3840x2160 → x1 3840×2160, x2 3840×1440, x3 3840×960
-# live_desktop_app[0]=RetroArch|/usr/bin/retroarch
-# live_desktop_app[0].title[0]=タイトル１|x1
+# live_desktop_app[0]=App|/usr/bin/app
+# live_desktop_app[0].title[0]=Title A|x1
 # Args: one `|` field each, or shell-like in one field (spaces + ~ expanded):
-# live_desktop_app[0].title[1]=Darius|x3|-f|-L|~/.config/retroarch/cores/mame2003_plus_libretro.so|~/.config/retroarch/roms/darius.zip
-# live_desktop_app[0].title[1]=Darius|x3|-f -L ~/.config/retroarch/cores/mame2003_plus_libretro.so ~/.config/retroarch/roms/darius.zip
+# live_desktop_app[0].title[1]=Title B|x3|-flag|/path/to/data
+# live_desktop_app[0].title[1]=Title B|x3|-flag ~/path/to/data
 ```
 
 `live_virtual_scale` sets `krfb-virtualmonitor --scale` and kscreen (Plasma
@@ -83,7 +84,7 @@ output name changes — re-run Set up).
    - KWin place **before** launch; ScreenCast only after place succeeds
    - if conf still has `live_restore_token=` empty after setup, the portal did not
      grant persistence — re-run Set up with Remember checked.
-4. In the HMD file menu, open a **`[Name]`** from `live_app[N]=` (default `[YouTube]`)
+4. In the HMD file menu, open a **`[Name]`** from `live_app[N]=`
    — recreates Virtual at the requested span size and restores ScreenCast with the
    same token (no picker if still valid).
 5. Leave the live app in the HMD (Options / ○ long) to stop Chromium / PipeWire
@@ -134,7 +135,7 @@ window may be parked off-screen after setup.
 
 ## In the HMD
 
-Open the file menu → a **`[Name]`** entry from `live_app[N]=` (default `[YouTube]`).
+Open the file menu → a **`[Name]`** entry from `live_app[N]=`.
 Every live app is forced **borderless fullscreen** on the Virtual MONITOR.
 
 | Control | Action |
@@ -143,7 +144,7 @@ Every live app is forced **borderless fullscreen** on the Virtual MONITOR.
 | R stick | Scroll (vertical mouse wheel) |
 | 十字 | Coarse cursor steps |
 | × | Click |
-| ○ short | Browser **Back** (YouTube / live browser only) |
+| ○ short | Browser **Back** (live browser only; not `[アプリ]`) |
 | PS long | Open/close VR menu (monaSphere-wide; [アプリ] swallows via pad filter) |
 | Options long | Also opens/closes VR menu |
 | L3+R3 | Recenter (monaSphere-wide) |
@@ -298,15 +299,14 @@ test path.
 Titles use **monitor span** instead of raw WxH:
 
 ```
-live_desktop_app[0]=RetroArch|/usr/bin/retroarch
-live_desktop_app[0].title[0]=タイトル１|x1
-live_desktop_app[0].title[1]=Darius|x3|-f|-L|~/.config/retroarch/cores/mame2003_plus_libretro.so|~/.config/retroarch/roms/darius.zip
+live_desktop_app[0]=App|/usr/bin/app
+live_desktop_app[0].title[0]=Title A|x1
+live_desktop_app[0].title[1]=Title B|x3|-flag|/path/to/data
 ```
 
 Launch args after `xN` are separate `|` fields (or one shell-like field with spaces).
-`~` is expanded. Do **not** put `-L /path/core.so /path/rom` as a single
-un-split token without spaces handled — that used to pass one argv to RetroArch
-so the core never loaded.
+`~` is expanded. Do **not** glue several path arguments into one `|` field without
+spaces — they become a single argv and the app may never see the intended files.
 
 `x1` / `x2` / `x3` keep the **width** of `live_virtual_size` and shrink **height**
 so wider aspects fit without exploding pixel count (4K-friendly):
@@ -342,8 +342,8 @@ starts playback.
 same return-to-[アプリ] flag so the menu is not skipped. Stop by process exit or
 launching something else from the menu.
 
-Apps that **recreate their window** on content start (e.g. RetroArch launcher →
-core) stay on Virtual-monaSphere via a session KWin Window Rule (discovered
+Apps that **recreate their window** on content start (launcher → child process)
+stay on Virtual-monaSphere via a session KWin Window Rule (discovered
 `wmclass`, **Force screen only**) plus a sticky `windowAdded` place script.
 Fullscreen / borderless is left to the app (same as on the primary display);
 monaSphere does not Force compositor fullscreen for `[アプリ]` (that caused a

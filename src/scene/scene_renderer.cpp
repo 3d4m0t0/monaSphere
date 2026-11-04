@@ -429,8 +429,12 @@ void SceneRenderer::init(XrVulkanApp& app, const std::string& shader_dir) {
 
 void SceneRenderer::shutdown() {
   if (!device_) return;
-  vkDeviceWaitIdle(device_);
+  // Timed fence only — DeviceWaitIdle hangs forever if the shared graphics queue
+  // was wedged (Vulkan Video sample before acquire / bad timeline).
   if (submit_fence_) {
+    if (vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, 200'000'000ull) != VK_SUCCESS) {
+      VRP_ERR("scene.shutdown: submit fence timeout — destroying anyway");
+    }
     vkDestroyFence(device_, submit_fence_, nullptr);
     submit_fence_ = VK_NULL_HANDLE;
   }
@@ -2232,13 +2236,34 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
   vkEndCommandBuffer(cmd);
 }
 
-void SceneRenderer::render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo& frame,
+bool SceneRenderer::render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo& frame,
                                  std::vector<XrCompositionLayerProjectionView>& proj_views,
                                  XrCompositionLayerProjection& layer) {
   if (submit_fence_) {
     // Must finish the previous eye submit before rewriting its command buffers.
-    // Never skip the layer: empty end_frame causes reprojection ghosting on head turn.
-    vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE, UINT64_MAX);
+    // Never UINT64_MAX; never reset an in-flight fence. After a known wedge, poll
+    // quickly so XR does not burn 5s every tick (blackout).
+    const int max_spin = eye_fence_wedged_ ? 0 : 20;  // ~0 or ~2s
+    for (int spin = 0;; ++spin) {
+      const VkResult wr =
+          vkWaitForFences(device_, 1, &submit_fence_, VK_TRUE,
+                          eye_fence_wedged_ ? 0ull : 100'000'000ull);
+      if (wr == VK_SUCCESS) {
+        eye_fence_wedged_ = false;
+        break;
+      }
+      if (spin >= max_spin) {
+        if (!eye_fence_wedged_) {
+          eye_fence_wedged_ = true;
+          VRP_ERR("render_frame: eye fence stuck — skip submit until queue recovers");
+        }
+        layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        layer.space = app.app_space();
+        layer.viewCount = 0;
+        layer.views = nullptr;
+        return false;
+      }
+    }
     vkResetFences(device_, 1, &submit_fence_);
   }
   // Descriptors are idle now — apply any video rebind staged from the XR loop.
@@ -2289,9 +2314,14 @@ void SceneRenderer::render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo&
     si.commandBufferCount = frame.view_count;
     si.pCommandBuffers = cmds_.data();
   }
+
   {
     std::lock_guard<std::mutex> qlock(app.queue_mutex());
-    VRP_CHECK(vkQueueSubmit(app.queue(), 1, &si, submit_fence_) == VK_SUCCESS, "eye submit");
+    const VkResult qr = vkQueueSubmit(app.queue(), 1, &si, submit_fence_);
+    if (qr != VK_SUCCESS) {
+      app.report_if_device_lost(qr);
+      VRP_CHECK(false, "eye submit");
+    }
   }
 
   for (uint32_t i = 0; i < frame.view_count; ++i) {
@@ -2310,6 +2340,7 @@ void SceneRenderer::render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo&
   layer.space = app.app_space();
   layer.viewCount = static_cast<uint32_t>(proj_views.size());
   layer.views = proj_views.data();
+  return true;
 }
 
 }  // namespace vrp

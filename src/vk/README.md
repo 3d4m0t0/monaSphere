@@ -1,2 +1,5 @@
-# Vulkan helpers live primarily inside `xr/xr_vulkan_app` (device creation via OpenXR).
-# Additional shared Vulkan utilities can be added here as the engine grows.
+# Vulkan helpers
+
+Device / instance creation lives in `xr/xr_vulkan_app` (via OpenXR). File zero-copy
+decode presentation is `video/VulkanVideoTexture` (see [`../video/README.md`](../video/README.md)).
+

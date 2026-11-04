@@ -37,6 +37,7 @@ class QRadioButton;
 namespace vrp {
 class XrVulkanApp;
 class VrMenu;
+class VulkanVideoTexture;
 }
 
 struct UsbHmdInfo {
@@ -222,6 +223,9 @@ class HostWindow : public QMainWindow {
   std::thread xr_thread_;
   std::mutex xr_app_mu_;
   vrp::XrVulkanApp* xr_app_ = nullptr;  // non-owning; set only while XR thread runs
+  /** Non-owning; XR thread publishes so UI close can abort decode holding queue_mu. */
+  std::atomic<vrp::VideoDecoder*> xr_decoder_{nullptr};
+  std::atomic<vrp::VulkanVideoTexture*> xr_vulkan_tex_{nullptr};
   std::mutex menu_mu_;
   vrp::VrMenu* vr_menu_ = nullptr;
   std::atomic<bool> controls_help_{false};
@@ -334,6 +338,11 @@ class HostWindow : public QMainWindow {
   int seek_thumb_edge_ = vrp::kSeekThumbMaxEdge;
   /** monasphere.conf `hwaccel`. 0 forces software decode for playback and seek thumbs. */
   bool hwaccel_ = true;
+  /**
+   * monasphere.conf `vulkan_video`. 0 = CUDA/NVDEC (default on NVIDIA).
+   * 1 = prefer FFmpeg Vulkan Video zero-copy when the XR device supports it.
+   */
+  bool vulkan_video_ = false;
   /** monasphere.conf `thumb_jpeg`. 1 stores seek thumbs as JPEG in main memory. */
   bool thumb_jpeg_ = true;
   /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */

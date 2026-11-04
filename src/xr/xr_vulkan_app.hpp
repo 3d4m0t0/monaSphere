@@ -6,6 +6,8 @@
 
 #include "common.hpp"
 #include "options.hpp"
+#include "video/ffmpeg_vulkan_device.hpp"
+#include "video/vulkan_video_probe.hpp"
 
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
@@ -24,6 +26,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace vrp {
@@ -69,6 +72,12 @@ class XrVulkanApp {
 
   /** Unblock xrWaitFrame from another thread (window close / disconnect). */
   void request_exit();
+  bool exit_requested() const { return exit_requested_.load(std::memory_order_acquire); }
+  /**
+   * Cooperative close: RequestExitSession + poll STOPPING → EndSession without
+   * xrWaitFrame. Call from the XR thread when xr_stop_ is set.
+   */
+  void finish_exit();
 
   struct FrameInfo {
     XrTime display_time = 0;
@@ -98,6 +107,19 @@ class XrVulkanApp {
   bool external_memory_fd() const { return external_memory_fd_; }
   /** VK_EXT_external_memory_dma_buf and VK_EXT_image_drm_format_modifier are enabled. */
   bool dma_buf_import() const { return dma_buf_import_; }
+  /** Log VK_ERROR_DEVICE_LOST (+ VK_EXT_device_fault details when enabled). */
+  void report_if_device_lost(VkResult result) const;
+  /** Phase 0/1: FFmpeg Vulkan Video feasibility + whether decode exts/queues are on the XR device. */
+  const VulkanVideoProbe& vulkan_video_probe() const { return vulkan_video_probe_; }
+  /** True when this VkDevice enabled Video Decode extensions + a decode queue (Phase 1). */
+  bool video_decode_ready() const { return video_decode_ready_; }
+  VkQueue video_decode_queue() const { return video_decode_queue_; }
+  uint32_t video_decode_queue_family() const { return video_decode_queue_family_; }
+  /** Phase 2: FFmpeg AVVulkanDeviceContext wrapping this XR device (null if inject failed). */
+  FfmpegVulkanDevice* ffmpeg_vulkan_device() { return ffmpeg_vulkan_ ? ffmpeg_vulkan_.get() : nullptr; }
+  const FfmpegVulkanDevice* ffmpeg_vulkan_device() const {
+    return ffmpeg_vulkan_ ? ffmpeg_vulkan_.get() : nullptr;
+  }
   const std::vector<ViewSwapchain>& swapchains() const { return swapchains_; }
   std::vector<ViewSwapchain>& swapchains() { return swapchains_; }
 
@@ -193,6 +215,7 @@ class XrVulkanApp {
   XrSpace view_space_ = XR_NULL_HANDLE;
 
   bool session_running_ = false;
+  std::atomic<bool> exit_requested_{false};
   bool session_focused_ = false;
   bool tracking_valid_ = false;
   bool tracking_origin_inited_ = false;
@@ -211,6 +234,14 @@ class XrVulkanApp {
   std::mutex queue_mu_;
   bool external_memory_fd_ = false;
   bool dma_buf_import_ = false;
+  bool device_fault_ext_ = false;
+  PFN_vkGetDeviceFaultInfoEXT pfn_get_device_fault_ = nullptr;
+  VulkanVideoProbe vulkan_video_probe_{};
+  bool video_decode_ready_ = false;
+  VkQueue video_decode_queue_ = VK_NULL_HANDLE;
+  uint32_t video_decode_queue_family_ = UINT32_MAX;
+  std::vector<std::string> enabled_dev_exts_;
+  std::unique_ptr<FfmpegVulkanDevice> ffmpeg_vulkan_;
 
   std::vector<ViewSwapchain> swapchains_;
   std::array<XrViewConfigurationView, 2> config_views_{};

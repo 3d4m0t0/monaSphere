@@ -28,12 +28,16 @@ class Fsr1Upscaler {
    * is safe to bind (front buffer is stable while the next pass writes the back).
    * nv12: 0=RGBA from VK_SRGB (blit encodes to gamma), 1=NV12 limited, 2=full-range,
    *       3=RGBA already gamma (UNORM Live/ScreenCast — blit copies as-is).
+   * src_layout: actual layout of src_y/src_uv (CUDA NV12=GENERAL, Vulkan Video=SRO).
    */
   bool process(VkImageView src_y, VkImageView src_uv, VkSampler src_sampler, int src_w, int src_h,
-               int nv12);
+               int nv12, VkImageLayout src_layout = VK_IMAGE_LAYOUT_GENERAL);
 
   /** Finish a completed async pass without starting new work. True if front was updated. */
   bool poll();
+
+  /** Block until any in-flight pass finishes, then publish via poll(). */
+  void drain();
 
   /**
    * Drop the published front so callers must bootstrap raw until a new process()+poll()
@@ -76,7 +80,7 @@ class Fsr1Upscaler {
   VkShaderModule load_shader(const std::string& path) const;
   void create_pipelines();
   void destroy_pipelines();
-  void update_blit_set(VkImageView y, VkImageView uv, VkSampler samp, int nv12);
+  void update_blit_set(VkImageView y, VkImageView uv, VkSampler samp, VkImageLayout src_layout);
   void update_fsr_set(VkDescriptorSet set, VkBuffer ubo, VkImageView in_view, VkImageView out_view);
   void barrier_rw(VkCommandBuffer cmd, VkImage image, VkAccessFlags src, VkAccessFlags dst,
                   VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage,

@@ -137,9 +137,9 @@ At runtime, **Monado** (`monado-service`) and `XR_RUNTIME_JSON` are required.
 - HMD 映像内にファイルダイアログと再生コントロール、設定が行える UI
 - HMD 自動検出と Monado 起動（所有プロセス）
 - リフレッシュレート選択（環境の表示モードに依存）
-- FSR1 アップスケール
-- ハードウェアデコード連携（環境により NVDEC / VA-API 等）
-- NVIDIA 環境での CUDA↔Vulkan NV12 経路（条件を満たす場合）
+- FSR1 アップスケール（ファイル再生／ブラウザ Live。Live は `live_fsr`、□ で切替）
+- ハードウェアデコード連携（環境により NVDEC / VA-API / Vulkan Video 等）
+- NVIDIA 既定: CUDA↔Vulkan NV12。任意で FFmpeg **Vulkan Video ゼロコピー**（`monasphere.conf` の `vulkan_video=1`。AVVkFrame を HMD／FSR へ直サンプル）
 - XR メニュー、リセンター、コントローラ / ゲームパッド操作
 - OpenAL Soft HRTF（世界固定スピーカー＋頭部追跡）。2ch は側差 4.0（`surround_gain`、file / Live / [アプリ] 共通；[`data/README_live.md`](data/README_live.md)）
 - Live ブラウザ / デスクトップアプリ（ScreenCast + Virtual MONITOR）
@@ -151,9 +151,9 @@ At runtime, **Monado** (`monado-service`) and `XR_RUNTIME_JSON` are required.
 - In-HMD UI for the file dialog, playback controls, and settings
 - Automatic HMD detection and owned Monado startup
 - Refresh-rate selection (depends on available display modes)
-- FSR1 upscaling
-- Hardware decode (NVDEC, VA-API, and similar, when available)
-- CUDA↔Vulkan NV12 path on NVIDIA when the requirements are met
+- FSR1 upscaling (file playback and browser Live; Live uses `live_fsr`, cycle with □)
+- Hardware decode (NVDEC, VA-API, Vulkan Video, when available)
+- NVIDIA default: CUDA↔Vulkan NV12. Optional FFmpeg **Vulkan Video zero-copy** (`vulkan_video=1` in `monasphere.conf` — sample AVVkFrame straight to the HMD / FSR)
 - XR menu, recenter, and controller / gamepad input
 - OpenAL Soft HRTF (world-locked speakers + head tracking); shared 2ch→4.0 upmix (`surround_gain`) for file / Live / [アプリ] (see [`data/README_live.md`](data/README_live.md))
 - Live browser / desktop apps (ScreenCast + Virtual MONITOR)
@@ -183,7 +183,7 @@ At runtime, **Monado** (`monado-service`) and `XR_RUNTIME_JSON` are required.
 | XR | Monado（`hardware:xr` 等 / and similar） |
 | HMD | PlayStation VR2（互換 PC アダプタ経由 / via a compatible PC adapter） |
 | コントローラー / Controller | USB 接続の DualSense / USB DualSense |
-| GPU | NVIDIA（NVDEC / CUDA 経路を含む確認 / including NVDEC and CUDA paths） |
+| GPU | NVIDIA（NVDEC / CUDA、および `vulkan_video=1` の Vulkan Video ゼロコピーを確認 / NVDEC, CUDA, and Vulkan Video zero-copy with `vulkan_video=1`） |
 | マルチメディア / Multimedia | 開発機の FFmpeg でコーデックを確認 / Codec checks use the development machine's FFmpeg |
 
 他ディストリ（Fedora、Debian/Ubuntu 等）でも同種の依存が揃えばビルド可能です。実機・コーデックの組み合わせは環境差があります。

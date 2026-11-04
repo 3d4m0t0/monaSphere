@@ -7,6 +7,7 @@
 #include "audio/audio_player.hpp"
 #include "audio/pulse_monitor.hpp"
 #include "common.hpp"
+#include "common/crash_guard.hpp"
 #include "input/gamepad.hpp"
 #include "input/pad_filter.hpp"
 #include "scene/fsr1_upscaler.hpp"
@@ -15,6 +16,7 @@
 #include "video/bc7_thumbs.hpp"
 #include "video/cuda_nv12_texture.hpp"
 #include "video/vaapi_nv12_texture.hpp"
+#include "video/vulkan_video_texture.hpp"
 #include "video/video_decoder.hpp"
 #include "xr/xr_vulkan_app.hpp"
 #include "youtube_session.hpp"
@@ -164,13 +166,23 @@ void HostWindow::closeEvent(QCloseEvent* event) {
 
 void HostWindow::signalXrStop() {
   xr_stop_.store(true);
+  // Trip decode stop from UI so FFmpeg unlocks queue_mu_ (WaitForFences) and
+  // XR end_frame can finish — otherwise join waits until Monado is killed (Broken pipe).
+  if (auto* vt = xr_vulkan_tex_.load(std::memory_order_acquire)) {
+    vt->set_present_abort(true);
+  }
+  if (auto* dec = xr_decoder_.load(std::memory_order_acquire)) {
+    dec->abort_decode_async();
+  }
   std::lock_guard<std::mutex> lock(xr_app_mu_);
   if (xr_app_) xr_app_->request_exit();
 }
 
 bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
   signalXrStop();
-  if (stop_monado && !monado_external_) stopMonadoProcess();
+  // Do NOT kill Monado before XR teardown finishes. xrDestroySession / WaitIdle /
+  // DestroyDevice need compositor IPC; stopping monado-service mid-teardown yields
+  // Broken pipe and can wedge NVIDIA so the next xrCreateVulkanInstanceKHR fails.
 
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
@@ -179,20 +191,57 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
     QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
   }
 
+  bool ok = false;
   if (xr_thread_.joinable()) {
     if (!xr_running_.load()) {
       xr_thread_.join();
-      return true;
+      ok = true;
     }
-    return false;
+  } else {
+    xr_running_.store(false);
+    ok = true;
   }
-  xr_running_.store(false);
-  return true;
+
+  if (!ok && xr_thread_.joinable() && stop_monado && !monado_external_) {
+    // XR stuck — kill runtime to unblock hung IPC, then brief grace for teardown.
+    VRP_ERR("shutdownXrSession: XR still running after timeout — stopping Monado to unblock");
+    stopMonadoProcess();
+    const auto grace =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
+      QThread::msleep(40);
+      QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+    }
+    if (!xr_running_.load() && xr_thread_.joinable()) {
+      xr_thread_.join();
+      ok = true;
+    }
+  } else if (ok && stop_monado && !monado_external_) {
+    stopMonadoProcess();
+  }
+
+  return ok;
 }
 
 bool HostWindow::usingWivrn() const { return runtime_kind_.load() == 1; }
 
 bool HostWindow::ensureMonadoReady() {
+  // Previous monasphere SEGV leaves Monado up with a dead IPC client → Broken pipe
+  // on the next xrCreateInstance. Restart owned Monado when the crash cookie remains.
+  const bool unclean = vrp::crash_guard::consume_unclean_session();
+  if (unclean && !usingWivrn() && !monado_external_) {
+    appendLog(tr("Previous session crashed — restarting Monado"));
+    stopMonadoProcess();
+    stopSystemdMonadoForOwnedStart();
+    clearStaleMonadoSocket();
+  } else if (unclean && usingWivrn() && !monado_external_) {
+    appendLog(tr("Previous session crashed — restarting WiVRn"));
+    stopMonadoProcess();  // also stops owned wivrn when runtime is wivrn
+  } else if (unclean) {
+    appendLog(tr("Previous session crashed — external runtime; clearing stale IPC only"));
+    clearStaleMonadoSocket();
+  }
+
   if (usingWivrn()) {
     if (!isWivrnServerLive()) startOwnedWivrn(/*allow_external_adopt=*/true);
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
@@ -208,13 +257,15 @@ bool HostWindow::ensureMonadoReady() {
     if (!runtime_json_.isEmpty()) qputenv("XR_RUNTIME_JSON", runtime_json_.toUtf8());
     return true;
   }
-  if (isMonadoIpcLive()) {
+  if (isMonadoIpcLive() && !unclean) {
     if (!monado_external_ && (!monado_ || monado_->state() == QProcess::NotRunning)) {
       (void)adoptExternalMonado();
     }
     return true;
   }
-  startMonado();
+  if (unclean || !isMonadoIpcLive()) {
+    startMonado();
+  }
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
   while (!isMonadoIpcLive() && std::chrono::steady_clock::now() < deadline) {
     QThread::msleep(100);
@@ -1351,6 +1402,8 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("thumb_count"), QString::number(vrp::kSeekThumbCount)},
       {QStringLiteral("thumb_edge"), QString::number(vrp::kSeekThumbMaxEdge)},
       {QStringLiteral("hwaccel"), QStringLiteral("1")},
+      // 0 = CUDA/NVDEC (NVIDIA default). 1 = prefer Vulkan Video zero-copy.
+      {QStringLiteral("vulkan_video"), QStringLiteral("0")},
       {QStringLiteral("thumb_jpeg"), QStringLiteral("1")},
       {QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2)},
       {QStringLiteral("flat_distance"),
@@ -1450,6 +1503,10 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const int v = line.mid(8).toInt(&ok);
       if (ok && (v == 0 || v == 1)) hwaccel_ = v != 0;
+    } else if (line.startsWith(QStringLiteral("vulkan_video="))) {
+      bool ok = false;
+      const int v = line.mid(13).toInt(&ok);
+      if (ok && (v == 0 || v == 1)) vulkan_video_ = v != 0;
     } else if (line.startsWith(QStringLiteral("thumb_jpeg="))) {
       bool ok = false;
       const int v = line.mid(11).toInt(&ok);
@@ -3131,26 +3188,8 @@ void HostWindow::reportThumbnails(const vrp::ThumbnailStrip& strip) {
 
 // Same strip the XR playback path starts. Count and long edge come from monasphere.conf.
 void HostWindow::beginThumbnailBuild(const std::string& path) {
-  if (path.empty()) return;
-  thumb_cancel_.store(true);
-  if (thumb_thread_.joinable()) thumb_thread_.detach();
-  thumb_cancel_.store(false);
-
-  const int thumb_count = seek_thumb_count_;
-  const int thumb_edge = seek_thumb_edge_;
-  const bool allow_hw = hwaccel_;
-  thumb_thread_ = std::thread([this, path, thumb_count, thumb_edge, allow_hw] {
-    vrp::ThumbnailStrip strip =
-        vrp::build_thumbnail_strip(path, thumb_count, 0, 0, {}, {}, thumb_edge, allow_hw);
-    if (thumb_cancel_.load() || shutting_down_.load()) return;
-    QMetaObject::invokeMethod(
-        this,
-        [this, strip = std::move(strip)] {
-          if (shutting_down_.load()) return;
-          reportThumbnails(strip);
-        },
-        Qt::QueuedConnection);
-  });
+  // Seek-thumb strip disabled — keep API for callers; seek uses decoder.seek_to.
+  (void)path;
 }
 
 void HostWindow::onRuntimeChosen(bool wivrn) {
@@ -4102,6 +4141,21 @@ void HostWindow::xrThreadMain() {
           }
           setHealth("Wait", shown);
           appendLog(shown);
+          // xrCreateVulkanInstanceKHR can block forever on a wedged Monado compositor.
+          // After ~15s of stall reports, kill owned Monado so the XR call returns.
+          static int vk_inst_stall_n = 0;
+          if (q.contains(QStringLiteral("Vulkan instance create blocked"))) {
+            ++vk_inst_stall_n;
+            if (vk_inst_stall_n >= 3 && !monado_external_ && !usingWivrn()) {
+              vk_inst_stall_n = 0;
+              appendLog(tr("Vulkan instance create hung — restarting Monado to unblock"));
+              stopMonadoProcess();
+              stopSystemdMonadoForOwnedStart();
+              clearStaleMonadoSocket();
+            }
+          } else {
+            vk_inst_stall_n = 0;
+          }
         },
         Qt::QueuedConnection);
   };
@@ -4130,6 +4184,18 @@ void HostWindow::xrThreadMain() {
     xr.set_controller_prefs(opt_.controller_profile, opt_.controller_hand);
     xr.set_preferred_display_refresh_hz(static_cast<float>(effectivePreferredHz()));
     xr.init(&xr_stop_, report_progress);
+    {
+      const QString vk_probe = QString::fromStdString(xr.vulkan_video_probe().summary());
+      const bool ff_vk = xr.ffmpeg_vulkan_device() && xr.ffmpeg_vulkan_device()->ok();
+      QMetaObject::invokeMethod(
+          this,
+          [this, vk_probe, ff_vk] {
+            appendLog(vk_probe);
+            appendLog(ff_vk ? tr("FFmpeg Vulkan hwctx: injected (playback still CUDA)")
+                            : tr("FFmpeg Vulkan hwctx: not injected"));
+          },
+          Qt::QueuedConnection);
+    }
     {
       std::lock_guard<std::mutex> lock(xr_app_mu_);
       xr_app_ = &xr;
@@ -4190,6 +4256,7 @@ void HostWindow::xrThreadMain() {
     vrp::VideoTexture texture;
     vrp::CudaNv12Texture cuda_tex;
     vrp::VaapiNv12Texture vaapi_tex;
+    vrp::VulkanVideoTexture vulkan_tex;
 #if defined(VRP_HAS_PIPEWIRE)
     vrp::PipewireDmaTexture pw_dma_tex;
 #endif
@@ -4226,8 +4293,28 @@ void HostWindow::xrThreadMain() {
     const bool pw_dma = false;
     const bool pw_dma_nvidia = false;
 #endif
+    const bool vk_video =
+        xr.ffmpeg_vulkan_device() && xr.ffmpeg_vulkan_device()->ok() &&
+        vulkan_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(),
+                        &xr.queue_mutex());
     decoder.set_cuda_texture(gpu_nv12 ? &cuda_tex : nullptr);
     decoder.set_vaapi_texture(vaapi_nv12 ? &vaapi_tex : nullptr);
+    decoder.set_vulkan_texture(vk_video ? &vulkan_tex : nullptr);
+    decoder.set_vulkan_hw_device(vk_video ? xr.ffmpeg_vulkan_device()->ref() : nullptr);
+    decoder.set_prefer_vulkan_video(vulkan_video_ && vk_video);
+    if (vk_video) {
+      const bool prefer = vulkan_video_;
+      QMetaObject::invokeMethod(
+          this,
+          [this, prefer] {
+            if (prefer) {
+              appendLog(tr("Vulkan Video: preferred (conf vulkan_video=1; CUDA fallback)"));
+            } else {
+              appendLog(tr("Vulkan Video: available (conf vulkan_video=0 → CUDA/NVDEC)"));
+            }
+          },
+          Qt::QueuedConnection);
+    }
     QMetaObject::invokeMethod(
         this,
         [this, gpu_nv12, vaapi_nv12, pw_dma, pw_dma_nvidia] {
@@ -4427,13 +4514,22 @@ void HostWindow::xrThreadMain() {
     int fsr_src_w = 0;
     int fsr_src_h = 0;
     int fsr_src_nv12 = 0;
+    auto clear_fsr_src = [&] {
+      fsr_need_process = false;
+      fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
+      fsr_src_samp = VK_NULL_HANDLE;
+      fsr_src_w = fsr_src_h = 0;
+      fsr_src_nv12 = 0;
+    };
     auto arm_live_fsr = [&](bool on) {
       if (on == live_fsr_armed) return;
       live_fsr_armed = on;
+      // Drop any file-video FSR front/src — decoder stays open (paused) under Live.
+      clear_fsr_src();
+      fsr.invalidate();
+      force_fsr_refresh = true;
       if (on) {
         fsr.set_mode(live_fsr_);
-        fsr.invalidate();
-        force_fsr_refresh = true;
         QMetaObject::invokeMethod(
             this,
             [this] {
@@ -4445,13 +4541,6 @@ void HostWindow::xrThreadMain() {
         const auto restore =
             fsr_locked_8k_.load() ? vrp::FsrMode::Off : preferred_fsr_;
         fsr.set_mode(restore);
-        fsr.invalidate();
-        force_fsr_refresh = true;
-        fsr_need_process = false;
-        fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
-        fsr_src_samp = VK_NULL_HANDLE;
-        fsr_src_w = fsr_src_h = 0;
-        fsr_src_nv12 = 0;
       }
     };
     // 8K+: force FSR Off for this media session (do not re-evaluate from per-frame
@@ -4476,11 +4565,7 @@ void HostWindow::xrThreadMain() {
         menu.set_fsr(vrp::FsrMode::Off);
         force_fsr_refresh = true;
         pending_video_rebind = true;
-        fsr_need_process = false;
-        fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
-        fsr_src_samp = VK_NULL_HANDLE;
-        fsr_src_w = fsr_src_h = 0;
-        fsr_src_nv12 = 0;
+        clear_fsr_src();
         QMetaObject::invokeMethod(
             this,
             [this, log_w, log_h] {
@@ -4516,8 +4601,15 @@ void HostWindow::xrThreadMain() {
     bool stop_seek_sent = false;
     bool stop_upload_sent = false;
     bool stop_seek_pending = false;
+    std::chrono::steady_clock::time_point seek_land_from{};
+    std::chrono::steady_clock::time_point seek_scrub_kick_at{};
+    bool seek_resume_force = false;
+    std::chrono::steady_clock::time_point stop_decoded_from{};
+    double last_scrub_seek_sec = -1.0;
+    std::chrono::steady_clock::time_point last_scrub_seek_at{};
     double stop_seek_sec = 0;
     uint64_t stop_seq = 0;
+    uint64_t stop_present_gen = 0;
     double stop_pts = -1.0;
     // Translucent flat panel (startup / after Stop) until playback shows frames again.
     bool show_idle_screen = true;
@@ -4528,6 +4620,7 @@ void HostWindow::xrThreadMain() {
     int thumb_idx = -1;
     vrp::VideoFrame pending_thumb;
     auto open_media = [&](const std::string& path) {
+      VRP_LOG("open_media: begin %s", path.c_str());
       vaapi_hud_pending = true;
       thumb_latched = false;
       seek_settle = false;
@@ -4536,6 +4629,11 @@ void HostWindow::xrThreadMain() {
       stop_seek_sent = false;
       stop_upload_sent = false;
       stop_seek_pending = false;
+      seek_land_from = {};
+      seek_resume_force = false;
+      stop_decoded_from = {};
+      last_scrub_seek_sec = -1.0;
+      last_scrub_seek_at = {};
       stop_seq = 0;
       stop_pts = -1.0;
       show_idle_screen = true;
@@ -4543,29 +4641,32 @@ void HostWindow::xrThreadMain() {
       thumb_idx = -1;
       pending_thumb = {};
       pending_video_rebind = false;
-      fsr_need_process = false;
-      fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
-      fsr_src_samp = VK_NULL_HANDLE;
-      fsr_src_w = fsr_src_h = 0;
-      fsr_src_nv12 = 0;
+      clear_fsr_src();
       // File path must not keep Live FSR arm / stale front from a prior capture.
       arm_live_fsr(false);
 
-      // Wait for the eye GPU to finish BEFORE halt_decode. Returning false after a
-      // halt left the demux/decode threads dead while is_open() stayed true — play
-      // after an Hz reconnect then did nothing / looked like "device not ready".
+      // Abort mailbox present waits before joining decode (USB / late timeline).
+      vulkan_tex.set_present_abort(true);
+
+      // Wait for the eye GPU to finish BEFORE halt_decode. Cap the wait so a
+      // wedged submit cannot freeze the HMD with no further logs.
       if (!scene.wait_previous_submit(0)) {
         VRP_LOG("open_media: waiting for previous eye submit");
+        int spins = 0;
         while (!xr_stop_.load() && !scene.wait_previous_submit(100'000'000ull)) {
+          if (++spins >= 10) {  // ~1s
+            VRP_ERR("open_media: eye submit wait capped — continuing teardown");
+            break;
+          }
         }
       }
       if (xr_stop_.load()) {
         VRP_LOG("open_media: cancelled (xr_stop before halt)");
+        vulkan_tex.set_present_abort(false);
         return false;
       }
-      if (!scene.wait_previous_submit(2'000'000'000ull)) {
-        VRP_ERR("open_media: GPU still busy after wait");
-        return false;
+      if (!scene.wait_previous_submit(500'000'000ull)) {
+        VRP_ERR("open_media: GPU still busy after wait — continuing teardown");
       }
 
       // Keep miniaudio alive and muted so silence keeps flushing HMD/Pulse during the switch.
@@ -4575,13 +4676,14 @@ void HostWindow::xrThreadMain() {
 
       // Stop video decode but keep NVDEC CUDA context alive until after slot teardown.
       // Do NOT audio.close() here — device stays up pumping silence.
+      VRP_LOG("open_media: halt_decode");
       decoder.halt_decode();
       // Release ffmpeg_offline_mu (seek thumbs) before joining the browser preview worker.
       decoder.stop_thumbnail_build();
       join_preview_worker();
       pending_upload = {};
       // Stop further BC7 submits; images are safe to drop now that the eye fence is idle.
-      const uint64_t bc7_build = bc7.begin_build();
+      (void)bc7.begin_build();
       {
         void* cu_ctx = decoder.cuda_context();
         cuda_tex.drain_copies(cu_ctx);
@@ -4593,31 +4695,22 @@ void HostWindow::xrThreadMain() {
         // Tear CUDA imports + async stream on the still-alive NVDEC context, then close.
         cuda_tex.reset_slots(cu_ctx);
         vaapi_tex.reset();
+        VRP_LOG("open_media: reset vulkan mailbox");
+        vulkan_tex.reset();
         bc7.release_images();
         decoder.close();
       }
+      vulkan_tex.set_present_abort(false);
 
+      VRP_LOG("open_media: decoder.open");
       const bool ok = decoder.open(path, hwaccel_);
+      VRP_LOG("open_media: decoder.open → %s", ok ? "ok" : "fail");
       const bool network_url =
           path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
       if (ok && !network_url) {
-        vrp::SeekThumbRawStep raw;
-        if (nvidia_bc7) {
-          raw = [&bc7, bc7_build](int index, double /*time_sec*/, int /*planned*/, double interval, int w, int h,
-                                  const uint8_t* rgba, size_t /*rgba_bytes*/) {
-            return bc7.compress(index, rgba, w, h, interval, bc7_build);
-          };
-        }
-        decoder.start_thumbnail_build(
-            [this](vrp::ThumbnailStrip strip) {
-              QMetaObject::invokeMethod(
-                  this,
-                  [this, strip = std::move(strip)] {
-                    if (!shutting_down_.load()) reportThumbnails(strip);
-                  },
-                  Qt::QueuedConnection);
-            },
-            seek_thumb_count_, 0, 0, raw, seek_thumb_edge_, hwaccel_);
+        // No prebuilt seek-thumb strip — scrub keeps the last frame; release
+        // lands via decoder.seek_to (avoids USB/Vulkan demux contention).
+        decoder.disable_thumbnail_strip();
       }
       const vrp::VideoInfo info = decoder.info();
       QMetaObject::invokeMethod(
@@ -4786,7 +4879,25 @@ void HostWindow::xrThreadMain() {
     float look_pitch = 0.f;
     int flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
 
-    while (!xr_stop_.load() && xr.pump_events()) {
+    xr_decoder_.store(&decoder, std::memory_order_release);
+    xr_vulkan_tex_.store(&vulkan_tex, std::memory_order_release);
+    struct ClearXrDecode {
+      HostWindow* self;
+      ~ClearXrDecode() {
+        self->xr_decoder_.store(nullptr, std::memory_order_release);
+        self->xr_vulkan_tex_.store(nullptr, std::memory_order_release);
+      }
+    } clear_xr_decode{this};
+
+    while (xr.pump_events()) {
+      if (xr_stop_.load()) {
+        // Do not leave session_running with an open frame — finish_exit EndSessions
+        // without another xrWaitFrame (avoids Monado kill / Broken pipe on close).
+        vulkan_tex.set_present_abort(true);
+        decoder.abort_decode_async();
+        xr.finish_exit();
+        break;
+      }
       bool help_shown = false;
       auto now = std::chrono::steady_clock::now();
       double dt = std::chrono::duration<double>(now - last).count();
@@ -5097,7 +5208,6 @@ void HostWindow::xrThreadMain() {
         const bool option = sony;
         if (face_sony_.exchange(sony) != sony || menu_option_.exchange(option) != option) hud_paint();
       }
-      decoder.set_seek_scrubbing(false);
 
       // Flat scale: Y/△ cycles Near→Cinema→Far (fixed cinema screen width; FOV follows
       // distance). XR triangle is flat_scale; Options/menu stays menu_toggle.
@@ -5160,6 +5270,7 @@ void HostWindow::xrThreadMain() {
         if (mode == vrp::FsrMode::Off) {
           arm_live_fsr(false);
         } else if (live_fsr_armed) {
+          clear_fsr_src();
           fsr.set_mode(mode);
           fsr.invalidate();
           force_fsr_refresh = true;
@@ -5214,11 +5325,7 @@ void HostWindow::xrThreadMain() {
           scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
           menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
           scene.set_content_aspect(16.f / 9.f);
-          fsr_need_process = false;
-          fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
-          fsr_src_samp = VK_NULL_HANDLE;
-          fsr_src_w = fsr_src_h = 0;
-          fsr_src_nv12 = 0;
+          clear_fsr_src();
           arm_live_fsr(false);
           fsr.invalidate();
           look_yaw = 0.f;
@@ -5343,11 +5450,7 @@ void HostWindow::xrThreadMain() {
             }
           }
           pending_video_rebind = false;
-          fsr_need_process = false;
-          fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
-          fsr_src_samp = VK_NULL_HANDLE;
-          fsr_src_w = fsr_src_h = 0;
-          fsr_src_nv12 = 0;
+          clear_fsr_src();
           (void)fsr.poll();
 #if defined(VRP_HAS_PIPEWIRE)
           pw_dma_tex.reset();
@@ -5538,11 +5641,12 @@ void HostWindow::xrThreadMain() {
       const bool menu_was = menu.visible();
       const bool controls_was = menu.controls_visible();
       if (decoder.is_open()) {
+        // Cover limits scrub range as the strip grows. Do NOT force seek-bar HUD
+        // for the whole build — that kept want_kind=4 / atlas uploads on the XR
+        // queue for minutes while SW thumbs hammer the same USB file as Vulkan Video.
         menu.set_thumb_cover(decoder.thumb_cover_sec());
-        menu.set_thumb_bar_force(!decoder.thumbnails_finished());
-      } else {
-        menu.set_thumb_bar_force(false);
       }
+      menu.set_thumb_bar_force(false);
       const auto menu_out = menu.update(pad, ui_dt);
       if (menu.visible() != menu_was || menu.controls_visible() != controls_was) hud_paint();
       auto apply_projection = [&](vrp::ProjectionMode proj, vrp::StereoLayout stereo, bool stereo_full) {
@@ -5574,11 +5678,7 @@ void HostWindow::xrThreadMain() {
         if (audio.is_open()) audio.pause();
         apply_projection(vrp::ProjectionMode::Flat, vrp::StereoLayout::Mono, true);
         menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
-        fsr_need_process = false;
-        fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
-        fsr_src_samp = VK_NULL_HANDLE;
-        fsr_src_w = fsr_src_h = 0;
-        fsr_src_nv12 = 0;
+        clear_fsr_src();
         (void)fsr.poll();
         sync_fsr_source_lock(false);
         arm_live_fsr(false);
@@ -5736,11 +5836,7 @@ void HostWindow::xrThreadMain() {
           }
         }
         pending_video_rebind = false;
-        fsr_need_process = false;
-        fsr_src_y = fsr_src_uv = VK_NULL_HANDLE;
-        fsr_src_samp = VK_NULL_HANDLE;
-        fsr_src_w = fsr_src_h = 0;
-        fsr_src_nv12 = 0;
+        clear_fsr_src();
         // Drop published FSR so post-end_frame cannot overlay the idle slate.
         fsr.invalidate();
         force_fsr_refresh = true;
@@ -5804,33 +5900,64 @@ void HostWindow::xrThreadMain() {
         menu.set_volume(audio.volume());
         hud_paint();
       }
-      // The bar moves on its own. Playback pauses and a prebuilt thumb fills the screen.
-      // On release, one seek and the still stays up. Playback starts 0.5s after the
-      // stick or shoulder is released, from the frame at that time.
+      // Seek bar scrub: pause and seek to the bar (throttled) so the panel shows
+      // landed decode frames. On release, a final seek_to lands before play.
       const bool file_ui = menu.visible();
       const bool scrubbing = !file_ui && menu_out.seek_scrubbing;
       const bool seek_release = !file_ui && menu_out.seek;
       const bool seek_now = seek_release || (!file_ui && menu_out.seek_start);
+      // Seek contract: do not host_signal mailbox frames on every scrub tick while
+      // decode still holds the same AVVkFrame in ff_->frame — that desyncs the
+      // timeline and wedges wait_avframe. Scrub keeps front/FSR still; decode
+      // releases before flush. Stop-seek releases + invalidates FSR.
+      auto begin_decoder_seek = [&](double sec, bool stop_seek) {
+        VRP_LOG("seekdbg: begin_decoder_seek sec=%.3f stop=%d before | %s", sec, stop_seek ? 1 : 0,
+                decoder.seek_debug_state().c_str());
+        if (vulkan_tex.enabled()) {
+          // Finish the current eye submit so decode's release_all_for_flush can
+          // return front without tearing L/R or wedging avcodec_flush_buffers.
+          if (!scene.wait_previous_submit(0))
+            (void)scene.wait_previous_submit(50'000'000ull);
+          vulkan_tex.mark_eye_done();
+          if (stop_seek) {
+            vulkan_tex.release_held();
+            fsr.invalidate();
+            force_fsr_refresh = true;
+          }
+        }
+        decoder.seek_to(sec);
+        VRP_LOG("seekdbg: begin_decoder_seek after | %s", decoder.seek_debug_state().c_str());
+      };
       auto arm_stop_seek = [&](double sec) {
+        VRP_LOG("seek: arm stop-seek sec=%.3f play_wanted=%d vulkan=%d fsr=%d seq=%llu",
+                sec, play_wanted ? 1 : 0, decoder.vulkan_path_active() ? 1 : 0,
+                fsr.enabled() ? 1 : 0,
+                static_cast<unsigned long long>(decoder.frame_seq()));
         audio.pause();
         decoder.pause();
-        decoder.seek_to(sec);
+        begin_decoder_seek(sec, /*stop_seek=*/true);
+        stop_seek_sec = sec;
         stop_seek_sent = true;
         wait_stop_frame = true;
         stop_frame_shown = false;
         stop_seq = decoder.frame_seq();
+        stop_present_gen = vulkan_tex.enabled() ? vulkan_tex.present_generation() : 0;
         stop_pts = -1.0;
         stop_upload_sent = false;
-        seek_settle = true;
-        seek_settle_from = now;
+        seek_land_from = now;
+        seek_settle = false;
         hud_paint();
       };
       if (scrubbing) {
-        if (!was_scrubbing) menu.clear_seek_bar_drawn();
+        if (!was_scrubbing) {
+          menu.clear_seek_bar_drawn();
+          last_scrub_seek_sec = -1.0;
+          last_scrub_seek_at = {};
+        }
         decoder.pause();
         audio.pause();
         decoder.set_seek_scrubbing(true);
-        thumb_latched = true;
+        thumb_latched = false;
         seek_settle = false;
         wait_stop_frame = false;
         stop_frame_shown = false;
@@ -5838,11 +5965,28 @@ void HostWindow::xrThreadMain() {
         stop_pts = -1.0;
         stop_upload_sent = false;
         stop_seek_pending = false;
-      } else if (seek_release) {
-        stop_seek_pending = true;
-        stop_seek_sec = menu_out.seek_sec;
-      } else if (was_scrubbing && !wait_stop_frame && !seek_settle && !stop_seek_pending) {
-        thumb_latched = false;
+        seek_land_from = {};
+        const double bar = menu.seek_bar_sec();
+        // 1e9 = first seek of this scrub gesture (last_scrub_seek_sec < 0).
+        const double moved =
+            last_scrub_seek_sec < 0.0 ? 1.0e9 : std::fabs(bar - last_scrub_seek_sec);
+        const bool cooled =
+            last_scrub_seek_at.time_since_epoch().count() == 0 ||
+            (now - last_scrub_seek_at) >= std::chrono::milliseconds(45);
+        if (cooled && (moved >= 0.05 || last_scrub_seek_sec < 0.0)) {
+          VRP_LOG("seek: scrub seek_to sec=%.3f (moved=%.3f)", bar, moved);
+          begin_decoder_seek(bar, /*stop_seek=*/false);
+          last_scrub_seek_sec = bar;
+          last_scrub_seek_at = now;
+        }
+      } else {
+        decoder.set_seek_scrubbing(false);
+        if (seek_release) {
+          stop_seek_pending = true;
+          stop_seek_sec = menu_out.seek_sec;
+        } else if (was_scrubbing && !wait_stop_frame && !seek_settle && !stop_seek_pending) {
+          thumb_latched = false;
+        }
       }
       if (stop_seek_pending && !seek_paint_wait) {
         arm_stop_seek(stop_seek_sec);
@@ -5867,12 +6011,26 @@ void HostWindow::xrThreadMain() {
 
       // Sole start: audible audio, then the first new frame. Seek-in-flight waits
       // so we arm at the landed PTS rather than the requested time.
+      // seek_resume_force: land timed out / zombie slots — do not stay muted forever.
       if (decoder.consume_playback_started() && play_wanted && !hold_play && !decoder.is_playing() &&
-          !decoder.seek_in_flight()) {
+          (!decoder.seek_in_flight() || seek_resume_force)) {
         const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
         if (audio.is_open()) audio.arm_at(arm);
         decoder.start_presentation();
+        VRP_LOG("seek: start_presentation (playback_started) arm=%.3f force=%d hold=%d",
+                arm, seek_resume_force ? 1 : 0, hold_play ? 1 : 0);
         stop_pts = -1.0;
+        seek_resume_force = false;
+      } else if (play_wanted && hold_play) {
+        static std::chrono::steady_clock::time_point hold_log{};
+        if (hold_log.time_since_epoch().count() == 0 ||
+            (now - hold_log) >= std::chrono::milliseconds(1000)) {
+          VRP_LOG("seek: hold_play scrub=%d settle=%d wait_stop=%d pending=%d busy=%d shown=%d",
+                  scrubbing ? 1 : 0, seek_settling ? 1 : 0, wait_stop_frame ? 1 : 0,
+                  stop_seek_pending ? 1 : 0, decoder.seek_in_flight() ? 1 : 0,
+                  stop_frame_shown ? 1 : 0);
+          hold_log = now;
+        }
       }
 
       // EOF auto-loop: treat as playback end → face forward again for 180/360.
@@ -6008,18 +6166,28 @@ void HostWindow::xrThreadMain() {
       }
 
       const auto frame_t0 = std::chrono::steady_clock::now();
-      if (xr_stop_.load()) break;
+      if (xr_stop_.load() || xr.exit_requested()) {
+        vulkan_tex.set_present_abort(true);
+        decoder.abort_decode_async();
+        xr.finish_exit();
+        break;
+      }
       vrp::XrVulkanApp::FrameInfo fi;
       if (!xr.begin_frame(fi)) {
-        if (xr_stop_.load()) break;
+        if (xr_stop_.load() || xr.exit_requested()) {
+          vulkan_tex.set_present_abort(true);
+          decoder.abort_decode_async();
+          xr.finish_exit();
+          break;
+        }
         continue;
       }
-      if (xr_stop_.load()) {
-        // Drop this frame and exit — request_exit already issued from UI.
-        XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
-        ei.displayTime = fi.display_time;
-        ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-        (void)xrEndFrame(xr.session(), &ei);
+      if (xr_stop_.load() || xr.exit_requested()) {
+        // Drop this frame — end_frame releases queue_mu with a short try-lock on exit.
+        xr.end_frame(fi, {});
+        vulkan_tex.set_present_abort(true);
+        decoder.abort_decode_async();
+        xr.finish_exit();
         break;
       }
       if (xr.maybe_init_tracking_origin()) {
@@ -6027,24 +6195,55 @@ void HostWindow::xrThreadMain() {
         help_shown = true;
       }
 
-      // While the bar is moving, show the prebuilt thumb at or behind the bar. After release, keep it
-      // until the decoded frame at the stop time is bound, then start from that frame.
-      if (wait_stop_frame && !scrubbing && stop_pts < 0.0 && decoder.frame_seq() != stop_seq) {
-        vrp::VideoFrame landed;
-        if (decoder.take_latest(landed)) {
-          stop_pts = landed.pts_sec;
-          if (landed.gpu || landed.rgba.empty()) {
-            stop_upload_sent = true;
-          } else {
+      // No prebuilt strip — scrub/seek show decoder frames via the normal path.
+      constexpr bool show_thumb = false;
+      constexpr bool seek_visual = false;
+      (void)thumb_latched;
+      // Resume gate = decode seek_busy cleared (bar reached), not mailbox acquire.
+      // Mailbox bind is best-effort for the still; A/V must not wait on samp/gen.
+      if (wait_stop_frame && !scrubbing && stop_pts < 0.0 && !decoder.seek_in_flight()) {
+        stop_pts = decoder.position();
+        stop_upload_sent = true;
+        stop_decoded_from = now;
+        if (decoder.vulkan_path_active()) {
+          VRP_LOG("seek: decode land pts=%.3f gen=%llu arm_gen=%llu samp=%d | %s",
+                  stop_pts,
+                  static_cast<unsigned long long>(vulkan_tex.present_generation()),
+                  static_cast<unsigned long long>(stop_present_gen),
+                  vulkan_tex.sampling_index(), vulkan_tex.debug_state().c_str());
+        } else if (decoder.frame_seq() != stop_seq) {
+          vrp::VideoFrame landed;
+          if (decoder.take_latest(landed) && !landed.gpu && !landed.rgba.empty())
             pending_upload = std::move(landed);
-            stop_upload_sent = false;
-          }
+          VRP_LOG("seek: decode land pts=%.3f (cpu/gpu path)", stop_pts);
+        } else {
+          VRP_LOG("seek: decode land pts=%.3f", stop_pts);
+        }
+      } else if (wait_stop_frame && !scrubbing && stop_pts < 0.0 &&
+                 decoder.seek_in_flight()) {
+        static std::chrono::steady_clock::time_point land_wait_log{};
+        if (land_wait_log.time_since_epoch().count() == 0 ||
+            (now - land_wait_log) >= std::chrono::milliseconds(500)) {
+          const double waited =
+              seek_land_from.time_since_epoch().count() == 0
+                  ? 0.0
+                  : std::chrono::duration<double>(now - seek_land_from).count();
+          VRP_LOG("seek: wait decode land after %.2fs busy=1 gen=%llu | %s", waited,
+                  static_cast<unsigned long long>(vulkan_tex.present_generation()),
+                  decoder.seek_debug_state().c_str());
+          land_wait_log = now;
         }
       }
       const bool reveal_stop = wait_stop_frame && !scrubbing && stop_pts >= 0.0;
-      const bool show_thumb =
-          thumb_latched && (scrubbing || stop_seek_pending || (wait_stop_frame && !reveal_stop));
-      const bool seek_visual = show_thumb && !reveal_stop;
+      // During stop-land only: kick can free an eye-done front so back can promote.
+      // Do not kick while scrubbing — it races DPB with in-flight send_packet.
+      if (vulkan_tex.enabled() && wait_stop_frame && !scrubbing) {
+        if (seek_scrub_kick_at.time_since_epoch().count() == 0 ||
+            (now - seek_scrub_kick_at) >= std::chrono::milliseconds(200)) {
+          if (vulkan_tex.pending_flip()) (void)vulkan_tex.kick_decode_stall();
+          seek_scrub_kick_at = now;
+        }
+      }
       // Stage video binds for flush after the eye-submit fence inside render_frame.
       // Do not wait here — wait(0) almost always fails while the previous frame is in flight.
       // Idle translucent panel (startup / Stop) must not be overwritten by a paused seek frame.
@@ -6283,7 +6482,64 @@ void HostWindow::xrThreadMain() {
         int src_w = 0;
         int src_h = 0;
 
-        if (decoder.gpu_path_active()) {
+        if (decoder.vulkan_path_active()) {
+          // Zero-copy AVVkFrame (SRO) for eye and FSR.
+          if (scene.wait_previous_submit(0)) vulkan_tex.mark_eye_done();
+
+          bool sampling_changed = vulkan_tex.prepare_display();
+          // Prior eye submit still holds sampling_ → brief wait so the flip can proceed.
+          if (!sampling_changed && vulkan_tex.pending_flip()) {
+            if (scene.wait_previous_submit(8'000'000ull)) {
+              vulkan_tex.mark_eye_done();
+              sampling_changed = vulkan_tex.prepare_display();
+            }
+          }
+          nv12_mode = vulkan_tex.full_range() ? 2 : 1;
+          // Views are null until acquire — do not FSR/eye sample raw display AVVkFrame.
+          src_y = vulkan_tex.y_view();
+          src_uv = vulkan_tex.uv_view();
+          src_samp = src_y ? vulkan_tex.sampler() : VK_NULL_HANDLE;
+          src_w = (src_y && vulkan_tex.width() > 0) ? vulkan_tex.width() : 0;
+          src_h = (src_y && vulkan_tex.height() > 0) ? vulkan_tex.height() : 0;
+          if (vulkan_tex.poll_present()) video_updated = true;
+          if (sampling_changed && src_y) {
+            pending_video_rebind = true;
+            video_updated = true;
+          }
+          // Mailbox: at most front+back. Stall → return eye-done front to free DPB.
+          {
+            static uint64_t stall_last_gen = 0;
+            static int stall_last_samp = -2;
+            static std::chrono::steady_clock::time_point stall_since{};
+            static int stall_logs = 0;
+            const uint64_t gen = vulkan_tex.present_generation();
+            const int samp = vulkan_tex.sampling_index();
+            const bool progressed = (gen != stall_last_gen) || (samp != stall_last_samp && samp >= 0);
+            if (progressed || !decoder.is_playing() || scrubbing || wait_stop_frame) {
+              stall_last_gen = gen;
+              stall_last_samp = samp;
+              stall_since = now;
+            } else if (stall_since.time_since_epoch().count() != 0 &&
+                       (now - stall_since) >= std::chrono::milliseconds(500)) {
+              (void)vulkan_tex.kick_decode_stall();
+              if (stall_logs < 8 || (stall_logs % 16) == 0) {
+                size_t qn = 0, qb = 0;
+                decoder.packet_queue_stats(qn, qb);
+                VRP_LOG(
+                    "vulkan mailbox stall: %.0fms play=%d flip=%d view=%d q=%zu "
+                    "bytes=%.2fMiB pos=%.3f | %s",
+                    std::chrono::duration<double, std::milli>(now - stall_since).count(),
+                    decoder.is_playing() ? 1 : 0, vulkan_tex.pending_flip() ? 1 : 0, src_y ? 1 : 0,
+                    qn, static_cast<double>(qb) / (1024.0 * 1024.0), decoder.position(),
+                    decoder.seek_debug_state().c_str());
+              }
+              ++stall_logs;
+              stall_since = now;
+            }
+          }
+          vrp::VideoFrame discard;
+          (void)decoder.update(dt, discard);
+        } else if (decoder.gpu_path_active()) {
           nv12_mode = cuda_tex.full_range() ? 2 : 1;
           src_y = cuda_tex.y_view();
           src_uv = cuda_tex.uv_view();
@@ -6335,9 +6591,13 @@ void HostWindow::xrThreadMain() {
 
         // FSR 8K lock is latched at open_media — do not re-sync from per-frame src size.
 
-        if (force_fsr_refresh) pending_video_rebind = true;
+        if (force_fsr_refresh && src_y) pending_video_rebind = true;
 
-        if (decoder.gpu_path_active() && cuda_tex.width() > 0 && cuda_tex.height() > 0) {
+        if (decoder.vulkan_path_active() && src_y && vulkan_tex.width() > 0 &&
+            vulkan_tex.height() > 0) {
+          src_w = vulkan_tex.width();
+          src_h = vulkan_tex.height();
+        } else if (decoder.gpu_path_active() && cuda_tex.width() > 0 && cuda_tex.height() > 0) {
           src_w = cuda_tex.width();
           src_h = cuda_tex.height();
         } else if (decoder.vaapi_path_active() && vaapi_tex.width() > 0 && vaapi_tex.height() > 0) {
@@ -6347,7 +6607,9 @@ void HostWindow::xrThreadMain() {
 
         auto queue_file_raw = [&] {
           if (!src_y || !src_samp || src_w <= 0 || src_h <= 0) return false;
-          if (decoder.gpu_path_active()) {
+          if (decoder.vulkan_path_active()) {
+            scene.queue_nv12_texture(src_y, src_uv ? src_uv : src_y, src_samp, vulkan_tex.full_range());
+          } else if (decoder.gpu_path_active()) {
             scene.queue_nv12_texture(src_y, src_uv ? src_uv : src_y, src_samp, cuda_tex.full_range());
           } else if (decoder.vaapi_path_active()) {
             scene.queue_nv12_texture(src_y, src_uv ? src_uv : src_y, src_samp,
@@ -6358,23 +6620,32 @@ void HostWindow::xrThreadMain() {
           return true;
         };
 
-        // XR critical path: publish completed FSR / queue raw. Never submit FSR here.
+        // XR critical path: bind FSR front or raw. Never submit FSR here.
+        // poll() is true only on the frame the fence retires — must still bind
+        // output_view() every frame afterward (Live already did; file path did not,
+        // so after the first poll the panel stayed on bootstrap raw forever).
         bool bound_file_video = false;
         if (fsr.enabled()) {
-          if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
+          (void)fsr.poll();
+          if (fsr.output_view() && fsr.output_sampler()) {
             scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
             force_fsr_refresh = false;
             bound_file_video = true;
           }
           if (pending_video_rebind && src_y && src_samp && src_w > 0 && src_h > 0) {
-            fsr_src_y = src_y;
-            fsr_src_uv = src_uv ? src_uv : src_y;
-            fsr_src_samp = src_samp;
-            fsr_src_w = src_w;
-            fsr_src_h = src_h;
-            fsr_src_nv12 = nv12_mode;
+            // CUDA/VAAPI/RGBA: stash views. Vulkan: arm need_process only — grab
+            // sampling views at process time (AVVkFrame borrow).
+            if (!decoder.vulkan_path_active()) {
+              fsr_src_y = src_y;
+              fsr_src_uv = src_uv ? src_uv : src_y;
+              fsr_src_samp = src_samp;
+              fsr_src_w = src_w;
+              fsr_src_h = src_h;
+              fsr_src_nv12 = nv12_mode;
+            } else {
+              fsr_src_nv12 = nv12_mode;
+            }
             fsr_need_process = true;
-            // Bootstrap raw until this media's FSR front exists (invalidate clears it).
             if (!fsr.output_view()) {
               bound_file_video = queue_file_raw() || bound_file_video;
             }
@@ -6387,32 +6658,122 @@ void HostWindow::xrThreadMain() {
           pending_video_rebind = false;
           force_fsr_refresh = false;
         }
-        // GPU/VAAPI seek land uses take_latest — poll_present may already be consumed.
-        if (reveal_stop && (video_updated || (stop_upload_sent && bound_file_video))) {
-          stop_frame_shown = true;
-        } else if (reveal_stop && stop_upload_sent && src_y && src_samp && src_w > 0 &&
-                   src_h > 0 && !stop_frame_shown) {
-          if (!fsr.enabled() || !fsr.output_view()) (void)queue_file_raw();
-          stop_frame_shown = true;
+        // Decode has landed (reveal_stop). Bind picture if ready; after 150ms grace
+        // settle anyway so A/V resume is not gated on mailbox acquire.
+        if (reveal_stop && !stop_frame_shown) {
+          const bool has_picture = src_y && src_samp && src_w > 0 && src_h > 0;
+          const bool pic_ready =
+              has_picture && (video_updated || stop_upload_sent || bound_file_video);
+          const bool grace =
+              stop_decoded_from.time_since_epoch().count() != 0 &&
+              (now - stop_decoded_from) >= std::chrono::milliseconds(150);
+          if (pic_ready || grace) {
+            if (pic_ready && !bound_file_video && (!fsr.enabled() || !fsr.output_view()))
+              (void)queue_file_raw();
+            stop_frame_shown = true;
+            seek_settle = true;
+            seek_settle_from = now;
+            VRP_LOG("seek: frame shown pts=%.3f pic=%d grace=%d bound=%d settle=0.5s",
+                    stop_pts, pic_ready ? 1 : 0, grace ? 1 : 0, bound_file_video ? 1 : 0);
+          }
         }
       }
 
-      // The still stays up through the 0.5s settle. Play starts after that, at the landed PTS.
-      if (stop_frame_shown && !seek_settling && !scrubbing && !decoder.seek_in_flight() &&
+      // Still stays up through the 0.5s settle after the landed frame is shown.
+      // Recompute settle here — seek_settle may have just started on this tick.
+      const bool seek_settling_now =
+          seek_settle && std::chrono::duration<double>(now - seek_settle_from).count() < 0.5;
+      if (stop_frame_shown && !seek_settling_now && !scrubbing && !decoder.seek_in_flight() &&
           !decoder.is_playing() && !decoder.is_priming()) {
+        VRP_LOG("seek: resume after settle pts=%.3f play_wanted=%d", stop_pts,
+                play_wanted ? 1 : 0);
         wait_stop_frame = false;
         thumb_latched = false;
         seek_settle = false;
+        seek_land_from = {};
+        stop_decoded_from = {};
         if (play_wanted) {
           decoder.play();
           if (decoder.consume_playback_started()) {
             const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
             if (audio.is_open()) audio.arm_at(arm);
             decoder.start_presentation();
+            VRP_LOG("seek: presentation started arm=%.3f", arm);
             stop_pts = -1.0;
+          } else {
+            // Priming fills asynchronously; general playback_started path resumes A/V.
+            seek_resume_force = true;
+            VRP_LOG("seek: play() — waiting playback_started (priming)");
           }
         }
         stop_frame_shown = false;
+      } else if (wait_stop_frame && !scrubbing &&
+                 seek_land_from.time_since_epoch().count() != 0) {
+        const double land_wait =
+            std::chrono::duration<double>(now - seek_land_from).count();
+        const char* phase = decoder.decode_phase();
+        // Never force_resume during seek_pre_flush_wait / flush / apply: host
+        // play=1 + demux while decode is still on the timeline stalls the mailbox.
+        const bool in_pre_flush =
+            phase && std::strcmp(phase, "seek_pre_flush_wait") == 0;
+        const bool in_flush =
+            phase && (std::strcmp(phase, "seek_flush") == 0 ||
+                      std::strcmp(phase, "seek_apply") == 0 ||
+                      std::strcmp(phase, "seek_av_seek") == 0 || in_pre_flush);
+        const bool land_wedged =
+            phase && (std::strcmp(phase, "wait_avframe") == 0 ||
+                      std::strcmp(phase, "seek_await") == 0 ||
+                      std::strcmp(phase, "send_packet") == 0 ||
+                      std::strcmp(phase, "present_after_skip") == 0 ||
+                      std::strcmp(phase, "send_timeout_reopen") == 0);
+        const double limit_sec = (in_flush || land_wedged) ? 5.0 : 3.0;
+        if (in_flush && land_wait >= 3.0 && land_wait < limit_sec) {
+          static std::chrono::steady_clock::time_point flush_wait_log{};
+          if (flush_wait_log.time_since_epoch().count() == 0 ||
+              (now - flush_wait_log) >= std::chrono::milliseconds(500)) {
+            VRP_LOG("seek: wait flush/apply after %.2fs | %s", land_wait,
+                    decoder.seek_debug_state().c_str());
+            flush_wait_log = now;
+          }
+        }
+        if (land_wait >= limit_sec) {
+          VRP_LOG("seek: TIMEOUT decode land — pts=%g busy=%d gen=%llu | %s",
+                  stop_pts, decoder.seek_in_flight() ? 1 : 0,
+                  static_cast<unsigned long long>(vulkan_tex.present_generation()),
+                  decoder.seek_debug_state().c_str());
+          if (vulkan_tex.enabled()) {
+            if (!scene.wait_previous_submit(0))
+              (void)scene.wait_previous_submit(50'000'000ull);
+            vulkan_tex.release_held();
+          }
+          decoder.force_resume_after_seek();
+          wait_stop_frame = false;
+          stop_frame_shown = false;
+          seek_settle = false;
+          seek_land_from = {};
+          stop_decoded_from = {};
+          thumb_latched = false;
+          seek_resume_force = true;
+          if (play_wanted) {
+            const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
+            if (audio.is_open()) audio.arm_at(arm);
+            decoder.start_presentation();
+            seek_resume_force = false;
+            stop_pts = -1.0;
+            VRP_LOG("seek: TIMEOUT forced presentation arm=%.3f", arm);
+          } else {
+            stop_pts = -1.0;
+          }
+        } else if ((in_flush || land_wedged) && land_wait >= 1.0) {
+          static std::chrono::steady_clock::time_point deep_wait_log{};
+          if (deep_wait_log.time_since_epoch().count() == 0 ||
+              (now - deep_wait_log) >= std::chrono::milliseconds(500)) {
+            VRP_LOG("seek: wait decode land after %.2fs busy=1 gen=%llu | %s", land_wait,
+                    static_cast<unsigned long long>(vulkan_tex.present_generation()),
+                    decoder.seek_debug_state().c_str());
+            deep_wait_log = now;
+          }
+        }
       }
 
       // HMD menu: cached atlas on the GPU, quads placed every paint.
@@ -6665,9 +7026,17 @@ void HostWindow::xrThreadMain() {
 
       // Idle / clear_only: sky only (no translucent content panel fill).
       scene.set_content_draw(!show_idle_screen && !opt_.clear_only);
-      scene.render_frame(xr, fi, proj_views, layer);
-      std::vector<XrCompositionLayerBaseHeader*> layers = {
-          reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+      bool rendered = scene.render_frame(xr, fi, proj_views, layer);
+      if (!rendered && decoder.vulkan_path_active()) {
+        // Acquire may be parking the graphics queue on an unmet decode timeline.
+        if (vulkan_tex.try_unwedge_acquire() && scene.wait_previous_submit(200'000'000ull)) {
+          rendered = scene.render_frame(xr, fi, proj_views, layer);
+        }
+      }
+      std::vector<XrCompositionLayerBaseHeader*> layers;
+      if (rendered && layer.viewCount > 0) {
+        layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
+      }
       xr.end_frame(fi, layers);
 
       // FSR after end_frame so predictedDisplayTime submit is not delayed by upscale.
@@ -6679,15 +7048,44 @@ void HostWindow::xrThreadMain() {
           scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
           force_fsr_refresh = false;
         }
-        if (fsr_need_process && !fsr.busy() && fsr_src_y && fsr_src_samp && fsr_src_w > 0 &&
-            fsr_src_h > 0) {
-          (void)fsr.process(fsr_src_y, fsr_src_uv ? fsr_src_uv : fsr_src_y, fsr_src_samp, fsr_src_w,
-                            fsr_src_h, fsr_src_nv12);
-          fsr_need_process = false;
-          if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
-            scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
-            force_fsr_refresh = false;
+        if (fsr_need_process && !fsr.busy()) {
+          VkImageView py = fsr_src_y;
+          VkImageView puv = fsr_src_uv ? fsr_src_uv : fsr_src_y;
+          VkSampler ps = fsr_src_samp;
+          int pw = fsr_src_w;
+          int ph = fsr_src_h;
+          int pnv = fsr_src_nv12;
+          // CUDA/VAAPI → GENERAL. Vulkan Video AVVkFrame / Live DMA / RGBA → SRO.
+          // Live FSR must keep bind_yt_rgba DMA/RGBA src — decoder is only paused and
+          // vulkan_path_active() would otherwise upscale the last SBS file frame.
+          VkImageLayout src_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+          if (!live_fsr_armed) {
+            if (decoder.gpu_path_active() || decoder.vaapi_path_active()) {
+              src_layout = VK_IMAGE_LAYOUT_GENERAL;
+            }
+            if (decoder.vulkan_path_active()) {
+              py = vulkan_tex.y_view();
+              puv = vulkan_tex.uv_view() ? vulkan_tex.uv_view() : py;
+              ps = vulkan_tex.sampler();
+              pw = vulkan_tex.width();
+              ph = vulkan_tex.height();
+              pnv = vulkan_tex.full_range() ? 2 : 1;
+              src_layout = vulkan_tex.sample_layout();
+              if (!py || !ps || pw <= 0 || ph <= 0) py = VK_NULL_HANDLE;
+            }
           }
+          if (py && ps && pw > 0 && ph > 0) {
+            (void)fsr.process(py, puv ? puv : py, ps, pw, ph, pnv, src_layout);
+            fsr_need_process = false;
+            (void)fsr.poll();
+            if (fsr.output_view() && fsr.output_sampler()) {
+              scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+              force_fsr_refresh = false;
+            }
+          }
+        } else if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
+          scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+          force_fsr_refresh = false;
         }
       } else if (fsr.enabled() && (show_idle_screen || skip_yt_fsr)) {
         (void)fsr.poll();
@@ -6797,15 +7195,9 @@ void HostWindow::xrThreadMain() {
     VRP_LOG("teardown: halt decode done");
     cuda_tex.prepare_shutdown();
     cuda_tex.drain_copies();
-    // Bound GPU waits — after physical unplug vkQueueWaitIdle can hang forever and
-    // leave the Vulkan instance alive if the UI thread detaches us.
+    // Timed fence only — vkQueueWaitIdle hangs forever on a wedged graphics queue
+    // and leaves a zombie process after the UI join timeout / detach.
     (void)scene.wait_previous_submit(100'000'000ull);
-    if (!xr_stop_.load()) {
-      std::lock_guard<std::mutex> qlock(xr.queue_mutex());
-      (void)vkQueueWaitIdle(xr.queue());
-    } else {
-      VRP_LOG("teardown: skip vkQueueWaitIdle (stop/unplug)");
-    }
     scene.set_texture(texture.view(), texture.sampler());
     scene.set_hud_texture(VK_NULL_HANDLE, VK_NULL_HANDLE, false);
     scene.set_thumb_texture(VK_NULL_HANDLE, VK_NULL_HANDLE, false);
@@ -6815,8 +7207,11 @@ void HostWindow::xrThreadMain() {
     bc7.shutdown();
     VRP_LOG("teardown: decoder closed");
     fsr.shutdown();
+    VRP_LOG("teardown: fsr done");
     cuda_tex.shutdown();
     vaapi_tex.shutdown();
+    VRP_LOG("teardown: vulkan_tex shutdown");
+    vulkan_tex.shutdown();
 #if defined(VRP_HAS_PIPEWIRE)
     pw_dma_tex.shutdown();
 #endif
@@ -6824,7 +7219,9 @@ void HostWindow::xrThreadMain() {
     hud_tex.shutdown();
     seek_tex.shutdown();
     texture.shutdown();
+    VRP_LOG("teardown: scene shutdown");
     scene.shutdown();
+    VRP_LOG("teardown: xr shutdown");
     xr.shutdown();
     VRP_LOG("teardown: complete (Vulkan instance destroyed)");
   } catch (const std::exception& e) {

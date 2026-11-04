@@ -78,7 +78,9 @@ class SceneRenderer {
   float sky_lon_deg() const { return sky_lon_deg_; }
 
   // Render both eye swapchains for the current frame; fills projection layers.
-  void render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo& frame,
+  // Returns false if the prior eye fence is stuck (no new submit; swapchains not touched).
+  // AVVkFrame timelines must NOT be attached here — acquire-once on VulkanVideoTexture.
+  bool render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo& frame,
                     std::vector<XrCompositionLayerProjectionView>& proj_views,
                     XrCompositionLayerProjection& layer);
 
@@ -248,6 +250,8 @@ class SceneRenderer {
   float thumb_y_ = 0.f;
   float thumb_distance_ = 1.32f;
   VkFence submit_fence_ = VK_NULL_HANDLE;
+  /** Prior eye submit never completed — poll instead of multi-second waits. */
+  bool eye_fence_wedged_ = false;
 };
 
 }  // namespace vrp

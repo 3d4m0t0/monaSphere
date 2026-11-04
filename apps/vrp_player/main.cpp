@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "common/crash_guard.hpp"
 #include "desktop_ui.hpp"
 #include "host_window.hpp"
 #include "i18n.hpp"
