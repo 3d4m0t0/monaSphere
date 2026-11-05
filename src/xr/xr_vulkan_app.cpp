@@ -212,13 +212,43 @@ void XrVulkanApp::request_exit() {
   }
 }
 
+namespace {
+
+/** Run a runtime/driver call that can block until Monado dies. Detach on timeout. */
+template <typename Fn>
+bool run_timed(const char* what, int timeout_ms, Fn&& fn) {
+  std::atomic<bool> done{false};
+  std::thread worker([&] {
+    fn();
+    done.store(true, std::memory_order_release);
+  });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  if (done.load(std::memory_order_acquire)) {
+    worker.join();
+    return true;
+  }
+  VRP_ERR("%s timed out after %dms — leak and continue", what, timeout_ms);
+  worker.detach();
+  return false;
+}
+
+}  // namespace
+
 void XrVulkanApp::finish_exit() {
+  VRP_LOG("shutdown: finish_exit begin running=%d session=%d", session_running_ ? 1 : 0,
+          session_ ? 1 : 0);
   exit_requested_.store(true, std::memory_order_release);
   if (!session_) {
     session_running_ = false;
+    VRP_LOG("shutdown: finish_exit end (no session)");
     return;
   }
   if (session_running_) {
+    VRP_LOG("shutdown: finish_exit request_exit");
     request_exit();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     while (session_running_ && std::chrono::steady_clock::now() < deadline) {
@@ -227,14 +257,20 @@ void XrVulkanApp::finish_exit() {
     }
     if (session_running_) {
       // STOPPING event missed (blocked in WaitFrame earlier) — EndSession best-effort.
-      const XrResult er = xrEndSession(session_);
-      if (XR_FAILED(er) && er != XR_ERROR_SESSION_NOT_STOPPING &&
-          er != XR_ERROR_SESSION_NOT_RUNNING) {
-        VRP_ERR("finish_exit: xrEndSession (%d)", static_cast<int>(er));
-      }
+      const XrSession session = session_;
+      const bool ended = run_timed("finish_exit xrEndSession", 1000, [session] {
+        const XrResult er = xrEndSession(session);
+        if (XR_FAILED(er) && er != XR_ERROR_SESSION_NOT_STOPPING &&
+            er != XR_ERROR_SESSION_NOT_RUNNING) {
+          VRP_ERR("finish_exit: xrEndSession (%d)", static_cast<int>(er));
+        }
+      });
       session_running_ = false;
+      if (!ended) session_ = XR_NULL_HANDLE;
     }
   }
+  VRP_LOG("shutdown: finish_exit end running=%d session=%d", session_running_ ? 1 : 0,
+          session_ ? 1 : 0);
 }
 
 void XrVulkanApp::report_if_device_lost(VkResult result) const {
@@ -265,38 +301,107 @@ void XrVulkanApp::report_if_device_lost(VkResult result) const {
 }
 
 void XrVulkanApp::shutdown() {
+  if (shutdown_done_.exchange(true, std::memory_order_acq_rel)) return;
+
+  // Drop every handle without another runtime call. Used when a call is still
+  // running on a detached thread, or the decode queue never went idle.
+  auto abandon = [this] {
+    swapchains_.clear();
+    app_space_ = XR_NULL_HANDLE;
+    local_space_ = XR_NULL_HANDLE;
+    view_space_ = XR_NULL_HANDLE;
+    action_set_ = XR_NULL_HANDLE;
+    session_ = XR_NULL_HANDLE;
+    session_running_ = false;
+    actions_ready_ = false;
+    if (ffmpeg_vulkan_) {
+      static FfmpegVulkanDevice* leaked_hwctx = nullptr;
+      leaked_hwctx = ffmpeg_vulkan_.release();
+      (void)leaked_hwctx;
+    }
+    video_decode_ready_ = false;
+    video_decode_queue_ = VK_NULL_HANDLE;
+    video_decode_queue_family_ = UINT32_MAX;
+    command_pool_ = VK_NULL_HANDLE;
+    color_pass_ = VK_NULL_HANDLE;
+    device_ = VK_NULL_HANDLE;
+    queue_ = VK_NULL_HANDLE;
+    physical_device_ = VK_NULL_HANDLE;
+    vk_instance_ = VK_NULL_HANDLE;
+    instance_ = XR_NULL_HANDLE;
+    session_focused_ = false;
+    tracking_valid_ = false;
+    crash_guard::clear_session_cookie();
+  };
+
+  VRP_LOG("shutdown: begin running=%d session=%d device=%d", session_running_ ? 1 : 0,
+          session_ ? 1 : 0, device_ != VK_NULL_HANDLE ? 1 : 0);
   // OpenXR session must be torn down before the Vulkan device it uses.
   if (session_ && session_running_) {
+    VRP_LOG("shutdown: session still running -> request_exit");
     request_exit();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
     while (session_running_ && std::chrono::steady_clock::now() < deadline) {
       if (!pump_events()) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    if (session_running_) {
-      xrEndSession(session_);
+    if (session_running_ && session_) {
+      const XrSession session = session_;
+      if (!run_timed("xrEndSession", 1000, [session] { (void)xrEndSession(session); })) {
+        abandon();
+        return;
+      }
       session_running_ = false;
     }
   }
 
-  destroy_swapchains();
+  // A wedged decode CB makes xrDestroySession / vkDestroyDevice block until
+  // Monado is killed. Idle first; if the queue does not drain, leak and return
+  // so the XR thread can finish without Broken pipe.
+  if (device_ != VK_NULL_HANDLE) {
+    VRP_LOG("shutdown: vkDeviceWaitIdle");
+    const VkDevice dev = device_;
+    if (!run_timed("vkDeviceWaitIdle", 1000, [dev] { (void)vkDeviceWaitIdle(dev); })) {
+      VRP_ERR("shutdown: device not idle — skip Destroy* (decode queue still busy)");
+      abandon();
+      return;
+    }
+    VRP_LOG("shutdown: vkDeviceWaitIdle done");
+  }
 
-  if (app_space_) {
-    xrDestroySpace(app_space_);
-    app_space_ = XR_NULL_HANDLE;
+  VRP_LOG("shutdown: destroy_swapchains");
+  if (!run_timed("destroy_swapchains", 2000, [this] { destroy_swapchains(); })) {
+    abandon();
+    return;
   }
-  if (local_space_) {
-    xrDestroySpace(local_space_);
-    local_space_ = XR_NULL_HANDLE;
+  VRP_LOG("shutdown: destroy_swapchains done");
+
+  VRP_LOG("shutdown: destroy spaces");
+  const XrSpace app_space = app_space_;
+  const XrSpace local_space = local_space_;
+  const XrSpace view_space = view_space_;
+  app_space_ = XR_NULL_HANDLE;
+  local_space_ = XR_NULL_HANDLE;
+  view_space_ = XR_NULL_HANDLE;
+  if (!run_timed("xrDestroySpace", 1000, [app_space, local_space, view_space] {
+        if (app_space) xrDestroySpace(app_space);
+        if (local_space) xrDestroySpace(local_space);
+        if (view_space) xrDestroySpace(view_space);
+      })) {
+    abandon();
+    return;
   }
-  if (view_space_) {
-    xrDestroySpace(view_space_);
-    view_space_ = XR_NULL_HANDLE;
-  }
+  VRP_LOG("shutdown: destroy spaces done");
   tracking_origin_inited_ = false;
   if (action_set_) {
-    xrDestroyActionSet(action_set_);
+    VRP_LOG("shutdown: xrDestroyActionSet");
+    const XrActionSet set = action_set_;
     action_set_ = XR_NULL_HANDLE;
+    if (!run_timed("xrDestroyActionSet", 1000, [set] { xrDestroyActionSet(set); })) {
+      abandon();
+      return;
+    }
+    VRP_LOG("shutdown: xrDestroyActionSet done");
   }
   actions_ready_ = false;
   play_action_ = seek_back_action_ = seek_fwd_action_ = recenter_action_ = XR_NULL_HANDLE;
@@ -308,12 +413,30 @@ void XrVulkanApp::shutdown() {
   menu_long_fired_ = false;
 
   if (session_) {
-    xrDestroySession(session_);
+    VRP_LOG("shutdown: xrDestroySession");
+    const XrSession session = session_;
     session_ = XR_NULL_HANDLE;
+    if (!run_timed("xrDestroySession", 2000, [session] { xrDestroySession(session); })) {
+      abandon();
+      return;
+    }
+    VRP_LOG("shutdown: xrDestroySession done");
   }
 
   // Drop FFmpeg hwctx before DestroyDevice (inject does not own the VkDevice).
-  ffmpeg_vulkan_.reset();
+  // reset() takes queue_mu_ / waits on a decode CB and used to stall with no log.
+  if (ffmpeg_vulkan_) {
+    VRP_LOG("shutdown: ffmpeg hwctx reset");
+    FfmpegVulkanDevice* ff = ffmpeg_vulkan_.get();
+    if (!run_timed("ffmpeg hwctx reset", 1000, [ff] { ff->reset(); })) {
+      static FfmpegVulkanDevice* leaked_hwctx = nullptr;
+      leaked_hwctx = ffmpeg_vulkan_.release();
+      (void)leaked_hwctx;
+    } else {
+      ffmpeg_vulkan_.reset();
+    }
+    VRP_LOG("shutdown: ffmpeg hwctx reset done");
+  }
   video_decode_ready_ = false;
   video_decode_queue_ = VK_NULL_HANDLE;
   video_decode_queue_family_ = UINT32_MAX;
@@ -321,72 +444,58 @@ void XrVulkanApp::shutdown() {
   pfn_get_device_fault_ = nullptr;
   enabled_dev_exts_.clear();
 
+  // WaitIdle already succeeded above. vkDestroyDevice can still block in the
+  // driver until Monado's IPC dies — that path printed no timeout of its own.
   if (device_ != VK_NULL_HANDLE) {
-    // HMD unplug / wedged decode CB can block forever. Never DestroyDevice while
-    // WaitIdle is still running — that wedges NVIDIA so the next process cannot
-    // create a Vulkan instance.
-    std::atomic<bool> idle_done{false};
-    const VkDevice idle_dev = device_;
-    std::thread idle_thr([idle_dev, &idle_done] {
-      (void)vkDeviceWaitIdle(idle_dev);
-      idle_done.store(true, std::memory_order_release);
-    });
-    const auto idle_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!idle_done.load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < idle_deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    VRP_LOG("shutdown: vkDestroyDevice");
+    const VkDevice dev = device_;
+    const VkCommandPool pool = command_pool_;
+    const VkRenderPass pass = color_pass_;
+    const VkInstance vk_inst = vk_instance_;
+    command_pool_ = VK_NULL_HANDLE;
+    color_pass_ = VK_NULL_HANDLE;
+    device_ = VK_NULL_HANDLE;
+    queue_ = VK_NULL_HANDLE;
+    physical_device_ = VK_NULL_HANDLE;
+    vk_instance_ = VK_NULL_HANDLE;
+    if (!run_timed("vkDestroyDevice", 2000, [dev, pool, pass, vk_inst] {
+          if (pool) vkDestroyCommandPool(dev, pool, nullptr);
+          if (pass) vkDestroyRenderPass(dev, pass, nullptr);
+          vkDestroyDevice(dev, nullptr);
+          if (vk_inst) vkDestroyInstance(vk_inst, nullptr);
+        })) {
+      if (instance_) instance_ = XR_NULL_HANDLE;
+      crash_guard::clear_session_cookie();
+      VRP_LOG("shutdown: vkDestroyDevice timed out — leaked device");
+      return;
     }
-    const bool idle_ok = idle_done.load(std::memory_order_acquire);
-    if (idle_ok) {
-      idle_thr.join();
-    } else {
-      VRP_ERR("vkDeviceWaitIdle timed out during XR shutdown — leak device/instance "
-              "(skip Destroy*; process exit cleans up; avoids next-launch wedge)");
-      idle_thr.detach();
-    }
-    if (idle_ok) {
-      if (command_pool_) {
-        vkDestroyCommandPool(device_, command_pool_, nullptr);
-        command_pool_ = VK_NULL_HANDLE;
-      }
-      if (color_pass_) {
-        vkDestroyRenderPass(device_, color_pass_, nullptr);
-        color_pass_ = VK_NULL_HANDLE;
-      }
-      vkDestroyDevice(device_, nullptr);
-      device_ = VK_NULL_HANDLE;
-      queue_ = VK_NULL_HANDLE;
-      physical_device_ = VK_NULL_HANDLE;
-      if (vk_instance_) {
-        vkDestroyInstance(vk_instance_, nullptr);
-        vk_instance_ = VK_NULL_HANDLE;
-      }
-    } else {
-      // Leak Vulkan handles; clear locals so we do not double-destroy on ~.
-      command_pool_ = VK_NULL_HANDLE;
-      color_pass_ = VK_NULL_HANDLE;
-      device_ = VK_NULL_HANDLE;
-      queue_ = VK_NULL_HANDLE;
-      physical_device_ = VK_NULL_HANDLE;
-      vk_instance_ = VK_NULL_HANDLE;
-    }
+    VRP_LOG("shutdown: vkDestroyDevice done");
   } else {
     queue_ = VK_NULL_HANDLE;
     physical_device_ = VK_NULL_HANDLE;
     if (vk_instance_) {
-      vkDestroyInstance(vk_instance_, nullptr);
+      VRP_LOG("shutdown: vkDestroyInstance (no device)");
+      const VkInstance vk_inst = vk_instance_;
       vk_instance_ = VK_NULL_HANDLE;
+      (void)run_timed("vkDestroyInstance", 2000, [vk_inst] { vkDestroyInstance(vk_inst, nullptr); });
     }
   }
 
   if (instance_) {
-    xrDestroyInstance(instance_);
+    VRP_LOG("shutdown: xrDestroyInstance");
+    const XrInstance instance = instance_;
     instance_ = XR_NULL_HANDLE;
+    if (!run_timed("xrDestroyInstance", 2000, [instance] { xrDestroyInstance(instance); })) {
+      crash_guard::clear_session_cookie();
+      return;
+    }
+    VRP_LOG("shutdown: xrDestroyInstance done");
   }
   session_focused_ = false;
   tracking_valid_ = false;
   last_display_time_ = 0;
   crash_guard::clear_session_cookie();
+  VRP_LOG("shutdown: end");
 }
 
 void XrVulkanApp::create_instance() { create_instance(nullptr, {}); }
@@ -984,7 +1093,10 @@ void XrVulkanApp::create_swapchains() {
 }
 
 void XrVulkanApp::destroy_swapchains() {
-  for (auto& sc : swapchains_) {
+  // Move out first so a timed caller can leak this object without racing the vector.
+  auto local = std::move(swapchains_);
+  swapchains_.clear();
+  for (auto& sc : local) {
     for (auto& img : sc.images) {
       if (device_) {
         if (img.framebuffer) vkDestroyFramebuffer(device_, img.framebuffer, nullptr);
@@ -1204,11 +1316,24 @@ bool XrVulkanApp::pump_events() {
             }
             break;
           }
-          case XR_SESSION_STATE_STOPPING:
-            xrEndSession(session_);
+          case XR_SESSION_STATE_STOPPING: {
+            // Untimed xrEndSession here blocked teardown with no "timed out" line:
+            // the UI only saw Session state 6 and then killed Monado.
+            VRP_LOG("shutdown: pump STOPPING -> xrEndSession");
+            const XrSession stopping = session_;
+            const bool ended = run_timed("pump xrEndSession", 1000, [stopping] {
+              const XrResult er = xrEndSession(stopping);
+              if (XR_FAILED(er) && er != XR_ERROR_SESSION_NOT_STOPPING &&
+                  er != XR_ERROR_SESSION_NOT_RUNNING) {
+                VRP_ERR("pump xrEndSession (%d)", static_cast<int>(er));
+              }
+            });
+            VRP_LOG("shutdown: pump xrEndSession done ok=%d", ended ? 1 : 0);
             session_running_ = false;
             tracking_origin_inited_ = false;
+            if (!ended) session_ = XR_NULL_HANDLE;
             break;
+          }
           case XR_SESSION_STATE_EXITING:
           case XR_SESSION_STATE_LOSS_PENDING:
             return false;

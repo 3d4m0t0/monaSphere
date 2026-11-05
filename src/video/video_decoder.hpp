@@ -283,6 +283,8 @@ class VideoDecoder {
   std::atomic<bool> playback_started_{false};
   std::atomic<size_t> priming_need_bytes_{0};  // threshold for current priming
   bool awaiting_frame_after_seek_ = false;  // decode thread only
+  /** Newest PTS shown during this scrub. Older pictures are not displayed. */
+  double seek_shown_pts_ = -1.0;
   std::atomic<bool> seek_busy_{false};
   std::atomic<bool> seek_abandon_{false};
   /** Decode-thread progress label for seek hang diagnosis (string literal only). */

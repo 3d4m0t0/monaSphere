@@ -1363,6 +1363,14 @@ void VideoDecoder::decode_loop() {
       demux_pause_.store(false);
       pkt_cv_.notify_all();
       next_deadline = clock::now();
+      // Forward scrub keeps the newest PTS already shown, so the re-decode from
+      // the keyframe does not replay earlier pictures (the 9↔10 flicker).
+      // A backward seek clears it and may show earlier frames again.
+      {
+        const double applied = position_sec_.load();
+        if (!(seek_shown_pts_ >= 0.0 && applied + frame_duration_ >= seek_shown_pts_))
+          seek_shown_pts_ = -1.0;
+      }
       awaiting_frame_after_seek_ = true;
       set_decode_phase("seek_await");
       {
@@ -1407,12 +1415,13 @@ void VideoDecoder::decode_loop() {
       continue;
     }
     if (open_.load() && (playing_.load() || awaiting_frame_after_seek_)) {
-      // Stop-seek: discard until the bar PTS. Scrub: publish intermediates.
+      // Scrub shows each newer approach frame (the responsive path). Stop-seek
+      // discards until the bar. Frames older than the newest shown PTS are
+      // dropped in decode_next so the picture never steps backward.
       const double present_after =
           (awaiting_frame_after_seek_ && seek_skips < 300 && !scrub_preview)
               ? seek_target_.load()
               : -1.0;
-      // Scrub: present every approach frame so the panel tracks the bar.
       // Discard (present_after / seek bail) uses recycle_frame (wait + consumer +1).
       got = decode_next(scratch, /*convert_rgba=*/true, present_after);
     }
@@ -2413,8 +2422,10 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
             out.height = 0;
             return true;
           }
+          // Half a frame: 0.04s accepted the previous 60fps picture (~16ms early).
+          const double seek_early = std::max(frame_duration_ * 0.5, 0.001);
           const bool skip_before =
-              present_after_sec >= 0.0 && out.pts_sec + 0.04 < present_after_sec;
+              present_after_sec >= 0.0 && out.pts_sec + seek_early < present_after_sec;
           const bool drop_for_seek = seek_req_.load();
           const bool want_mailbox = convert_rgba && !skip_before && !drop_for_seek;
           // Seek land: kick_gpu during wait; short last-resort if still stalled.
@@ -2472,6 +2483,19 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
             return true;
           }
           const bool full = ff_->codec && ff_->codec->color_range == AVCOL_RANGE_JPEG;
+          // Show newer frames during the seek. Drop a picture older than the
+          // newest one already shown (B-frame after its reference → 10 then 9).
+          const bool seek_picture =
+              awaiting_frame_after_seek_ || seek_busy_.load() || seek_scrubbing_.load();
+          if (seek_picture && seek_shown_pts_ >= 0.0 &&
+              out.pts_sec + frame_duration_ * 0.5 < seek_shown_pts_) {
+            set_decode_phase("present_pts_regress");
+            (void)vulkan_tex_->recycle_frame(ff_->frame, wait_ns, &wait_why);
+            lock.lock();
+            out.width = 0;
+            out.height = 0;
+            return true;
+          }
           const bool presented =
               vulkan_tex_->try_present(ff_->frame, full, wait_ns, &wait_why);
           if (!presented && wait_why && std::strcmp(wait_why, "timeout") == 0 &&
@@ -2481,6 +2505,7 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
           }
           lock.lock();
           if (presented) {
+            if (seek_picture && out.pts_sec > seek_shown_pts_) seek_shown_pts_ = out.pts_sec;
             set_decode_phase("presented");
             out.width = width_;
             out.height = height_;
@@ -2523,7 +2548,8 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
           out.height = 0;
           return true;
         }
-        if (present_after_sec >= 0.0 && out.pts_sec + 0.04 < present_after_sec) {
+        if (present_after_sec >= 0.0 &&
+            out.pts_sec + std::max(frame_duration_ * 0.5, 0.001) < present_after_sec) {
           set_decode_phase("present_after_skip");
           out.width = 0;
           out.height = 0;

@@ -106,6 +106,7 @@ struct OpenAlSpatial::Impl {
   int sample_rate = 48000;
   int channels = 0;
   float gain = 1.f;
+  bool hold_silence = false;
   std::string last_error;
   /** Pulse sink passed to the last successful init (empty = default device). */
   std::string pulse_sink;
@@ -358,10 +359,16 @@ void OpenAlSpatial::set_gain(float linear_0_1) {
 #endif
 }
 
+void OpenAlSpatial::set_hold_silence(bool hold) {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  impl_->hold_silence = hold;
+}
+
 void OpenAlSpatial::play() {
 #if defined(VRP_HAS_OPENAL)
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || !impl_->context) return;
+  if (impl_->hold_silence) return;
   alcMakeContextCurrent(impl_->context);
   for (Speaker& sp : impl_->speakers) {
     ALint state = AL_INITIAL;

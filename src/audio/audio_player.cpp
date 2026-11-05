@@ -842,6 +842,28 @@ bool AudioPlayer::ensure_output(const std::string& device_name) {
 #endif
 }
 
+void AudioPlayer::apply_listener_gain() {
+  if (!st_ || !st_->use_spatial) return;
+  // Live ignores the file volume. The page's own control is the level;
+  // our output stays at unity until the monitor stops.
+  const float g = switch_muted_ ? 0.f
+                  : (live_monitor_.load(std::memory_order_acquire) ? 1.f : volume_);
+  st_->spatial.set_gain(g);
+}
+
+void AudioPlayer::mute_for_switch() {
+  switch_muted_ = true;
+  playing_ = false;
+  if (st_) {
+    st_->volume.store(0.f, std::memory_order_relaxed);
+    st_->output_live.store(false, std::memory_order_release);
+    st_->playing.store(false, std::memory_order_release);
+    st_->spatial.set_gain(0.f);
+    st_->spatial.set_hold_silence(true);
+  }
+  mute_output();
+}
+
 void AudioPlayer::clear_file() {
   if (live_monitor_) {
     // Live capture owns the spatial path — don't tear it down via clear_file.
@@ -849,7 +871,8 @@ void AudioPlayer::clear_file() {
     free_demux();
     return;
   }
-  mute_output();
+  // Mute before any stop/flush so OpenAL source stop is inaudible.
+  mute_for_switch();
   stop_thread();
   free_demux();
   has_audio_ = false;
@@ -863,6 +886,7 @@ void AudioPlayer::clear_file() {
     st_->playing.store(false, std::memory_order_release);
     st_->stop.store(false);
     flush_output();
+    apply_listener_gain();
     if (is_output_ready()) start_thread();  // keep idle silence thread
   }
 }
@@ -1359,7 +1383,9 @@ bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
   if (st_->use_spatial) {
     st_->output_live.store(false, std::memory_order_release);  // keep miniaudio silent
     st_->playing.store(true, std::memory_order_release);
-    st_->spatial.set_gain(volume_);
+    const bool restore = switch_muted_;
+    if (restore) st_->spatial.set_gain(0.f);
+    else st_->spatial.set_gain(volume_);
     if (wait_for_prefill) {
       const int want = st_->out_rate / 10;
       for (int i = 0; i < 50; ++i) {
@@ -1368,7 +1394,18 @@ bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
       }
     }
+    switch_muted_ = false;
+    st_->spatial.set_hold_silence(false);
     st_->spatial.play();
+    if (restore) {
+      const float target = volume_;
+      for (int i = 1; i <= 8; ++i) {
+        st_->spatial.set_gain(target * (static_cast<float>(i) / 8.f));
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+      }
+    } else {
+      st_->spatial.set_gain(volume_);
+    }
     playing_ = true;
     return true;
   }
@@ -1382,8 +1419,10 @@ bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
   }
-  const int fade = std::max(1, st_->out_rate * 15 / 1000);
-  st_->fade_in_total.store(fade, std::memory_order_relaxed);
+  const int fade = std::max(1, st_->out_rate * (switch_muted_ ? 40 : 15) / 1000);
+  switch_muted_ = false;
+  st_->spatial.set_hold_silence(false);
+  st_->volume.store(volume_, std::memory_order_relaxed);
   st_->fade_in_left.store(fade, std::memory_order_relaxed);
   st_->output_live.store(true, std::memory_order_release);
   playing_ = true;
@@ -1488,10 +1527,9 @@ void AudioPlayer::flush_output() {
 
 void AudioPlayer::set_volume(float v) {
   volume_ = std::clamp(v, 0.f, 1.f);
-  if (st_) {
-    st_->volume.store(volume_, std::memory_order_relaxed);
-    if (st_->use_spatial) st_->spatial.set_gain(volume_);
-  }
+  if (!st_ || switch_muted_) return;
+  st_->volume.store(volume_, std::memory_order_relaxed);
+  apply_listener_gain();
 }
 
 void AudioPlayer::set_rate(float rate) {
@@ -1670,12 +1708,16 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
   spatial_active_.store(true, std::memory_order_release);
   has_audio_ = true;
   live_monitor_.store(true, std::memory_order_release);
-
-  st_->spatial.set_gain(volume_);
+  // File-switch mute must not carry into Live. hold_silence makes play() a no-op.
+  switch_muted_ = false;
+  st_->volume.store(volume_, std::memory_order_relaxed);
+  st_->spatial.set_hold_silence(false);
+  st_->spatial.set_gain(1.f);
   st_->spatial.flush();
   start_live_thread(monitor);
   if (!st_->live_mon.ok()) {
     live_monitor_.store(false, std::memory_order_release);
+    apply_listener_gain();
     spatial_active_.store(false, std::memory_order_release);
     has_audio_ = false;
     playing_ = false;
@@ -1689,6 +1731,7 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
     has_audio_ = false;
     playing_ = false;
     live_monitor_.store(false, std::memory_order_release);
+    apply_listener_gain();
     return false;
   }
   st_->playing.store(true, std::memory_order_release);
@@ -1700,7 +1743,7 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
     char line[256];
     std::snprintf(line, sizeof(line),
                   "live audio: guest PCM → Soft HRTF 4.0 side-diff "
-                  "(vol=%.2f surround_gain=%.2f) monitor=%s module=%u",
+                  "(gain=1.00 file_vol=%.2f surround_gain=%.2f) monitor=%s module=%u",
                   static_cast<double>(volume_), static_cast<double>(surround_gain_),
                   monitor.c_str(), PulseMonitor::last_module_index());
     push_audio_status(line);
@@ -1844,6 +1887,8 @@ void AudioPlayer::stop_live_monitor() {
   // XR must not call set_listener while we pause Soft.
   spatial_active_.store(false, std::memory_order_release);
   live_monitor_.store(false, std::memory_order_release);
+  // Monitor is down: put the file volume back on the listener before teardown.
+  apply_listener_gain();
   stop_live_thread();
   if (st_) {
     st_->use_spatial = false;

@@ -36,6 +36,8 @@ class OpenAlSpatial {
 
   void set_listener_orientation(float yaw_rad, float pitch_rad);
   void set_gain(float linear_0_1);
+  /** While held, play() does not start sources (queued PCM stays silent). */
+  void set_hold_silence(bool hold);
 
   void play();
   void pause();

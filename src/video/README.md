@@ -24,11 +24,19 @@ Seek scrub pauses and issues throttled `decoder.seek_to` at the bar. Each seek r
 | Freed | `av_frame_unref` | after Released |
 
 - Ledger (`waited_decode_` / `signaled_upto_`) makes +1 idempotent across mailbox + `ff_->frame` sharing one `AVVkFrame`.
-- Skip/seek-bail **must** `recycle_frame` (wait-only discard caused `need=D+2 cur=D`).
-- Acquire never bumps `sem_value`. Never `force_resume` during `seek_flush`/`seek_apply`/`seek_pre_flush_wait`.
 - Seek: eye_done → `release_all_for_flush` → `recycle_frame(ff_->frame)` → `av_frame_unref` → `avcodec_flush_buffers`.
 - Never host-signal decode `need`. On recycle timeout (~2s): orphan + reopen (skip flush) + re-seek.
-- **PowerMizer AUTO**: with play/demux paused, clocks stay low → `need=cur+1` stalls. `kick_gpu_activity()` (graphics no-op) during wait raises clocks. Prefer fixed Preferred/Performance or `vulkan_video=0`.
+
+**Stall conditions:**
+
+| Condition | What happens | Do instead |
+|-----------|----------------|------------|
+| Host `release_held` while decode phase is `send_packet` | In-flight decode still owns the `AVVkFrame`. Host `+1` leaves `need=cur+1`; `wait_avframe` never returns. Mailbox may already be empty. `kick_gpu_activity` does not move `cur`. | Skip `release_held`. Decode thread returns front and back in `release_all_for_flush` after `send_packet` returns. Scrub never calls `release_held`. |
+| Returning both mailbox slots from the decode thread (`release_all_for_flush`) | Safe. Same `had_front=1 had_back=1` state during scrub does not stall, because `send_packet` has already returned. | Keep that return on the decode thread, before `avcodec_flush_buffers`. |
+| Skip/seek-bail discards a frame without `recycle_frame` | `need=D+2 cur=D`. | Always `recycle_frame` (wait D, then exactly one `D+1`). |
+| Acquire submits a consumer `+1` | GPU has not finished D; next wait is `need=cur+1`. | Acquire waits on D only. `+1` is only `host_signal_slot` on return. |
+| `force_resume` during `seek_pre_flush_wait` / `seek_flush` / `seek_apply` | Host `play=1` plus demux while decode is still on the timeline stalls the mailbox. | Do not `force_resume` in those phases. |
+| PowerMizer AUTO, play/demux paused | Clocks stay low and a live decode CB sits at `need=cur+1` until clocks rise. | `kick_gpu_activity()` (graphics no-op) during the wait. If `cur` stays put across kicks, this is a timeline desync, not clocks. |
 
 Eye / FSR bind only **acquired** sampling views (`y_view` is null until then). Sampling a raw display `AVVkFrame` before acquire (wrong layout) wedged the graphics queue — blank picture, audio still playing, process hung on exit.
 

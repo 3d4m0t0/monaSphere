@@ -216,6 +216,8 @@ class XrVulkanApp {
 
   bool session_running_ = false;
   std::atomic<bool> exit_requested_{false};
+  /** shutdown() is also called from the destructor. */
+  std::atomic<bool> shutdown_done_{false};
   bool session_focused_ = false;
   bool tracking_valid_ = false;
   bool tracking_origin_inited_ = false;

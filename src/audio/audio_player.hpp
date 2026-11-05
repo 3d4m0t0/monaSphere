@@ -80,6 +80,8 @@ class AudioPlayer {
   void pause();
   /** Soft-mute + flush ring; device keeps running and outputs silence to the HMD. */
   void mute_output();
+  /** Gain 0, then drop queued PCM. Volume returns on the next prefill. */
+  void mute_for_switch();
   /** Seek to sec and stay silent. Video is held on the matching still. */
   void park_at(double sec);
   /** Seek to sec, prefill, then unmute. Call start_presentation() immediately after. */
@@ -153,6 +155,8 @@ class AudioPlayer {
   std::mutex live_ops_mu_;
   bool start_live_monitor_with_gen(uint64_t gen);
   float volume_ = 0.2f;
+  /** File switch: listener stays at 0 until the new stream is prefilled. */
+  bool switch_muted_ = false;
   float rate_ = 1.f;
   float surround_gain_ = 0.55f;
   std::string device_name_;
@@ -166,6 +170,7 @@ class AudioPlayer {
   void fail(const std::string& msg);
   void start_thread();
   void stop_thread();
+  void apply_listener_gain();
   void start_live_thread(const std::string& monitor_source);
   void stop_live_thread();
   /** Free FFmpeg demux/codec/swr (device/ring untouched). */

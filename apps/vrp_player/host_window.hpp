@@ -263,6 +263,8 @@ class HostWindow : public QMainWindow {
   uint64_t thumb_gen_ = 0;
   std::atomic<bool> xr_stop_{false};
   std::atomic<bool> xr_running_{false};
+  /** True only inside the XR frame loop. request_exit is for a stuck WaitFrame. */
+  std::atomic<bool> xr_in_frame_loop_{false};
   std::atomic<int> cmd_{0};  // 1 play, 2 seek-, 3 seek+, 4 recenter
   std::atomic<int> proj_req_{-1};
   std::atomic<int> stereo_req_{-1};
@@ -411,6 +413,8 @@ class HostWindow : public QMainWindow {
   vrp::VirtualDisplayManager::Spec virtualSpecForSpan(int span) const;
   /** Destroy Virtual when leaving live (video / [アプリ] / shutdown). */
   void destroyVirtualForLeaveLive();
+  /** Live capture, desktop app, and virtual display. Before XR teardown. */
+  void stopExternalSessions();
   struct LiveAppEntry {
     QString name;
     QString url;

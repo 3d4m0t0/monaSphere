@@ -2278,17 +2278,47 @@ bool SceneRenderer::render_frame(XrVulkanApp& app, const XrVulkanApp::FrameInfo&
     hud_pending_dirty_ = false;
   }
 
+  if (app.exit_requested()) return false;
+
   proj_views.resize(frame.view_count);
   auto& swapchains = app.swapchains();
   std::array<uint32_t, 2> image_indices{};
-
-  for (uint32_t i = 0; i < frame.view_count; ++i) {
+  uint32_t acquired = 0;
+  bool swap_ok = frame.view_count > 0 && frame.view_count <= swapchains.size();
+  for (uint32_t i = 0; swap_ok && i < frame.view_count; ++i) {
+    if (app.exit_requested()) {
+      swap_ok = false;
+      break;
+    }
     auto& sc = swapchains[i];
     XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-    VRP_CHECK(XR_SUCCEEDED(xrAcquireSwapchainImage(sc.handle, &ai, &image_indices[i])), "acquire");
+    if (!XR_SUCCEEDED(xrAcquireSwapchainImage(sc.handle, &ai, &image_indices[i]))) {
+      VRP_ERR("swapchain acquire failed");
+      swap_ok = false;
+      break;
+    }
+    ++acquired;
+    // Infinite wait never returns once the session is STOPPING, so the XR
+    // thread misses teardown and the UI kills Monado.
     XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-    wi.timeout = XR_INFINITE_DURATION;
-    VRP_CHECK(XR_SUCCEEDED(xrWaitSwapchainImage(sc.handle, &wi)), "wait");
+    wi.timeout = 500000000ll;  // 500 ms
+    const XrResult wr = xrWaitSwapchainImage(sc.handle, &wi);
+    if (!XR_SUCCEEDED(wr)) {
+      VRP_ERR("swapchain wait failed (%d)", static_cast<int>(wr));
+      swap_ok = false;
+      break;
+    }
+  }
+  if (!swap_ok) {
+    for (uint32_t i = 0; i < acquired; ++i) {
+      XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+      (void)xrReleaseSwapchainImage(swapchains[i].handle, &ri);
+    }
+    layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    layer.space = app.app_space();
+    layer.viewCount = 0;
+    layer.views = nullptr;
+    return false;
   }
 
   // cmds_[0] = full-sky mono (union FOV); cmds_[1..] = eyes sampling it.
