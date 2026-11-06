@@ -2023,6 +2023,9 @@ void HostWindow::ensureYouTubeSession() {
   if (!vdisp_mgr_) {
     vdisp_mgr_ = new vrp::VirtualDisplayManager(this);
     connect(vdisp_mgr_, &vrp::VirtualDisplayManager::logMessage, this, &HostWindow::appendLog);
+    vdisp_mgr_->set_progress_sink([this](int percent) {
+      if (yt_session_) yt_session_->set_busy_progress(percent);
+    });
     connect(vdisp_mgr_, &vrp::VirtualDisplayManager::busyStatus, this, [this](const QString& s) {
       // Empty must clear — otherwise 「切替中」/「削除中」stick and XR skips DMA forever.
       if (!yt_session_) return;
@@ -2606,12 +2609,20 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   cfg.desktop_label = desktop_label.trimmed();
   if (cfg.exec.isEmpty()) {
     cfg.url = !url_override.isEmpty() ? url_override : firstLiveAppUrl();
+    for (const LiveAppEntry& a : live_apps_) {
+      if (a.url.trimmed() == cfg.url.trimmed() && !a.name.trimmed().isEmpty()) {
+        cfg.launch_title = a.name.trimmed();
+        break;
+      }
+    }
+    if (cfg.launch_title.isEmpty()) cfg.launch_title = QStringLiteral("YouTube");
   } else {
     cfg.url.clear();
     if (cfg.desktop_label.isEmpty()) {
       const QFileInfo fi(cfg.exec);
       cfg.desktop_label = fi.completeBaseName().isEmpty() ? cfg.exec : fi.completeBaseName();
     }
+    cfg.launch_title = cfg.desktop_label;
   }
   cfg.restore_token = host_setup ? QString() : tokenForSpan(span);
   // Fixed Virtual-monaSphere; span only picks WxH. One ScreenCast Remember token.
@@ -4650,6 +4661,7 @@ void HostWindow::xrThreadMain() {
     bool yt_suppress_idle_uploaded = false;
     float yt_spin_phase = 0.f;
     QString yt_busy_atlas_status;
+    int yt_busy_atlas_percent = -2;
     bool have_pending_thumb = false;
     int thumb_idx = -1;
     vrp::VideoFrame pending_thumb;
@@ -6464,6 +6476,7 @@ void HostWindow::xrThreadMain() {
           yt_spin_phase += static_cast<float>(dt) * 9.5f;
           if (yt_spin_phase > 6.2831853f) yt_spin_phase = std::fmod(yt_spin_phase, 6.2831853f);
           const QString status = yt_session_->busy_status();
+          const int busy_pct = yt_session_->busy_progress();
           auto qimage_to_frame = [](const QImage& img, vrp::VideoFrame& ph) {
             ph.width = img.width();
             ph.height = img.height();
@@ -6476,7 +6489,8 @@ void HostWindow::xrThreadMain() {
             }
           };
           // Spinners once; panel (bg+text) only when status changes; animate = center blit.
-          if (!texture.busy_ready() || status != yt_busy_atlas_status) {
+          if (!texture.busy_ready() || status != yt_busy_atlas_status ||
+              busy_pct != yt_busy_atlas_percent) {
             if (!texture.busy_ready()) {
               const QVector<QImage> spins = vrp::paint_live_busy_spinner_atlas();
               if (spins.size() == vrp::VideoTexture::kBusyFrameCount) {
@@ -6497,11 +6511,15 @@ void HostWindow::xrThreadMain() {
               }
             }
             const QImage panel = vrp::paint_live_busy_panel(vrp::VideoTexture::kBusyPanelW,
-                                                            vrp::VideoTexture::kBusyPanelH, status);
+                                                            vrp::VideoTexture::kBusyPanelH, status,
+                                                            busy_pct);
             if (!panel.isNull()) {
               vrp::VideoFrame pf;
               qimage_to_frame(panel, pf);
-              if (texture.upload_busy_panel(pf)) yt_busy_atlas_status = status;
+              if (texture.upload_busy_panel(pf)) {
+                yt_busy_atlas_status = status;
+                yt_busy_atlas_percent = busy_pct;
+              }
             }
           }
           if (VkImageView bv = texture.present_busy(yt_spin_phase)) {

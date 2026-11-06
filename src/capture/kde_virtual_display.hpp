@@ -6,6 +6,7 @@
 #include <QString>
 
 #include <cmath>
+#include <functional>
 
 namespace vrp {
 
@@ -67,8 +68,12 @@ class KdeVirtualDisplay : public QObject {
   static int killAllManaged();
   static bool anyManagedOutputExists();
 
-  /** Enable + place + scale output via kscreen-doctor (best-effort). */
-  static bool enableOutput(const QString& output_name, int x, int y, float scale = 1.f);
+  /**
+   * Enable, then position, then scale (best-effort). on_step runs after each of
+   * those three steps, including a skipped scale.
+   */
+  static bool enableOutput(const QString& output_name, int x, int y, float scale = 1.f,
+                           const std::function<void()>& on_step = {});
   /**
    * Geometry from kscreen-doctor -j (works even when Qt is xcb and misses
    * compositor-only Virtual-* outputs).
@@ -82,13 +87,29 @@ class KdeVirtualDisplay : public QObject {
                               float* scale, QString* matched_name = nullptr);
   /** True while kscreen still lists an output whose name contains substr. */
   static bool outputExists(const QString& output_name_substr);
+  /**
+   * One kscreen-doctor -j. listed/rect/mode are all read from that snapshot
+   * so callers do not pay for a separate process per field.
+   */
+  struct OutputInfo {
+    bool fetched = false;
+    bool listed = false;
+    QString matched;
+    QRect rect;
+    int mode_w = 0;
+    int mode_h = 0;
+    float scale = 1.f;
+    bool have_mode = false;
+  };
+  static OutputInfo describeOutput(const QString& needle);
 
   /**
    * Start krfb-virtualmonitor if needed. Returns true when the process is up
    * (caller should still wait for the output to appear in kscreen / QScreen).
    */
   bool start();
-  void stop();
+  /** kill_orphans false when the caller will run killAllManaged() itself. */
+  void stop(bool kill_orphans = true);
 
  signals:
   void started();

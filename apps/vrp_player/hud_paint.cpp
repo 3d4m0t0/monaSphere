@@ -1125,7 +1125,7 @@ QImage paint_live_busy_spinner(float phase, bool opaque_bg) {
   return img;
 }
 
-QImage paint_live_busy_panel(int width, int height, const QString& status) {
+QImage paint_live_busy_panel(int width, int height, const QString& status, int percent) {
   const int w = std::clamp(width > 0 ? width : kLiveBusyPanelW, 64, 3840);
   const int h = std::clamp(height > 0 ? height : kLiveBusyPanelH, 64, 2160);
   QImage img(w, h, QImage::Format_RGBA8888);
@@ -1140,12 +1140,18 @@ QImage paint_live_busy_panel(int width, int height, const QString& status) {
   p.setFont(font);
   p.setPen(QColor(230, 240, 255, 240));
   const QRect tr(0, kOy + kSpin + 2, w, 40);
-  p.drawText(tr, Qt::AlignHCenter | Qt::AlignTop, status);
+  QString line = status;
+  if (percent >= 0) {
+    line += QStringLiteral("  ");
+    line += QString::number(std::clamp(percent, 0, 100));
+    line += QLatin1Char('%');
+  }
+  p.drawText(tr, Qt::AlignHCenter | Qt::AlignTop, line);
   return img;
 }
 
-QImage paint_live_busy(int width, int height, float phase, const QString& status) {
-  QImage img = paint_live_busy_panel(width, height, status);
+QImage paint_live_busy(int width, int height, float phase, const QString& status, int percent) {
+  QImage img = paint_live_busy_panel(width, height, status, percent);
   const QImage spin = paint_live_busy_spinner(phase);
   QPainter p(&img);
   const int ox = (img.width() - spin.width()) / 2;

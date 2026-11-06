@@ -6,6 +6,9 @@
 #include <QObject>
 #include <QString>
 
+#include <functional>
+#include <mutex>
+
 namespace vrp {
 
 /**
@@ -107,6 +110,12 @@ class VirtualDisplayManager : public QObject {
   KdeVirtualDisplay* display() { return vdisp_; }
   const KdeVirtualDisplay* display() const { return vdisp_; }
 
+  /**
+   * Thread-safe. Called with 0–100 as each Virtual step's completion is confirmed.
+   * -1 is not used here; the sink owner clears the readout when busy status clears.
+   */
+  void set_progress_sink(std::function<void(int)> sink);
+
  signals:
   void logMessage(const QString& msg);
   void busyStatus(const QString& status);
@@ -115,10 +124,22 @@ class VirtualDisplayManager : public QObject {
 
  private:
   static bool spec_equal(const Spec& a, int w, int h, float sc, const QString& name);
-  bool wait_ready(const Spec& want, QString* matched_out);
-  bool wait_gone(int timeout_ms);
-  /** Set cached name + query KWin index; fill Result fields. */
-  void commit_identity(const Spec& want, const QString& matched, Result* r);
+  /**
+   * Poll until mode+rect match. screen_index_out, when non-null, receives a KWin
+   * index queried in parallel once the output name is known (-1 if that attempt
+   * missed and the caller must query again).
+   */
+  bool wait_ready(const Spec& want, QString* matched_out, int* screen_index_out);
+  /** gone_budget is added across confirmed kscreen polls, remainder when the wait ends. */
+  bool wait_gone(int timeout_ms, int gone_budget);
+  void begin_progress();
+  void add_progress(int delta);
+  /**
+   * Set cached name + KWin index. index_checked means known_index is the result
+   * of a query that ran after the output was listed — do not query again.
+   */
+  void commit_identity(const Spec& want, const QString& matched, Result* r, int known_index,
+                       bool index_checked);
 
   KdeVirtualDisplay* vdisp_ = nullptr;
   Spec current_{};
@@ -127,6 +148,9 @@ class VirtualDisplayManager : public QObject {
   QString output_name_;
   int screen_index_ = -1;
   QMap<int, QString> tokens_;
+  std::function<void(int)> progress_sink_;
+  std::mutex progress_mu_;
+  int progress_ = -1;
 };
 
 }  // namespace vrp

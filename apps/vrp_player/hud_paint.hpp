@@ -41,8 +41,10 @@ constexpr float kLiveBusyPeriod = 2.09439510239f;  // 2π/3
 int live_busy_spinner_frame_index(float phase_rad);
 /** opaque_bg: Flat panel blit. transparent: HMD menu overlay. */
 QImage paint_live_busy_spinner(float phase, bool opaque_bg = true);
-QImage paint_live_busy_panel(int width, int height, const QString& status);
-QImage paint_live_busy(int width, int height, float phase, const QString& status);
+/** percent < 0 draws the label alone. 0–100 is appended and the whole line is centered. */
+QImage paint_live_busy_panel(int width, int height, const QString& status, int percent = -1);
+QImage paint_live_busy(int width, int height, float phase, const QString& status,
+                       int percent = -1);
 /** Eight opaque 256² frames for Flat VRAM (build once). */
 QVector<QImage> paint_live_busy_spinner_atlas();
 /** Transparent frame for HUD paint_cached (build once per index). */

@@ -194,11 +194,20 @@ void YouTubeSession::set_busy_status(const QString& status) {
 void YouTubeSession::clear_busy_status() {
   std::lock_guard<std::mutex> lock(busy_mu_);
   busy_status_.clear();
+  busy_percent_.store(-1, std::memory_order_release);
 }
 
 QString YouTubeSession::busy_status() const {
   std::lock_guard<std::mutex> lock(busy_mu_);
   return busy_status_;
+}
+
+void YouTubeSession::set_busy_progress(int percent) {
+  busy_percent_.store(percent, std::memory_order_release);
+}
+
+int YouTubeSession::busy_progress() const {
+  return busy_percent_.load(std::memory_order_acquire);
 }
 
 void YouTubeSession::onDesktopAppFinished(int exit_code, QProcess::ExitStatus status) {
@@ -420,12 +429,13 @@ void YouTubeSession::start(const Config& cfg) {
                           .arg(restore_token_.size()));
     }
     setState(State::VDispReady);
-    {
-      const QString label = desktop_label_.isEmpty()
-                                ? (desktopAppMode() ? tr("アプリ") : tr("Live"))
-                                : desktop_label_;
-      set_busy_status(tr("%1 起動中").arg(label));
-    }
+    set_busy_progress(-1);
+    const QString title = !cfg_.launch_title.isEmpty()
+                              ? cfg_.launch_title
+                              : (desktopAppMode()
+                                     ? (desktop_label_.isEmpty() ? tr("アプリ") : desktop_label_)
+                                     : QStringLiteral("YouTube"));
+    set_busy_status(title);
   }
 
   QRect geo;

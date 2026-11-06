@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <memory>
+#include <vector>
 
 namespace vrp {
 namespace {
@@ -71,16 +73,21 @@ QRect rectFromOutputObject(const QJsonObject& o) {
   return QRect(x, y, w, h);
 }
 
-bool findOutputObject(const QString& needle_in, QJsonObject* out_obj, QString* matched_name,
-                      bool require_enabled) {
-  if (!out_obj || needle_in.isEmpty()) return false;
+bool loadOutputs(QJsonArray* outputs) {
+  if (!outputs) return false;
   QByteArray json;
   if (!runKscreen({QStringLiteral("-j")}, &json, 5000)) return false;
   const QJsonDocument doc = QJsonDocument::fromJson(json);
   if (!doc.isObject()) return false;
   const QJsonObject root = doc.object();
-  QJsonArray outputs = root.value(QStringLiteral("outputs")).toArray();
-  if (outputs.isEmpty()) outputs = root.value(QStringLiteral("screens")).toArray();
+  *outputs = root.value(QStringLiteral("outputs")).toArray();
+  if (outputs->isEmpty()) *outputs = root.value(QStringLiteral("screens")).toArray();
+  return true;
+}
+
+bool findInOutputs(const QJsonArray& outputs, const QString& needle_in, QJsonObject* out_obj,
+                   QString* matched_name, bool require_enabled) {
+  if (!out_obj || needle_in.isEmpty()) return false;
   const QString needle = needle_in.toLower();
   auto try_one = [&](bool only_enabled) -> bool {
     for (const QJsonValue& v : outputs) {
@@ -100,6 +107,13 @@ bool findOutputObject(const QString& needle_in, QJsonObject* out_obj, QString* m
   };
   if (require_enabled && try_one(true)) return true;
   return try_one(false);
+}
+
+bool findOutputObject(const QString& needle_in, QJsonObject* out_obj, QString* matched_name,
+                      bool require_enabled) {
+  QJsonArray outputs;
+  if (!loadOutputs(&outputs)) return false;
+  return findInOutputs(outputs, needle_in, out_obj, matched_name, require_enabled);
 }
 
 void modeSizeFromObject(const QJsonObject& o, int* mode_w, int* mode_h, float* scale) {
@@ -175,16 +189,71 @@ QStringList KdeVirtualDisplay::allManagedNames() {
 }
 
 int KdeVirtualDisplay::killAllManaged() {
-  int n = 0;
-  for (const QString& name : allManagedNames()) n += killOrphans(name);
-  return n;
+  // pgrep for each managed name is independent. Start them together and collect
+  // every result; TERM then KILL stays ordered per pid.
+  struct Job {
+    std::unique_ptr<QProcess> proc;
+  };
+  std::vector<Job> jobs;
+  jobs.reserve(static_cast<size_t>(allManagedNames().size()));
+  for (const QString& name : allManagedNames()) {
+    Job job;
+    job.proc = std::make_unique<QProcess>();
+    job.proc->start(QStringLiteral("pgrep"),
+                    {QStringLiteral("-f"),
+                     QStringLiteral("krfb-virtualmonitor.*--name[ =]%1").arg(name)});
+    jobs.push_back(std::move(job));
+  }
+  QList<qint64> pids;
+  for (Job& job : jobs) {
+    if (!job.proc->waitForFinished(2000) || job.proc->exitCode() != 0) continue;
+    const QStringList parts = QString::fromUtf8(job.proc->readAllStandardOutput())
+                                  .split(QRegularExpression(QStringLiteral("\\s+")),
+                                         Qt::SkipEmptyParts);
+    for (const QString& ps : parts) {
+      bool ok = false;
+      const qint64 pid = ps.toLongLong(&ok);
+      if (ok && pid > 1 && !pids.contains(pid)) pids.push_back(pid);
+    }
+  }
+  if (pids.isEmpty()) return 0;
+  for (qint64 pid : pids) {
+    QProcess::execute(QStringLiteral("kill"), {QStringLiteral("-TERM"), QString::number(pid)});
+  }
+  QThread::msleep(400);
+  for (qint64 pid : pids) {
+    QProcess::execute(QStringLiteral("kill"), {QStringLiteral("-KILL"), QString::number(pid)});
+  }
+  QThread::msleep(200);
+  VRP_LOG("live: killed %d orphan krfb-virtualmonitor (all managed names)", pids.size());
+  return pids.size();
 }
 
 bool KdeVirtualDisplay::anyManagedOutputExists() {
+  QJsonArray outputs;
+  if (!loadOutputs(&outputs)) return false;
   for (const QString& name : allManagedNames()) {
-    if (outputExists(name) || outputExists(QStringLiteral("Virtual-") + name)) return true;
+    QJsonObject o;
+    if (findInOutputs(outputs, name, &o, nullptr, false)) return true;
+    if (findInOutputs(outputs, QStringLiteral("Virtual-") + name, &o, nullptr, false)) return true;
   }
   return false;
+}
+
+KdeVirtualDisplay::OutputInfo KdeVirtualDisplay::describeOutput(const QString& needle) {
+  OutputInfo info;
+  QJsonArray outputs;
+  if (!loadOutputs(&outputs)) return info;
+  info.fetched = true;
+  QJsonObject o;
+  QString matched;
+  if (!findInOutputs(outputs, needle, &o, &matched, false)) return info;
+  info.listed = true;
+  info.matched = matched;
+  info.rect = rectFromOutputObject(o);
+  modeSizeFromObject(o, &info.mode_w, &info.mode_h, &info.scale);
+  info.have_mode = info.mode_w > 0 && info.mode_h > 0;
+  return info;
 }
 
 QString KdeVirtualDisplay::detectBinary() {
@@ -201,15 +270,18 @@ bool KdeVirtualDisplay::waylandSession() {
                                                           Qt::CaseInsensitive) == 0;
 }
 
-bool KdeVirtualDisplay::enableOutput(const QString& output_name, int x, int y, float scale) {
+bool KdeVirtualDisplay::enableOutput(const QString& output_name, int x, int y, float scale,
+                                    const std::function<void()>& on_step) {
   if (output_name.isEmpty() || findKscreenDoctor().isEmpty()) return false;
   const QString target = QStringLiteral("output.") + output_name;
   QByteArray ignored;
   // enable first, then position / scale (order matters on some Plasma builds)
   (void)runKscreen({target + QStringLiteral(".enable")}, &ignored);
+  if (on_step) on_step();
   (void)runKscreen({target + QStringLiteral(".position.") + QString::number(x) + QLatin1Char(',') +
                     QString::number(y)},
                    &ignored);
+  if (on_step) on_step();
   if (scale >= 1.f && scale <= 3.f) {
     // Prefer "1" / "1.5" — some Plasma builds reject trailing zeros.
     QString s = QString::number(static_cast<double>(scale), 'f', 2);
@@ -217,6 +289,7 @@ bool KdeVirtualDisplay::enableOutput(const QString& output_name, int x, int y, f
     if (s.endsWith(QLatin1Char('.'))) s.chop(1);
     (void)runKscreen({target + QStringLiteral(".scale.") + s}, &ignored);
   }
+  if (on_step) on_step();
   return true;
 }
 
@@ -352,7 +425,7 @@ bool KdeVirtualDisplay::start() {
   return true;
 }
 
-void KdeVirtualDisplay::stop() {
+void KdeVirtualDisplay::stop(bool kill_orphans) {
   stopping_ = true;
   launched_w_ = launched_h_ = 0;
   launched_scale_ = 0.f;
@@ -367,7 +440,7 @@ void KdeVirtualDisplay::stop() {
   }
   owned_ = false;
   // Also clear orphans (e.g. previous crash left a second Virtual-* output).
-  (void)killOrphans(name_);
+  if (kill_orphans) (void)killOrphans(name_);
   stopping_ = false;
 }
 

@@ -53,8 +53,10 @@ class YouTubeSession : public QObject {
      */
     QString exec;
     QStringList exec_args;
-    /** Display name for busy status (app or title). */
+    /** Display name for the 「起動中」 line (app or title). */
     QString desktop_label;
+    /** Shown under the spinner once Virtual setup reaches 100%. No percent. */
+    QString launch_title;
     /**
      * Legacy PadFilter uinput node. Prefer pad_hook_sock + LD_PRELOAD (no uinput).
      */
@@ -116,6 +118,9 @@ class YouTubeSession : public QObject {
   void set_busy_status(const QString& status);
   void clear_busy_status();
   QString busy_status() const;
+  /** -1 hides the readout. 0–100 is drawn in the same centered line as the status. */
+  void set_busy_progress(int percent);
+  int busy_progress() const;
   bool show_busy_overlay() const {
     return loading_.load(std::memory_order_acquire) || !busy_status().isEmpty();
   }
@@ -205,6 +210,7 @@ class YouTubeSession : public QObject {
   QString desktop_label_;
   mutable std::mutex busy_mu_;
   QString busy_status_;
+  std::atomic<int> busy_percent_{-1};
 
   ChromiumYtLauncher* chrome_ = nullptr;
   QProcess* desktop_app_ = nullptr;
