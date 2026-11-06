@@ -20,6 +20,8 @@ void FfmpegVulkanDevice::unlock_queue(struct AVHWDeviceContext*, uint32_t, uint3
 #else
 
 #include <algorithm>
+#include <cstring>
+#include <vector>
 
 extern "C" {
 #include <libavutil/buffer.h>
@@ -28,6 +30,40 @@ extern "C" {
 }
 
 namespace vrp {
+namespace {
+
+bool ext_enabled(const std::vector<const char*>& exts, const char* name) {
+  for (const char* e : exts) {
+    if (e && name && std::strcmp(e, name) == 0) return true;
+  }
+  return false;
+}
+
+// Decode ops the queue family actually reports. 0 means the driver left the
+// query empty — callers then trust the enabled extensions instead.
+VkVideoCodecOperationFlagsKHR decode_ops_for_queue(VkPhysicalDevice phys, uint32_t qf) {
+  if (!phys || qf == UINT32_MAX) return 0;
+  uint32_t count = 0;
+  vkGetPhysicalDeviceQueueFamilyProperties2(phys, &count, nullptr);
+  if (count == 0 || qf >= count) return 0;
+  std::vector<VkQueueFamilyVideoPropertiesKHR> video(count);
+  std::vector<VkQueueFamilyProperties2> props(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    video[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_VIDEO_PROPERTIES_KHR;
+    video[i].pNext = nullptr;
+    video[i].videoCodecOperations = 0;
+    props[i].sType = VK_STRUCTURE_TYPE_QUEUE_FAMILY_PROPERTIES_2;
+    props[i].pNext = &video[i];
+  }
+  vkGetPhysicalDeviceQueueFamilyProperties2(phys, &count, props.data());
+  if (qf >= count) return 0;
+  constexpr VkVideoCodecOperationFlagsKHR kDecode =
+      VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR | VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR |
+      VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR | VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
+  return video[qf].videoCodecOperations & kDecode;
+}
+
+}  // namespace
 
 void FfmpegVulkanDevice::lock_queue(AVHWDeviceContext* ctx, uint32_t, uint32_t) {
   auto* self = static_cast<FfmpegVulkanDevice*>(ctx->user_opaque);
@@ -137,20 +173,22 @@ bool FfmpegVulkanDevice::init(VkInstance inst, VkPhysicalDevice phys, VkDevice a
           static_cast<VkVideoCodecOperationFlagBitsKHR>(0));
 
   if (decode_qf != UINT32_MAX && decode_queue_count > 0) {
-    VkVideoCodecOperationFlagBitsKHR caps = static_cast<VkVideoCodecOperationFlagBitsKHR>(0);
-#if defined(VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR)
-    caps = static_cast<VkVideoCodecOperationFlagBitsKHR>(
-        caps | VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR);
-#endif
-#if defined(VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR)
-    caps = static_cast<VkVideoCodecOperationFlagBitsKHR>(
-        caps | VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR);
-#endif
-#if defined(VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR)
-    caps = static_cast<VkVideoCodecOperationFlagBitsKHR>(
-        caps | VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR);
-#endif
-    push_qf(decode_qf, decode_queue_count, VK_QUEUE_VIDEO_DECODE_BIT_KHR, caps);
+    // Advertise a decode op only when its extension is on this device. FFmpeg
+    // picks the queue by video_caps, then requires the matching extension.
+    VkVideoCodecOperationFlagsKHR caps = 0;
+    auto allow = [&](const char* ext, VkVideoCodecOperationFlagBitsKHR bit) {
+      if (ext_enabled(enabled_dev_exts, ext)) caps |= bit;
+    };
+    allow(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR);
+    allow(VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR);
+    allow(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR);
+    allow(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR);
+    const VkVideoCodecOperationFlagsKHR reported = decode_ops_for_queue(phys, decode_qf);
+    if (reported != 0) caps &= reported;
+    push_qf(decode_qf, decode_queue_count, VK_QUEUE_VIDEO_DECODE_BIT_KHR,
+            static_cast<VkVideoCodecOperationFlagBitsKHR>(caps));
+    VRP_LOG("FFmpeg Vulkan decode caps: 0x%x (queue reports 0x%x)", static_cast<unsigned>(caps),
+            static_cast<unsigned>(reported));
   }
 
 #if FF_API_VULKAN_FIXED_QUEUES

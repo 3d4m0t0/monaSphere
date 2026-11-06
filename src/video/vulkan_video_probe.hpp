@@ -21,6 +21,8 @@ struct VulkanVideoProbe {
   bool ext_decode_h264 = false;
   bool ext_decode_h265 = false;
   bool ext_decode_av1 = false;
+  /** VK_KHR_video_decode_vp9 and videoDecodeVP9. The other codecs have no feature bit. */
+  bool ext_decode_vp9 = false;
   bool ext_timeline_semaphore = false;
   bool ext_synchronization2 = false;
 

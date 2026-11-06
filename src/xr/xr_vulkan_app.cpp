@@ -735,8 +735,8 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   const bool want_video = vulkan_video_probe_.candidate && app_info.apiVersion >= VK_API_VERSION_1_3 &&
                           video_decode_queue_family_ != UINT32_MAX;
 
-  auto build_exts = [&](bool with_video, std::vector<const char*>* out, bool* out_ext_fd,
-                        bool* out_dma, bool* out_fault) {
+  auto build_exts = [&](bool with_video, bool enable_vp9, std::vector<const char*>* out,
+                        bool* out_ext_fd, bool* out_dma, bool* out_fault) {
     out->clear();
     *out_ext_fd = false;
     *out_dma = false;
@@ -776,6 +776,13 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
 #if defined(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)
       add(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME);
 #endif
+#if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
+      // VP9 is the only decode codec with a feature bit. Enable it only when the
+      // device reports videoDecodeVP9; forcing the bit fails vkCreateDevice.
+      if (enable_vp9) add(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME);
+#else
+      (void)enable_vp9;
+#endif
       // Core in 1.2/1.3 but still listed by some stacks as device exts — add if advertised.
       add(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
       add(VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME);
@@ -783,11 +790,26 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   };
 
   auto try_create_device = [&](bool with_video) -> bool {
+    bool enable_vp9 = false;
+#if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
+    if (with_video && has_ext(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)) {
+      VkPhysicalDeviceVideoDecodeVP9FeaturesKHR queried{
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR};
+      VkPhysicalDeviceFeatures2 qfeats{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      qfeats.pNext = &queried;
+      vkGetPhysicalDeviceFeatures2(physical_device_, &qfeats);
+      enable_vp9 = queried.videoDecodeVP9 == VK_TRUE;
+    }
+#endif
+    VkPhysicalDeviceVideoDecodeVP9FeaturesKHR vp9_feat{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR};
+    vp9_feat.videoDecodeVP9 = enable_vp9 ? VK_TRUE : VK_FALSE;
+
     std::vector<const char*> dev_exts;
     bool ext_fd = false;
     bool dma = false;
     bool fault = false;
-    build_exts(with_video, &dev_exts, &ext_fd, &dma, &fault);
+    build_exts(with_video, enable_vp9, &dev_exts, &ext_fd, &dma, &fault);
 
     std::vector<VkDeviceQueueCreateInfo> qcis;
     VkDeviceQueueCreateInfo gq{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -809,6 +831,7 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.timelineSemaphore = VK_TRUE;
     v12.pNext = with_video ? &v13 : nullptr;
+    if (enable_vp9) v13.pNext = &vp9_feat;
 #if defined(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
     VkPhysicalDeviceFaultFeaturesEXT fault_feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     fault_feat.deviceFault = fault ? VK_TRUE : VK_FALSE;
@@ -910,7 +933,17 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
   if (video_decode_ready_ && video_decode_queue_family_ != UINT32_MAX) {
     vkGetDeviceQueue(device_, video_decode_queue_family_, 0, &video_decode_queue_);
     vulkan_video_probe_.enabled_on_device = true;
-    VRP_LOG("Vulkan Video: enabled on XR device (decode_qf=%u)", video_decode_queue_family_);
+    auto ext_on = [&](const char* n) {
+      for (const auto& s : enabled_dev_exts_) {
+        if (s == n) return 1;
+      }
+      return 0;
+    };
+    VRP_LOG("Vulkan Video: enabled on XR device (decode_qf=%u) codecs h264=%d h265=%d av1=%d vp9=%d",
+            video_decode_queue_family_, ext_on(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME),
+            ext_on(VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME),
+            ext_on(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME),
+            ext_on(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME));
 
     // Phase 2: inject XR device into FFmpeg AVVulkanDeviceContext (playback still CUDA).
     std::vector<const char*> ext_ptrs;

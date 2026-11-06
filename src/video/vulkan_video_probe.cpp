@@ -62,6 +62,7 @@ std::string VulkanVideoProbe::summary() const {
     << (api_1_3 ? " (>=1.3 ok)" : " (<1.3 — FFmpeg needs 1.3+)");
   o << " ext[vq=" << ext_video_queue << " decq=" << ext_video_decode_queue
     << " h264=" << ext_decode_h264 << " h265=" << ext_decode_h265 << " av1=" << ext_decode_av1
+    << " vp9=" << ext_decode_vp9
     << " timeline=" << ext_timeline_semaphore << " sync2=" << ext_synchronization2 << ']';
   if (decode_queue_family != UINT32_MAX) {
     o << " decode_qf=" << decode_queue_family << "x" << decode_queue_count;
@@ -96,6 +97,16 @@ VulkanVideoProbe probe_vulkan_video(VkPhysicalDevice phys) {
 #if defined(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)
   p.ext_decode_av1 = has_device_ext(phys, VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME);
 #endif
+#if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
+  if (has_device_ext(phys, VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)) {
+    VkPhysicalDeviceVideoDecodeVP9FeaturesKHR vp9{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR};
+    VkPhysicalDeviceFeatures2 feats{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    feats.pNext = &vp9;
+    vkGetPhysicalDeviceFeatures2(phys, &feats);
+    p.ext_decode_vp9 = vp9.videoDecodeVP9 == VK_TRUE;
+  }
+#endif
   p.ext_timeline_semaphore =
       has_device_ext(phys, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) || p.api_1_3;
   p.ext_synchronization2 =
@@ -117,7 +128,8 @@ VulkanVideoProbe probe_vulkan_video(VkPhysicalDevice phys) {
   p.ffmpeg_vulkan_type = ffmpeg_lists_vulkan_type();
   p.ffmpeg_codec_vulkan = ffmpeg_codec_has_vulkan(AV_CODEC_ID_H264) ||
                           ffmpeg_codec_has_vulkan(AV_CODEC_ID_HEVC) ||
-                          ffmpeg_codec_has_vulkan(AV_CODEC_ID_AV1);
+                          ffmpeg_codec_has_vulkan(AV_CODEC_ID_AV1) ||
+                          ffmpeg_codec_has_vulkan(AV_CODEC_ID_VP9);
 #else
   p.ffmpeg_vulkan_type = false;
   p.ffmpeg_codec_vulkan = false;
@@ -125,7 +137,8 @@ VulkanVideoProbe probe_vulkan_video(VkPhysicalDevice phys) {
 
   const bool device_side = p.ext_video_queue && p.ext_video_decode_queue &&
                            p.decode_queue_family != UINT32_MAX &&
-                           (p.ext_decode_h264 || p.ext_decode_h265 || p.ext_decode_av1);
+                           (p.ext_decode_h264 || p.ext_decode_h265 || p.ext_decode_av1 ||
+                            p.ext_decode_vp9);
   // Hardware + FFmpeg type present. api_1_3 is separately required to inject into FFmpeg.
   p.candidate = device_side && p.ffmpeg_vulkan_type && p.ffmpeg_codec_vulkan;
 
