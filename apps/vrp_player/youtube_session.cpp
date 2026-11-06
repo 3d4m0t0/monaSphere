@@ -328,7 +328,9 @@ void YouTubeSession::cleanupStreaming() {
 #if defined(VRP_HAS_PULSE)
   // Always scrub monaSphereYt — even when Flat live audio was never started
   // (older builds set PULSE_SINK unconditionally and left the null sink around).
-  std::thread([] { (void)PulseMonitor::restore_browser_routing(); }).detach();
+  // Synchronous: stopped() unmutes only after this returns, so the leftover
+  // buffer is dropped while the output is still muted.
+  (void)PulseMonitor::restore_browser_routing();
 #endif
 }
 

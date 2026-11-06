@@ -146,6 +146,13 @@ class AudioPlayer {
   /** Non-blocking: runs stop_live_monitor on a worker. */
   void request_stop_live_monitor();
   /**
+   * Live close: mute the listener and the output sink before any buffer drains.
+   * Paired with end_live_close_mute() once the Live session is gone.
+   */
+  void begin_live_close_mute();
+  /** Restore the file listener after Live has been deleted. Idempotent. */
+  void end_live_close_mute();
+  /**
    * Block until live start/stop workers finish (and monitor is down).
    * Call from XR before tearing down capture — avoids OpenAL Soft HRTF JIT UAF.
    */
@@ -163,6 +170,8 @@ class AudioPlayer {
   bool playing_ = false;
   std::atomic<bool> spatial_active_{false};
   std::atomic<bool> live_monitor_{false};
+  /** True from begin_live_close_mute until end_live_close_mute or the next Live start. */
+  std::atomic<bool> live_close_muted_{false};
   std::atomic<bool> live_op_busy_{false};
   /** Bumped on each live start/stop request so a wedged start cannot stick busy. */
   std::atomic<uint64_t> live_op_gen_{0};

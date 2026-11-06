@@ -60,6 +60,8 @@ class PulseMonitor {
   static int route_browser_to_yt_sink();
   /** Move yt streams back to the default sink, then destroy the null sink. */
   static int restore_browser_routing();
+  /** Mute or unmute a Pulse sink by name. Empty or unsafe names are ignored. */
+  static void set_sink_muted(const std::string& sink, bool muted);
   static constexpr const char* kYtSinkName = "monaSphereYt";
 
   /** Module index from last successful load-module (0 = unknown). */

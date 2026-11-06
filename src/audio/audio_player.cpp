@@ -1755,7 +1755,9 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
   has_audio_ = true;
   live_monitor_.store(true, std::memory_order_release);
   // File-switch mute must not carry into Live. hold_silence makes play() a no-op.
+  live_close_muted_.store(false, std::memory_order_release);
   switch_muted_ = false;
+  PulseMonitor::set_sink_muted(device_name_, false);
   st_->volume.store(volume_, std::memory_order_relaxed);
   st_->spatial.set_hold_silence(false);
   st_->spatial.set_gain(live_base_gain_);
@@ -1895,6 +1897,8 @@ void AudioPlayer::request_start_live_monitor() {
 void AudioPlayer::request_stop_live_monitor() {
   // Invalidate in-flight start (aborts between Pulse and OpenAL).
   const uint64_t gen = live_op_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
+  // First action: silence. The worker clears buffers, then Live deletion unmutes.
+  begin_live_close_mute();
   // Drop listener updates immediately so XR does not touch Soft during stop.
   spatial_active_.store(false, std::memory_order_release);
   std::thread([this, gen] {
@@ -1928,14 +1932,42 @@ void AudioPlayer::wait_live_monitor_idle(int timeout_ms) {
           live_monitor_.load(std::memory_order_relaxed) ? 1 : 0);
 }
 
+void AudioPlayer::begin_live_close_mute() {
+  live_close_muted_.store(true, std::memory_order_release);
+  switch_muted_ = true;
+  if (st_) {
+    st_->volume.store(0.f, std::memory_order_relaxed);
+    st_->playing.store(false, std::memory_order_release);
+    st_->output_live.store(false, std::memory_order_release);
+    st_->spatial.set_gain(0.f);
+    st_->spatial.set_hold_silence(true);
+  }
+}
+
+void AudioPlayer::end_live_close_mute() {
+  if (!live_close_muted_.exchange(false, std::memory_order_acq_rel)) return;
+  switch_muted_ = false;
+  PulseMonitor::set_sink_muted(device_name_, false);
+  if (!st_) return;
+  st_->volume.store(volume_, std::memory_order_relaxed);
+  st_->spatial.set_hold_silence(false);
+  if (live_monitor_.load(std::memory_order_acquire)) {
+    st_->spatial.set_gain(live_base_gain_);
+    return;
+  }
+  apply_listener_gain();
+}
+
 void AudioPlayer::stop_live_monitor() {
   if (!live_monitor_.load(std::memory_order_acquire) && !(st_ && st_->live_thread.joinable()))
     return;
+  // Mute before the reader or OpenAL can drain what is already queued.
+  begin_live_close_mute();
+  // Hardware sink: a Pulse buffer moved off monaSphereYt never passed the trim.
+  PulseMonitor::set_sink_muted(device_name_, true);
   // XR must not call set_listener while we pause Soft.
   spatial_active_.store(false, std::memory_order_release);
   live_monitor_.store(false, std::memory_order_release);
-  // Monitor is down: put the file volume back on the listener before teardown.
-  apply_listener_gain();
   stop_live_thread();
   if (st_) {
     st_->use_spatial = false;
@@ -1943,11 +1975,13 @@ void AudioPlayer::stop_live_monitor() {
     st_->stereo_upmix.clear();
     st_->spatial.flush();
     st_->spatial.pause();
+    if (st_->rb_ok) st_->clear_ring_exclusive();
   }
   has_audio_ = false;
   playing_ = false;
-  push_audio_status("live audio: live monitor stopping — restore + destroy monaSphereYt");
-  std::thread([] { (void)PulseMonitor::restore_browser_routing(); }).detach();
+  push_audio_status("live audio: muted, buffers cleared — restore + destroy monaSphereYt");
+  // Still muted. Drop the null sink here so its leftover PCM cannot reach the HMD.
+  (void)PulseMonitor::restore_browser_routing();
 }
 
 }  // namespace vrp

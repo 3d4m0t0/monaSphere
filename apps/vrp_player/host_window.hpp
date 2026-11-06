@@ -502,6 +502,10 @@ class HostWindow : public QMainWindow {
   std::atomic<bool> yt_return_apps_menu_{false};
   /** Set on Qt stopped() when return-apps was requested — XR opens menu next frame. */
   std::atomic<bool> yt_show_apps_after_stop_{false};
+  /** UI thread: XR mutes Live output on the next frame, before the monitor stops. */
+  std::atomic<bool> yt_live_mute_req_{false};
+  /** UI thread: XR restores listener gain once the monitor is down and Live is gone. */
+  std::atomic<bool> yt_live_unmute_req_{false};
   /** XR thread only: log once when async live-monitor start settles. */
   bool yt_audio_pending_log_ = false;
   int yt_audio_fail_retries_ = 0;

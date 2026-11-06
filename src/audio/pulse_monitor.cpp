@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -777,6 +778,22 @@ int PulseMonitor::restore_browser_routing() {
   // Remove null sink from the mixer after streams have left it.
   destroy_yt_null_sink();
   return st.moved;
+#endif
+}
+
+void PulseMonitor::set_sink_muted(const std::string& sink, bool muted) {
+#if !defined(VRP_HAS_PULSE)
+  (void)sink;
+  (void)muted;
+#else
+  if (sink.empty() || sink.size() > 200) return;
+  for (unsigned char c : sink) {
+    if (!(std::isalnum(c) || c == '.' || c == '_' || c == '-' || c == ':' || c == '@')) return;
+  }
+  char cmd[320];
+  std::snprintf(cmd, sizeof(cmd), "pactl set-sink-mute %s %d >/dev/null 2>&1", sink.c_str(),
+                muted ? 1 : 0);
+  (void)std::system(cmd);
 #endif
 }
 

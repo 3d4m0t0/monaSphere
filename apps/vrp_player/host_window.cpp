@@ -2425,6 +2425,8 @@ void HostWindow::ensureYouTubeSession() {
     });
   });
   connect(yt_session_, &vrp::YouTubeSession::stopped, this, [this] {
+    // Live window and capture are gone. XR unmutes after the monitor buffers are clear.
+    yt_live_unmute_req_.store(true, std::memory_order_release);
     pad_hook_.stop();
     pad_hook_active_ = false;
     pad_filter_.stop();
@@ -2928,6 +2930,7 @@ void HostWindow::stopYouTubeCapture() {
   yt_audio_pending_log_ = false;
   yt_audio_fail_retries_ = 0;
   if (yt_session_) yt_session_->clear_audio_wanted();
+  yt_live_mute_req_.store(true, std::memory_order_release);
   appendLog(tr("Stopping live capture… (DMA -> PipeWire -> app -> Virtual)"));
   // While XR is running, tear down on the XR thread: reset DMA → stop PipeWire →
   // then finish portal/Chrome here. Doing capture->stop() on the UI thread races
@@ -2944,12 +2947,10 @@ void HostWindow::stopYouTubeCapture() {
       if (yt_session_->state() != vrp::YouTubeSession::State::Stopping) return;
       appendLog(tr("Live stop fallback (UI) — still Stopping"));
       yt_session_->stop();
-      std::thread([] { (void)vrp::PulseMonitor::restore_browser_routing(); }).detach();
     });
     return;
   }
   if (yt_session_) yt_session_->stop();
-  std::thread([] { (void)vrp::PulseMonitor::restore_browser_routing(); }).detach();
 }
 
 void HostWindow::showAboutDialog() {
@@ -5581,7 +5582,9 @@ void HostWindow::xrThreadMain() {
             Qt::QueuedConnection);
       }
 
-      // Safe live teardown on XR: drop dma-buf imports before PipeWire stop.
+      // Safe live teardown on XR: mute, then drop dma-buf imports before PipeWire stop.
+      if (yt_live_mute_req_.exchange(false, std::memory_order_acq_rel))
+        audio.begin_live_close_mute();
       {
         const bool capture_dead =
             yt_session_ && yt_session_->active() && yt_cap && !yt_cap->running();
@@ -5634,6 +5637,7 @@ void HostWindow::xrThreadMain() {
                   if (!yt_session_) return;
                   if (yt_session_->state() == vrp::YouTubeSession::State::Idle &&
                       !yt_session_->active() && !yt_session_->loading()) {
+                    yt_live_unmute_req_.store(true, std::memory_order_release);
                     return;
                   }
                   const bool reuse_next =
@@ -5641,7 +5645,6 @@ void HostWindow::xrThreadMain() {
                       vdisp_mgr_->matches(virtualSpecForSpan(yt_pending_span_));
                   yt_session_->set_busy_status(reuse_next ? tr("切替中") : tr("Virtual 削除中"));
                   yt_session_->stop();
-                  std::thread([] { (void)vrp::PulseMonitor::restore_browser_routing(); }).detach();
                   appendLog(tr("Live capture stopped (after DMA settle)"));
                 });
               },
@@ -5709,6 +5712,15 @@ void HostWindow::xrThreadMain() {
         yt_audio_pending_log_ = false;
         yt_audio_fail_retries_ = 0;
         audio.request_stop_live_monitor();
+      }
+      if (yt_live_unmute_req_.load(std::memory_order_acquire)) {
+        if (!audio.live_monitor_busy() && !audio.live_monitor_active()) {
+          audio.end_live_close_mute();
+          yt_live_unmute_req_.store(false, std::memory_order_release);
+        } else if (audio.live_monitor_active() && !audio.live_monitor_busy()) {
+          // A new Live already owns the output and cleared the close-mute.
+          yt_live_unmute_req_.store(false, std::memory_order_release);
+        }
       }
       if (yt_live || audio.live_monitor_active()) {
         for (const std::string& s : audio.drain_audio_status()) {
