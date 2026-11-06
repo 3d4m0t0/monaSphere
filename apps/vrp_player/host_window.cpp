@@ -5976,14 +5976,37 @@ void HostWindow::xrThreadMain() {
       auto prepare_live_flat = [&] {
         play_wanted = false;
         show_idle_screen = true;
+        // Drop the file picture before Live. Pause alone leaves the last frame in
+        // the Vulkan/CUDA mailbox, and it is drawn again when capture ends and
+        // the main screen is up, before the next file's first frame.
         if (decoder.is_open()) decoder.pause();
         if (audio.is_open()) audio.pause();
+        if (!scene.wait_previous_submit(0)) {
+          int spins = 0;
+          while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
+            if (++spins >= 8) break;
+          }
+        }
+        if (decoder.is_open()) decoder.halt_decode();
+        pending_upload = {};
+        pending_video_rebind = false;
+        have_pending_thumb = false;
+        {
+          void* cu_ctx = decoder.cuda_context();
+          cuda_tex.drain_copies(cu_ctx);
+          cuda_clear_samples();
+          cuda_tex.reset_slots(cu_ctx);
+          vaapi_tex.reset();
+          vulkan_tex.reset();
+        }
         apply_projection(vrp::ProjectionMode::Flat, vrp::StereoLayout::Mono, true);
         menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
         clear_fsr_src();
         (void)fsr.poll();
         sync_fsr_source_lock(false);
         arm_live_fsr(false);
+        fsr.invalidate();
+        force_fsr_refresh = false;
         (void)texture.upload_idle_screen();
         if (texture.view()) scene.set_texture(texture.view(), texture.sampler());
         hud_paint();

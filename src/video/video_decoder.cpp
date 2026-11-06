@@ -2144,6 +2144,9 @@ void VideoDecoder::close() {
 void VideoDecoder::play() {
   if (!open_.load()) return;
   if (playing_.load() || priming_.load()) return;
+  // halt_decode() joins the thread when the picture is dropped (Live / close).
+  // Resume must bring demux and decode back; otherwise play() only sets a flag.
+  if (!decode_thread_.joinable()) start_decode_thread();
   seek_scrubbing_.store(false);
   begin_priming(prefetch_target_bytes_);  // fill full ~2s before start
   if (prefetch_enough(prefetch_target_bytes_)) {
