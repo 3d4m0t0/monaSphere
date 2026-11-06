@@ -14,7 +14,7 @@ class StereoSurround {
   void reset(int sample_rate);
   void clear();
 
-  /** Rear (BL/BR) linear gain. Default 0.55. Clamped to 0..2. */
+  /** Rear (BL/BR) linear gain. Default 0.8. Clamped to 0..2. */
   void set_rear_gain(float g);
   float rear_gain() const { return rear_gain_; }
 
@@ -25,7 +25,7 @@ class StereoSurround {
   int process(const int16_t* stereo_in, int frame_count, std::vector<int16_t>& quad_out);
 
   static constexpr int kOutChannels = 4;
-  static constexpr float kDefaultRearGain = 0.55f;
+  static constexpr float kDefaultRearGain = 0.8f;
 
  private:
   int sample_rate_ = 48000;

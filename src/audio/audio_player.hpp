@@ -95,9 +95,16 @@ class AudioPlayer {
   /** Drop buffered PCM (only while output is muted). */
   void flush_output();
 
-  /** Linear gain 0..1 (default 1). */
+  /** Linear file gain 0..1. 1 is the safe maximum. */
   void set_volume(float v);
   float volume() const { return volume_; }
+
+  /**
+   * `monasphere.conf` hrtf_trim_db. Decibels cut before upmix and HRTF.
+   * 0..24, default 9. 0 leaves the limiter output unchanged.
+   */
+  void set_hrtf_trim_db(float db);
+  float hrtf_trim_db() const { return hrtf_trim_db_; }
 
   /** Playback rate 0.5 .. 20 (1 = normal). */
   void set_rate(float rate);
@@ -112,11 +119,19 @@ class AudioPlayer {
   bool spatial_active() const { return spatial_active_.load(std::memory_order_acquire); }
 
   /**
-   * Stereo→4.0 rear upmix gain (0..2, default 0.55). Shared by file / Live / [アプリ]
+   * Stereo→4.0 rear upmix gain (0..2, default 0.8). Shared by file / Live / [アプリ]
    * 2ch Soft path (`monasphere.conf` surround_gain). Ignored for discrete multichannel.
    */
   void set_surround_gain(float g);
   float surround_gain() const { return surround_gain_; }
+
+  /**
+   * Short-window loudness match (`monasphere.conf` audio_normalize).
+   * Default on. File and Live. Before upmix and OpenAL HRTF so head rotation
+   * does not drive the limiter. Peak ceiling -6 dBFS. Listener gain unchanged.
+   */
+  void set_loudness_normalize(bool on);
+  bool loudness_normalize() const { return loudness_normalize_; }
 
   /**
    * Live stereo from a Pulse monitor (browser/[アプリ]) → same Soft 4.0 path as file
@@ -155,10 +170,19 @@ class AudioPlayer {
   std::mutex live_ops_mu_;
   bool start_live_monitor_with_gen(uint64_t gen);
   float volume_ = 0.2f;
+  /** Decibels cut before upmix / HRTF. Default −9 dB. */
+  static constexpr float kDefaultHrtfTrimDb = 12.f;
+  static constexpr float kMaxHrtfTrimDb = 24.f;
+  float hrtf_trim_db_ = kDefaultHrtfTrimDb;
+  /** Linear form of hrtf_trim_db_. 10^(-12/20) until set_hrtf_trim_db. */
+  std::atomic<float> headroom_gain_{0.2511886f};
+  /** Live / [アプリ] listener gain. Unity; the level cut is headroom_gain_. */
+  float live_base_gain_ = 1.f;
   /** File switch: listener stays at 0 until the new stream is prefilled. */
   bool switch_muted_ = false;
   float rate_ = 1.f;
-  float surround_gain_ = 0.55f;
+  float surround_gain_ = 0.8f;
+  bool loudness_normalize_ = true;
   std::string device_name_;
   std::string last_error_;
   std::mutex status_mu_;

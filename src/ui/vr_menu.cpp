@@ -252,7 +252,14 @@ void VrMenu::set_playback(bool playing, double position_sec) {
 }
 
 void VrMenu::set_volume(float v) {
-  volume_ = std::clamp(v, 0.f, 1.f);
+  volume_ = std::clamp(v, 0.f, volume_cap_);
+  bump();
+}
+
+void VrMenu::set_volume_cap(float linear_max) {
+  volume_cap_ = linear_max >= 0.99f ? 1.f : 0.5f;
+  volume_ = std::clamp(volume_, 0.f, volume_cap_);
+  pick_volume_ = std::clamp(pick_volume_, 0.f, volume_cap_);
   bump();
 }
 
@@ -1608,7 +1615,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         // 0–9%: ±1; 10% and above: ±5
         const int step = (pct < 10) ? 1 : 5;
         out.volume_delta = (dy < 0) ? (step / 100.f) : -(step / 100.f);
-        volume_ = std::clamp(volume_ + out.volume_delta, 0.f, 1.f);
+        volume_ = std::clamp(volume_ + out.volume_delta, 0.f, volume_cap_);
         save_volume();
         bump();
         nav_cooldown_ = 0.12f;

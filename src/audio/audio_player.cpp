@@ -1,5 +1,6 @@
 #include "audio/audio_player.hpp"
 
+#include "audio/loudness_normalizer.hpp"
 #include "audio/openal_spatial.hpp"
 #include "audio/pulse_monitor.hpp"
 #include "audio/stereo_surround.hpp"
@@ -38,6 +39,15 @@ extern "C" {
 
 namespace vrp {
 namespace {
+
+/** Fixed cut after the limiter, before upmix and HRTF. Gain comes from hrtf_trim_db. */
+void apply_pre_hrtf_trim(int16_t* samples, int count, float gain) {
+  if (!samples || count <= 0 || gain >= 0.999f) return;
+  for (int i = 0; i < count; ++i) {
+    const int s = static_cast<int>(std::lround(static_cast<float>(samples[i]) * gain));
+    samples[i] = static_cast<int16_t>(std::clamp(s, -32768, 32767));
+  }
+}
 
 #if defined(VRP_HAS_PULSE)
 constexpr const char* kProfilePrefix = "vrp:profile:";
@@ -442,6 +452,9 @@ struct AudioPlayer::State {
   /** 2ch → 4.0 side-diff rear upmix (OpenAL path only). */
   bool use_stereo_upmix = false;
   StereoSurround stereo_upmix;
+  /** File decode thread and live thread each own one. Do not share. */
+  LoudnessNormalizer file_norm;
+  LoudnessNormalizer live_norm;
   /** Pulse monitor → Flat surround (live). Separate from file demux thread. */
   std::thread live_thread;
   std::atomic<bool> live_stop{false};
@@ -829,6 +842,10 @@ bool AudioPlayer::ensure_output(const std::string& device_name) {
   st_->seek_req.store(false);
   st_->volume.store(volume_);
   st_->rate.store(rate_);
+  st_->file_norm.set_enabled(loudness_normalize_);
+  st_->live_norm.set_enabled(loudness_normalize_);
+  st_->file_norm.reset();
+  st_->live_norm.reset();
 
   if (!init_device(sink)) {
     open_ = false;
@@ -844,10 +861,9 @@ bool AudioPlayer::ensure_output(const std::string& device_name) {
 
 void AudioPlayer::apply_listener_gain() {
   if (!st_ || !st_->use_spatial) return;
-  // Live ignores the file volume. The page's own control is the level;
-  // our output stays at unity until the monitor stops.
+  // Live stays at unity. The safe-level cut is the pre-HRTF trim, not this gain.
   const float g = switch_muted_ ? 0.f
-                  : (live_monitor_.load(std::memory_order_acquire) ? 1.f : volume_);
+                  : (live_monitor_.load(std::memory_order_acquire) ? live_base_gain_ : volume_);
   st_->spatial.set_gain(g);
 }
 
@@ -1073,6 +1089,8 @@ void AudioPlayer::start_thread() {
   st_->stop.store(false, std::memory_order_release);
   st_->thread = std::thread([this] {
     std::vector<int16_t> buf;
+    st_->file_norm.set_enabled(loudness_normalize_);
+    st_->file_norm.reset();
 
     auto flush_swr = [&] {
       if (!st_->swr) return;
@@ -1096,6 +1114,7 @@ void AudioPlayer::start_thread() {
       }
       avcodec_flush_buffers(st_->codec);
       flush_swr();
+      st_->file_norm.reset();
       if (st_->use_spatial) {
         if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
         st_->spatial.flush();
@@ -1133,6 +1152,7 @@ void AudioPlayer::start_thread() {
         }
         avcodec_flush_buffers(st_->codec);
         flush_swr();
+        st_->file_norm.reset();
         st_->discard_until_sec = sec;
         // Host already muted output before posting seek_req; reset is exclusive here.
         if (st_->use_spatial) {
@@ -1235,8 +1255,12 @@ void AudioPlayer::start_thread() {
 
         float rate = std::clamp(st_->rate.load(), 0.5f, 20.f);
         std::vector<int16_t> timed;
-        const int16_t* play_src = buf.data() + static_cast<size_t>(skip_out * st_->out_channels);
+        int16_t* play_src = buf.data() + static_cast<size_t>(skip_out * st_->out_channels);
         int play_frames = converted - skip_out;
+        // Before rate stretch, upmix, and OpenAL HRTF. Head turns must not drive this.
+        st_->file_norm.process(play_src, play_frames, st_->out_channels, st_->out_rate);
+        apply_pre_hrtf_trim(play_src, play_frames * st_->out_channels,
+                            headroom_gain_.load(std::memory_order_relaxed));
         if (std::fabs(rate - 1.f) > 0.01f) {
           const int out_n = std::max(1, static_cast<int>(std::lround(play_frames / rate)));
           timed.resize(static_cast<size_t>(out_n * st_->out_channels));
@@ -1532,6 +1556,13 @@ void AudioPlayer::set_volume(float v) {
   apply_listener_gain();
 }
 
+void AudioPlayer::set_hrtf_trim_db(float db) {
+  hrtf_trim_db_ = std::clamp(db, 0.f, kMaxHrtfTrimDb);
+  const float gain = std::pow(10.f, -hrtf_trim_db_ / 20.f);
+  headroom_gain_.store(gain, std::memory_order_relaxed);
+  VRP_LOG("Audio: pre-HRTF trim -%.1f dB", static_cast<double>(hrtf_trim_db_));
+}
+
 void AudioPlayer::set_rate(float rate) {
   rate_ = std::clamp(rate, 0.5f, 20.f);
   if (st_) st_->rate.store(rate_, std::memory_order_relaxed);
@@ -1549,6 +1580,15 @@ void AudioPlayer::set_listener_orientation(float yaw_rad, float pitch_rad) {
 void AudioPlayer::set_surround_gain(float g) {
   surround_gain_ = std::clamp(g, 0.f, 2.f);
   if (st_) st_->stereo_upmix.set_rear_gain(surround_gain_);
+}
+
+void AudioPlayer::set_loudness_normalize(bool on) {
+  loudness_normalize_ = on;
+  if (st_) {
+    st_->file_norm.set_enabled(on);
+    st_->live_norm.set_enabled(on);
+  }
+  VRP_LOG("Audio: loudness normalize %s", on ? "on" : "off");
 }
 
 void AudioPlayer::stop_live_thread() {
@@ -1575,6 +1615,8 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
   st_->live_thread = std::thread([this] {
     if (!st_) return;
     std::vector<int16_t> buf(static_cast<size_t>(PulseMonitor::kRate / 50 * PulseMonitor::kChannels));
+    st_->live_norm.set_enabled(loudness_normalize_);
+    st_->live_norm.reset();
     auto last_dbg = std::chrono::steady_clock::now();
     uint64_t frames_in = 0;
     uint64_t frames_queued = 0;
@@ -1593,6 +1635,10 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
         continue;
       }
       if (got == 0) continue;
+      // Before StereoSurround and OpenAL HRTF. Head turns must not drive this.
+      st_->live_norm.process(buf.data(), got, PulseMonitor::kChannels, PulseMonitor::kRate);
+      apply_pre_hrtf_trim(buf.data(), got * PulseMonitor::kChannels,
+                          headroom_gain_.load(std::memory_order_relaxed));
       frames_in += static_cast<uint64_t>(got);
       for (int i = 0; i < got * PulseMonitor::kChannels; ++i) {
         const double a = std::fabs(static_cast<double>(buf[static_cast<size_t>(i)]) / 32768.0);
@@ -1712,7 +1758,7 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
   switch_muted_ = false;
   st_->volume.store(volume_, std::memory_order_relaxed);
   st_->spatial.set_hold_silence(false);
-  st_->spatial.set_gain(1.f);
+  st_->spatial.set_gain(live_base_gain_);
   st_->spatial.flush();
   start_live_thread(monitor);
   if (!st_->live_mon.ok()) {
@@ -1743,8 +1789,9 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
     char line[256];
     std::snprintf(line, sizeof(line),
                   "live audio: guest PCM -> Soft HRTF 4.0 side-diff "
-                  "(gain=1.00 file_vol=%.2f surround_gain=%.2f) monitor=%s module=%u",
-                  static_cast<double>(volume_), static_cast<double>(surround_gain_),
+                  "(gain=%.2f file_vol=%.2f surround_gain=%.2f) monitor=%s module=%u",
+                  static_cast<double>(live_base_gain_), static_cast<double>(volume_),
+                  static_cast<double>(surround_gain_),
                   monitor.c_str(), PulseMonitor::last_module_index());
     push_audio_status(line);
   }

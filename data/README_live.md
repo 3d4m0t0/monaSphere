@@ -178,6 +178,8 @@ monaSphereYt  (null sink, device.class=filter)
     ▼
 PulseMonitor  (S16 stereo @ 48 kHz, audio worker)
     ▼
+LoudnessNormalizer  (audio_normalize=1; before upmix/HRTF; RMS toward -16 dBFS, peak -6 dBFS)
+    ▼
 StereoSurround  (L−R + 14 ms + HPF 180 Hz → BL/BR; gain = surround_gain)
     ▼
 OpenAL Soft HRTF  4.0 (FL|FR|BL|BR)  →  HMD HDMI
@@ -188,11 +190,16 @@ Same Soft + `StereoSurround` path as local file 2ch. Shared knobs:
 
 | Knob | Conf / UI | Applies to |
 |------|-----------|------------|
-| Master volume | HMD menu / conf `volume` | file, Live, `[アプリ]` (one `AudioPlayer`) |
-| Rear upmix | conf `surround_gain` (0..2, default `0.55`) | file 2ch, Live, `[アプリ]` |
+| File volume | HMD menu / conf `volume` | file only, Vol 0–100. 100 is the safe maximum |
+| Live base | listener `1.0` | Live / `[アプリ]`. Not the file slider |
+| Pre-HRTF trim | conf `hrtf_trim_db` (0..24, default `12`) | dB cut after the limiter, before upmix and HRTF |
+| Rear upmix | conf `surround_gain` (0..2, default `0.8`) | file 2ch, Live, `[アプリ]` |
+| Loudness | conf `audio_normalize` (`1`/`on` default, `0`/`off`), peak -6 dBFS | file, Live, `[アプリ]` (before upmix and HRTF) |
 
-`surround_gain` has no HMD UI — edit `~/.config/monasphere/monasphere.conf` and
-restart the HMD session (applied at Soft start via `audio.set_surround_gain`).
+`surround_gain`, `audio_normalize`, and `hrtf_trim_db` have no HMD UI — edit
+`~/.config/monasphere/monasphere.conf` and restart the HMD session.
+Missing `audio_normalize` is written as `1`, and missing `hrtf_trim_db` as `12`,
+on the next launch. Retired keys such as `volume_uncap` are commented out.
 
 ### Startup order (must keep)
 
@@ -270,8 +277,10 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 
 | Key | Meaning |
 |-----|---------|
-| `surround_gain` | Stereo→4.0 rear level for **file / Live / [アプリ]** (0..2, default `0.55`) |
-| `volume` | Master level (HMD menu); same `AudioPlayer` for file / Live / `[アプリ]` |
+| `surround_gain` | Stereo→4.0 rear level for **file / Live / [アプリ]** (0..2, default `0.8`) |
+| `audio_normalize` | Loudness match before upmix and HRTF (`1` or `on` default, `0` or `off`). Peak ceiling -6 dBFS. Listener gain stays as-is |
+| `volume` | File slider 0–1 (Vol 0–100). Live does not follow this |
+| `hrtf_trim_db` | Decibels cut before upmix and HRTF (0..24, default `12`). `0` is no extra cut. Missing key is written as `12` |
 | `live_capture` | `monitor` (default) or `window` |
 | `live_virtual` | `1` = app starts/stops `krfb-virtualmonitor` (KDE Wayland only) |
 | `live_virtual_size` | e.g. `1280x720` (managed virtual output `Virtual-monaSphere`) |

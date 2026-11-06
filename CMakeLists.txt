@@ -212,6 +212,7 @@ add_library(vrp_core STATIC
   src/audio/audio_player.cpp
   src/audio/openal_spatial.cpp
   src/audio/stereo_surround.cpp
+  src/audio/loudness_normalizer.cpp
   src/audio/pulse_monitor.cpp
   src/scene/scene_renderer.cpp
   src/scene/fsr1_upscaler.cpp

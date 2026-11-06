@@ -349,8 +349,12 @@ class HostWindow : public QMainWindow {
   bool thumb_jpeg_ = true;
   /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */
   float milkyway_gain_ = 1.f;
-  /** monasphere.conf `surround_gain`. Stereo→4.0 rear for file / Live / [アプリ] (default 0.55; no UI). */
-  float surround_gain_ = 0.55f;
+  /** monasphere.conf `surround_gain`. Stereo→4.0 rear for file / Live / [アプリ] (default 0.8; no UI). */
+  float surround_gain_ = 0.8f;
+  /** monasphere.conf `audio_normalize`. 1 = loudness match on file / Live / [アプリ] (default on; no UI). */
+  bool audio_normalize_ = true;
+  /** monasphere.conf `hrtf_trim_db`. Cut before upmix/HRTF, 0..24 dB, default 12. No UI. */
+  float hrtf_trim_db_ = 12.f;
   /**
    * Earth-horizon sky observer. When `sky_from_timezone=1` (default), filled from the
    * host IANA zone (zone.tab). Manual `sky_lat` / `sky_lon` apply only if that flag is 0.

@@ -1392,6 +1392,10 @@ void HostWindow::saveAppConf() const {
                        QString::number(static_cast<double>(milkyway_gain_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("surround_gain"),
                        QString::number(static_cast<double>(surround_gain_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("audio_normalize"),
+                       audio_normalize_ ? QStringLiteral("1") : QStringLiteral("0"));
+  setMonasphereConfKey(QStringLiteral("hrtf_trim_db"),
+                       QString::number(static_cast<double>(hrtf_trim_db_), 'f', 1));
   setMonasphereConfKey(QStringLiteral("sky_from_timezone"), sky_from_timezone_ ? QStringLiteral("1") : QStringLiteral("0"));
   setMonasphereConfKey(QStringLiteral("sky_lat"), QString::number(static_cast<double>(sky_lat_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("sky_lon"), QString::number(static_cast<double>(sky_lon_), 'f', 2));
@@ -1431,6 +1435,9 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("pad"), QStringLiteral("auto")},
       {QStringLiteral("hand"), QStringLiteral("right")},
       {QStringLiteral("gamepad"), QStringLiteral("1")},
+      {QStringLiteral("surround_gain"), QStringLiteral("0.80")},
+      {QStringLiteral("audio_normalize"), QStringLiteral("1")},
+      {QStringLiteral("hrtf_trim_db"), QStringLiteral("12")},
       {QStringLiteral("thumb_count"), QString::number(vrp::kSeekThumbCount)},
       {QStringLiteral("thumb_edge"), QString::number(vrp::kSeekThumbMaxEdge)},
       {QStringLiteral("hwaccel"), QStringLiteral("1")},
@@ -1441,7 +1448,6 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("flat_distance"),
        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
       {QStringLiteral("milkyway_gain"), QStringLiteral("1.00")},
-      {QStringLiteral("surround_gain"), QStringLiteral("0.55")},
       {QStringLiteral("sky_from_timezone"), QStringLiteral("1")},
       {QStringLiteral("sky_lat"), QStringLiteral("35.68")},
       {QStringLiteral("sky_lon"), QStringLiteral("139.65")},
@@ -1559,6 +1565,17 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
       if (ok && v >= 0.f && v <= 2.f) surround_gain_ = v;
+    } else if (line.startsWith(QStringLiteral("audio_normalize="))) {
+      const QString v = line.mid(QStringLiteral("audio_normalize=").size()).trimmed();
+      if (v == QLatin1String("0") || v.compare(QLatin1String("off"), Qt::CaseInsensitive) == 0) {
+        audio_normalize_ = false;
+      } else if (v == QLatin1String("1") || v.compare(QLatin1String("on"), Qt::CaseInsensitive) == 0) {
+        audio_normalize_ = true;
+      }
+    } else if (line.startsWith(QStringLiteral("hrtf_trim_db="))) {
+      bool ok = false;
+      const float v = line.mid(QStringLiteral("hrtf_trim_db=").size()).trimmed().toFloat(&ok);
+      if (ok && v >= 0.f && v <= 24.f) hrtf_trim_db_ = v;
     } else if (line.startsWith(QStringLiteral("sky_from_timezone="))) {
       bool ok = false;
       const int v = line.mid(18).toInt(&ok);
@@ -1728,6 +1745,15 @@ void HostWindow::loadAppConf() {
     }
   }
   user.close();
+  // Shipped defaults moved. A different saved value is left as edited.
+  if (hrtf_trim_db_ > 8.95f && hrtf_trim_db_ < 9.05f) {
+    hrtf_trim_db_ = 12.f;
+    setMonasphereConfKey(QStringLiteral("hrtf_trim_db"), QStringLiteral("12.0"));
+  }
+  if (surround_gain_ > 0.549f && surround_gain_ < 0.551f) {
+    surround_gain_ = 0.8f;
+    setMonasphereConfKey(QStringLiteral("surround_gain"), QStringLiteral("0.80"));
+  }
 
   if (!live_by_index.isEmpty()) {
     for (auto it = live_by_index.cbegin(); it != live_by_index.cend(); ++it) {
@@ -4282,6 +4308,8 @@ void HostWindow::xrThreadMain() {
     vrp::VideoDecoder decoder;
     vrp::AudioPlayer audio;
     audio.set_surround_gain(surround_gain_);
+    audio.set_loudness_normalize(audio_normalize_);
+    audio.set_hrtf_trim_db(hrtf_trim_db_);
     // Keep miniaudio up for the whole HMD session (silence when idle / switching).
     if (!opt_.mute) {
       std::string adev;
@@ -4435,6 +4463,7 @@ void HostWindow::xrThreadMain() {
         }
         menu.set_desktop_apps(std::move(apps));
       }
+      menu.set_volume_cap(1.f);
       audio.set_volume(menu.volume());
       menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
       menu.set_fsr(preferred_fsr_);

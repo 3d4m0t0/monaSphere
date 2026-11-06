@@ -232,6 +232,8 @@ class VrMenu {
   void set_playback(bool playing, double position_sec);
   void set_volume(float v);
   float volume() const { return volume_; }
+  /** Menu ceiling. 1 = Vol 100, the safe maximum. */
+  void set_volume_cap(float linear_max);
   void set_rate(float r);
   float rate() const { return rate_; }
   void set_fsr(FsrMode m);
@@ -464,6 +466,8 @@ class VrMenu {
   bool rate_trigger_lock_ = false;
   AxisRepeat rate_trigger_repeat_{};
   float volume_ = 0.2f;
+  /** Linear ceiling for the file volume control. Vol 100. */
+  float volume_cap_ = 1.f;
   float rate_ = 1.f;
   FsrMode fsr_ = FsrMode::Quality;
   bool fsr_locked_ = false;
