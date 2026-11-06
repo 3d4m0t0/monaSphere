@@ -31,6 +31,8 @@ class VulkanVideoTexture {
  public:
   bool init(VkPhysicalDevice phys, VkDevice device, VkQueue queue, uint32_t queue_family,
             std::mutex* queue_mu);
+  /** Wait the displayed frame's graphics submission. Does not free the mailbox. */
+  void wait_display_gpu(uint64_t timeout_ns);
   void shutdown();
 
   bool enabled() const { return enabled_; }

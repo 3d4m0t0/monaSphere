@@ -437,6 +437,20 @@ void XrVulkanApp::shutdown() {
     }
     VRP_LOG("shutdown: ffmpeg hwctx reset done");
   }
+  // Vulkan Video's decode engine is not always finished by vkDeviceWaitIdle.
+  // Idling the decode queue while the device still exists lets vkDestroyInstance
+  // release the ICD without the ~15s driver timeout. Do not skip the later
+  // vkDestroyInstance dlclose — that is what frees the compositor's client device.
+  if (video_decode_queue_ != VK_NULL_HANDLE) {
+    const auto t0 = std::chrono::steady_clock::now();
+    vkQueueWaitIdle(video_decode_queue_);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    if (ms >= 50) {
+      VRP_LOG("shutdown: video decode queue idle %lld ms", static_cast<long long>(ms));
+    }
+  }
   video_decode_ready_ = false;
   video_decode_queue_ = VK_NULL_HANDLE;
   video_decode_queue_family_ = UINT32_MAX;
@@ -444,42 +458,20 @@ void XrVulkanApp::shutdown() {
   pfn_get_device_fault_ = nullptr;
   enabled_dev_exts_.clear();
 
-  // WaitIdle already succeeded above. vkDestroyDevice can still block in the
-  // driver until Monado's IPC dies — that path printed no timeout of its own.
-  if (device_ != VK_NULL_HANDLE) {
-    VRP_LOG("shutdown: vkDestroyDevice");
-    const VkDevice dev = device_;
-    const VkCommandPool pool = command_pool_;
-    const VkRenderPass pass = color_pass_;
-    const VkInstance vk_inst = vk_instance_;
-    command_pool_ = VK_NULL_HANDLE;
-    color_pass_ = VK_NULL_HANDLE;
-    device_ = VK_NULL_HANDLE;
-    queue_ = VK_NULL_HANDLE;
-    physical_device_ = VK_NULL_HANDLE;
-    vk_instance_ = VK_NULL_HANDLE;
-    if (!run_timed("vkDestroyDevice", 2000, [dev, pool, pass, vk_inst] {
-          if (pool) vkDestroyCommandPool(dev, pool, nullptr);
-          if (pass) vkDestroyRenderPass(dev, pass, nullptr);
-          vkDestroyDevice(dev, nullptr);
-          if (vk_inst) vkDestroyInstance(vk_inst, nullptr);
-        })) {
-      if (instance_) instance_ = XR_NULL_HANDLE;
-      crash_guard::clear_session_cookie();
-      VRP_LOG("shutdown: vkDestroyDevice timed out — leaked device");
-      return;
-    }
-    VRP_LOG("shutdown: vkDestroyDevice done");
-  } else {
-    queue_ = VK_NULL_HANDLE;
-    physical_device_ = VK_NULL_HANDLE;
-    if (vk_instance_) {
-      VRP_LOG("shutdown: vkDestroyInstance (no device)");
-      const VkInstance vk_inst = vk_instance_;
-      vk_instance_ = VK_NULL_HANDLE;
-      (void)run_timed("vkDestroyInstance", 2000, [vk_inst] { vkDestroyInstance(vk_inst, nullptr); });
-    }
-  }
+  // vkDestroyDevice before xrDestroyInstance does not return: the compositor still
+  // holds the device. Leaking it and exiting wedges the next
+  // xrCreateVulkanInstanceKHR until Monado is restarted. Drop the XR instance
+  // first, then destroy the device.
+  const VkDevice dev = device_;
+  const VkCommandPool pool = command_pool_;
+  const VkRenderPass pass = color_pass_;
+  const VkInstance vk_inst = vk_instance_;
+  command_pool_ = VK_NULL_HANDLE;
+  color_pass_ = VK_NULL_HANDLE;
+  device_ = VK_NULL_HANDLE;
+  queue_ = VK_NULL_HANDLE;
+  physical_device_ = VK_NULL_HANDLE;
+  vk_instance_ = VK_NULL_HANDLE;
 
   if (instance_) {
     VRP_LOG("shutdown: xrDestroyInstance");
@@ -487,9 +479,30 @@ void XrVulkanApp::shutdown() {
     instance_ = XR_NULL_HANDLE;
     if (!run_timed("xrDestroyInstance", 2000, [instance] { xrDestroyInstance(instance); })) {
       crash_guard::clear_session_cookie();
+      VRP_ERR("shutdown: xrDestroyInstance timed out — leaking VkDevice; next "
+              "xrCreateVulkanInstanceKHR may block");
       return;
     }
     VRP_LOG("shutdown: xrDestroyInstance done");
+  }
+  if (dev != VK_NULL_HANDLE || vk_inst != VK_NULL_HANDLE) {
+    // On the thread that created the device. A side thread deadlocks NVIDIA
+    // inside vkDestroyDevice. vkDestroyInstance must run to completion: its
+    // dlclose is what drops the compositor's client device. After Vulkan Video
+    // that call can take around 15s and still succeed; do not log it as a failure.
+    auto timed = [&](const char* name, auto&& fn) {
+      const auto t0 = std::chrono::steady_clock::now();
+      VRP_LOG("shutdown: %s enter", name);
+      fn();
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+      VRP_LOG("shutdown: %s leave %lld ms", name, static_cast<long long>(ms));
+    };
+    if (dev && pool) timed("vkDestroyCommandPool", [&] { vkDestroyCommandPool(dev, pool, nullptr); });
+    if (dev && pass) timed("vkDestroyRenderPass", [&] { vkDestroyRenderPass(dev, pass, nullptr); });
+    if (dev) timed("vkDestroyDevice", [&] { vkDestroyDevice(dev, nullptr); });
+    if (vk_inst) timed("vkDestroyInstance", [&] { vkDestroyInstance(vk_inst, nullptr); });
   }
   session_focused_ = false;
   tracking_valid_ = false;
@@ -628,27 +641,37 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     note(std::string("Vulkan: creating instance (") + label + " " + vk_api_version_string(api) +
          ", req " + req_min + ".." + req_max + ")…");
     check_cancel();
-    // Monado compositor IPC can block forever here after a prior Broken pipe.
+    // This call blocks in the Monado compositor when the previous process exited
+    // without vkDestroyDevice (NVIDIA keeps the old client until Monado restarts).
+    VRP_LOG("startup: xrCreateVulkanInstanceKHR enter (%s system=%llu)", label,
+            static_cast<unsigned long long>(system_));
+    const auto t0 = std::chrono::steady_clock::now();
     std::atomic<bool> creating{true};
     std::thread watchdog([&] {
       for (int sec = 0; creating.load(std::memory_order_acquire); ++sec) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!creating.load(std::memory_order_acquire)) return;
         if (sec > 0 && (sec % 5) == 0) {
-          const std::string stall = std::string("Vulkan instance create blocked (") +
-                                    std::to_string(sec) + "s, " + label +
-                                    ") — Monado compositor may be wedged";
+          const std::string stall = std::string("startup: xrCreateVulkanInstanceKHR blocked ") +
+                                    std::to_string(sec) + "s (" + label +
+                                    ") — compositor still holds the previous VkDevice";
           VRP_ERR("%s", stall.c_str());
           if (progress) progress(stall);
         }
         if (cancel && cancel->load(std::memory_order_acquire)) {
-          VRP_ERR("Vulkan instance create: cancel requested while blocked (%s)", label);
+          VRP_ERR("startup: xrCreateVulkanInstanceKHR cancel requested while blocked (%s)", label);
         }
       }
     });
     const XrResult xr_out = xrCreateVulkanInstanceKHR(instance_, &xvici, &vk_instance_, &vk_out);
     creating.store(false, std::memory_order_release);
     watchdog.join();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    VRP_LOG("startup: xrCreateVulkanInstanceKHR returned in %lld ms xr=%d vk=%d instance=%d",
+            static_cast<long long>(ms), static_cast<int>(xr_out), static_cast<int>(vk_out),
+            vk_instance_ != VK_NULL_HANDLE ? 1 : 0);
     return {xr_out, vk_out};
   };
 

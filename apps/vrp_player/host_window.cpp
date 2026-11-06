@@ -134,7 +134,8 @@ HostWindow::~HostWindow() {
   shutting_down_.store(true);
   thumb_cancel_.store(true);
   stopExternalSessions();
-  if (!shutdownXrSession(10000, true)) {
+  // Vulkan Video's vkDestroyInstance can take ~15s and must finish.
+  if (!shutdownXrSession(25000, true)) {
     VRP_ERR("XR thread did not exit in destructor — detaching (last resort)");
     if (xr_thread_.joinable()) xr_thread_.detach();
   }
@@ -149,7 +150,8 @@ void HostWindow::closeEvent(QCloseEvent* event) {
   shutting_down_.store(true);
   thumb_cancel_.store(true);
   stopExternalSessions();
-  if (!shutdownXrSession(10000, true)) {
+  // Vulkan Video's vkDestroyInstance can take ~15s and must finish.
+  if (!shutdownXrSession(25000, true)) {
     appendLog(tr("XR thread hung — detach"));
     VRP_ERR("XR thread join timed out on close — detaching");
     if (xr_thread_.joinable()) xr_thread_.detach();
@@ -219,18 +221,32 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
   }
 
   if (!ok && xr_thread_.joinable() && stop_monado && !monado_external_) {
-    // XR stuck — kill runtime to unblock hung IPC, then brief grace for teardown.
-    VRP_ERR("shutdownXrSession: XR still running after timeout — stopping Monado to unblock");
-    stopMonadoProcess();
-    const auto grace =
-        std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
-      QThread::msleep(40);
-      QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
-    }
-    if (!xr_running_.load() && xr_thread_.joinable()) {
-      xr_thread_.join();
-      ok = true;
+    if (!xr_in_frame_loop_.load(std::memory_order_acquire)) {
+      // Past WaitFrame. Teardown is inside Vulkan/OpenXR destroy. Killing Monado
+      // here is what wedges the next xrCreateVulkanInstanceKHR.
+      VRP_LOG("shutdownXrSession: frame loop left — waiting for teardown, not stopping Monado");
+      const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+      while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
+        QThread::msleep(40);
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+      }
+      if (!xr_running_.load() && xr_thread_.joinable()) {
+        xr_thread_.join();
+        ok = true;
+      }
+    } else {
+      // Still inside xrWaitFrame — kill runtime to unblock hung IPC.
+      VRP_ERR("shutdownXrSession: XR still running after timeout — stopping Monado to unblock");
+      stopMonadoProcess();
+      const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
+        QThread::msleep(40);
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+      }
+      if (!xr_running_.load() && xr_thread_.joinable()) {
+        xr_thread_.join();
+        ok = true;
+      }
     }
   } else if (ok && stop_monado && !monado_external_) {
     stopMonadoProcess();
@@ -4160,10 +4176,11 @@ void HostWindow::xrThreadMain() {
           // xrCreateVulkanInstanceKHR can block forever on a wedged Monado compositor.
           // After ~15s of stall reports, kill owned Monado so the XR call returns.
           static int vk_inst_stall_n = 0;
-          if (q.contains(QStringLiteral("Vulkan instance create blocked"))) {
+          if (q.contains(QStringLiteral("xrCreateVulkanInstanceKHR blocked"))) {
             ++vk_inst_stall_n;
             if (vk_inst_stall_n >= 3 && !monado_external_ && !usingWivrn()) {
               vk_inst_stall_n = 0;
+              VRP_LOG("startup: xrCreateVulkanInstanceKHR still blocked — stopping Monado");
               appendLog(tr("Vulkan instance create hung — restarting Monado to unblock"));
               stopMonadoProcess();
               stopSystemdMonadoForOwnedStart();
@@ -4194,6 +4211,7 @@ void HostWindow::xrThreadMain() {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
       }
       if (logged_wait) report_progress("Monado connected");
+      VRP_LOG("startup: Monado IPC live (%s)", monadoIpcPath().toUtf8().constData());
     }
 
     vrp::XrVulkanApp xr;
@@ -7244,6 +7262,38 @@ void HostWindow::xrThreadMain() {
     scene.set_texture(texture.view(), texture.sampler());
     scene.set_hud_texture(VK_NULL_HANDLE, VK_NULL_HANDLE, false);
     scene.set_thumb_texture(VK_NULL_HANDLE, VK_NULL_HANDLE, false);
+    // Shown frame's graphics submit, then the decode queue, while the
+    // VkVideoSession still exists. NVIDIA's video thread exits on that
+    // completion; destroying the session first leaves it until vkDestroyInstance.
+    VRP_LOG("teardown: vulkan display gpu");
+    vulkan_tex.wait_display_gpu(2'000'000'000ull);
+    if (VkQueue vq = xr.video_decode_queue()) {
+      VkFence fence = VK_NULL_HANDLE;
+      VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+      const auto t0 = std::chrono::steady_clock::now();
+      VkResult submit = VK_ERROR_INITIALIZATION_FAILED;
+      if (vkCreateFence(xr.device(), &fi, nullptr, &fence) == VK_SUCCESS) {
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        {
+          std::lock_guard<std::mutex> lock(xr.queue_mutex());
+          submit = vkQueueSubmit(vq, 1, &si, fence);
+        }
+        if (submit == VK_SUCCESS) {
+          submit = vkWaitForFences(xr.device(), 1, &fence, VK_TRUE, 2'000'000'000ull);
+        }
+        vkDestroyFence(xr.device(), fence, nullptr);
+      }
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - t0)
+                          .count();
+      VRP_LOG("teardown: vulkan decode idle %lld ms ok=%d", static_cast<long long>(ms),
+              submit == VK_SUCCESS ? 1 : 0);
+    }
+    // AVVkFrames before avcodec_free_context, so the VkVideoSession is destroyed
+    // with no outstanding images. CUDA imports before decoder.close(), while the
+    // NVDEC CUcontext that imported them is still alive.
+    VRP_LOG("teardown: vulkan frames");
+    vulkan_tex.shutdown();
     VRP_LOG("teardown: reset NV12 slots (before decoder.close)");
     cuda_tex.reset_slots(decoder.cuda_context());
     decoder.close();
@@ -7253,7 +7303,6 @@ void HostWindow::xrThreadMain() {
     VRP_LOG("teardown: fsr done");
     cuda_tex.shutdown();
     vaapi_tex.shutdown();
-    VRP_LOG("teardown: vulkan_tex shutdown");
     vulkan_tex.shutdown();
 #if defined(VRP_HAS_PIPEWIRE)
     pw_dma_tex.shutdown();
@@ -7271,7 +7320,10 @@ void HostWindow::xrThreadMain() {
     VRP_LOG("teardown: xr.shutdown");
     xr.shutdown();
     VRP_LOG("teardown: xr.shutdown done");
-    VRP_LOG("teardown: complete (Vulkan instance destroyed)");
+    // App exit joins once this drops. A normal session end keeps the flag set
+    // until the thread returns, so reconnect does not overlap the unwind.
+    if (shutting_down_.load()) xr_running_.store(false);
+    VRP_LOG("teardown: complete");
   } catch (const std::exception& e) {
     const QString msg = QString::fromUtf8(e.what());
     if (!shutting_down_.load()) {

@@ -104,15 +104,39 @@ void VulkanVideoTexture::drain_layout_fence(uint64_t timeout_ns) {
   pending_wait_count_ = 0;
 }
 
+void VulkanVideoTexture::wait_display_gpu(uint64_t timeout_ns) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const bool pending = fence_pending_;
+  drain_layout_fence(timeout_ns);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  if (pending) {
+    VRP_LOG("VulkanVideoTexture: display gpu %lld ms pending=%d", static_cast<long long>(ms),
+            fence_pending_ ? 1 : 0);
+  }
+}
+
 void VulkanVideoTexture::shutdown() {
-  // Teardown must not burn the XR join budget (was 2s+8s). kick_gpu leaves this
-  // fence pending; a wedged graphics queue never signals it.
-  drain_layout_fence(100'000'000ull);
+  // Shown frame first. A wedged graphics queue must not sit here for the whole
+  // UI join; 2s covers a normal eye submit, then we stop waiting.
+  if (fence_pending_) wait_display_gpu(2'000'000'000ull);
   {
     std::lock_guard<std::mutex> lock(mu_);
-    // Abandon mailbox without long timeline waits — device is going away.
-    if (front_.held) abandon_slot_locked(front_);
-    if (back_.held) abandon_slot_locked(back_);
+    // Decode timeline before the consumer +1. host_signal ahead of the GPU is
+    // what leaves NVIDIA's video thread blocked until vkDestroyInstance times out.
+    constexpr uint64_t kDecodeWaitNs = 2'000'000'000ull;
+    auto release = [&](Slot& slot) {
+      if (!slot.held) return;
+      if (!decode_ready_now(slot) && !wait_decode_ready(slot, kDecodeWaitNs)) {
+        VRP_ERR("VulkanVideoTexture: decode wait timed out — abandoning frame");
+        abandon_slot_locked(slot);
+        return;
+      }
+      if (!return_to_ffmpeg(slot, 0)) abandon_slot_locked(slot);
+    };
+    release(front_);
+    release(back_);
     deferred_drop_front_ = false;
     width_ = height_ = 0;
     valid_.store(false);

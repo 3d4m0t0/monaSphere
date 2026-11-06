@@ -273,8 +273,19 @@ void CudaNv12Texture::reset_slots(void* cu_context) {
   drain_copies(cu_context);
   std::lock_guard<std::mutex> cuda_lock(cuda_decode_mu());
   std::lock_guard<std::mutex> lock(slots_mu_);
+  int imports = 0;
+  for (const Slot& s : slots_) {
+    if (s.y.cuda_ptr || s.y.cuda_ext_mem) ++imports;
+    if (s.uv.cuda_ptr || s.uv.cuda_ext_mem) ++imports;
+  }
+  const bool cuda_live = imports > 0 || copy_stream_ != nullptr;
   CtxScope scope;
   const bool ctx = push_cuda_ctx(scope, cu_context);
+  if (cuda_live && !ctx) {
+    VRP_ERR("CudaNv12Texture: %d CUDA imports but context push failed — Vulkan export kept",
+            imports);
+    return;
+  }
   if (ctx) {
     (void)retire_pending_copy();
     auto& cu = cuda::api();
@@ -287,8 +298,15 @@ void CudaNv12Texture::reset_slots(void* cu_context) {
   layouts_ready_ = false;
   // Stream/events are tied to the previous CUcontext — must die with the slots or the
   // next open reuses a dead stream and cuMemcpy2DAsync SEGVs on the 2nd+ file.
-  destroy_async_copy_path();
-  destroy_slots();
+  if (ctx || !cuda_live) destroy_async_copy_path();
+  const bool released = destroy_slots();
+  if (imports > 0) {
+    if (released) {
+      VRP_LOG("CudaNv12Texture: released %d CUDA external imports", imports);
+    } else {
+      VRP_ERR("CudaNv12Texture: CUDA external release incomplete (%d imports)", imports);
+    }
+  }
   if (ctx) pop_cuda_ctx(scope);
   create_failed_ = false;
   pending_slot_ = -1;
@@ -315,34 +333,22 @@ void CudaNv12Texture::shutdown() {
          slots_[1].y.cuda_ext_mem || slots_[0].uv.cuda_ptr || slots_[0].uv.cuda_ext_mem ||
          slots_[1].uv.cuda_ptr || slots_[1].uv.cuda_ext_mem);
     if (has_import) {
-      VRP_ERR("CudaNv12Texture::shutdown: CUDA imports still present — call reset_slots(ctx) "
-              "before decoder.close()");
       CtxScope scope;
-      if (push_cuda_ctx(scope)) {
-        if (cuda::api().cuCtxSynchronize) (void)cuda::api().cuCtxSynchronize();
-        destroy_slots();
-        pop_cuda_ctx(scope);
+      if (!push_cuda_ctx(scope)) {
+        VRP_ERR("CudaNv12Texture::shutdown: CUDA imports still present and context is gone — "
+                "leaving Vulkan export (vkDestroyDevice would block)");
       } else {
-        // Last resort: clear Vk handles without CUDA free (may leak driver objects).
-        for (Slot& s : slots_) {
-          auto scrub = [&](Plane& p) {
-            p.cuda_ptr = 0;
-            p.cuda_ext_mem = nullptr;
-            if (device_) {
-              if (p.view) vkDestroyImageView(device_, p.view, nullptr);
-              if (p.image) vkDestroyImage(device_, p.image, nullptr);
-              if (p.memory) vkFreeMemory(device_, p.memory, nullptr);
-            }
-            p = {};
-          };
-          scrub(s.y);
-          scrub(s.uv);
+        if (cuda::api().cuCtxSynchronize) (void)cuda::api().cuCtxSynchronize();
+        destroy_async_copy_path();
+        if (!destroy_slots()) {
+          VRP_ERR("CudaNv12Texture::shutdown: CUDA external release failed");
         }
+        pop_cuda_ctx(scope);
       }
     } else {
       destroy_slots();
+      destroy_async_copy_path();
     }
-    destroy_async_copy_path();
   }
   if (sampler_) vkDestroySampler(device_, sampler_, nullptr);
   sampler_ = VK_NULL_HANDLE;
@@ -355,6 +361,20 @@ void CudaNv12Texture::shutdown() {
   enabled_ = false;
   valid_.store(false);
   device_ = VK_NULL_HANDLE;
+  auto& cu = cuda::api();
+  if (cu.ok && cu.cuCtxGetCurrent) {
+    cuda::CUcontext cur = nullptr;
+    (void)cu.cuCtxGetCurrent(&cur);
+    int popped = 0;
+    while (cur && popped < 8 && cu.cuCtxPopCurrent) {
+      cuda::CUcontext out = nullptr;
+      if (cu.cuCtxPopCurrent(&out) != cuda::CUDA_SUCCESS) break;
+      ++popped;
+      cur = nullptr;
+      (void)cu.cuCtxGetCurrent(&cur);
+    }
+    VRP_LOG("CudaNv12Texture: shutdown cuda current=%p popped=%d", static_cast<void*>(cur), popped);
+  }
 }
 
 bool CudaNv12Texture::match_cuda_uuid() {
@@ -389,30 +409,45 @@ uint32_t CudaNv12Texture::find_memory_type(uint32_t type_bits, VkMemoryPropertyF
   vrp_fatal("CudaNv12Texture: no suitable memory type");
 }
 
-void CudaNv12Texture::destroy_plane(Plane& p) {
+bool CudaNv12Texture::destroy_plane(Plane& p) {
   auto& cu = cuda::api();
-  // Mapped buffers must be freed before destroying the external memory object.
-  // Doing this after the owning CUcontext is gone (decoder.close) can hang in the driver.
-  if (p.cuda_ptr && cu.ok && cu.cuMemFree) {
-    (void)cu.cuMemFree(p.cuda_ptr);
+  // Mapped buffers must be freed before the external memory object, on the same
+  // CUcontext that imported them. Zeroing the handle after a failed free leaves
+  // the NVIDIA driver holding the VkDeviceMemory, and vkDestroyDevice never returns.
+  if (p.cuda_ptr) {
+    if (!cu.ok || !cu.cuMemFree) return false;
+    const cuda::CUresult cr = cu.cuMemFree(p.cuda_ptr);
+    if (cr != cuda::CUDA_SUCCESS) {
+      VRP_ERR("CudaNv12Texture: cuMemFree failed (%s) — keeping Vulkan export", cuda::err_name(cr));
+      return false;
+    }
+    p.cuda_ptr = 0;
   }
-  p.cuda_ptr = 0;
-  if (p.cuda_ext_mem && cu.ok && cu.cuDestroyExternalMemory) {
-    (void)cu.cuDestroyExternalMemory(reinterpret_cast<cuda::CUexternalMemory>(p.cuda_ext_mem));
+  if (p.cuda_ext_mem) {
+    if (!cu.ok || !cu.cuDestroyExternalMemory) return false;
+    const cuda::CUresult cr =
+        cu.cuDestroyExternalMemory(reinterpret_cast<cuda::CUexternalMemory>(p.cuda_ext_mem));
+    if (cr != cuda::CUDA_SUCCESS) {
+      VRP_ERR("CudaNv12Texture: cuDestroyExternalMemory failed (%s) — keeping Vulkan export",
+              cuda::err_name(cr));
+      return false;
+    }
+    p.cuda_ext_mem = nullptr;
   }
-  p.cuda_ext_mem = nullptr;
   if (device_) {
     if (p.view) vkDestroyImageView(device_, p.view, nullptr);
     if (p.image) vkDestroyImage(device_, p.image, nullptr);
     if (p.memory) vkFreeMemory(device_, p.memory, nullptr);
   }
   p = {};
+  return true;
 }
 
-void CudaNv12Texture::destroy_slots() {
+bool CudaNv12Texture::destroy_slots() {
+  bool ok = true;
   for (Slot& s : slots_) {
-    destroy_plane(s.y);
-    destroy_plane(s.uv);
+    ok = destroy_plane(s.y) && ok;
+    ok = destroy_plane(s.uv) && ok;
   }
   display_slot_.store(0);
   write_ = 1;
@@ -422,6 +457,7 @@ void CudaNv12Texture::destroy_slots() {
   height_ = 0;
   valid_.store(false);
   layouts_ready_ = false;
+  return ok;
 }
 
 bool CudaNv12Texture::create_plane(Plane& p, int width, int height, VkFormat format) {

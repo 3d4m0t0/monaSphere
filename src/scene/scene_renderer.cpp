@@ -438,6 +438,13 @@ void SceneRenderer::shutdown() {
     vkDestroyFence(device_, submit_fence_, nullptr);
     submit_fence_ = VK_NULL_HANDLE;
   }
+  // These CBs come from the XR pool destroyed later. Leaving them recorded makes
+  // NVIDIA's vkDestroyDevice join its worker and never return after playback.
+  if (app_ && app_->command_pool() && !cmds_.empty()) {
+    vkFreeCommandBuffers(device_, app_->command_pool(), static_cast<uint32_t>(cmds_.size()),
+                         cmds_.data());
+    cmds_.clear();
+  }
   if (pipeline_) vkDestroyPipeline(device_, pipeline_, nullptr);
   if (grid_pipeline_) vkDestroyPipeline(device_, grid_pipeline_, nullptr);
   if (star_pipeline_) vkDestroyPipeline(device_, star_pipeline_, nullptr);
@@ -550,6 +557,8 @@ void SceneRenderer::shutdown() {
   milkyway_layout_ = VK_NULL_HANDLE;
   moon_layout_ = VK_NULL_HANDLE;
   sky_blit_layout_ = VK_NULL_HANDLE;
+  device_ = VK_NULL_HANDLE;
+  app_ = nullptr;
 }
 
 void SceneRenderer::destroy_sky_mono() {

@@ -1303,7 +1303,7 @@ void VideoDecoder::decode_loop() {
           if (latest_issue != issue) {
             seek_apply_gen_.store(latest_issue, std::memory_order_release);
             seek_req_.store(false, std::memory_order_release);
-            VRP_LOG("seekdbg: apply coalesced issue %llu->%llu target=%.3f",
+            VRP_LOG("seekdbg: apply coalesced issue %llu→%llu target=%.3f",
                     static_cast<unsigned long long>(issue),
                     static_cast<unsigned long long>(latest_issue), t_apply);
           }
@@ -2107,11 +2107,17 @@ void VideoDecoder::close() {
       sws_freeContext(ff_->sws);
       ff_->sws = nullptr;
     }
+    // free_context destroys VkVideoSession / NVDEC while hw_device_ctx is still
+    // set. Dropping that ref first makes FFmpeg skip the session teardown, and
+    // vkDestroyDevice then waits on the leftover driver objects.
     if (ff_->codec) {
-      av_buffer_unref(&ff_->codec->hw_device_ctx);
+      VRP_LOG("decoder.close: free codec hwaccel=%s", info_.hwaccel.c_str());
       avcodec_free_context(&ff_->codec);
     }
-    if (ff_->hw_device_ctx) av_buffer_unref(&ff_->hw_device_ctx);
+    if (ff_->hw_device_ctx) {
+      VRP_LOG("decoder.close: unref hw device");
+      av_buffer_unref(&ff_->hw_device_ctx);
+    }
     if (ff_->fmt) avformat_close_input(&ff_->fmt);
     ff_->sws_src_fmt = AV_PIX_FMT_NONE;
     ff_->sws_src_w = 0;
@@ -2618,7 +2624,7 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
             {
               static std::atomic<bool> range_logged{false};
               if (!range_logged.exchange(true)) {
-                VRP_LOG("NV12 color_range frame=%d codec=%d -> %s",
+                VRP_LOG("NV12 color_range frame=%d codec=%d → %s",
                         static_cast<int>(ff_->frame->color_range),
                         ff_->codec ? static_cast<int>(ff_->codec->color_range) : -1,
                         out.full_range ? "full" : "limited");
@@ -2662,7 +2668,7 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
           ff_->sws_src_w = src->width;
           ff_->sws_src_h = src->height;
           if (!ff_->sws) {
-            VRP_ERR("sws_getContext failed %dx%d -> %dx%d fmt=%d", src->width, src->height, display_w_,
+            VRP_ERR("sws_getContext failed %dx%d → %dx%d fmt=%d", src->width, src->height, display_w_,
                     display_h_, static_cast<int>(src_fmt));
             continue;
           }

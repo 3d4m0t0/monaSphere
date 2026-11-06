@@ -141,8 +141,9 @@ class CudaNv12Texture {
   /** Push CUDA context; caller must pop_cuda_ctx(scope) when done. */
   bool push_cuda_ctx(CtxScope& scope, void* preferred = nullptr);
   void pop_cuda_ctx(CtxScope& scope);
-  void destroy_plane(Plane& p);
-  void destroy_slots();
+  /** False if a CUDA import is still held. Vulkan export is freed only after CUDA releases it. */
+  bool destroy_plane(Plane& p);
+  bool destroy_slots();
   bool create_plane(Plane& p, int width, int height, VkFormat format);
   bool create_slot(Slot& slot, int width, int height);
   bool import_cuda_plane(Plane& p);
