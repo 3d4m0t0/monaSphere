@@ -374,8 +374,10 @@ int HudCanvas::clock_width(const QString& s, const QFont& font) const {
   return w;
 }
 
-void HudCanvas::clock(const QRect& r, const QString& s, const QFont& font, const QColor& color, int flags) {
+void HudCanvas::clock(const QRect& r, const QString& s, const QFont& font, const QColor& color, int flags,
+                      float scale) {
   if (s.isEmpty() || r.width() <= 0 || r.height() <= 0 || color.alpha() == 0) return;
+  if (!(scale > 0.f)) scale = 1.f;
   const uint64_t key = mix_key(font_key(font), color.rgba());
   ClockFace& face = clocks_[key];
   const ClockMetrics metrics = clock_metrics(font);
@@ -392,21 +394,38 @@ void HudCanvas::clock(const QRect& r, const QString& s, const QFont& font, const
   }
   const QFontMetrics fm(font);
   const ClockMetrics laid{face.digit_advance, face.space_advance, face.height};
-  int total = 0;
-  for (const QChar ch : s) total += clock_advance(laid, fm, ch);
-  int x = r.x();
-  if (flags & Qt::AlignHCenter) x = r.x() + (r.width() - total) / 2;
-  else if (flags & Qt::AlignRight) x = r.x() + r.width() - total;
-  int y = r.y();
-  if (flags & Qt::AlignBottom) y = r.y() + r.height() - face.height;
-  else if (!(flags & Qt::AlignTop)) y = r.y() + (r.height() - face.height) / 2;
+  float total = 0.f;
+  for (const QChar ch : s) total += static_cast<float>(clock_advance(laid, fm, ch)) * scale;
+  float x = static_cast<float>(r.x());
+  if (flags & Qt::AlignHCenter) x += (static_cast<float>(r.width()) - total) / 2.f;
+  else if (flags & Qt::AlignRight) x += static_cast<float>(r.width()) - total;
+  const float draw_h = static_cast<float>(face.height) * scale;
+  float y = static_cast<float>(r.y());
+  if (flags & Qt::AlignBottom) y += static_cast<float>(r.height()) - draw_h;
+  else if (!(flags & Qt::AlignTop)) y += (static_cast<float>(r.height()) - draw_h) / 2.f;
   for (const QChar ch : s) {
-    const int cell = clock_advance(laid, fm, ch);
+    const float cell = static_cast<float>(clock_advance(laid, fm, ch)) * scale;
     const auto found = face.glyphs.find(ch.unicode());
     if (found != face.glyphs.end()) {
-      const int glyph_w = found->second.width;
-      const int gx = (ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) ? x + (cell - glyph_w) / 2 : x;
-      blit_text(gx, y, found->second, r);
+      const TextSprite& glyph = found->second;
+      const float glyph_w = static_cast<float>(glyph.width) * scale;
+      const float gx =
+          (ch >= QLatin1Char('0') && ch <= QLatin1Char('9')) ? x + (cell - glyph_w) / 2.f : x;
+      const int max_w = std::max(8, atlas_w_ - 4);
+      int cursor = 0;
+      for (const Sprite& slice : glyph.slices) {
+        const int content_w = std::min(max_w, glyph.width - cursor);
+        if (content_w <= 0) break;
+        const float dw = (static_cast<float>(content_w) + static_cast<float>(glyph.pad) * 2.f) * scale;
+        const float dh = (static_cast<float>(glyph.height) + static_cast<float>(glyph.pad) * 2.f) * scale;
+        const float dx = gx + (static_cast<float>(cursor) - static_cast<float>(glyph.pad)) * scale;
+        const float dy = y - static_cast<float>(glyph.pad) * scale;
+        blit_clipped(QRect(static_cast<int>(std::lround(dx)), static_cast<int>(std::lround(dy)),
+                           std::max(1, static_cast<int>(std::lround(dw))),
+                           std::max(1, static_cast<int>(std::lround(dh)))),
+                     slice, r);
+        cursor += content_w;
+      }
     }
     x += cell;
   }

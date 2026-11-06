@@ -4,6 +4,7 @@
 
 #include "ui/gamepad_icons.hpp"
 
+#include <QDateTime>
 #include <QGuiApplication>
 #include <QPainter>
 #include <QFont>
@@ -17,6 +18,10 @@
 #include <initializer_list>
 
 namespace vrp {
+
+/** Scrub-bar digits. Root clock must use this color so both share one glyph cache. */
+const QColor kScrubClock(200, 210, 220);
+
 namespace {
 
 uint64_t hud_key(std::initializer_list<uint64_t> parts, const QString& extra = {}) {
@@ -662,7 +667,7 @@ void paint_scrub_bar(HudCanvas& c, const VrMenu::Snapshot& snap, const QRect& ba
   const int fill_w = std::max(0, static_cast<int>(bar.width() * t));
   if (fill_w > 0) c.rounded(QRect(bar.x(), bar.y(), fill_w, bar.height()), QColor(50, 160, 255, 230), 3);
   const QString label = fmt_time(snap.position_sec) + QStringLiteral(" / ") + fmt_time(snap.duration_sec);
-  c.clock(time, label, hint_font, QColor(200, 210, 220), Qt::AlignRight | Qt::AlignVCenter);
+  c.clock(time, label, hint_font, kScrubClock, Qt::AlignRight | Qt::AlignVCenter);
 }
 
 void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int width, int height,
@@ -993,8 +998,21 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
   const int content_w = width - side * 2;
   canvas.fill(QRect(side, 0, content_w, height), QColor(12, 16, 24, 230));
   canvas.fill(QRect(side, 0, content_w, 48), QColor(20, 28, 40, 255));
-  canvas.text(QRect(side + 16, 4, content_w - 32, 40), VRP_TR(snap.title.c_str()), title_font,
-              QColor(230, 240, 255), Qt::AlignVCenter | Qt::AlignLeft);
+  int title_right = side + content_w - 16;
+  if (snap.root) {
+    // Same scrub-bar glyphs, scaled so the line box matches the title on the left.
+    const QString now = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm"));
+    const int title_h = std::max(1, QFontMetrics(title_font).height());
+    const int hint_h = std::max(1, QFontMetrics(hint_font).height());
+    const float scale = 0.82f * static_cast<float>(title_h) / static_cast<float>(hint_h);
+    const int clock_w =
+        static_cast<int>(std::lround(static_cast<float>(canvas.clock_width(now, hint_font)) * scale)) + 8;
+    const QRect clock_r(title_right - clock_w, 4, clock_w, 40);
+    canvas.clock(clock_r, now, hint_font, kScrubClock, Qt::AlignRight | Qt::AlignVCenter, scale);
+    title_right = clock_r.left() - 12;
+  }
+  canvas.text(QRect(side + 16, 4, std::max(0, title_right - (side + 16)), 40), VRP_TR(snap.title.c_str()),
+              title_font, QColor(230, 240, 255), Qt::AlignVCenter | Qt::AlignLeft);
 
   const QRect foot(side + 16, height - 44, content_w - 32, 40);
   const int option_left =

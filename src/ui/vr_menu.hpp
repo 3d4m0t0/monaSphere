@@ -97,6 +97,8 @@ class VrMenu {
     ControlsEdit controls_edit = ControlsEdit::None;
     std::string title;
     std::string hint;
+    /** Root list (monaSphere). HUD draws the local clock on the title bar. */
+    bool root = false;
     std::vector<Entry> entries;
     int cursor = 0;
     int scroll = 0;

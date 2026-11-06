@@ -56,8 +56,10 @@ class HudCanvas {
   /**
    * Time label sampled from digit glyphs already in the atlas.
    * A new time only moves quads; the atlas is not uploaded again.
+   * `scale` enlarges those glyphs. It does not rasterize a second face.
    */
-  void clock(const QRect& r, const QString& s, const QFont& font, const QColor& color, int flags);
+  void clock(const QRect& r, const QString& s, const QFont& font, const QColor& color, int flags,
+             float scale = 1.f);
   void scrolling_text(const QRect& r, const QString& s, const QFont& font, const QColor& color);
   void paint_cached(uint64_t key, const QRect& dest, int raster_w, int raster_h,
                     const std::function<void(QPainter&)>& draw);

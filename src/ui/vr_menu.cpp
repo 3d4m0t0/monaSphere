@@ -1964,6 +1964,7 @@ void VrMenu::publish_hud_snapshot() {
   } else if (place_ == Place::Roots) {
     s.title = "monaSphere";
     s.hint = "A: open  B: back";
+    s.root = true;
   } else if (place_ == Place::AppsList) {
     s.title = "アプリ";
     s.hint = desktop_apps_.empty() ? "conf: live_desktop_app[N]=Name|exec  B: back"
