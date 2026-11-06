@@ -1089,6 +1089,200 @@ QString monasphereConfPath() {
   return QDir::homePath() + QStringLiteral("/.config/monasphere/monasphere.conf");
 }
 
+/** Text to the right of '#' is a comment and is not part of the assignment. */
+QString confCode(QString line) {
+  line = line.trimmed();
+  const int hash = line.indexOf(QLatin1Char('#'));
+  if (hash >= 0) line.truncate(hash);
+  return line.trimmed();
+}
+
+bool confKeyIs(const QString& code, const QString& key, QString* value) {
+  const QString prefix = key + QLatin1Char('=');
+  if (!code.startsWith(prefix)) return false;
+  if (value) *value = code.mid(prefix.size()).trimmed();
+  return true;
+}
+
+bool confInt(const QString& v, int lo, int hi) {
+  bool ok = false;
+  const int n = v.toInt(&ok);
+  return ok && n >= lo && n <= hi;
+}
+
+bool confFloat(const QString& v, float lo, float hi) {
+  bool ok = false;
+  const float n = v.toFloat(&ok);
+  return ok && n >= lo && n <= hi;
+}
+
+bool confOneOf(const QString& v, std::initializer_list<QLatin1String> opts, bool ignore_case = false) {
+  for (const QLatin1String o : opts) {
+    if (ignore_case ? v.compare(o, Qt::CaseInsensitive) == 0 : v == o) return true;
+  }
+  return false;
+}
+
+/**
+ * Assignments the running app still reads. Unknown keys and values the
+ * parser would ignore are not ok — those lines are commented out.
+ * allow_legacy keeps youtube_url= for the one migration pass.
+ */
+bool monasphereConfAssignmentOk(const QString& code, bool allow_legacy) {
+  QString v;
+  if (confKeyIs(code, QStringLiteral("volume"), &v)) return confFloat(v, 0.f, 1.f);
+  if (confKeyIs(code, QStringLiteral("fsr"), &v)) return confInt(v, 0, 3);
+  if (confKeyIs(code, QStringLiteral("live_fsr"), &v)) return confInt(v, 0, 3);
+  if (confKeyIs(code, QStringLiteral("hz"), &v)) {
+    bool ok = false;
+    const int n = v.toInt(&ok);
+    return ok && (n == 0 || n == 90 || n == 120);
+  }
+  if (confKeyIs(code, QStringLiteral("runtime"), &v))
+    return confOneOf(v, {QLatin1String("monado"), QLatin1String("wivrn")});
+  if (confKeyIs(code, QStringLiteral("pad"), &v))
+    return confOneOf(v, {QLatin1String("auto"), QLatin1String("simple"), QLatin1String("oculus_touch"),
+                         QLatin1String("ms_motion"), QLatin1String("vive"), QLatin1String("index"),
+                         QLatin1String("gamepad")});
+  if (confKeyIs(code, QStringLiteral("hand"), &v))
+    return confOneOf(v, {QLatin1String("left"), QLatin1String("right")});
+  if (confKeyIs(code, QStringLiteral("gamepad"), &v)) return v == QLatin1String("0") || v == QLatin1String("1");
+  if (confKeyIs(code, QStringLiteral("hwaccel"), &v)) return v == QLatin1String("0") || v == QLatin1String("1");
+  if (confKeyIs(code, QStringLiteral("vulkan_video"), &v))
+    return v == QLatin1String("0") || v == QLatin1String("1");
+  if (confKeyIs(code, QStringLiteral("flat_fov"), &v)) return confFloat(v, 20.f, 140.f);
+  if (confKeyIs(code, QStringLiteral("flat_distance"), &v)) return confFloat(v, 2.f, 40.f);
+  if (confKeyIs(code, QStringLiteral("milkyway_gain"), &v)) return confFloat(v, 0.2f, 2.5f);
+  if (confKeyIs(code, QStringLiteral("surround_gain"), &v)) return confFloat(v, 0.f, 2.f);
+  if (confKeyIs(code, QStringLiteral("audio_normalize"), &v))
+    return confOneOf(v, {QLatin1String("0"), QLatin1String("1"), QLatin1String("on"), QLatin1String("off")},
+                     true);
+  if (confKeyIs(code, QStringLiteral("hrtf_trim_db"), &v)) return confFloat(v, 0.f, 24.f);
+  if (confKeyIs(code, QStringLiteral("sky_from_timezone"), &v))
+    return v == QLatin1String("0") || v == QLatin1String("1");
+  if (confKeyIs(code, QStringLiteral("sky_lat"), &v)) return confFloat(v, -90.f, 90.f);
+  if (confKeyIs(code, QStringLiteral("sky_lon"), &v)) return confFloat(v, -180.f, 180.f);
+  if (confKeyIs(code, QStringLiteral("live_restore_token"), &v)) return true;
+  if (confKeyIs(code, QStringLiteral("live_output"), &v)) return true;
+  if (confKeyIs(code, QStringLiteral("live_capture"), &v))
+    return v.compare(QLatin1String("monitor"), Qt::CaseInsensitive) == 0 ||
+           v.compare(QLatin1String("window"), Qt::CaseInsensitive) == 0;
+  if (confKeyIs(code, QStringLiteral("live_virtual"), &v))
+    return v == QLatin1String("0") || v == QLatin1String("1");
+  if (confKeyIs(code, QStringLiteral("live_virtual_size"), &v)) {
+    const QRegularExpression re(QStringLiteral("^(\\d+)x(\\d+)$"));
+    const QRegularExpressionMatch m = re.match(v.toLower());
+    if (!m.hasMatch()) return false;
+    const int w = m.captured(1).toInt();
+    const int h = m.captured(2).toInt();
+    return w >= 640 && w <= 7680 && h >= 360 && h <= 4320;
+  }
+  if (confKeyIs(code, QStringLiteral("live_virtual_scale"), &v)) return confFloat(v, 1.f, 3.f);
+  if (confKeyIs(code, QStringLiteral("live_chrome_scale"), &v)) return confFloat(v, 1.f, 3.f);
+  if (confKeyIs(code, QStringLiteral("live_cursor_scale"), &v)) return confInt(v, 1, 6);
+  if (confKeyIs(code, QStringLiteral("live_chrome_profile"), &v))
+    return v.compare(QLatin1String("default"), Qt::CaseInsensitive) == 0 ||
+           v.compare(QLatin1String("isolated"), Qt::CaseInsensitive) == 0;
+  if (confKeyIs(code, QStringLiteral("last_dir"), &v)) return !v.isEmpty();
+  if (confKeyIs(code, QStringLiteral("geometry"), &v)) return !v.isEmpty();
+  if (confKeyIs(code, QStringLiteral("modes"), &v)) {
+    const QStringList parts = v.split(QLatin1Char(';'), Qt::SkipEmptyParts);
+    if (parts.isEmpty()) return false;
+    for (const QString& part : parts) {
+      const QStringList f = part.split(QLatin1Char(':'));
+      if (f.size() < 2) return false;
+      bool ok1 = false;
+      bool ok2 = false;
+      const int idx = f[0].toInt(&ok1);
+      const double hz = f[1].toDouble(&ok2);
+      if (!ok1 || !ok2 || idx < 0 || hz <= 0.0) return false;
+      if (f.size() >= 3) {
+        bool ok3 = false;
+        f[2].toLongLong(&ok3);
+        if (!ok3) return false;
+      }
+    }
+    return true;
+  }
+  if (allow_legacy && confKeyIs(code, QStringLiteral("youtube_url"), &v)) return !v.isEmpty();
+  if (allow_legacy) {
+    // One pass so a span token can be copied into live_restore_token, then commented out.
+    const QRegularExpression re(QStringLiteral("^live_restore_token\\[x([1-3])\\]=(.*)$"));
+    if (re.match(code).hasMatch()) return true;
+  }
+
+  {
+    const QRegularExpression re(QStringLiteral("^live_app(?:\\[(\\d+)\\])?=(.*)$"));
+    const QRegularExpressionMatch m = re.match(code);
+    if (m.hasMatch()) {
+      const QString rest = m.captured(2).trimmed();
+      if (rest.isEmpty()) return true;
+      const int bar = rest.indexOf(QLatin1Char('|'));
+      if (bar <= 0) return false;
+      const QString name = rest.left(bar).trimmed();
+      const QString url = rest.mid(bar + 1).trimmed();
+      return !name.isEmpty() &&
+             (url.startsWith(QLatin1String("http://")) || url.startsWith(QLatin1String("https://")));
+    }
+  }
+  {
+    const QRegularExpression re(
+        QStringLiteral("^live_desktop_app\\[(\\d+)\\]\\.title\\[(\\d+)\\]=(.*)$"));
+    const QRegularExpressionMatch m = re.match(code);
+    if (m.hasMatch()) {
+      const QString rest = m.captured(3).trimmed();
+      if (rest.isEmpty()) return true;
+      const QString name = rest.section(QLatin1Char('|'), 0, 0).trimmed();
+      return !name.isEmpty();
+    }
+  }
+  {
+    const QRegularExpression re(QStringLiteral("^live_desktop_app(?:\\[(\\d+)\\])?=(.*)$"));
+    const QRegularExpressionMatch m = re.match(code);
+    if (m.hasMatch()) {
+      const QString rest = m.captured(2).trimmed();
+      if (rest.isEmpty()) return true;
+      const QStringList parts = rest.split(QLatin1Char('|'));
+      return parts.size() >= 2 && !parts[0].trimmed().isEmpty() && !parts[1].trimmed().isEmpty();
+    }
+  }
+  return false;
+}
+
+/** Comment lines that are not a current option or whose value would be ignored. */
+void commentOutStaleConf(bool allow_legacy) {
+  const QString path = monasphereConfPath();
+  QFile in(path);
+  if (!in.open(QIODevice::ReadOnly | QIODevice::Text)) return;
+  QStringList lines;
+  bool changed = false;
+  while (!in.atEnd()) {
+    QString line = QString::fromUtf8(in.readLine());
+    if (line.endsWith(QLatin1Char('\n'))) line.chop(1);
+    if (line.endsWith(QLatin1Char('\r'))) line.chop(1);
+    const QString trimmed = line.trimmed();
+    if (trimmed.isEmpty() || trimmed.startsWith(QLatin1Char('#'))) {
+      lines << trimmed;
+      if (trimmed != line) changed = true;
+      continue;
+    }
+    const QString code = confCode(trimmed);
+    if (!code.isEmpty() && monasphereConfAssignmentOk(code, allow_legacy)) {
+      lines << trimmed;
+      if (trimmed != line) changed = true;
+      continue;
+    }
+    lines << QStringLiteral("# ") + trimmed;
+    changed = true;
+  }
+  in.close();
+  if (!changed) return;
+  QFile out(path);
+  if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) return;
+  QTextStream ts(&out);
+  for (const QString& line : lines) ts << line << '\n';
+}
+
 /** Parse zone.tab ISO-6709 coords: ±DDMMSS±DDDMMSS or ±DDMM±DDDMM. */
 bool parseZoneTabCoords(const QByteArray& coord, float& lat_deg, float& lon_deg) {
   if (coord.size() < 5) return false;
@@ -1263,11 +1457,14 @@ void ensureMonasphereConfKeys(const QHash<QString, QString>& defaults) {
   QFile in(path);
   if (in.open(QIODevice::ReadOnly | QIODevice::Text)) {
     while (!in.atEnd()) {
-      const QString line = QString::fromUtf8(in.readLine()).trimmed();
-      if (line.isEmpty()) continue;
-      lines << line;
-      const int eq = line.indexOf(QLatin1Char('='));
-      if (eq > 0) seen.insert(line.left(eq));
+      QString line = QString::fromUtf8(in.readLine());
+      if (line.endsWith(QLatin1Char('\n'))) line.chop(1);
+      if (line.endsWith(QLatin1Char('\r'))) line.chop(1);
+      const QString trimmed = line.trimmed();
+      lines << trimmed;
+      const QString code = confCode(trimmed);
+      const int eq = code.indexOf(QLatin1Char('='));
+      if (eq > 0) seen.insert(code.left(eq));
     }
     in.close();
   }
@@ -1292,13 +1489,16 @@ void setMonasphereConfKey(const QString& key, const QString& value) {
   QFile in(path);
   if (in.open(QIODevice::ReadOnly | QIODevice::Text)) {
     while (!in.atEnd()) {
-      const QString line = QString::fromUtf8(in.readLine()).trimmed();
-      if (line.isEmpty()) continue;
-      if (line.startsWith(key + QLatin1Char('='))) {
+      QString line = QString::fromUtf8(in.readLine());
+      if (line.endsWith(QLatin1Char('\n'))) line.chop(1);
+      if (line.endsWith(QLatin1Char('\r'))) line.chop(1);
+      const QString trimmed = line.trimmed();
+      const QString code = confCode(trimmed);
+      if (code.startsWith(key + QLatin1Char('='))) {
         lines << key + QLatin1Char('=') + value;
         replaced = true;
       } else {
-        lines << line;
+        lines << trimmed;
       }
     }
     in.close();
@@ -1315,8 +1515,8 @@ QString monasphereConfValue(const QString& key) {
   if (!in.open(QIODevice::ReadOnly | QIODevice::Text)) return {};
   const QString prefix = key + QLatin1Char('=');
   while (!in.atEnd()) {
-    const QString line = QString::fromUtf8(in.readLine()).trimmed();
-    if (line.startsWith(prefix)) return line.mid(prefix.size());
+    const QString line = confCode(QString::fromUtf8(in.readLine()));
+    if (line.startsWith(prefix)) return line.mid(prefix.size()).trimmed();
   }
   return {};
 }
@@ -1409,7 +1609,7 @@ void HostWindow::loadAppConf() {
   QFile f(legacy);
   if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
     while (!f.atEnd()) {
-      const QString line = QString::fromUtf8(f.readLine()).trimmed();
+      const QString line = confCode(QString::fromUtf8(f.readLine()));
       if (line.startsWith(QStringLiteral("fsr="))) {
         bool ok = false;
         const int v = line.mid(4).toInt(&ok);
@@ -1438,12 +1638,9 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("surround_gain"), QStringLiteral("0.80")},
       {QStringLiteral("audio_normalize"), QStringLiteral("1")},
       {QStringLiteral("hrtf_trim_db"), QStringLiteral("12")},
-      {QStringLiteral("thumb_count"), QString::number(vrp::kSeekThumbCount)},
-      {QStringLiteral("thumb_edge"), QString::number(vrp::kSeekThumbMaxEdge)},
       {QStringLiteral("hwaccel"), QStringLiteral("1")},
       // 0 = CUDA/NVDEC (NVIDIA default). 1 = prefer Vulkan Video zero-copy.
       {QStringLiteral("vulkan_video"), QStringLiteral("0")},
-      {QStringLiteral("thumb_jpeg"), QStringLiteral("1")},
       {QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2)},
       {QStringLiteral("flat_distance"),
        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
@@ -1452,8 +1649,6 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("sky_lat"), QStringLiteral("35.68")},
       {QStringLiteral("sky_lon"), QStringLiteral("139.65")},
       {QStringLiteral("live_restore_token"), QString()},
-      // One Remember for Virtual-monaSphere (x1 size). Span sizes share that token.
-      {QStringLiteral("live_setup_spans"), QStringLiteral("1")},
       {QStringLiteral("live_capture"), QStringLiteral("monitor")},
       {QStringLiteral("live_output"), QString()},
       {QStringLiteral("live_virtual"), QStringLiteral("1")},
@@ -1465,12 +1660,13 @@ void HostWindow::loadAppConf() {
   };
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   migrateYoutubeConfKeysToLive();
+  commentOutStaleConf(/*allow_legacy=*/true);
   ensureMonasphereConfKeys(defaults);
   bool migrated = QFile::exists(monasphereConfPath()) && last_dir_migrated.isEmpty();
   QFile check(monasphereConfPath());
   if (!migrated && check.open(QIODevice::ReadOnly | QIODevice::Text)) {
     while (!check.atEnd()) {
-      const QString line = QString::fromUtf8(check.readLine()).trimmed();
+      const QString line = confCode(QString::fromUtf8(check.readLine()));
       if (line.startsWith(QStringLiteral("last_dir="))) {
         migrated = true;
         break;
@@ -1491,9 +1687,11 @@ void HostWindow::loadAppConf() {
   QVector<LiveDesktopAppEntry> desktop_unindexed;
   QMap<int, QMap<int, LiveDesktopTitle>> desktop_titles_by_app;
   QString legacy_youtube_url;
+  QString legacy_span_tok[3];
   bool saw_live_app_key = false;
   while (!user.atEnd()) {
-    const QString line = QString::fromUtf8(user.readLine()).trimmed();
+    const QString line = confCode(QString::fromUtf8(user.readLine()));
+    if (line.isEmpty()) continue;
     if (line.startsWith(QStringLiteral("fsr="))) {
       bool ok = false;
       const int v = line.mid(4).toInt(&ok);
@@ -1588,19 +1786,17 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(8).toFloat(&ok);
       if (ok && v >= -180.f && v <= 180.f) sky_lon_ = v;
-    } else if (line.startsWith(QStringLiteral("live_restore_token"))) {
-      // live_restore_token[xN]=…  or legacy live_restore_token=
+    } else if (line.startsWith(QStringLiteral("live_restore_token="))) {
+      live_restore_token_ = line.mid(19);
+      live_restore_tokens_.insert(1, live_restore_token_);
+    } else if (line.startsWith(QStringLiteral("live_restore_token["))) {
+      // Retired per-span keys. Kept only to fill an empty live_restore_token once.
       const QRegularExpression span_tok(
           QStringLiteral("^live_restore_token\\[x([1-3])\\]=(.*)$"));
       const QRegularExpressionMatch sm = span_tok.match(line);
       if (sm.hasMatch()) {
         const int span = sm.captured(1).toInt();
-        const QString tok = sm.captured(2);
-        live_restore_tokens_.insert(span, tok);
-        if (span == 1) live_restore_token_ = tok;
-      } else if (line.startsWith(QStringLiteral("live_restore_token="))) {
-        live_restore_token_ = line.mid(19);
-        live_restore_tokens_.insert(1, live_restore_token_);
+        if (span >= 1 && span <= 3) legacy_span_tok[span - 1] = sm.captured(2).trimmed();
       }
     } else if (line.startsWith(QStringLiteral("youtube_url="))) {
       // Legacy — migrate into live_app[0] only when no live_app entries exist.
@@ -1793,11 +1989,21 @@ void HostWindow::loadAppConf() {
     QStringList lines;
     if (in.open(QIODevice::ReadOnly | QIODevice::Text)) {
       while (!in.atEnd()) {
-        const QString line = QString::fromUtf8(in.readLine()).trimmed();
-        if (line.isEmpty()) continue;
+        QString raw = QString::fromUtf8(in.readLine());
+        if (raw.endsWith(QLatin1Char('\n'))) raw.chop(1);
+        if (raw.endsWith(QLatin1Char('\r'))) raw.chop(1);
+        const QString trimmed = raw.trimmed();
+        if (trimmed.isEmpty() || trimmed.startsWith(QLatin1Char('#'))) {
+          lines << trimmed;
+          continue;
+        }
+        const QString line = confCode(trimmed);
         if (line.startsWith(QStringLiteral("live_app"))) continue;
-        if (line.startsWith(QStringLiteral("youtube_url="))) continue;
-        lines << line;
+        if (line.startsWith(QStringLiteral("youtube_url="))) {
+          lines << QStringLiteral("# ") + trimmed;
+          continue;
+        }
+        lines << trimmed;
       }
       in.close();
     }
@@ -1825,11 +2031,27 @@ void HostWindow::loadAppConf() {
               zid.toUtf8().constData(), static_cast<double>(sky_lat_), static_cast<double>(sky_lon_));
     }
   }
+  if (live_restore_token_.isEmpty()) {
+    QString chosen;
+    for (const QString& tok : legacy_span_tok) {
+      if (!tok.isEmpty()) {
+        chosen = tok;
+        break;
+      }
+    }
+    if (!chosen.isEmpty()) {
+      live_restore_token_ = chosen;
+      live_restore_tokens_.insert(1, chosen);
+      setMonasphereConfKey(QStringLiteral("live_restore_token"), chosen);
+    }
+  }
   if (legacy_pad_gamepad) {
     if (!saw_gamepad_key) gamepad_enabled_.store(true);
     setMonasphereConfKey(QStringLiteral("pad"), QStringLiteral("auto"));
     setMonasphereConfKey(QStringLiteral("gamepad"), gamepad_enabled_.load() ? QStringLiteral("1") : QStringLiteral("0"));
   }
+  commentOutStaleConf(/*allow_legacy=*/false);
+  ensureMonasphereConfKeys(defaults);
 }
 
 void HostWindow::restoreWindowGeometry() {
@@ -2537,20 +2759,12 @@ void HostWindow::reloadLiveCaptureConf() {
   QFile user(monasphereConfPath());
   if (!user.open(QIODevice::ReadOnly | QIODevice::Text)) return;
   while (!user.atEnd()) {
-    const QString line = QString::fromUtf8(user.readLine()).trimmed();
-    if (line.startsWith(QStringLiteral("live_restore_token"))) {
-      const QRegularExpression span_tok(
-          QStringLiteral("^live_restore_token\\[x([1-3])\\]=(.*)$"));
-      const QRegularExpressionMatch sm = span_tok.match(line);
-      if (sm.hasMatch()) {
-        const int span = sm.captured(1).toInt();
-        const QString tok = sm.captured(2);
-        live_restore_tokens_.insert(span, tok);
-        if (span == 1) live_restore_token_ = tok;
-      } else if (line.startsWith(QStringLiteral("live_restore_token="))) {
-        live_restore_token_ = line.mid(19);
-        live_restore_tokens_.insert(1, live_restore_token_);
-      }
+    const QString line = confCode(QString::fromUtf8(user.readLine()));
+    if (line.isEmpty()) continue;
+    if (line.startsWith(QStringLiteral("live_restore_token="))) {
+      live_restore_token_ = line.mid(19);
+      live_restore_tokens_.clear();
+      if (!live_restore_token_.isEmpty()) live_restore_tokens_.insert(1, live_restore_token_);
     } else if (line.startsWith(QStringLiteral("live_capture="))) {
       const QString v = line.mid(13).trimmed().toLower();
       live_capture_monitor_ = (v != QLatin1String("window"));

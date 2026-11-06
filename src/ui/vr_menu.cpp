@@ -30,12 +30,21 @@ void upsert_conf_key(const fs::path& conf, const std::string& key, const std::st
   const std::string prefix = key + "=";
   std::vector<std::string> lines;
   bool replaced = false;
+  auto code_of = [](std::string line) {
+    const auto hash = line.find('#');
+    if (hash != std::string::npos) line.erase(hash);
+    while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) line.pop_back();
+    size_t i = 0;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+    return line.substr(i);
+  };
   {
     std::ifstream in(conf);
     std::string line;
     while (std::getline(in, line)) {
       if (line.empty()) continue;
-      if (line.rfind(prefix, 0) == 0) {
+      const std::string code = code_of(line);
+      if (code.rfind(prefix, 0) == 0) {
         if (!replaced) lines.push_back(prefix + value);
         replaced = true;
       } else {
@@ -301,6 +310,9 @@ std::filesystem::path VrMenu::load_last_dir() const {
   if (!in) return {};
   std::string line;
   while (std::getline(in, line)) {
+    const auto hash = line.find('#');
+    if (hash != std::string::npos) line.erase(hash);
+    while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) line.pop_back();
     constexpr const char* k = "last_dir=";
     if (line.rfind(k, 0) == 0) return fs::path(line.substr(9));
   }
@@ -1045,13 +1057,21 @@ void VrMenu::load_volume() {
   if (!in) return;
   std::string line;
   while (std::getline(in, line)) {
+    const auto hash = line.find('#');
+    if (hash != std::string::npos) line.erase(hash);
+    while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) line.pop_back();
+    size_t i = 0;
+    while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) ++i;
+    if (i > 0) line.erase(0, i);
     if (line.rfind("volume=", 0) == 0) {
       try {
-        volume_ = std::clamp(std::stof(line.substr(7)), 0.f, 1.f);
+        volume_ = std::stof(line.substr(7));
       } catch (...) {
       }
     }
   }
+  volume_cap_ = 1.f;
+  volume_ = std::clamp(volume_, 0.f, volume_cap_);
 }
 
 void VrMenu::save_volume() const {

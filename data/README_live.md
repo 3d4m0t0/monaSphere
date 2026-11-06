@@ -275,6 +275,8 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 
 ## Config keys
 
+`#` starts a comment. On launch, a line whose key is not used, or whose value would be ignored, is rewritten as a comment (`# ` plus the old line). That drops retired keys such as `thumb_count`, `thumb_edge`, `thumb_jpeg`, and `volume_uncap` without deleting the text.
+
 | Key | Meaning |
 |-----|---------|
 | `surround_gain` | Stereo→4.0 rear level for **file / Live / [アプリ]** (0..2, default `0.8`) |
@@ -290,7 +292,6 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 | `live_chrome_profile` | `default` (system logins) or `isolated` (scale always applies) |
 | `live_output` | Output name substring for Chromium placement |
 | `live_restore_token` | ScreenCast Remember token for `Virtual-monaSphere` (shared by all spans) |
-| `live_restore_token[xN]` | Legacy; still read as fallback, new saves go to `live_restore_token` |
 | `live_setup_spans` | Kept for compat; setup always authenticates once at x1 size |
 | `live_app[N]` | `Name\|https://…` → HMD Roots `[Name]`; empty value = unused slot |
 | `live_desktop_app[N]` | `Name\|/path/to/app[\|arg…]` → HMD `[アプリ]` list; process exit ends capture |
@@ -329,8 +330,9 @@ so wider aspects fit without exploding pixel count (4K-friendly):
 ScreenCast restore uses **one token** for the fixed name **`Virtual-monaSphere`**.
 **Tools → Set up live capture…** authenticates once at x1 size; x2/x3 only change
 resolution and reuse that token (re-auth only if the portal rejects restore).
-If you still have only legacy `live_restore_token[xN]=` entries, they are accepted as
-fallback; new grants are written to `live_restore_token=`.
+Old `live_restore_token[x1]` … `[x3]` lines are not settings. If `live_restore_token=`
+is empty, x1 then x2 then x3 is copied into it on launch, and the span lines are
+commented out.
 HMD navigation is **`[アプリ]` → App → Title`**. Omitting titles keeps a flat list
 (A launches with x1).
 

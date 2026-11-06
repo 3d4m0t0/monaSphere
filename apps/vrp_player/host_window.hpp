@@ -401,7 +401,8 @@ class HostWindow : public QMainWindow {
 
   /**
    * ScreenCast restore token for Virtual-monaSphere (shared by x1–x3 sizes).
-   * Legacy live_restore_token[xN] is still read as a fallback.
+   * live_restore_token[xN] is not a setting; an empty live_restore_token is filled
+   * from one of those lines once, then the span lines are commented out.
    */
   QMap<int, QString> live_restore_tokens_;
   QString live_restore_token_;
