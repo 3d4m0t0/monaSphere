@@ -533,7 +533,7 @@ bool Fsr1Upscaler::process(VkImageView src_y, VkImageView src_uv, VkSampler src_
   static bool last_rcas_only = false;
   if (mode_ != last_logged_mode || src_w != last_logged_sw || src_h != last_logged_sh ||
       dst_w != last_logged_dw || dst_h != last_logged_dh || rcas_only != last_rcas_only) {
-    VRP_LOG("FSR1 %s: %dx%d → %dx%d (scale %.2f%s)", fsr_mode_name(mode_), src_w, src_h, dst_w, dst_h,
+    VRP_LOG("FSR1 %s: %dx%d -> %dx%d (scale %.2f%s)", fsr_mode_name(mode_), src_w, src_h, dst_w, dst_h,
             scale, rcas_only ? ", rcas-only" : "");
     last_logged_mode = mode_;
     last_logged_sw = src_w;

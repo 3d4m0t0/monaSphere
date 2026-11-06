@@ -350,7 +350,7 @@ PadFilter::Edges PadFilter::pump(bool guest_forward) {
   // Re-evaluate after long-fire in this pump (do not capture once).
   auto allow_guest = [&]() { return guest_forward && !ps_menu_gesture_; };
   if (guest_forward != last_guest_forward_) {
-    VRP_LOG("PadFilter: guest_forward %d → %d (menu_gesture=%d allow_guest=%d)",
+    VRP_LOG("PadFilter: guest_forward %d -> %d (menu_gesture=%d allow_guest=%d)",
             last_guest_forward_ ? 1 : 0, guest_forward ? 1 : 0, ps_menu_gesture_ ? 1 : 0,
             allow_guest() ? 1 : 0);
     last_guest_forward_ = guest_forward;
@@ -360,7 +360,7 @@ PadFilter::Edges PadFilter::pump(bool guest_forward) {
   if (ps_release_pending_) {
     ps_release_pending_ = false;
     if (allow_guest()) {
-      VRP_LOG("PadFilter: short-PS pending UP → guest");
+      VRP_LOG("PadFilter: short-PS pending UP -> guest");
       inject_key(BTN_MODE, 0);
       flush_uinput_sync();
     } else {
@@ -430,7 +430,7 @@ PadFilter::Edges PadFilter::pump(bool guest_forward) {
             ps_ignore_until_ = now + std::chrono::milliseconds(400);
             VRP_LOG("PadFilter: PS up after LONG — no inject, cooldown 400ms");
           } else if (allow_guest()) {
-            VRP_LOG("PadFilter: PS up SHORT → inject pulse to guest");
+            VRP_LOG("PadFilter: PS up SHORT -> inject pulse to guest");
             inject_key(BTN_MODE, 1);
             flush_uinput_sync();
             ps_release_pending_ = true;

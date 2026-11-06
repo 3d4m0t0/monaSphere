@@ -892,12 +892,12 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
       VRP_LOG("Vulkan Video: falling back to baseline device (CUDA path unchanged)");
       if (!try_create_device(false)) {
         vrp_fatal("Vulkan device create failed (baseline after video). "
-                  "See xr=/vk= lines above; Monado Broken pipe → restart monado-service.");
+                  "See xr=/vk= lines above; Monado Broken pipe -> restart monado-service.");
       }
     }
   } else if (!try_create_device(false)) {
     vrp_fatal("Vulkan device create failed (baseline). "
-              "See xr=/vk= lines above; Monado Broken pipe → restart monado-service.");
+              "See xr=/vk= lines above; Monado Broken pipe -> restart monado-service.");
   }
 
   vkGetDeviceQueue(device_, queue_family_index_, 0, &queue_);
@@ -1353,7 +1353,7 @@ bool XrVulkanApp::pump_events() {
       case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB: {
         auto* e = reinterpret_cast<XrEventDataDisplayRefreshRateChangedFB*>(&ev);
         ext_display_hz_ = e->toDisplayRefreshRate;
-        VRP_LOG("Display refresh rate changed: %.2f → %.2f Hz", e->fromDisplayRefreshRate,
+        VRP_LOG("Display refresh rate changed: %.2f -> %.2f Hz", e->fromDisplayRefreshRate,
                 e->toDisplayRefreshRate);
         break;
       }
@@ -1812,7 +1812,7 @@ bool XrVulkanApp::request_display_refresh_rate(float hz) {
     VRP_ERR("xrRequestDisplayRefreshRateFB(%.1f) failed (%d)", target, static_cast<int>(r));
     return false;
   }
-  VRP_LOG("xrRequestDisplayRefreshRateFB → %.1f Hz (pref %.1f)", target, hz);
+  VRP_LOG("xrRequestDisplayRefreshRateFB -> %.1f Hz (pref %.1f)", target, hz);
   if (pfn_get_refresh_rate_) {
     float now = 0.f;
     if (XR_SUCCEEDED(pfn_get_refresh_rate_(session_, &now)) && now > 0.f) ext_display_hz_ = now;

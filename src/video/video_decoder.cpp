@@ -416,7 +416,7 @@ std::string VideoInfo::summary_line() const {
   if (!profile.empty()) oss << " (" << profile << ")";
   oss << "  " << width << "x" << height;
   if (display_width > 0 && (display_width != width || display_height != height)) {
-    oss << "→" << display_width << "x" << display_height;
+    oss << "->" << display_width << "x" << display_height;
   }
   if (fps > 0) {
     char fps_buf[24];
@@ -917,20 +917,20 @@ void VideoDecoder::choose_display_size() {
     info_.display_note = "FFmpeg Vulkan Video zero-copy (AVVkFrame)";
     info_.display_width = display_w_;
     info_.display_height = display_h_;
-    VRP_LOG("display path: Vulkan Video → AVVkFrame zero-copy %dx%d", display_w_, display_h_);
+    VRP_LOG("display path: Vulkan Video -> AVVkFrame zero-copy %dx%d", display_w_, display_h_);
     return;
   }
   if (cuda_tex_ && cuda_tex_->enabled() && info_.hwaccel.find("cuda") != std::string::npos) {
     info_.display_note = "Vulkan NV12 zero-copy (native)";
     info_.display_width = display_w_;
     info_.display_height = display_h_;
-    VRP_LOG("display path: NVDEC → Vulkan NV12 zero-copy %dx%d", display_w_, display_h_);
+    VRP_LOG("display path: NVDEC -> Vulkan NV12 zero-copy %dx%d", display_w_, display_h_);
     return;
   }
   if (info_.hwaccel.find("vaapi") != std::string::npos) {
     info_.display_note = (vaapi_tex_ && vaapi_tex_->enabled())
                              ? "VA-API dma-buf import (CPU RGBA if it fails)"
-                             : "VA-API → CPU RGBA";
+                             : "VA-API -> CPU RGBA";
   }
   constexpr int kMaxPixels = 3840 * 2160;
   const int64_t pixels = static_cast<int64_t>(width_) * height_;
@@ -945,10 +945,10 @@ void VideoDecoder::choose_display_size() {
     else info_.display_note += std::string(" — ") + buf;
     VRP_LOG("%s", info_.display_note.c_str());
   } else if (info_.hwaccel.find("vaapi") != std::string::npos) {
-    VRP_LOG("display path: VA-API → CPU RGBA %dx%d (dma-buf import not implemented)", display_w_,
+    VRP_LOG("display path: VA-API -> CPU RGBA %dx%d (dma-buf import not implemented)", display_w_,
             display_h_);
   } else if (!info_.hwaccel_active || info_.hwaccel.find("software") != std::string::npos) {
-    VRP_LOG("display path: software decode → CPU RGBA %dx%d", display_w_, display_h_);
+    VRP_LOG("display path: software decode -> CPU RGBA %dx%d", display_w_, display_h_);
   }
   info_.display_width = display_w_;
   info_.display_height = display_h_;
@@ -1303,7 +1303,7 @@ void VideoDecoder::decode_loop() {
           if (latest_issue != issue) {
             seek_apply_gen_.store(latest_issue, std::memory_order_release);
             seek_req_.store(false, std::memory_order_release);
-            VRP_LOG("seekdbg: apply coalesced issue %llu→%llu target=%.3f",
+            VRP_LOG("seekdbg: apply coalesced issue %llu->%llu target=%.3f",
                     static_cast<unsigned long long>(issue),
                     static_cast<unsigned long long>(latest_issue), t_apply);
           }
@@ -2618,7 +2618,7 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
             {
               static std::atomic<bool> range_logged{false};
               if (!range_logged.exchange(true)) {
-                VRP_LOG("NV12 color_range frame=%d codec=%d → %s",
+                VRP_LOG("NV12 color_range frame=%d codec=%d -> %s",
                         static_cast<int>(ff_->frame->color_range),
                         ff_->codec ? static_cast<int>(ff_->codec->color_range) : -1,
                         out.full_range ? "full" : "limited");
@@ -2662,7 +2662,7 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
           ff_->sws_src_w = src->width;
           ff_->sws_src_h = src->height;
           if (!ff_->sws) {
-            VRP_ERR("sws_getContext failed %dx%d → %dx%d fmt=%d", src->width, src->height, display_w_,
+            VRP_ERR("sws_getContext failed %dx%d -> %dx%d fmt=%d", src->width, src->height, display_w_,
                     display_h_, static_cast<int>(src_fmt));
             continue;
           }

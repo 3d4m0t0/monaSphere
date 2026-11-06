@@ -476,7 +476,7 @@ bool VaapiNv12Texture::try_import(const AVFrame* vaapi_frame, bool full_range_hi
   present_gen_.fetch_add(1, std::memory_order_release);
   if (!import_logged_) {
     import_logged_ = true;
-    VRP_LOG("display path: VA-API → Vulkan NV12 zero-copy %dx%d modifier=0x%llx", w, h,
+    VRP_LOG("display path: VA-API -> Vulkan NV12 zero-copy %dx%d modifier=0x%llx", w, h,
             static_cast<unsigned long long>(ymod));
   }
   return true;

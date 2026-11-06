@@ -141,7 +141,7 @@ void VirtualDisplayManager::commit_identity(const Spec& want, const QString& mat
     VRP_LOG("Virtual: identity name=%s index=%d", output_name_.toUtf8().constData(),
             screen_index_);
     emit logMessage(
-        tr("Virtual: identity %1 → KWin screen #%2").arg(output_name_).arg(screen_index_));
+        tr("Virtual: identity %1 -> KWin screen #%2").arg(output_name_).arg(screen_index_));
   }
   if (r) {
     r->output_name = output_name_;

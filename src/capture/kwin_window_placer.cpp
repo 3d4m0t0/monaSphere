@@ -1618,7 +1618,7 @@ bool KwinWindowPlacer::arm_portal_dialog_on_primary(QString* error_out) {
   portalArm().armed = true;
   portalArm().script_id = id;
   portalArm().script_dir = keep;
-  VRP_LOG("kwin-place: armed portal-dialog → primary (script=%d)", id);
+  VRP_LOG("kwin-place: armed portal-dialog -> primary (script=%d)", id);
   return true;
 }
 

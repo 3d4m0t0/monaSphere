@@ -83,7 +83,7 @@ void EisPointer::pick_region_for_device(void* device) {
     // Caller passes MONITOR-local; warp() adds region origin → desktop-global.
     if (region_w_ > 0 && region_h_ > 0) {
       region_local_.store(true, std::memory_order_release);
-      VRP_LOG("eis-pointer: MONITOR-local → global via region %ux%u @%u,%u", region_w_,
+      VRP_LOG("eis-pointer: MONITOR-local -> global via region %ux%u @%u,%u", region_w_,
               region_h_, region_x_, region_y_);
     }
   }

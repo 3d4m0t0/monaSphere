@@ -594,7 +594,7 @@ bool ChromiumYtX11::click() {
     eis_abs_from_cursor(&ax, &ay);
     eis_->warp(ax, ay);
     eis_->click_left();
-    VRP_LOG("live-x11: click at %.0f,%.0f → eis %.0f,%.0f", static_cast<double>(cursor_x_),
+    VRP_LOG("live-x11: click at %.0f,%.0f -> eis %.0f,%.0f", static_cast<double>(cursor_x_),
             static_cast<double>(cursor_y_), ax, ay);
     return true;
   }

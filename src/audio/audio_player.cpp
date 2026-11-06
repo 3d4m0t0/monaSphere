@@ -163,8 +163,8 @@ bool set_card_profile(PulseSession& ps, const std::string& card, const std::stri
   ps.wait_op(pa_context_set_card_profile_by_name(
       ps.ctx, card.c_str(), profile.c_str(),
       [](pa_context*, int success, void* u) { *static_cast<bool*>(u) = success != 0; }, &ok));
-  if (ok) VRP_LOG("Pulse: card %s → profile %s", card.c_str(), profile.c_str());
-  else VRP_ERR("Pulse: failed profile %s → %s", card.c_str(), profile.c_str());
+  if (ok) VRP_LOG("Pulse: card %s -> profile %s", card.c_str(), profile.c_str());
+  else VRP_ERR("Pulse: failed profile %s -> %s", card.c_str(), profile.c_str());
   return ok;
 }
 
@@ -209,7 +209,7 @@ void activate_sink(PulseSession& ps, const std::string& sink) {
       ps.ctx, sink.c_str(), 0, [](pa_context*, int, void*) {}, nullptr));
   ps.wait_op(pa_context_set_sink_volume_by_name(
       ps.ctx, sink.c_str(), &vol, [](pa_context*, int, void*) {}, nullptr));
-  VRP_LOG("Pulse: default sink + unmute → %s", sink.c_str());
+  VRP_LOG("Pulse: default sink + unmute -> %s", sink.c_str());
 }
 
 std::string wait_for_sink(PulseSession& ps, const std::string& profile, bool want_psvr) {
@@ -1001,7 +1001,7 @@ bool AudioPlayer::setup_demux(const std::string& path) {
   }
 #else
   (void)ch_mask;
-  if (src_ch > 2) VRP_LOG("Audio: multichannel → stereo downmix (%d ch; built without OpenAL)", src_ch);
+  if (src_ch > 2) VRP_LOG("Audio: multichannel -> stereo downmix (%d ch; built without OpenAL)", src_ch);
 #endif
 
   AVChannelLayout out_ch{};
@@ -1742,7 +1742,7 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
   {
     char line[256];
     std::snprintf(line, sizeof(line),
-                  "live audio: guest PCM → Soft HRTF 4.0 side-diff "
+                  "live audio: guest PCM -> Soft HRTF 4.0 side-diff "
                   "(gain=1.00 file_vol=%.2f surround_gain=%.2f) monitor=%s module=%u",
                   static_cast<double>(volume_), static_cast<double>(surround_gain_),
                   monitor.c_str(), PulseMonitor::last_module_index());

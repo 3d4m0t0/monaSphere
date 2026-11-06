@@ -1779,7 +1779,7 @@ void HostWindow::loadAppConf() {
       sky_lon_ = lon;
       setMonasphereConfKey(QStringLiteral("sky_lat"), QString::number(static_cast<double>(sky_lat_), 'f', 4));
       setMonasphereConfKey(QStringLiteral("sky_lon"), QString::number(static_cast<double>(sky_lon_), 'f', 4));
-      VRP_LOG("sky observer from timezone %s → lat=%.4f lon=%.4f (geocentric dirs, horizon tip only)",
+      VRP_LOG("sky observer from timezone %s -> lat=%.4f lon=%.4f (geocentric dirs, horizon tip only)",
               zid.toUtf8().constData(), static_cast<double>(sky_lat_), static_cast<double>(sky_lon_));
     }
   }
@@ -2081,7 +2081,7 @@ void HostWindow::ensureYouTubeSession() {
         yt_host_setup_stop_after_stream_ = false;
         appendLog(tr("Live setup FAILED — portal returned no restore_token for x%1. "
                      "On the KDE share dialog, enable “Remember” / allow restore, "
-                     "then run Tools → Set up live capture again.")
+                     "then run Tools -> Set up live capture again.")
                       .arg(live_session_span_));
         showHudToast(tr("No token — check Remember on host dialog"));
         QTimer::singleShot(800, this, [this] { stopYouTubeCapture(); });
@@ -2297,12 +2297,12 @@ void HostWindow::flushPendingLiveStart() {
   yt_hmd_start_waits_ = 0;
 
   const bool kept_virtual = yt_session_ && yt_session_->virtual_display_alive();
-  appendLog(kept_virtual ? tr("Live: Virtual kept → start queued %1 (x%2)")
+  appendLog(kept_virtual ? tr("Live: Virtual kept -> start queued %1 (x%2)")
                                .arg(kind == YtPendingKind::Live
                                         ? tr("browser")
                                         : (kind == YtPendingKind::Desktop ? tr("app") : tr("video")))
                                .arg(span)
-                         : tr("Live: after Virtual gone → start queued %1 (x%2)")
+                         : tr("Live: after Virtual gone -> start queued %1 (x%2)")
                                .arg(kind == YtPendingKind::Live
                                         ? tr("browser")
                                         : (kind == YtPendingKind::Desktop ? tr("app") : tr("video")))
@@ -2376,7 +2376,7 @@ void HostWindow::startLiveFromHmd(const QString& url) {
   yt_setup_phase_ = YtSetupPhase::None;
 
   if (tokenForSpan(1).isEmpty()) {
-    appendLog(tr("Live: no restore token — use Tools → Set up live capture on the host first "
+    appendLog(tr("Live: no restore token — use Tools -> Set up live capture on the host first "
                  "(pick Virtual-monaSphere, enable Remember)"));
     showHudToast(tr("Host: Set up live capture first"));
     yt_pending_kind_ = YtPendingKind::None;
@@ -2435,7 +2435,7 @@ void HostWindow::startLiveDesktopApp(const QString& exec, const QStringList& arg
 
   const QString tok = tokenForSpan(span);
   if (tok.isEmpty()) {
-    appendLog(tr("Live: no restore token — use Tools → Set up live capture on the host first "
+    appendLog(tr("Live: no restore token — use Tools -> Set up live capture on the host first "
                  "(pick Virtual-monaSphere, enable Remember)"));
     showHudToast(tr("Host: Set up live capture first"));
     yt_pending_kind_ = YtPendingKind::None;
@@ -2566,7 +2566,7 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   live_session_span_ = span;
   int use_w = 0, use_h = 0;
   virtualSizeForSpan(span, &use_w, &use_h);
-  appendLog(tr("Live Virtual config x%1 → %2×%3 @ scale %4 (%5)")
+  appendLog(tr("Live Virtual config x%1 -> %2×%3 @ scale %4 (%5)")
                 .arg(span)
                 .arg(use_w)
                 .arg(use_h)
@@ -2610,7 +2610,7 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   // Flat live: Chrome/[アプリ] → monaSphereYt → monitor → Soft 4.0 (same as file 2ch).
   cfg.enable_audio = true;
   cfg.drm_modifiers = live_drm_modifiers_;
-  appendLog(tr("Live audio: Soft HRTF 4.0 (monaSphereYt → side-diff, surround_gain=%1)")
+  appendLog(tr("Live audio: Soft HRTF 4.0 (monaSphereYt -> side-diff, surround_gain=%1)")
                 .arg(QString::number(static_cast<double>(surround_gain_), 'f', 2)));
   if (!live_drm_modifiers_.empty()) {
     appendLog(tr("ScreenCast: announcing %1 Vulkan-sampleable DRM modifier(s)")
@@ -2661,7 +2661,7 @@ void HostWindow::stopYouTubeCapture() {
   yt_audio_pending_log_ = false;
   yt_audio_fail_retries_ = 0;
   if (yt_session_) yt_session_->clear_audio_wanted();
-  appendLog(tr("Stopping live capture… (DMA → PipeWire → app → Virtual)"));
+  appendLog(tr("Stopping live capture… (DMA -> PipeWire -> app -> Virtual)"));
   // While XR is running, tear down on the XR thread: reset DMA → stop PipeWire →
   // then finish portal/Chrome here. Doing capture->stop() on the UI thread races
   // VkImage imports (SEGV after tray "Stop sharing" / Tools → Stop).
@@ -3099,7 +3099,7 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
   if (!wivrn_pick.empty()) {
     idx = audio_device_ids_.indexOf(QString::fromStdString(wivrn_pick));
     if (idx >= 0 && audio_device_ids_[idx] != prev) {
-      appendLog(tr("Audio → WiVRn: %1").arg(audio_device_labels_[idx]));
+      appendLog(tr("Audio -> WiVRn: %1").arg(audio_device_labels_[idx]));
     }
   }
 
@@ -3114,7 +3114,7 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
       if (idx >= 0) {
         audio_user_override_.store(false);
         if (audio_device_ids_[idx] != prev) {
-          appendLog(tr("Audio → HMD: %1").arg(audio_device_labels_[idx]));
+          appendLog(tr("Audio -> HMD: %1").arg(audio_device_labels_[idx]));
         }
       }
     }
@@ -3131,7 +3131,7 @@ void HostWindow::refreshAudioDevices(bool prefer_hmd) {
       if (idx >= 0) break;
     }
     if (idx >= 0 && audio_device_ids_[idx] != prev) {
-      appendLog(tr("Audio → desktop: %1").arg(audio_device_labels_[idx]));
+      appendLog(tr("Audio -> desktop: %1").arg(audio_device_labels_[idx]));
     }
   }
 
@@ -3688,7 +3688,7 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
             if (!list.isEmpty()) list += ", ";
             list += QString::number(r, 'f', 1);
           }
-          appendLog(tr("OpenXR refresh → %1 (rates: %2)").arg(want_label).arg(list.isEmpty() ? tr("none") : list));
+          appendLog(tr("OpenXR refresh -> %1 (rates: %2)").arg(want_label).arg(list.isEmpty() ? tr("none") : list));
           // FB get can lie / lag — verify measured period shortly; fall back to Monado restart.
           const int conf_hz = preferred_hz_;
           const int expect = want_hz;
@@ -3713,7 +3713,7 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
       }
     }
   } else {
-    appendLog(tr("Restart Monado for refresh → %1").arg(want_label));
+    appendLog(tr("Restart Monado for refresh -> %1").arg(want_label));
   }
 
   // Pick DESIRED_MODE while mode table is still available (probe if empty).
@@ -4326,7 +4326,7 @@ void HostWindow::xrThreadMain() {
             if (prefer) {
               appendLog(tr("Vulkan Video: preferred (conf vulkan_video=1; CUDA fallback)"));
             } else {
-              appendLog(tr("Vulkan Video: available (conf vulkan_video=0 → CUDA/NVDEC)"));
+              appendLog(tr("Vulkan Video: available (conf vulkan_video=0 -> CUDA/NVDEC)"));
             }
           },
           Qt::QueuedConnection);
@@ -4722,7 +4722,7 @@ void HostWindow::xrThreadMain() {
 
       VRP_LOG("open_media: decoder.open");
       const bool ok = decoder.open(path, hwaccel_);
-      VRP_LOG("open_media: decoder.open → %s", ok ? "ok" : "fail");
+      VRP_LOG("open_media: decoder.open -> %s", ok ? "ok" : "fail");
       const bool network_url =
           path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
       if (ok && !network_url) {
@@ -4818,7 +4818,7 @@ void HostWindow::xrThreadMain() {
             audio.set_rate(1.f);
             const QString dev = QString::fromStdString(audio.device_name());
             QMetaObject::invokeMethod(
-                this, [this, dev] { appendLog(tr("Audio → %1").arg(dev)); }, Qt::QueuedConnection);
+                this, [this, dev] { appendLog(tr("Audio -> %1").arg(dev)); }, Qt::QueuedConnection);
           } else {
             audio.clear_file();  // video-only / demux fail — keep silent device
             const QString err = QString::fromStdString(audio.last_error());
@@ -5404,7 +5404,7 @@ void HostWindow::xrThreadMain() {
           QMetaObject::invokeMethod(
               this,
               [this] {
-                appendLog(tr("Live audio: Flat path active (2ch → Soft HRTF 4.0)"));
+                appendLog(tr("Live audio: Flat path active (2ch -> Soft HRTF 4.0)"));
               },
               Qt::QueuedConnection);
         } else {
@@ -7204,20 +7204,15 @@ void HostWindow::xrThreadMain() {
         }
         if (decoder.is_open() && gpu_nv12) {
           static auto last_vid_dbg = std::chrono::steady_clock::time_point{};
-          if (now - last_vid_dbg > std::chrono::seconds(2)) {
+          if (now - last_vid_dbg > std::chrono::seconds(30)) {
             last_vid_dbg = now;
-            const QString vid =
-                QString("NV12 copy ok=%1 fail=%2 flips=%3 valid=%4 %5x%6 gpu=%7 err=%8")
-                    .arg(cuda_tex.copy_ok())
-                    .arg(cuda_tex.copy_fail())
-                    .arg(cuda_tex.present_flips())
-                    .arg(cuda_tex.has_valid_frame() ? 1 : 0)
-                    .arg(cuda_tex.width())
-                    .arg(cuda_tex.height())
-                    .arg(decoder.gpu_path_active() ? 1 : 0)
-                    .arg(QString::fromStdString(cuda_tex.last_error()));
-            QMetaObject::invokeMethod(
-                this, [this, vid] { appendLog(tr("Video DBG: %1").arg(vid)); }, Qt::QueuedConnection);
+            const std::string err = cuda_tex.last_error();
+            VRP_LOG("NV12 copy ok=%llu fail=%llu flips=%llu valid=%d %dx%d gpu=%d err=%s",
+                    static_cast<unsigned long long>(cuda_tex.copy_ok()),
+                    static_cast<unsigned long long>(cuda_tex.copy_fail()),
+                    static_cast<unsigned long long>(cuda_tex.present_flips()),
+                    cuda_tex.has_valid_frame() ? 1 : 0, cuda_tex.width(), cuda_tex.height(),
+                    decoder.gpu_path_active() ? 1 : 0, err.c_str());
           }
         }
         // Use this frame's measured ms (not a stale pre-render sample).

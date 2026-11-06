@@ -708,7 +708,7 @@ std::vector<Item> browse(const Server& server, const std::string& object_id, int
   result = strip_cdata(result);
   result = xml_unescape(result);
   auto items = parse_didl(result);
-  VRP_LOG("dlna: Browse %s id=%s → %zu entries", server.friendly_name.c_str(), oid.c_str(),
+  VRP_LOG("dlna: Browse %s id=%s -> %zu entries", server.friendly_name.c_str(), oid.c_str(),
           items.size());
   if (!items.empty()) {
     const auto& s0 = items.front();

@@ -619,7 +619,7 @@ bool CudaNv12Texture::ensure_size(int width, int height) {
   }
   if (create_failed_) return false;
 
-  VRP_LOG("CudaNv12Texture: ensure_size %dx%d → %dx%d", width_, height_, width, height);
+  VRP_LOG("CudaNv12Texture: ensure_size %dx%d -> %dx%d", width_, height_, width, height);
   (void)retire_pending_copy();
   valid_.store(false, std::memory_order_release);
   layouts_ready_ = false;

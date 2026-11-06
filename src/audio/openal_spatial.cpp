@@ -252,7 +252,7 @@ bool OpenAlSpatial::configure(uint64_t channel_mask, int channels, int sample_ra
     // init() takes mu_ (recursive).
     if (!init(want)) return false;
   } else if (sink_changed) {
-    VRP_LOG("OpenAL: reopening for pulse_sink %s → %s", impl_->pulse_sink.c_str(), want.c_str());
+    VRP_LOG("OpenAL: reopening for pulse_sink %s -> %s", impl_->pulse_sink.c_str(), want.c_str());
     shutdown_unlocked();
     if (!init(want)) return false;
   }

@@ -86,7 +86,7 @@ void PadHookBridge::set_block_guest(bool block) {
   if (block_guest_ == block) return;
   block_guest_ = block;
   block_sent_ = false;  // force rebroadcast
-  VRP_LOG("PadHookBridge: block_guest → %d", block ? 1 : 0);
+  VRP_LOG("PadHookBridge: block_guest -> %d", block ? 1 : 0);
 }
 
 void PadHookBridge::close_all() {

@@ -263,7 +263,7 @@ void YouTubeSession::installDesktopAppSessionRule() {
                                                                       &rule_err);
   if (ok) {
     desktop_rule_installed_ = true;
-    emit logMessage(tr("Desktop app: Window Rule after map complete=%1 → %2 (#%3) Exact")
+    emit logMessage(tr("Desktop app: Window Rule after map complete=%1 -> %2 (#%3) Exact")
                         .arg(complete, output_name_)
                         .arg(scr));
   } else {
@@ -470,7 +470,7 @@ void YouTubeSession::start(const Config& cfg) {
       fail(tr("Desktop apps ([アプリ]) require KDE Plasma for window placement"));
       return;
     }
-    emit logMessage(tr("Desktop app → %1 (%2×%3): %4")
+    emit logMessage(tr("Desktop app -> %1 (%2×%3): %4")
                         .arg(output_name_)
                         .arg(place_w_)
                         .arg(place_h_)
@@ -525,7 +525,7 @@ void YouTubeSession::start(const Config& cfg) {
   chrome_->set_start_minimized(cfg_.virtual_display && desk_ == DesktopEnv::Kde);
   if (desk_ == DesktopEnv::Gnome) {
     chrome_->set_window_position(place_x_, place_y_);
-    emit logMessage(tr("Live browser → %1 (%2×%3) @%4,%5 (GNOME / window-position)")
+    emit logMessage(tr("Live browser -> %1 (%2×%3) @%4,%5 (GNOME / window-position)")
                         .arg(output_name_)
                         .arg(place_w_)
                         .arg(place_h_)
@@ -533,7 +533,7 @@ void YouTubeSession::start(const Config& cfg) {
                         .arg(place_y_));
     beginPlaceGnome();
   } else {
-    emit logMessage(tr("Live browser → %1 (%2×%3) via KWin")
+    emit logMessage(tr("Live browser -> %1 (%2×%3) via KWin")
                         .arg(output_name_)
                         .arg(place_w_)
                         .arg(place_h_));
@@ -625,7 +625,7 @@ void YouTubeSession::beginPlace() {
              .arg(arm_err.isEmpty() ? tr("(no detail)") : arm_err));
     return;
   }
-  emit logMessage(tr("KWin: armed — next Chrome window → %1 (#%2)")
+  emit logMessage(tr("KWin: armed — next Chrome window -> %1 (#%2)")
                       .arg(output_name_)
                       .arg(chrome_scr));
 
@@ -689,7 +689,7 @@ void YouTubeSession::beginPlaceDesktopApp() {
              .arg(arm_err.isEmpty() ? tr("(no detail)") : arm_err));
     return;
   }
-  emit logMessage(tr("KWin: armed — next desktop window → %1 (names %2)")
+  emit logMessage(tr("KWin: armed — next desktop window -> %1 (names %2)")
                       .arg(output_name_, desktop_want_names_.join(QLatin1Char(','))));
 
   if (QWidget* w = qobject_cast<QWidget*>(QObject::parent())) {
@@ -731,7 +731,7 @@ void YouTubeSession::beginPlaceDesktopApp() {
     }
     args.append(QStringLiteral("--appendconfig"));
     args.append(ra_cfg);
-    emit logMessage(tr("Desktop app: RetroArch appendconfig → sdl2 joypad"));
+    emit logMessage(tr("Desktop app: RetroArch appendconfig -> sdl2 joypad"));
   }
   desktop_app_->setProgram(cfg_.exec);
   desktop_app_->setArguments(args);
@@ -984,7 +984,7 @@ void YouTubeSession::beginPortal(bool after_reject) {
     if (desk_ == DesktopEnv::Kde) {
       QString arm_err;
       if (KwinWindowPlacer::arm_portal_dialog_on_primary(&arm_err)) {
-        emit logMessage(tr("ScreenCast: portal dialog armed → primary"));
+        emit logMessage(tr("ScreenCast: portal dialog armed -> primary"));
       }
     }
     emit toast(tr("Host: share ONLY “%1” (not whole desktop)").arg(output_name_));
@@ -1283,7 +1283,7 @@ void YouTubeSession::onPortalFailed(const QString& e) {
       // Memory only — keep conf token until a successful Start replaces it.
       emit logMessage(tr("ScreenCast restore still rejected — opening host picker "
                          "(conf token kept until a new one is saved). "
-                         "If Virtual size/scale changed, re-run Tools → Set up live capture."));
+                         "If Virtual size/scale changed, re-run Tools -> Set up live capture."));
       restore_token_.clear();
       emit toast(tr("Host: pick Virtual-monaSphere"));
       QTimer::singleShot(0, this, [this] {

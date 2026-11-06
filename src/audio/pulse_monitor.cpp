@@ -614,7 +614,7 @@ int PulseMonitor::route_browser_to_yt_sink() {
       std::snprintf(cmd, sizeof(cmd), "pactl move-sink-input %d %s 2>/dev/null", cur, kYtSinkName);
       if (std::system(cmd) == 0) {
         ++moved;
-        VRP_LOG("PulseMonitor: move sink-input #%d (%s / %s) → %s", cur,
+        VRP_LOG("PulseMonitor: move sink-input #%d (%s / %s) -> %s", cur,
                 app_name.empty() ? "?" : app_name.c_str(),
                 app_bin.empty() ? "?" : app_bin.c_str(), kYtSinkName);
       }
@@ -677,7 +677,7 @@ int PulseMonitor::route_browser_to_yt_sink() {
   if (do_dump) dump_inputs = false;
 
   if (moved > 0) {
-    VRP_LOG("PulseMonitor: moved %d browser stream(s) → %s (seen=%d)", moved, kYtSinkName,
+    VRP_LOG("PulseMonitor: moved %d browser stream(s) -> %s (seen=%d)", moved, kYtSinkName,
             browser_seen);
     return moved;
   }
@@ -751,7 +751,7 @@ int PulseMonitor::restore_browser_routing() {
       &st));
   ps.drain(40);
   if (st.moved > 0 || st.unmuted > 0)
-    VRP_LOG("PulseMonitor: restored (moved=%d unmuted=%d) → %s", st.moved, st.unmuted, dest.c_str());
+    VRP_LOG("PulseMonitor: restored (moved=%d unmuted=%d) -> %s", st.moved, st.unmuted, dest.c_str());
 
   // If the session default was somehow monaSphereYt, pick a real hardware sink.
   if (dest == kYtSinkName || dest.find("monaSphereYt") != std::string::npos) {

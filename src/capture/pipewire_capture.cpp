@@ -239,7 +239,7 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
   const uint32_t h = st->info.size.height;
   if (was_mod && !negotiated_mod && !st->logged_demote) {
     st->logged_demote = true;
-    VRP_LOG("pipewire: producer demoted DMA-BUF → SHM (modifier alloc failed?)");
+    VRP_LOG("pipewire: producer demoted DMA-BUF -> SHM (modifier alloc failed?)");
   }
   VRP_LOG("pipewire: format %s %ux%u modifier=0x%llx drm=0x%x negotiated_mod=%d",
           spa_fmt_name(st->format), w, h, static_cast<unsigned long long>(st->modifier),
