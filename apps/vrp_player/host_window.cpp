@@ -5724,6 +5724,8 @@ void HostWindow::xrThreadMain() {
       }
       if (yt_live || audio.live_monitor_active()) {
         for (const std::string& s : audio.drain_audio_status()) {
+          // Periodic / diagnostic "live audio:" stays in [vrp] only.
+          if (s.rfind("live audio:", 0) == 0) continue;
           const QString note = QString::fromStdString(s);
           QMetaObject::invokeMethod(
               this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
@@ -7369,18 +7371,13 @@ void HostWindow::xrThreadMain() {
         const float lis_pitch = hmd_pitch - look_pitch;
         audio.set_listener_orientation(lis_yaw, lis_pitch);
         if (audio.live_monitor_active()) {
-          static double last_lis_log = 0.0;
-          const double tnow =
-              std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch())
-                  .count();
-          if (tnow - last_lis_log >= 2.0) {
+          static auto last_lis_log = std::chrono::steady_clock::time_point{};
+          const auto tnow = std::chrono::steady_clock::now();
+          if (tnow - last_lis_log >= std::chrono::seconds(30)) {
             last_lis_log = tnow;
-            const QString note =
-                tr("live audio: HRTF listener yaw=%1° pitch=%2° (head-tracked)")
-                    .arg(lis_yaw * 180.f / 3.14159265f, 0, 'f', 1)
-                    .arg(lis_pitch * 180.f / 3.14159265f, 0, 'f', 1);
-            QMetaObject::invokeMethod(
-                this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
+            VRP_LOG("live audio: HRTF listener yaw=%.1f° pitch=%.1f° (head-tracked)",
+                    static_cast<double>(lis_yaw * 180.f / 3.14159265f),
+                    static_cast<double>(lis_pitch * 180.f / 3.14159265f));
           }
         }
       }

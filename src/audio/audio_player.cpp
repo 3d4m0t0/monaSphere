@@ -1668,16 +1668,13 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
         qsrc += n * q_ch;
         q_left -= n;
       }
-      if (now - last_dbg >= std::chrono::seconds(2)) {
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "live audio: Flat surround feed peak=%.3f in=%llu q=%llu upmix=%d "
-                      "gain=%.2f spatial=%d src=%s",
-                      peak, static_cast<unsigned long long>(frames_in),
-                      static_cast<unsigned long long>(frames_queued),
-                      st_->use_stereo_upmix ? 1 : 0, static_cast<double>(surround_gain_),
-                      st_->use_spatial ? 1 : 0, st_->live_mon.source().c_str());
-        push_audio_status(line);
+      if (now - last_dbg >= std::chrono::seconds(30)) {
+        VRP_LOG("live audio: Flat surround feed peak=%.3f in=%llu q=%llu upmix=%d "
+                "gain=%.2f spatial=%d src=%s",
+                peak, static_cast<unsigned long long>(frames_in),
+                static_cast<unsigned long long>(frames_queued),
+                st_->use_stereo_upmix ? 1 : 0, static_cast<double>(surround_gain_),
+                st_->use_spatial ? 1 : 0, st_->live_mon.source().c_str());
         peak = 0.0;
         frames_in = 0;
         frames_queued = 0;
