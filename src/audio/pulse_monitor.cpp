@@ -333,7 +333,9 @@ bool PulseMonitor::open(const std::string& source) {
   ss.rate = static_cast<uint32_t>(kRate);
   ss.channels = static_cast<uint8_t>(kChannels);
   pa_buffer_attr attr{};
-  attr.fragsize = static_cast<uint32_t>(kRate / 50 * kChannels * sizeof(int16_t));  // ~20ms
+  // ~20ms fragments. Do not enlarge (40ms made Live click period follow fragsize).
+  // Soft is fed from a PCM ring so pa_simple_read blocking does not starve Soft.
+  attr.fragsize = static_cast<uint32_t>(kRate / 50 * kChannels * sizeof(int16_t));
   attr.maxlength = static_cast<uint32_t>(-1);
   attr.tlength = attr.prebuf = attr.minreq = static_cast<uint32_t>(-1);
 

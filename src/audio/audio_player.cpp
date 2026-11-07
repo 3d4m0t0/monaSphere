@@ -459,6 +459,8 @@ struct AudioPlayer::State {
   std::thread live_thread;
   std::atomic<bool> live_stop{false};
   PulseMonitor live_mon;
+  /** Pulse-ring frames into Soft (excludes silence pads). Unmute waits for this. */
+  std::atomic<uint64_t> live_real_frames{0};
   /** Filled by request_start before taking live_ops_mu_ (Pulse outside lock). */
   std::string pending_yt_monitor;
 };
@@ -1612,75 +1614,191 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
                                             : st_->live_mon.last_error());
     return;
   }
+  st_->live_real_frames.store(0, std::memory_order_relaxed);
   st_->live_thread = std::thread([this] {
     if (!st_) return;
-    std::vector<int16_t> buf(static_cast<size_t>(PulseMonitor::kRate / 50 * PulseMonitor::kChannels));
+    /*
+     * Live Flat audio path (keep these; verified against rhythmic / startup clicks):
+     *  - Pulse reader thread → PCM ring → Soft feeder (Soft must not block on pa_simple_read)
+     *  - Pulse frag ~20ms (40ms made click period follow fragsize)
+     *  - Coalesce to Soft buffer size (2048f) before queue (short Soft buffers underran)
+     *  - Silence-pad Soft when ring empty (browser→yt route is async for ~10s)
+     *  - Unmute only after live_real_frames (silence pads stay inaudible)
+     * Rejected: Pulse 40ms frag, Soft-internal pending counted as depth, unmute fade,
+     * dual high/low watermarks, Soft 4-deep alone as the fix.
+     */
+    constexpr int kFragFrames = PulseMonitor::kRate / 50;  // ~20ms
+    constexpr int kRingFrames = PulseMonitor::kRate / 4;   // ~250ms
+    constexpr int kSoftBufFrames = 2048;                  // Soft buffer (~43ms @ 48k)
+    constexpr int kSoftTargetMs = 200;
+    const int soft_target = PulseMonitor::kRate * kSoftTargetMs / 1000;
+
+    std::vector<int16_t> ring(static_cast<size_t>(kRingFrames * PulseMonitor::kChannels));
+    size_t ring_r = 0;
+    size_t ring_w = 0;
+    size_t ring_n = 0;
+    std::mutex ring_mu;
+    std::atomic<bool> reader_stop{false};
+
+    auto ring_push = [&](const int16_t* src, int frames) {
+      if (!src || frames <= 0) return;
+      std::lock_guard<std::mutex> lock(ring_mu);
+      for (int i = 0; i < frames; ++i) {
+        if (ring_n >= static_cast<size_t>(kRingFrames)) {
+          ring_r = (ring_r + 1) % static_cast<size_t>(kRingFrames);
+          --ring_n;
+        }
+        const size_t o = ring_w * static_cast<size_t>(PulseMonitor::kChannels);
+        const size_t s = static_cast<size_t>(i) * static_cast<size_t>(PulseMonitor::kChannels);
+        ring[o] = src[s];
+        ring[o + 1] = src[s + 1];
+        ring_w = (ring_w + 1) % static_cast<size_t>(kRingFrames);
+        ++ring_n;
+      }
+    };
+    auto ring_pop = [&](int16_t* dst, int max_frames) -> int {
+      if (!dst || max_frames <= 0) return 0;
+      std::lock_guard<std::mutex> lock(ring_mu);
+      const int n = std::min(max_frames, static_cast<int>(ring_n));
+      for (int i = 0; i < n; ++i) {
+        const size_t o = static_cast<size_t>(i) * static_cast<size_t>(PulseMonitor::kChannels);
+        const size_t s = ring_r * static_cast<size_t>(PulseMonitor::kChannels);
+        dst[o] = ring[s];
+        dst[o + 1] = ring[s + 1];
+        ring_r = (ring_r + 1) % static_cast<size_t>(kRingFrames);
+        --ring_n;
+      }
+      return n;
+    };
+    auto ring_frames = [&]() -> size_t {
+      std::lock_guard<std::mutex> lock(ring_mu);
+      return ring_n;
+    };
+
+    std::thread reader([this, &reader_stop, &ring_push] {
+      std::vector<int16_t> buf(
+          static_cast<size_t>(kFragFrames * PulseMonitor::kChannels));
+      while (!reader_stop.load(std::memory_order_relaxed) &&
+             !st_->live_stop.load(std::memory_order_relaxed)) {
+        if (!st_->playing.load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+          continue;
+        }
+        const int got = st_->live_mon.read_s16_stereo(buf.data(), kFragFrames);
+        if (got < 0) {
+          push_audio_status(std::string("live audio: monitor read error: ") +
+                            st_->live_mon.last_error());
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+          continue;
+        }
+        if (got > 0) ring_push(buf.data(), got);
+      }
+    });
+
     st_->live_norm.set_enabled(loudness_normalize_);
     st_->live_norm.reset();
     auto last_dbg = std::chrono::steady_clock::now();
     uint64_t frames_in = 0;
     uint64_t frames_queued = 0;
     double peak = 0.0;
+    std::vector<int16_t> soft_acc(
+        static_cast<size_t>(kSoftBufFrames * PulseMonitor::kChannels));
+    int soft_acc_n = 0;
+    std::vector<int16_t> chunk(
+        static_cast<size_t>(kFragFrames * PulseMonitor::kChannels));
+
+    auto flush_soft_acc = [&](bool from_ring) -> bool {
+      if (soft_acc_n < kSoftBufFrames) return true;
+      if (from_ring) {
+        st_->live_norm.process(soft_acc.data(), soft_acc_n, PulseMonitor::kChannels,
+                               PulseMonitor::kRate);
+        apply_pre_hrtf_trim(soft_acc.data(), soft_acc_n * PulseMonitor::kChannels,
+                            headroom_gain_.load(std::memory_order_relaxed));
+        for (int i = 0; i < soft_acc_n * PulseMonitor::kChannels; ++i) {
+          const double a =
+              std::fabs(static_cast<double>(soft_acc[static_cast<size_t>(i)]) / 32768.0);
+          if (a > peak) peak = a;
+        }
+      }
+      std::vector<int16_t> upmixed;
+      const int16_t* qsrc = soft_acc.data();
+      if (st_->use_stereo_upmix) {
+        st_->stereo_upmix.process(soft_acc.data(), soft_acc_n, upmixed);
+        qsrc = upmixed.data();
+      }
+      const int n = st_->spatial.queue_interleaved_s16(qsrc, soft_acc_n);
+      if (n <= 0) return false;
+      frames_queued += static_cast<uint64_t>(n);
+      if (from_ring) {
+        frames_in += static_cast<uint64_t>(soft_acc_n);
+        st_->live_real_frames.fetch_add(static_cast<uint64_t>(soft_acc_n),
+                                        std::memory_order_relaxed);
+      }
+      soft_acc_n = 0;
+      return true;
+    };
+
     while (!st_->live_stop.load(std::memory_order_relaxed)) {
       const auto now = std::chrono::steady_clock::now();
       if (!st_->playing.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         continue;
       }
-      const int max_frames = static_cast<int>(buf.size() / PulseMonitor::kChannels);
-      const int got = st_->live_mon.read_s16_stereo(buf.data(), max_frames);
-      if (got < 0) {
-        push_audio_status(std::string("live audio: monitor read error: ") + st_->live_mon.last_error());
+      if (!st_->use_spatial) {
+        push_audio_status("live audio: WARNING use_spatial=0 — dropping monitor PCM");
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
         continue;
       }
-      if (got == 0) continue;
-      // Before StereoSurround and OpenAL HRTF. Head turns must not drive this.
-      st_->live_norm.process(buf.data(), got, PulseMonitor::kChannels, PulseMonitor::kRate);
-      apply_pre_hrtf_trim(buf.data(), got * PulseMonitor::kChannels,
-                          headroom_gain_.load(std::memory_order_relaxed));
-      frames_in += static_cast<uint64_t>(got);
-      for (int i = 0; i < got * PulseMonitor::kChannels; ++i) {
-        const double a = std::fabs(static_cast<double>(buf[static_cast<size_t>(i)]) / 32768.0);
-        if (a > peak) peak = a;
-      }
-      if (!st_->use_spatial) {
-        push_audio_status("live audio: WARNING use_spatial=0 — dropping monitor PCM");
-        continue;
-      }
-      // Same path as file 2ch: stereo → StereoSurround → Soft 4.0 HRTF.
-      std::vector<int16_t> upmixed;
-      const int16_t* qsrc = buf.data();
-      int q_ch = PulseMonitor::kChannels;
-      int q_left = got;
-      if (st_->use_stereo_upmix) {
-        st_->stereo_upmix.process(buf.data(), got, upmixed);
-        qsrc = upmixed.data();
-        q_ch = StereoSurround::kOutChannels;
-      }
-      while (q_left > 0 && !st_->live_stop.load() && st_->playing.load()) {
-        const int n = st_->spatial.queue_interleaved_s16(qsrc, q_left);
-        if (n <= 0) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+      while (st_->spatial.min_queued_frames() < soft_target &&
+             !st_->live_stop.load(std::memory_order_relaxed) &&
+             st_->playing.load(std::memory_order_acquire)) {
+        if (soft_acc_n >= kSoftBufFrames) {
+          if (!flush_soft_acc(true)) break;
           continue;
         }
-        frames_queued += static_cast<uint64_t>(n);
-        qsrc += n * q_ch;
-        q_left -= n;
+        const int want = kSoftBufFrames - soft_acc_n;
+        const int got = ring_pop(chunk.data(), std::min(want, kFragFrames));
+        if (got > 0) {
+          std::memcpy(soft_acc.data() + static_cast<size_t>(soft_acc_n) * PulseMonitor::kChannels,
+                      chunk.data(),
+                      static_cast<size_t>(got) * PulseMonitor::kChannels * sizeof(int16_t));
+          soft_acc_n += got;
+          continue;
+        }
+        // Ring empty while Soft still needs depth — pad one Soft buffer of silence.
+        const bool had_real = soft_acc_n > 0;
+        std::fill(soft_acc.begin() + static_cast<size_t>(soft_acc_n) * PulseMonitor::kChannels,
+                  soft_acc.begin() + static_cast<size_t>(kSoftBufFrames) * PulseMonitor::kChannels,
+                  static_cast<int16_t>(0));
+        soft_acc_n = kSoftBufFrames;
+        if (!flush_soft_acc(had_real)) break;
+        break;
       }
+
+      const int queued = st_->spatial.min_queued_frames();
+      std::this_thread::sleep_for(
+          std::chrono::milliseconds(queued >= soft_target ? 2 : 1));
+
       if (now - last_dbg >= std::chrono::seconds(30)) {
-        VRP_LOG("live audio: Flat surround feed peak=%.3f in=%llu q=%llu upmix=%d "
-                "gain=%.2f spatial=%d src=%s",
+        VRP_LOG("live audio: Flat surround feed peak=%.3f in=%llu q=%llu real=%llu ring=%zu "
+                "soft=%d acc=%d upmix=%d src=%s",
                 peak, static_cast<unsigned long long>(frames_in),
                 static_cast<unsigned long long>(frames_queued),
-                st_->use_stereo_upmix ? 1 : 0, static_cast<double>(surround_gain_),
-                st_->use_spatial ? 1 : 0, st_->live_mon.source().c_str());
+                static_cast<unsigned long long>(
+                    st_->live_real_frames.load(std::memory_order_relaxed)),
+                ring_frames(), queued, soft_acc_n, st_->use_stereo_upmix ? 1 : 0,
+                st_->live_mon.source().c_str());
         peak = 0.0;
         frames_in = 0;
         frames_queued = 0;
         last_dbg = now;
       }
     }
+
+    reader_stop.store(true, std::memory_order_release);
+    st_->live_mon.interrupt();
+    if (reader.joinable()) reader.join();
   });
 }
 
@@ -1757,7 +1875,7 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
   PulseMonitor::set_sink_muted(device_name_, false);
   st_->volume.store(volume_, std::memory_order_relaxed);
   st_->spatial.set_hold_silence(false);
-  st_->spatial.set_gain(live_base_gain_);
+  st_->spatial.set_gain(0.f);
   st_->spatial.flush();
   start_live_thread(monitor);
   if (!st_->live_mon.ok()) {
@@ -1780,9 +1898,40 @@ bool AudioPlayer::start_live_monitor_with_gen(uint64_t gen) {
     return false;
   }
   st_->playing.store(true, std::memory_order_release);
+  // Mute until Soft has depth and real Pulse PCM has arrived. Silence pads during
+  // browser→yt routing would otherwise be unmuted underrun clicks for ~10s.
+  constexpr int kLivePrefillMs = 200;
+  constexpr int kLiveRealMs = 100;
+  const int want = 48000 * kLivePrefillMs / 1000;
+  const uint64_t want_real = static_cast<uint64_t>(48000 * kLiveRealMs / 1000);
+  for (int i = 0; i < 150 && !cancelled(); ++i) {
+    if (st_->spatial.min_queued_frames() >= want) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  // Route worker may take several seconds; timeout ~12s then unmute anyway.
+  for (int i = 0; i < 600 && !cancelled(); ++i) {
+    if (st_->live_real_frames.load(std::memory_order_relaxed) >= want_real) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  if (cancelled()) {
+    stop_live_thread();
+    st_->spatial.flush();
+    st_->spatial.pause();
+    spatial_active_.store(false, std::memory_order_release);
+    has_audio_ = false;
+    playing_ = false;
+    live_monitor_.store(false, std::memory_order_release);
+    apply_listener_gain();
+    return false;
+  }
+  st_->spatial.set_gain(live_base_gain_);
   st_->spatial.play();
   playing_ = true;
-  // Guest→yt routing is async after Soft is up (see request_start_live_monitor).
+  VRP_LOG("live audio: Soft unmute queued=%d real=%llu (~prefill %dms, wait real %dms)",
+          st_->spatial.min_queued_frames(),
+          static_cast<unsigned long long>(
+              st_->live_real_frames.load(std::memory_order_relaxed)),
+          kLivePrefillMs, kLiveRealMs);
 
   {
     char line[256];

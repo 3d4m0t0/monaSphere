@@ -30,7 +30,8 @@ constexpr uint64_t kChBC = 0x00000100ull;
 constexpr uint64_t kChSL = 0x00000200ull;
 constexpr uint64_t kChSR = 0x00000400ull;
 
-constexpr int kBuffersPerSource = 4;
+// Live Soft needs depth: 4× was thin; 8×2048 ≈ 341ms at 48 kHz.
+constexpr int kBuffersPerSource = 8;
 constexpr int kBufferFrames = 2048;
 constexpr float kSpeakerDist = 2.5f;
 
@@ -72,13 +73,18 @@ bool enable_hrtf(ALCdevice* dev) {
   auto reset = reinterpret_cast<LPALCRESETDEVICESOFT>(alcGetProcAddress(dev, "alcResetDeviceSOFT"));
   auto getstr = reinterpret_cast<LPALCGETSTRINGISOFT>(alcGetProcAddress(dev, "alcGetStringiSOFT"));
   if (!reset) return false;
-  const ALCint attrs[] = {ALC_HRTF_SOFT, ALC_TRUE, 0};
+  // Keep device mix rate at 48 kHz so alBufferData(48000) does not add a Soft resampler.
+  const ALCint attrs[] = {ALC_HRTF_SOFT, ALC_TRUE, ALC_FREQUENCY, 48000, 0};
   if (!reset(dev, attrs)) return false;
   ALCint on = ALC_FALSE;
   alcGetIntegerv(dev, ALC_HRTF_SOFT, 1, &on);
+  ALCint hz = 0;
+  alcGetIntegerv(dev, ALC_FREQUENCY, 1, &hz);
   if (on) {
     const ALCchar* name = getstr ? getstr(dev, ALC_HRTF_SPECIFIER_SOFT, 0) : nullptr;
-    VRP_LOG("OpenAL Soft HRTF: %s", name ? name : "on");
+    VRP_LOG("OpenAL Soft HRTF: %s (device %d Hz)", name ? name : "on", static_cast<int>(hz));
+  } else {
+    VRP_LOG("OpenAL Soft HRTF off (device %d Hz)", static_cast<int>(hz));
   }
   return on == ALC_TRUE;
 }
@@ -87,10 +93,35 @@ struct Speaker {
   ALuint source = 0;
   ALuint buffers[kBuffersPerSource]{};
   ALuint free_ids[kBuffersPerSource]{};
+  /** Actual frames in buffers[i] (do not assume kBufferFrames — short submits underran). */
+  int buf_frames[kBuffersPerSource]{};
   int free_count = 0;
+  int queued_frames = 0;
   int channel_index = 0;
   bool lfe = false;
   std::vector<int16_t> mono;
+
+  int buf_index(ALuint id) const {
+    for (int i = 0; i < kBuffersPerSource; ++i) {
+      if (buffers[i] == id) return i;
+    }
+    return -1;
+  }
+
+  void reclaim_processed() {
+    ALint processed = 0;
+    alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+    while (processed-- > 0 && free_count < kBuffersPerSource) {
+      ALuint buf = 0;
+      alSourceUnqueueBuffers(source, 1, &buf);
+      const int bi = buf_index(buf);
+      if (bi >= 0) {
+        queued_frames = std::max(0, queued_frames - buf_frames[bi]);
+        buf_frames[bi] = 0;
+      }
+      free_ids[free_count++] = buf;
+    }
+  }
 };
 #endif
 
@@ -170,7 +201,8 @@ bool OpenAlSpatial::init(const std::string& pulse_sink) {
     VRP_ERR("openal: %s", impl_->last_error.c_str());
     return false;
   }
-  impl_->context = alcCreateContext(impl_->device, nullptr);
+  const ALCint ctx_attrs[] = {ALC_FREQUENCY, 48000, 0};
+  impl_->context = alcCreateContext(impl_->device, ctx_attrs);
   if (!impl_->context || !alcMakeContextCurrent(impl_->context)) {
     impl_->last_error = "OpenAL コンテキストを作成できません";
     VRP_ERR("openal: %s", impl_->last_error.c_str());
@@ -274,8 +306,12 @@ bool OpenAlSpatial::configure(uint64_t channel_mask, int channels, int sample_ra
     sp.lfe = lfe;
     alGenSources(1, &sp.source);
     alGenBuffers(kBuffersPerSource, sp.buffers);
-    for (int i = 0; i < kBuffersPerSource; ++i) sp.free_ids[i] = sp.buffers[i];
+    for (int i = 0; i < kBuffersPerSource; ++i) {
+      sp.free_ids[i] = sp.buffers[i];
+      sp.buf_frames[i] = 0;
+    }
     sp.free_count = kBuffersPerSource;
+    sp.queued_frames = 0;
     sp.mono.resize(static_cast<size_t>(kBufferFrames));
     // REFERENCE_DISTANCE = speaker radius so the seat (origin) is unity gain;
     // keep kSpeakerDist for HRTF layout without the old ×0.4 inverse drop.
@@ -400,19 +436,28 @@ void OpenAlSpatial::flush() {
       ALuint buf = 0;
       alSourceUnqueueBuffers(sp.source, 1, &buf);
     }
-    for (int i = 0; i < kBuffersPerSource; ++i) sp.free_ids[i] = sp.buffers[i];
+    for (int i = 0; i < kBuffersPerSource; ++i) {
+      sp.free_ids[i] = sp.buffers[i];
+      sp.buf_frames[i] = 0;
+    }
     sp.free_count = kBuffersPerSource;
+    sp.queued_frames = 0;
   }
 #endif
 }
 
-int OpenAlSpatial::min_queued_frames() const {
+int OpenAlSpatial::min_queued_frames() {
 #if defined(VRP_HAS_OPENAL)
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!impl_->ready || impl_->speakers.empty()) return 0;
-  int min_free = kBuffersPerSource;
-  for (const Speaker& sp : impl_->speakers) min_free = std::min(min_free, sp.free_count);
-  return (kBuffersPerSource - min_free) * kBufferFrames;
+  // Must reclaim here: otherwise free_count stays stale and Soft looks "full" forever.
+  if (impl_->context) {
+    alcMakeContextCurrent(impl_->context);
+    for (Speaker& sp : impl_->speakers) sp.reclaim_processed();
+  }
+  int min_q = impl_->speakers.front().queued_frames;
+  for (const Speaker& sp : impl_->speakers) min_q = std::min(min_q, sp.queued_frames);
+  return min_q;
 #else
   return 0;
 #endif
@@ -429,21 +474,9 @@ int OpenAlSpatial::queue_interleaved_s16(const int16_t* frames, int frame_count)
     return 0;
   alcMakeContextCurrent(impl_->context);
 
-  auto unqueue = [&] {
-    for (Speaker& sp : impl_->speakers) {
-      ALint processed = 0;
-      alGetSourcei(sp.source, AL_BUFFERS_PROCESSED, &processed);
-      while (processed-- > 0 && sp.free_count < kBuffersPerSource) {
-        ALuint buf = 0;
-        alSourceUnqueueBuffers(sp.source, 1, &buf);
-        sp.free_ids[sp.free_count++] = buf;
-      }
-    }
-  };
-
   int offset = 0;
   while (offset < frame_count) {
-    unqueue();
+    for (Speaker& sp : impl_->speakers) sp.reclaim_processed();
     bool all_have = true;
     for (const Speaker& sp : impl_->speakers) {
       if (sp.free_count <= 0) {
@@ -453,6 +486,7 @@ int OpenAlSpatial::queue_interleaved_s16(const int16_t* frames, int frame_count)
     }
     if (!all_have) break;
 
+    // Prefer full Soft buffers (Live feeder coalesces to kBufferFrames).
     const int n = std::min(kBufferFrames, frame_count - offset);
     for (Speaker& sp : impl_->speakers) {
       sp.mono.resize(static_cast<size_t>(n));
@@ -461,6 +495,9 @@ int OpenAlSpatial::queue_interleaved_s16(const int16_t* frames, int frame_count)
             frames[static_cast<size_t>((offset + i) * impl_->channels + sp.channel_index)];
       }
       const ALuint buf = sp.free_ids[--sp.free_count];
+      const int bi = sp.buf_index(buf);
+      if (bi >= 0) sp.buf_frames[bi] = n;
+      sp.queued_frames += n;
       alBufferData(buf, AL_FORMAT_MONO16, sp.mono.data(),
                    static_cast<ALsizei>(n * static_cast<int>(sizeof(int16_t))), impl_->sample_rate);
       alSourceQueueBuffers(sp.source, 1, &buf);

@@ -46,8 +46,11 @@ class OpenAlSpatial {
   /** Interleaved S16 frames (channel count from configure). Returns frames accepted. */
   int queue_interleaved_s16(const int16_t* frames, int frame_count);
 
-  /** Approximate queued PCM depth (frames). */
-  int min_queued_frames() const;
+  /**
+   * Queued PCM depth in real frames (sum of per-buffer sizes, not buffer_count×2048).
+   * Reclaims played Soft buffers so depth stays accurate while nothing is queueing.
+   */
+  int min_queued_frames();
 
   const std::string& last_error() const;
 
