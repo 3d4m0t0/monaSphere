@@ -533,6 +533,7 @@ void YouTubeSession::start(const Config& cfg) {
                         .arg(QString::number(static_cast<double>(cfg_.chrome_scale), 'f', 2)));
   }
   // Borderless fullscreen on the target MONITOR (KWin also sets fullScreen after place).
+  // Top “exit fullscreen” is avoided by keeping the injected cursor Y ≥ 4 (see ChromiumYtX11).
   chrome_->set_start_fullscreen(true);
   chrome_->set_start_minimized(cfg_.virtual_display && desk_ == DesktopEnv::Kde);
   if (desk_ == DesktopEnv::Gnome) {

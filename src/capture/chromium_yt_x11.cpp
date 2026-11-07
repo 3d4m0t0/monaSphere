@@ -23,6 +23,22 @@ namespace {
 
 constexpr const char* kClass = "monaSphereYT";
 
+/** Keep injected Y off the top strip so Chromium does not show “exit fullscreen”. */
+float clamp_cursor_x(float x, int width) {
+  return std::clamp(x, 0.f, static_cast<float>(std::max(1, width - 1)));
+}
+float clamp_cursor_y(float y, int height) {
+  const float ymax = static_cast<float>(std::max(1, height - 1));
+  // Y ≥ 4 keeps Chromium from arming the top “exit fullscreen” strip.
+  const float ymin = height > 5 ? 4.f : 0.f;
+  return std::clamp(y, ymin, ymax);
+}
+double clamp_abs_y(double y, int height) {
+  const double ymax = static_cast<double>(std::max(1, height - 1));
+  const double ymin = height > 5 ? 4.0 : 0.0;
+  return std::clamp(y, ymin, ymax);
+}
+
 bool get_wm_class(Display* dpy, Window w, std::string* name, std::string* cls) {
   XClassHint hint{};
   if (!XGetClassHint(dpy, w, &hint)) return false;
@@ -250,8 +266,8 @@ bool ChromiumYtX11::bind_output_by_name(const std::string& output_name_substr, i
   xtest_w_ = cw;
   xtest_h_ = ch;
   screen_input_ = true;
-  cursor_x_ = std::clamp(cursor_x_, 0.f, static_cast<float>(std::max(1, width_ - 1)));
-  cursor_y_ = std::clamp(cursor_y_, 0.f, static_cast<float>(std::max(1, height_ - 1)));
+  cursor_x_ = clamp_cursor_x(cursor_x_, width_);
+  cursor_y_ = clamp_cursor_y(cursor_y_, height_);
   if (changed) {
     VRP_LOG("live-x11: bind Xrandr origin @%d,%d (crtc %dx%d) cfg clamp %dx%d", x, y, w, h, cw,
             ch);
@@ -306,8 +322,8 @@ bool ChromiumYtX11::refresh_geometry() {
   if (!screen_input_) {
     width_ = client_w_;
     height_ = client_h_;
-    cursor_x_ = std::clamp(cursor_x_, 0.f, static_cast<float>(width_ - 1));
-    cursor_y_ = std::clamp(cursor_y_, 0.f, static_cast<float>(height_ - 1));
+    cursor_x_ = clamp_cursor_x(cursor_x_, width_);
+    cursor_y_ = clamp_cursor_y(cursor_y_, height_);
   }
   return true;
 }
@@ -320,10 +336,10 @@ void ChromiumYtX11::client_cursor(int* cx, int* cy) const {
     const float u = cursor_x_ / static_cast<float>(width_ - 1);
     const float v = cursor_y_ / static_cast<float>(height_ - 1);
     *cx = std::clamp(static_cast<int>(u * static_cast<float>(cw - 1) + 0.5f), 0, cw - 1);
-    *cy = std::clamp(static_cast<int>(v * static_cast<float>(ch - 1) + 0.5f), 0, ch - 1);
+    *cy = static_cast<int>(clamp_cursor_y(v * static_cast<float>(ch - 1) + 0.5f, ch));
   } else {
     *cx = static_cast<int>(cursor_x_);
-    *cy = static_cast<int>(cursor_y_);
+    *cy = static_cast<int>(clamp_cursor_y(cursor_y_, ch));
   }
 }
 
@@ -418,7 +434,8 @@ void ChromiumYtX11::eis_abs_from_cursor(double* ax, double* ay) const {
   if (!ax || !ay || !eis_) return;
   if (!eis_->region_local()) {
     *ax = static_cast<double>(eis_ox_) + static_cast<double>(cursor_x_);
-    *ay = static_cast<double>(eis_oy_) + static_cast<double>(cursor_y_);
+    *ay = static_cast<double>(eis_oy_) +
+          clamp_abs_y(static_cast<double>(cursor_y_), height_);
     return;
   }
   // cursor_* is configured Virtual size (often physical mode). libei regions
@@ -435,13 +452,14 @@ void ChromiumYtX11::eis_abs_from_cursor(double* ax, double* ay) const {
     *ax = static_cast<double>(cursor_x_);
     *ay = static_cast<double>(cursor_y_);
   }
+  *ay = clamp_abs_y(*ay, static_cast<int>(rh > 0 ? rh : height_));
 }
 
 void ChromiumYtX11::set_cursor(float x, float y) {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   (void)ensure_inject_target();
-  cursor_x_ = std::clamp(x, 0.f, static_cast<float>(std::max(1, width_ - 1)));
-  cursor_y_ = std::clamp(y, 0.f, static_cast<float>(std::max(1, height_ - 1)));
+  cursor_x_ = clamp_cursor_x(x, width_);
+  cursor_y_ = clamp_cursor_y(y, height_);
   if (eis_ && eis_->ready()) {
     double ax = 0, ay = 0;
     eis_abs_from_cursor(&ax, &ay);
@@ -456,8 +474,8 @@ void ChromiumYtX11::set_cursor(float x, float y) {
 void ChromiumYtX11::move_cursor(float dx, float dy) {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!ensure_inject_target() && !(eis_ && eis_->ready())) return;
-  cursor_x_ = std::clamp(cursor_x_ + dx, 0.f, static_cast<float>(std::max(1, width_ - 1)));
-  cursor_y_ = std::clamp(cursor_y_ + dy, 0.f, static_cast<float>(std::max(1, height_ - 1)));
+  cursor_x_ = clamp_cursor_x(cursor_x_ + dx, width_);
+  cursor_y_ = clamp_cursor_y(cursor_y_ + dy, height_);
   if (eis_ && eis_->ready()) {
     double ax = 0, ay = 0;
     eis_abs_from_cursor(&ax, &ay);
@@ -498,11 +516,14 @@ bool ChromiumYtX11::root_coords(int* root_x, int* root_y) const {
       *root_x = place_x_ + static_cast<int>(cursor_x_);
     }
     if (height_ > 1 && th > 1 && th != height_) {
-      *root_y = place_y_ + static_cast<int>(cursor_y_ * static_cast<float>(th - 1) /
-                                                static_cast<float>(height_ - 1) +
-                                            0.5f);
+      *root_y =
+          place_y_ + static_cast<int>(clamp_abs_y(
+                         static_cast<double>(cursor_y_) * static_cast<double>(th - 1) /
+                                 static_cast<double>(height_ - 1) +
+                             0.5,
+                         th));
     } else {
-      *root_y = place_y_ + static_cast<int>(cursor_y_);
+      *root_y = place_y_ + static_cast<int>(clamp_abs_y(static_cast<double>(cursor_y_), th));
     }
     return true;
   }
