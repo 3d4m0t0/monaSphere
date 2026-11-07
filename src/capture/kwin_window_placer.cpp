@@ -232,7 +232,8 @@ QString rulesPath() {
 }
 
 /** ruleValue: 2 = Force (see KWin SetRule / ForceRule). */
-bool installTempWindowRule(int screen_index, bool session_keep, QString* error_out) {
+bool installTempWindowRule(int screen_index, bool session_keep, QString* error_out,
+                           bool force_fullscreen = true) {
   if (screen_index < 0) {
     if (error_out) *error_out = QStringLiteral("bad screen index");
     return false;
@@ -261,8 +262,11 @@ bool installTempWindowRule(int screen_index, bool session_keep, QString* error_o
 
   s.beginGroup(id);
   s.setValue(QStringLiteral("Description"),
-             session_keep ? QStringLiteral("monaSphere live → Force fullscreen on Virtual")
-                          : QStringLiteral("monaSphere live → virtual display (place)"));
+             session_keep
+                 ? (force_fullscreen
+                        ? QStringLiteral("monaSphere live → Force fullscreen on Virtual")
+                        : QStringLiteral("monaSphere live → maximize (no FS) on Virtual"))
+                 : QStringLiteral("monaSphere live → virtual display (place)"));
   // Match --class=monaSphereYT only. Never match a normal browser caption — that would
   // Force-screen the user's already-open Chrome tab onto the virtual display.
   s.setValue(QStringLiteral("wmclass"), QStringLiteral("monaSphereYT"));
@@ -274,7 +278,7 @@ bool installTempWindowRule(int screen_index, bool session_keep, QString* error_o
   s.setValue(QStringLiteral("screen"), screen_index);
   s.setValue(QStringLiteral("screenrule"), 2);  // Force → Virtual-*
   if (session_keep) {
-    // Session: always Force fullscreen / noborder (not only --start-fullscreen).
+    // Session: Chrome Force fullscreen; Firefox maximize only (FS+video FS = 2× on Wayland 200%).
     s.setValue(QStringLiteral("minimize"), false);
     s.setValue(QStringLiteral("minimizerule"), 0);
   } else {
@@ -282,8 +286,22 @@ bool installTempWindowRule(int screen_index, bool session_keep, QString* error_o
     s.setValue(QStringLiteral("minimize"), true);
     s.setValue(QStringLiteral("minimizerule"), 1);  // Apply Initially
   }
-  s.setValue(QStringLiteral("fullscreen"), true);
-  s.setValue(QStringLiteral("fullscreenrule"), 2);  // Force
+  if (force_fullscreen) {
+    s.setValue(QStringLiteral("fullscreen"), true);
+    s.setValue(QStringLiteral("fullscreenrule"), 2);  // Force
+    s.remove(QStringLiteral("maximizehoriz"));
+    s.remove(QStringLiteral("maximizehorizrule"));
+    s.remove(QStringLiteral("maximizevert"));
+    s.remove(QStringLiteral("maximizevertrule"));
+  } else {
+    // Keep compositor fullscreen OFF so in-page YouTube FS is not double-scaled.
+    s.setValue(QStringLiteral("fullscreen"), false);
+    s.setValue(QStringLiteral("fullscreenrule"), 2);  // Force not-fullscreen
+    s.setValue(QStringLiteral("maximizehoriz"), true);
+    s.setValue(QStringLiteral("maximizehorizrule"), 2);
+    s.setValue(QStringLiteral("maximizevert"), true);
+    s.setValue(QStringLiteral("maximizevertrule"), 2);
+  }
   s.setValue(QStringLiteral("noborder"), true);
   s.setValue(QStringLiteral("noborderrule"), 2);  // Force
   s.setValue(QStringLiteral("skiptaskbar"), true);
@@ -297,8 +315,8 @@ bool installTempWindowRule(int screen_index, bool session_keep, QString* error_o
     return false;
   }
   kwinReconfigure();
-  VRP_LOG("kwin-place: installed Window Rule '%s' Force screen=%d fullscreen noborder keep=%d",
-          kTempRuleId, screen_index, session_keep ? 1 : 0);
+  VRP_LOG("kwin-place: installed Window Rule '%s' Force screen=%d fs=%d noborder keep=%d",
+          kTempRuleId, screen_index, force_fullscreen ? 1 : 0, session_keep ? 1 : 0);
   return true;
 }
 
@@ -390,12 +408,14 @@ QString jsHelpers() {
       "  } catch (e) { print('monaSphere report failed: ' + e); }\n"
       "}\n"
       "function isChrome(w) {\n"
+      "  // Live browser window (Chrome/Chromium/Firefox + monaSphereYT class).\n"
       "  const rc = (w.resourceClass || '').toLowerCase();\n"
       "  const rn = (w.resourceName || '').toLowerCase();\n"
       "  if (rc.indexOf('monasphereyt') >= 0 || rn.indexOf('monasphereyt') >= 0) return true;\n"
       "  if (rn.indexOf('crx_') === 0) return true;\n"
       "  if (rc.indexOf('chrome') >= 0 || rc.indexOf('chromium') >= 0) return true;\n"
       "  if (rn.indexOf('chrome') >= 0 || rn.indexOf('chromium') >= 0) return true;\n"
+      "  if (rc.indexOf('firefox') >= 0 || rn.indexOf('firefox') >= 0) return true;\n"
       "  return false;\n"
       "}\n"
       "function isOurs(w) {\n"
@@ -437,8 +457,10 @@ QString jsHelpers() {
       "  }\n"
       "  return -1;\n"
       "}\n"
-      // Chrome live: minimize while moving, then force compositor fullscreen.
+      // Live browser: minimize while moving, then FS (Chrome) or maximize (Firefox).
+      // kLiveForceFullscreen is set by the arm/move script (default true).
       "function placeOnOutput(w, targetOut) {\n"
+      "  const forceFs = (typeof kLiveForceFullscreen === 'undefined') ? true : !!kLiveForceFullscreen;\n"
       "  try {\n"
       "    w.fullScreen = false;\n"
       "    w.minimized = true;\n"
@@ -458,12 +480,20 @@ QString jsHelpers() {
       "    w.skipSwitcher = true;\n"
       "    w.minimized = false;\n"
       "    try { w.noBorder = true; } catch (eNb) {}\n"
-      "    w.fullScreen = true;\n"
+      "    if (forceFs) {\n"
+      "      w.fullScreen = true;\n"
+      "    } else if (typeof workspace.setMaximize === 'function') {\n"
+      "      workspace.setMaximize(w, true, true);\n"
+      "    }\n"
       "    if (typeof workspace.sendClientToScreen === 'function')\n"
       "      workspace.sendClientToScreen(w, targetOut);\n"
       "    try { w.output = targetOut; } catch (eO2) {}\n"
       "    try { w.noBorder = true; } catch (eNb2) {}\n"
-      "    w.fullScreen = true;\n"
+      "    if (forceFs) {\n"
+      "      w.fullScreen = true;\n"
+      "    } else if (typeof workspace.setMaximize === 'function') {\n"
+      "      workspace.setMaximize(w, true, true);\n"
+      "    }\n"
       "    return true;\n"
       "  } catch (e) { print(e); return false; }\n"
       "}\n"
@@ -549,6 +579,8 @@ struct ArmState {
   QTemporaryDir* script_dir = nullptr;
   bool rule_installed = false;
   int rule_screen_index = -1;
+  /** false for Firefox: compositor FS + YouTube FS double-scales at 200%. */
+  bool force_fullscreen = true;
   QStringList exclude_ids;
   QString output_substr;
   ~ArmState() {
@@ -600,11 +632,13 @@ void disarmLocked(bool keep_fullscreen_rule) {
   if (!arm().rule_installed) return;
   if (keep_fullscreen_rule && arm().rule_screen_index >= 0) {
     QString err;
-    if (installTempWindowRule(arm().rule_screen_index, /*session_keep=*/true, &err)) {
-      VRP_LOG("kwin-place: kept Force fullscreen rule (screen=%d)", arm().rule_screen_index);
+    if (installTempWindowRule(arm().rule_screen_index, /*session_keep=*/true, &err,
+                              arm().force_fullscreen)) {
+      VRP_LOG("kwin-place: kept live window rule (screen=%d fs=%d)", arm().rule_screen_index,
+              arm().force_fullscreen ? 1 : 0);
       return;
     }
-    VRP_LOG("kwin-place: keep fullscreen rule failed (%s) — removing", err.toUtf8().constData());
+    VRP_LOG("kwin-place: keep live window rule failed (%s) — removing", err.toUtf8().constData());
   }
   removeTempWindowRule();
   arm().rule_installed = false;
@@ -933,7 +967,7 @@ QStringList KwinWindowPlacer::list_all_window_ids(QString* error_out) {
 
 bool KwinWindowPlacer::arm_place_on_open(const QString& output_substr,
                                          const QStringList& exclude_ids, QString* error_out,
-                                         int screen_index) {
+                                         int screen_index, bool force_compositor_fullscreen) {
   if (output_substr.isEmpty()) {
     if (error_out) *error_out = QStringLiteral("empty output");
     return false;
@@ -943,6 +977,7 @@ bool KwinWindowPlacer::arm_place_on_open(const QString& output_substr,
   {
     QMutexLocker lock(&arm().mu);
     disarmLocked(/*keep_fullscreen_rule=*/false);
+    arm().force_fullscreen = force_compositor_fullscreen;
   }
 
   if (!placeHub().ok) {
@@ -956,7 +991,8 @@ bool KwinWindowPlacer::arm_place_on_open(const QString& output_substr,
   if (screen_idx < 0) screen_idx = queryOutputIndex(output_substr, &idx_err);
   if (screen_idx >= 0) {
     QString rule_err;
-    if (installTempWindowRule(screen_idx, /*session_keep=*/false, &rule_err)) {
+    if (installTempWindowRule(screen_idx, /*session_keep=*/false, &rule_err,
+                              force_compositor_fullscreen)) {
       rule_ok = true;
     } else {
       VRP_LOG("kwin-place: Window Rule install failed: %s", rule_err.toUtf8().constData());
@@ -971,6 +1007,8 @@ bool KwinWindowPlacer::arm_place_on_open(const QString& output_substr,
   // windowAdded + QTimer scan — XWayland Chrome often maps after the signal, or
   // with an empty class on the first tick; polling catches it within ~1s.
   const QString script =
+      QStringLiteral("const kLiveForceFullscreen = %1;\n")
+          .arg(force_compositor_fullscreen ? QStringLiteral("true") : QStringLiteral("false")) +
       jsHelpers() +
       QStringLiteral(
           "const outNeedle = '%1'.toLowerCase();\n"
@@ -1390,11 +1428,18 @@ bool KwinWindowPlacer::move_youtube_to_output(const QString& output_substr,
     if (error_out) *error_out = QStringLiteral("empty output");
     return false;
   }
+  bool force_fs = true;
+  {
+    QMutexLocker lock(&arm().mu);
+    force_fs = arm().force_fullscreen;
+  }
   BusGuard guard;
   // Preserve an in-flight arm ok: — clearing it raced with windowAdded reports.
   const QString prior = placeHub().reporter.last;
   if (!prior.startsWith(QLatin1String("ok:"))) guard.clearLast();
   const QString script =
+      QStringLiteral("const kLiveForceFullscreen = %1;\n")
+          .arg(force_fs ? QStringLiteral("true") : QStringLiteral("false")) +
       jsHelpers() +
       QStringLiteral(
           "const outNeedle = '%1'.toLowerCase();\n"
@@ -1530,63 +1575,77 @@ bool KwinWindowPlacer::close_youtube_window(QString* error_out) {
   return guard.last().startsWith(QLatin1String("closed"));
 }
 
-bool KwinWindowPlacer::activate_youtube_window(const QString& internal_id, QString* error_out) {
+bool KwinWindowPlacer::activate_youtube_window(const QString& internal_id, QString* error_out,
+                                               bool force_compositor_fullscreen) {
   BusGuard guard;
   guard.clearLast();
-  QString script;
+  const QString apply_fs =
+      force_compositor_fullscreen
+          ? QStringLiteral("    target.fullScreen = true;\n")
+          : QStringLiteral(
+                "    target.fullScreen = false;\n"
+                "    if (typeof workspace.setMaximize === 'function')\n"
+                "      workspace.setMaximize(target, true, true);\n");
+  QString script = QStringLiteral("const kLiveForceFullscreen = %1;\n")
+                       .arg(force_compositor_fullscreen ? QStringLiteral("true")
+                                                        : QStringLiteral("false")) +
+                   jsHelpers();
   if (!internal_id.isEmpty()) {
-    script = jsHelpers() + QStringLiteral(
-                 "const want = '%1';\n"
-                 "const wins = (typeof workspace.windowList === 'function')\n"
-                 "    ? workspace.windowList() : workspace.windowList;\n"
-                 "let ok = false;\n"
-                 "for (let i = 0; i < wins.length; ++i) {\n"
-                 "  const w = wins[i];\n"
-                 "  if (!w || w.deleted) continue;\n"
-                 "  if (String(w.internalId) !== want) continue;\n"
-                 "  try {\n"
-                 "    w.minimized = false;\n"
-                 "    try { w.noBorder = true; } catch (eNb) {}\n"
-                 "    w.fullScreen = true;\n"
-                 "    if (typeof workspace.activateWindow === 'function') workspace.activateWindow(w);\n"
-                 "    else workspace.activeWindow = w;\n"
-                 "    try { w.noBorder = true; } catch (eNb2) {}\n"
-                 "    w.fullScreen = true;\n"
-                 "    ok = true;\n"
-                 "  } catch (e) { print(e); }\n"
-                 "  break;\n"
-                 "}\n"
-                 "report(ok ? 'activated' : 'fail:not-found');\n")
-                 .arg(jsEscape(internal_id));
+    script += QStringLiteral(
+                  "const want = '%1';\n"
+                  "const wins = (typeof workspace.windowList === 'function')\n"
+                  "    ? workspace.windowList() : workspace.windowList;\n"
+                  "let ok = false;\n"
+                  "for (let i = 0; i < wins.length; ++i) {\n"
+                  "  const w = wins[i];\n"
+                  "  if (!w || w.deleted) continue;\n"
+                  "  if (String(w.internalId) !== want) continue;\n"
+                  "  try {\n"
+                  "    const target = w;\n"
+                  "    target.minimized = false;\n"
+                  "    try { target.noBorder = true; } catch (eNb) {}\n"
+                  "%2"
+                  "    if (typeof workspace.activateWindow === 'function') workspace.activateWindow(target);\n"
+                  "    else workspace.activeWindow = target;\n"
+                  "    try { target.noBorder = true; } catch (eNb2) {}\n"
+                  "%2"
+                  "    ok = true;\n"
+                  "  } catch (e) { print(e); }\n"
+                  "  break;\n"
+                  "}\n"
+                  "report(ok ? 'activated' : 'fail:not-found');\n")
+                  .arg(jsEscape(internal_id), apply_fs);
   } else {
-    script = jsHelpers() + QStringLiteral(
-                 "const wins = (typeof workspace.windowList === 'function')\n"
-                 "    ? workspace.windowList() : workspace.windowList;\n"
-                 "let best = null;\n"
-                 "let bestScore = -1;\n"
-                 "for (let i = wins.length - 1; i >= 0; --i) {\n"
-                 "  const w = wins[i];\n"
-                 "  if (!w || w.deleted || !isOurs(w)) continue;\n"
-                 "  const rn = (w.resourceName || '').toLowerCase();\n"
-                 "  const rc = (w.resourceClass || '').toLowerCase();\n"
-                 "  let score = wins.length - i;\n"
-                 "  if (rc.indexOf('monasphereyt') >= 0 || rn.indexOf('monasphereyt') >= 0) score += 100000;\n"
-                 "  if (rn.indexOf('crx_') === 0) score += 80000;\n"
-                 "  if (score > bestScore) { bestScore = score; best = w; }\n"
-                 "}\n"
-                 "if (!best) { report('fail:no-window'); }\n"
-                 "else {\n"
-                 "  try {\n"
-                 "    best.minimized = false;\n"
-                 "    try { best.noBorder = true; } catch (eNb) {}\n"
-                 "    best.fullScreen = true;\n"
-                 "    if (typeof workspace.activateWindow === 'function') workspace.activateWindow(best);\n"
-                 "    else workspace.activeWindow = best;\n"
-                 "    try { best.noBorder = true; } catch (eNb2) {}\n"
-                 "    best.fullScreen = true;\n"
-                 "    report('activated:' + String(best.internalId));\n"
-                 "  } catch (e) { report('fail:exception'); }\n"
-                 "}\n");
+    script += QStringLiteral(
+                  "const wins = (typeof workspace.windowList === 'function')\n"
+                  "    ? workspace.windowList() : workspace.windowList;\n"
+                  "let best = null;\n"
+                  "let bestScore = -1;\n"
+                  "for (let i = wins.length - 1; i >= 0; --i) {\n"
+                  "  const w = wins[i];\n"
+                  "  if (!w || w.deleted || !isOurs(w)) continue;\n"
+                  "  const rn = (w.resourceName || '').toLowerCase();\n"
+                  "  const rc = (w.resourceClass || '').toLowerCase();\n"
+                  "  let score = wins.length - i;\n"
+                  "  if (rc.indexOf('monasphereyt') >= 0 || rn.indexOf('monasphereyt') >= 0) score += 100000;\n"
+                  "  if (rn.indexOf('crx_') === 0) score += 80000;\n"
+                  "  if (score > bestScore) { bestScore = score; best = w; }\n"
+                  "}\n"
+                  "if (!best) { report('fail:no-window'); }\n"
+                  "else {\n"
+                  "  try {\n"
+                  "    const target = best;\n"
+                  "    target.minimized = false;\n"
+                  "    try { target.noBorder = true; } catch (eNb) {}\n"
+                  "%1"
+                  "    if (typeof workspace.activateWindow === 'function') workspace.activateWindow(target);\n"
+                  "    else workspace.activeWindow = target;\n"
+                  "    try { target.noBorder = true; } catch (eNb2) {}\n"
+                  "%1"
+                  "    report('activated:' + String(best.internalId));\n"
+                  "  } catch (e) { report('fail:exception'); }\n"
+                  "}\n")
+                  .arg(apply_fs);
   }
   if (!runScript(script, error_out)) return false;
   return guard.last().startsWith(QLatin1String("activated"));

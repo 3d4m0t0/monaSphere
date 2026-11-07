@@ -455,6 +455,8 @@ class HostWindow : public QMainWindow {
   int live_cursor_scale_ = 1;
   QString live_output_;
   bool live_chrome_default_profile_ = true;
+  /** Conf `live_browser` — chrome (default) or firefox. */
+  vrp::LiveBrowser live_browser_ = vrp::LiveBrowser::Chrome;
   /** Filled on XR thread from PipewireDmaTexture::query_sampleable_modifiers. */
   std::vector<uint64_t> live_drm_modifiers_;
 

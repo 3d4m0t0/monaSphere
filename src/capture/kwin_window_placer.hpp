@@ -40,8 +40,13 @@ class KwinWindowPlacer {
    * @param screen_index  ≥0: use this KWin screen index for the Window Rule
    *                      (from VirtualDisplayManager). -1: resolve by name.
    */
+  /**
+   * @param force_compositor_fullscreen  Chrome: true (Force FS). Firefox: false
+   *        (maximize only — Wayland 200% + browser FS + video FS double-scales).
+   */
   static bool arm_place_on_open(const QString& output_substr, const QStringList& exclude_ids,
-                                QString* error_out = nullptr, int screen_index = -1);
+                                QString* error_out = nullptr, int screen_index = -1,
+                                bool force_compositor_fullscreen = true);
 
   /**
    * Arm windowAdded / scan for desktop GUI windows. Match prefer_pids and/or

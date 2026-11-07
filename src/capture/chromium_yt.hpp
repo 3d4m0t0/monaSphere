@@ -6,14 +6,23 @@
 
 namespace vrp {
 
-/** Chromium/Chrome --app launcher for live ScreenCast capture. */
+/** Live browser backend (conf `live_browser`). */
+enum class LiveBrowser {
+  Chrome,   // Google Chrome / Chromium
+  Firefox,
+};
+
+/** Chromium/Chrome/Firefox launcher for live ScreenCast capture. */
 class ChromiumYtLauncher : public QObject {
   Q_OBJECT
  public:
   explicit ChromiumYtLauncher(QObject* parent = nullptr);
   ~ChromiumYtLauncher() override;
 
-  /** Override binary path (empty = auto-detect). */
+  void set_browser(LiveBrowser b) { browser_ = b; }
+  LiveBrowser browser() const { return browser_; }
+
+  /** Override binary path (empty = auto-detect for `browser_`). */
   void set_browser_path(const QString& path) { browser_path_ = path; }
   QString browser_path() const { return browser_path_; }
 
@@ -42,21 +51,21 @@ class ChromiumYtLauncher : public QObject {
   void set_start_minimized(bool on) { start_minimized_ = on; }
   bool start_minimized() const { return start_minimized_; }
 
-  /** Chromium --force-device-scale-factor (UI chrome size). */
+  /** Chromium --force-device-scale-factor (UI chrome size; ignored for Firefox). */
   void set_device_scale_factor(float s) { device_scale_ = (s >= 1.f && s <= 3.f) ? s : 1.f; }
   float device_scale_factor() const { return device_scale_; }
 
   /**
    * Wayland: omit --force-device-scale-factor so Chromium uses the output scale
    * (live_virtual_scale / Plasma 200% == true 2×). When false, always pass
-   * --force-device-scale-factor (needed for X11 ozone).
+   * --force-device-scale-factor (needed for X11 ozone). Firefox ignores this.
    */
   void set_follow_output_scale(bool on) { follow_output_scale_ = on; }
   bool follow_output_scale() const { return follow_output_scale_; }
 
   /**
-   * true (default): system Chrome profile (subscription logins).
-   * false: isolated ~/.config/monasphere/chromium-yt (scale always applies).
+   * true (default): system browser profile (subscription logins).
+   * false: isolated ~/.config/monasphere/chromium-yt or firefox-yt.
    */
   void set_use_default_profile(bool on) { use_default_profile_ = on; }
   bool use_default_profile() const { return use_default_profile_; }
@@ -74,14 +83,14 @@ class ChromiumYtLauncher : public QObject {
   /** Start or attach; returns false if no browser found. */
   bool start();
   /**
-   * Stop our live window. Shared (default) profile: do not kill system Chrome.
-   * Isolated: terminate the monasphere Chrome process.
+   * Stop our live window. Shared (default) profile: do not kill system browser.
+   * Isolated: terminate the monasphere browser process.
    */
   void stop();
 
-  static QString detectBrowser();
+  static QString detectBrowser(LiveBrowser kind = LiveBrowser::Chrome);
   /** Isolated profile path (live_chrome_profile=isolated). */
-  static QString profileDir();
+  static QString profileDir(LiveBrowser kind = LiveBrowser::Chrome);
   /** Default Chrome/Chromium user-data-dir if present. */
   static QString defaultUserDataDir(const QString& browser_path);
 
@@ -91,6 +100,7 @@ class ChromiumYtLauncher : public QObject {
   void failed(const QString& error);
 
  private:
+  LiveBrowser browser_ = LiveBrowser::Chrome;
   QString browser_path_;
   QString url_ = QStringLiteral("https://www.youtube.com/");
   int window_w_ = 1280;

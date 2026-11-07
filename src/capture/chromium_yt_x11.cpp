@@ -75,7 +75,7 @@ std::string window_title(Display* dpy, Window w) {
   return {};
 }
 
-bool is_chrome_family(const std::string& name, const std::string& cls) {
+bool is_browser_family(const std::string& name, const std::string& cls) {
   auto low = [](std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
@@ -83,6 +83,7 @@ bool is_chrome_family(const std::string& name, const std::string& cls) {
   const std::string a = low(name), b = low(cls);
   return a.find("chrome") != std::string::npos || a.find("chromium") != std::string::npos ||
          b.find("chrome") != std::string::npos || b.find("chromium") != std::string::npos ||
+         a.find("firefox") != std::string::npos || b.find("firefox") != std::string::npos ||
          a.find("monasphereyt") != std::string::npos || b.find("monasphereyt") != std::string::npos;
 }
 
@@ -102,11 +103,11 @@ int score_window(Display* dpy, Window w) {
   if (!get_wm_class(dpy, w, &name, &cls)) return -1;
   const std::string title = window_title(dpy, w);
   const bool ours = class_is_ours(name, cls);
-  // Prefer --class=monaSphereYT. Fallback: Chrome --app window (live) only
-  // when class was ignored by a shared singleton — still require chrome family.
-  const bool chrome = is_chrome_family(name, cls);
+  // Prefer --class=monaSphereYT. Fallback: Chrome --app / Firefox window (live)
+  // when class was ignored by a shared singleton — still require browser family.
+  const bool browser = is_browser_family(name, cls);
   const bool yt = title_is_youtube(title);
-  if (!ours && !(chrome && yt)) return -1;
+  if (!ours && !(browser && yt)) return -1;
 
   XWindowAttributes wa{};
   if (!XGetWindowAttributes(dpy, w, &wa) || wa.map_state != IsViewable) return -1;

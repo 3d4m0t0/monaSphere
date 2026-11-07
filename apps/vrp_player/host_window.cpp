@@ -1183,6 +1183,10 @@ bool monasphereConfAssignmentOk(const QString& code, bool allow_legacy) {
   if (confKeyIs(code, QStringLiteral("live_chrome_profile"), &v))
     return v.compare(QLatin1String("default"), Qt::CaseInsensitive) == 0 ||
            v.compare(QLatin1String("isolated"), Qt::CaseInsensitive) == 0;
+  if (confKeyIs(code, QStringLiteral("live_browser"), &v))
+    return confOneOf(v, {QLatin1String("chrome"), QLatin1String("chromium"),
+                         QLatin1String("firefox")},
+                     /*ignore_case=*/true);
   if (confKeyIs(code, QStringLiteral("last_dir"), &v)) return !v.isEmpty();
   if (confKeyIs(code, QStringLiteral("geometry"), &v)) return !v.isEmpty();
   if (confKeyIs(code, QStringLiteral("modes"), &v)) {
@@ -1939,6 +1943,12 @@ void HostWindow::loadAppConf() {
       const QString v = line.mid(19).trimmed().toLower();
       live_chrome_default_profile_ = (v != QLatin1String("isolated"));
     }
+    } else if (line.startsWith(QStringLiteral("live_browser="))) {
+      const QString v = line.mid(13).trimmed().toLower();
+      if (v == QLatin1String("firefox"))
+        live_browser_ = vrp::LiveBrowser::Firefox;
+      else
+        live_browser_ = vrp::LiveBrowser::Chrome;
   }
   user.close();
   // Shipped defaults moved. A different saved value is left as edited.
@@ -2804,6 +2814,12 @@ void HostWindow::reloadLiveCaptureConf() {
       const QString v = line.mid(19).trimmed().toLower();
       live_chrome_default_profile_ = (v != QLatin1String("isolated"));
     }
+    } else if (line.startsWith(QStringLiteral("live_browser="))) {
+      const QString v = line.mid(13).trimmed().toLower();
+      if (v == QLatin1String("firefox"))
+        live_browser_ = vrp::LiveBrowser::Firefox;
+      else
+        live_browser_ = vrp::LiveBrowser::Chrome;
   }
   syncTokensIntoManager();
 }
@@ -2877,6 +2893,8 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   cfg.chrome_scale = live_chrome_scale_;
   cfg.use_default_chrome_profile = live_chrome_default_profile_;
   // Flat live: Chrome/[アプリ] → monaSphereYt → monitor → Soft 4.0 (same as file 2ch).
+  cfg.browser = live_browser_;
+  // Flat live: browser/[アプリ] → monaSphereYt → monitor → Soft 4.0 (same as file 2ch).
   cfg.enable_audio = true;
   cfg.drm_modifiers = live_drm_modifiers_;
   appendLog(tr("Live audio: Soft HRTF 4.0 (monaSphereYt -> side-diff, surround_gain=%1)")
@@ -2885,9 +2903,12 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
     appendLog(tr("ScreenCast: announcing %1 Vulkan-sampleable DRM modifier(s)")
                   .arg(live_drm_modifiers_.size()));
   }
-  if (cfg.exec.isEmpty() && live_chrome_default_profile_) {
-    appendLog(tr("Chrome: using default profile (logins/cookies)"));
-  }
+  if (cfg.exec.isEmpty()) {
+    const QString browser_name =
+        live_browser_ == vrp::LiveBrowser::Firefox ? tr("Firefox") : tr("Chrome");
+    appendLog(tr("Live browser: %1 (%2)")
+                  .arg(browser_name, live_chrome_default_profile_ ? tr("default profile")
+                                                                 : tr("isolated profile")));
   if (host_setup) {
     appendLog(tr("Live setup — pick %1, enable Remember/allow restore, "
                  "then capture will stop and Chrome will close")

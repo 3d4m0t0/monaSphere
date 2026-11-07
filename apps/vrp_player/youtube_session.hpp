@@ -80,6 +80,8 @@ class YouTubeSession : public QObject {
      */
     float chrome_scale = 1.f;
     bool use_default_chrome_profile = true;
+    /** Conf `live_browser` — Chrome/Chromium (default) or Firefox. */
+    LiveBrowser browser = LiveBrowser::Chrome;
     /** When true, HostWindow may start Flat live audio after streaming. */
     bool enable_audio = false;
     /** Vulkan-sampleable DRM modifiers for PipeWire DMA-BUF EnumFormat (LINEAR min). */

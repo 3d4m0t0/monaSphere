@@ -502,6 +502,7 @@ void YouTubeSession::start(const Config& cfg) {
       std::abs(cfg_.chrome_scale - 1.f) < 0.05f) {
     chrome_dsf = cfg_.virtual_scale;
   }
+  chrome_->set_browser(cfg_.browser);
   chrome_->set_device_scale_factor(chrome_dsf);
   // Omit --force-device-scale-factor on Wayland so Chromium uses the output scale.
   const bool follow_out = !ozone_x11 && std::abs(cfg_.chrome_scale - 1.f) < 0.05f;
@@ -532,10 +533,14 @@ void YouTubeSession::start(const Config& cfg) {
                         .arg(QString::number(static_cast<double>(cfg_.virtual_scale), 'f', 2))
                         .arg(QString::number(static_cast<double>(cfg_.chrome_scale), 'f', 2)));
   }
-  // Borderless fullscreen on the target MONITOR (KWin also sets fullScreen after place).
+  // Chrome: borderless compositor FS. Firefox: maximize only + XWayland (see launcher).
   // Top “exit fullscreen” is avoided by keeping the injected cursor Y ≥ 4 (see ChromiumYtX11).
-  chrome_->set_start_fullscreen(true);
-  chrome_->set_start_minimized(cfg_.virtual_display && desk_ == DesktopEnv::Kde);
+  chrome_->set_start_fullscreen(cfg_.browser != LiveBrowser::Firefox);
+  chrome_->set_start_minimized(cfg_.virtual_display && desk_ == DesktopEnv::Kde &&
+                               cfg_.browser != LiveBrowser::Firefox);
+  if (cfg_.browser == LiveBrowser::Firefox) {
+    emit logMessage(tr("Firefox Live: --new-instance + XWayland; KWin maximize (no compositor FS)"));
+  }
   if (desk_ == DesktopEnv::Gnome) {
     chrome_->set_window_position(place_x_, place_y_);
     emit logMessage(tr("Live browser -> %1 (%2×%3) @%4,%5 (GNOME / window-position)")
@@ -632,15 +637,19 @@ void YouTubeSession::beginPlace() {
 
   QString arm_err;
   const int chrome_scr = vdisp_mgr_ ? vdisp_mgr_->screen_index() : -1;
+  // Firefox: do not Force compositor fullscreen — Wayland 200% + browser FS +
+  // YouTube video FS double-scales the player (Mozilla 1869724 / 1898311).
+  const bool force_fs = cfg_.browser != LiveBrowser::Firefox;
   if (!KwinWindowPlacer::arm_place_on_open(output_name_, chrome_ids_before_, &arm_err,
-                                           chrome_scr)) {
-    fail(tr("KWin place arm failed: %1 — abort (will not leave Chrome on primary)")
+                                           chrome_scr, force_fs)) {
+    fail(tr("KWin place arm failed: %1 — abort (will not leave browser on primary)")
              .arg(arm_err.isEmpty() ? tr("(no detail)") : arm_err));
     return;
   }
-  emit logMessage(tr("KWin: armed — next Chrome window -> %1 (#%2)")
+  emit logMessage(tr("KWin: armed — next browser window -> %1 (#%2, fs=%3)")
                       .arg(output_name_)
-                      .arg(chrome_scr));
+                      .arg(chrome_scr)
+                      .arg(force_fs ? 1 : 0));
 
   if (QWidget* w = qobject_cast<QWidget*>(QObject::parent())) {
     w->activateWindow();
@@ -961,7 +970,8 @@ void YouTubeSession::onPlaced() {
   x11_.set_cursor(place_w_ * 0.5f, place_h_ * 0.5f);
   if (desk_ == DesktopEnv::Kde) {
     QString act_err;
-    if (KwinWindowPlacer::activate_youtube_window(kwin_window_id_, &act_err)) {
+    const bool force_fs = cfg_.browser != LiveBrowser::Firefox;
+    if (KwinWindowPlacer::activate_youtube_window(kwin_window_id_, &act_err, force_fs)) {
       emit logMessage(tr("KWin: activated live browser for pointer input"));
     }
   }

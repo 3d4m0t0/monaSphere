@@ -28,9 +28,10 @@ live_capture=monitor
 live_virtual=1
 live_virtual_size=1280x720
 live_virtual_scale=2     # 1.0–3.0 — krfb Virtual MONITOR scale (2 = 200%)
-live_chrome_scale=1      # Chromium --force-device-scale-factor (keep 1 when Virtual is scaled)
+live_browser=chrome      # chrome|chromium|firefox — Live URL browser (default chrome)
+live_chrome_scale=1      # Chromium --force-device-scale-factor (keep 1 when Virtual is scaled; Firefox ignores)
 live_cursor_scale=1      # 1–6 stick cursor gain (exponential curve; lower = slower)
-live_chrome_profile=default  # default = system Chrome logins; isolated = monasphere profile
+live_chrome_profile=default  # default = system browser logins; isolated = monasphere profile
 # FSR1 for browser Live only (not [アプリ] / not file UI). 0=Off 1=UQ 2=Q 3=P (default).
 # □ / X (menus closed) cycles Off→UQ→Q→P and writes this key. File FSR stays preferred_fsr / UI.
 live_fsr=3
@@ -65,13 +66,30 @@ again. Conf is re-read on each setup/HMD start.
 If the host portal reports `AvailableCursorModes=0` (no Embedded DE cursor in
 the stream), Flat draws a software stick cursor so the pointer stays visible.
 
-`live_chrome_profile=default` uses the normal Chrome profile (subscription logins).
-Stop closes only the app window — it does not quit Chrome.
+`live_browser=chrome` (default) launches Chrome/Chromium with `--app=`.
+`live_browser=firefox` launches Firefox (`--new-window` / `--profile` when isolated).
+Both try `--class=monaSphereYT` so KWin can place the Live window.
+
+Firefox on a 200% Virtual (`live_virtual_scale=2`) hits a Wayland bug when the browser
+is compositor-fullscreen and YouTube then goes fullscreen (player ~2×). Live therefore:
+- starts Firefox with `--new-instance` (so `--class` / env are not dropped by remoting)
+- sets `MOZ_ENABLE_WAYLAND=0` (XWayland; the bug is Wayland-only)
+- uses KWin maximize + noborder instead of Force fullscreen
+
+If system Firefox is already open and `live_chrome_profile=default`, Live falls back to
+the isolated profile (`~/.config/monasphere/firefox-yt`) so a real second instance can
+start — quit Firefox first to use system logins. Chrome still Force-fullscreen.
+
+`live_chrome_profile=default` uses the normal browser profile (subscription logins).
+Stop closes only the Live window — it does not quit the system browser.
 
 `live_chrome_scale` (`--force-device-scale-factor`) is ignored when a system Chrome is
-already running (singleton). Prefer `live_virtual_scale` for size, or set
-`live_chrome_profile=isolated` (separate logins in `~/.config/monasphere/chromium-yt`)
-when device-scale must apply every launch.
+already running (singleton), and is unused for Firefox. Prefer `live_virtual_scale`
+for size, or set `live_chrome_profile=isolated` (Chrome:
+`~/.config/monasphere/chromium-yt`; Firefox: `~/.config/monasphere/firefox-yt`)
+when a dedicated profile must apply every launch.
+
+TODO (later): expose conf keys such as `live_browser` in the host UI.
 
 Legacy `youtube_*` keys are renamed to `live_*` on startup (and
 `Virtual-monaSphereYT` → `Virtual-monaSphere`; restore token is cleared when the
@@ -287,9 +305,10 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 | `live_virtual` | `1` = app starts/stops `krfb-virtualmonitor` (KDE Wayland only) |
 | `live_virtual_size` | e.g. `1280x720` (managed virtual output `Virtual-monaSphere`) |
 | `live_virtual_scale` | `1.0`–`3.0` Virtual MONITOR scale (default `2` = 200%) |
-| `live_chrome_scale` | `1.0`–`3.0` Chromium device scale (default `1`) |
+| `live_browser` | `chrome` / `chromium` (default) or `firefox` |
+| `live_chrome_scale` | `1.0`–`3.0` Chromium device scale (default `1`; Firefox ignores) |
 | `live_cursor_scale` | `1`–`6` stick/D-pad gain (default `1`; base speed scales with `live_virtual_size`) |
-| `live_chrome_profile` | `default` (system logins) or `isolated` (scale always applies) |
+| `live_chrome_profile` | `default` (system logins) or `isolated` (monaSphere profile) |
 | `live_output` | Output name substring for Chromium placement |
 | `live_restore_token` | ScreenCast Remember token for `Virtual-monaSphere` (shared by all spans) |
 | `live_setup_spans` | Kept for compat; setup always authenticates once at x1 size |
