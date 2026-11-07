@@ -118,9 +118,10 @@ class KwinWindowPlacer {
 
   static bool close_window_by_id(const QString& internal_id, QString* error_out = nullptr);
   static bool close_youtube_window(QString* error_out = nullptr);
-  /** Raise + activate the live Chrome window so pointer/scroll reach it. */
+  /** Raise + activate the live browser window so pointer/scroll reach it. */
   static bool activate_youtube_window(const QString& internal_id = {},
-                                      QString* error_out = nullptr);
+                                      QString* error_out = nullptr,
+                                      bool force_compositor_fullscreen = true);
   /**
    * Close Chrome-family windows whose internalId is not in keep_ids.
    * Used when place fails so a default-profile --new-window does not linger

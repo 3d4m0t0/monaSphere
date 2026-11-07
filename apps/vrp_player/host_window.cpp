@@ -1942,13 +1942,13 @@ void HostWindow::loadAppConf() {
     } else if (line.startsWith(QStringLiteral("live_chrome_profile="))) {
       const QString v = line.mid(19).trimmed().toLower();
       live_chrome_default_profile_ = (v != QLatin1String("isolated"));
-    }
     } else if (line.startsWith(QStringLiteral("live_browser="))) {
       const QString v = line.mid(13).trimmed().toLower();
       if (v == QLatin1String("firefox"))
         live_browser_ = vrp::LiveBrowser::Firefox;
       else
         live_browser_ = vrp::LiveBrowser::Chrome;
+    }
   }
   user.close();
   // Shipped defaults moved. A different saved value is left as edited.
@@ -2813,13 +2813,13 @@ void HostWindow::reloadLiveCaptureConf() {
     } else if (line.startsWith(QStringLiteral("live_chrome_profile="))) {
       const QString v = line.mid(19).trimmed().toLower();
       live_chrome_default_profile_ = (v != QLatin1String("isolated"));
-    }
     } else if (line.startsWith(QStringLiteral("live_browser="))) {
       const QString v = line.mid(13).trimmed().toLower();
       if (v == QLatin1String("firefox"))
         live_browser_ = vrp::LiveBrowser::Firefox;
       else
         live_browser_ = vrp::LiveBrowser::Chrome;
+    }
   }
   syncTokensIntoManager();
 }
@@ -2909,6 +2909,7 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
     appendLog(tr("Live browser: %1 (%2)")
                   .arg(browser_name, live_chrome_default_profile_ ? tr("default profile")
                                                                  : tr("isolated profile")));
+  }
   if (host_setup) {
     appendLog(tr("Live setup — pick %1, enable Remember/allow restore, "
                  "then capture will stop and Chrome will close")

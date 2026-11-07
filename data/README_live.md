@@ -1,14 +1,15 @@
-# Live browser via Chromium + PipeWire ScreenCast
+# Live browser via Chrome / Firefox + PipeWire ScreenCast
 
 monaSphere can show web video services (`live_app` URLs) by capturing a
-**dedicated display output** (preferred) or a Chromium window through
+**dedicated display output** (preferred) or a browser window through
 **xdg-desktop-portal ScreenCast** + **PipeWire**, then uploading RGBA frames to
-the Flat screen.
+the Flat screen. Choose the browser with `live_browser=chrome|firefox`
+(default chrome).
 
 ## Recommended: dedicated monitor (virtual or spare)
 
-Host desktop stays clean: put Chromium fullscreen on a second / virtual output and
-cast **that MONITOR** into the HMD.
+Host desktop stays clean: put the Live browser fullscreen on a second / virtual
+output and cast **that MONITOR** into the HMD.
 
 ### KDE Plasma (this project’s usual host)
 
