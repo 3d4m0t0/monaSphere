@@ -47,6 +47,10 @@ class SceneRenderer {
   void queue_texture(VkImageView view, VkSampler sampler);
   void queue_texture_gamma(VkImageView view, VkSampler sampler);
   void queue_nv12_texture(VkImageView y, VkImageView uv, VkSampler sampler, bool full_range = false);
+  /** Optional Live CPU stamp applied with the next flush_queued_texture(). */
+  void set_queued_tex_debug(uint64_t seq, uint64_t fp, int slot);
+  /** True once per flush that carried a debug stamp (XR thread after render_frame). */
+  bool take_flushed_tex_debug(uint64_t& seq, uint64_t& fp, int& slot);
   /** HUD atlas (RGBA). Empty view clears overlay. */
   void set_hud_texture(VkImageView view, VkSampler sampler, bool visible);
   /**
@@ -232,6 +236,14 @@ class SceneRenderer {
   bool rgba_gamma_ = false;  // FSR / CPU video: gamma RGB needing srgb_to_linear
   enum class QueuedTex : uint8_t { None, Rgba, RgbaGamma, Nv12 };
   QueuedTex queued_tex_ = QueuedTex::None;
+  bool queued_dbg_valid_ = false;
+  uint64_t queued_dbg_seq_ = 0;
+  uint64_t queued_dbg_fp_ = 0;
+  int queued_dbg_slot_ = -1;
+  bool flushed_dbg_pending_ = false;
+  uint64_t flushed_dbg_seq_ = 0;
+  uint64_t flushed_dbg_fp_ = 0;
+  int flushed_dbg_slot_ = -1;
   VkImageView queued_y_ = VK_NULL_HANDLE;
   VkImageView queued_uv_ = VK_NULL_HANDLE;
   VkSampler queued_samp_ = VK_NULL_HANDLE;

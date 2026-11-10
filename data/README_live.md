@@ -130,17 +130,76 @@ Plug any panel (or run `krfb-virtualmonitor` yourself), set its mode in
 
 ### GNOME (Wayland)
 
-Managed `krfb-virtualmonitor` is **KDE-only**. On GNOME:
+monaSphere detects `XDG_CURRENT_DESKTOP` and branches:
 
-1. Set `live_virtual=0` and point `live_output=` at a spare MONITOR name
-   substring (from Settings → Displays), **or** use window capture below.
-2. **Tools → Set up live capture…** — monaSphere uses portal
-   **RemoteDesktop + ScreenCast** so you get a screen/window picker **and**
-   pointer inject via `ConnectToEIS` (libei). Approve both remote-control and
-   the chosen MONITOR; enable Remember when offered.
-3. Stick cursor uses the Embedded compositor cursor inside the capture.
+#### Managed virtual (`live_virtual=1`, recommended)
 
-Do not leave `live_virtual=1` on GNOME — setup fails with a clear log message.
+Uses portal **RemoteDesktop + ScreenCast** with source type **VIRTUAL**
+(Mutter `RecordVirtual` via xdg-desktop-portal-gnome). Unlike Plasma (krfb
+creates `Virtual-*` first), Meta-* appears only **after** PipeWire negotiates
+size on `Start`.
+
+Procedure (portal + Mutter; KDE-parity goal — Virtual creation differs):
+
+1. Install `xdg-desktop-portal-gnome` (and a current GNOME / Mutter).
+2. Leave `live_virtual=1` (same conf as Plasma).
+3. **Tools → Set up live capture…** — approve **remote control / virtual
+   monitor** (no monitor list). Enable Remember when offered.
+4. Meta-* stream → HMD shows the virtual wallpaper. Portal grant dialogs are
+   moved off Meta-* onto the **primary** (they must not stay in the capture).
+5. HMD pointer uses a **software stick cursor** (`cursor_mode=Hidden` + Flat
+   overlay), not the desktop arrow — intentional while Embedded trails/flicker
+   on VIRTUAL. Pad **clicks** stay disabled briefly until evacuate settles.
+6. After Meta-* appears, Chrome (isolated X11) is placed onto Meta with
+   `_NET_WM_FULLSCREEN_MONITORS` — that paint keeps the SHM stream alive.
+
+**GNOME Virtual (monaSphere path):** call Mutter directly —
+
+1. `org.gnome.Mutter.ScreenCast.CreateSession`
+2. `RecordVirtual({is-platform: true, cursor-mode: hidden})` — **required**;
+   xdg-desktop-portal-gnome omits `is-platform` (defaults false). Non-platform
+   Meta shows in XRandR but XWayland/Chrome often never composites into the
+   stream (wallpaper-only HMD).
+3. `ScreenCast.Start` → `PipeWireStreamAdded`
+4. `Mutter.RemoteDesktop` CreateSession/Start/`ConnectToEIS`
+5. Connect default PipeWire socket to the node (SHM for Meta)
+6. Place Chrome on Meta-0; enable EIS
+
+**Portal RD+SC VIRTUAL** (not used for monaSphere GNOME virtual anymore; kept
+for reference / spare MONITOR):
+
+1. `RemoteDesktop.CreateSession` → `SelectDevices` → `SelectSources(VIRTUAL)` →
+   `Start` → `ConnectToEIS` — portal never sets `is-platform`.
+
+**Must I approve remote control every time?** Not always — a valid
+`restore_token` can make `Start` succeed silently (`restore=yes`,
+`Start Response=0`). When GNOME cannot restore (token spent, VIRTUAL source
+gone, permission revoked), the live grant UI appears again. If that UI opens
+on Meta-*, it is visible in the HMD and pad/EIS can operate it; X11 evacuate
+cannot move gnome-shell Wayland surfaces.
+
+Teardown evacuates windows from Meta before `Session.Close` (Mutter can log
+you out if a window still references a removed logical monitor).
+
+**Capture / DMA research (GNOME VIRTUAL):**
+
+| Source | Finding |
+|--------|---------|
+| [Fjarr ADR 0041](https://fjarr.io/adr/0041-desktop-capture-dmabuf/) | **Meta- / RecordVirtual → prefer SHM**; virtual monitors have no KMS CRTC, DMA-BUF path not validated. Physical monitors: DMA-BUF + hold until consumer done. |
+| [WebRTC SharedScreenCastStream](https://webrtc.googlesource.com/src) | Dequeue (keep newest), **ProcessBuffer, `queue_buffer` in the same `on_process`**. DMA via EGL import+readback on discrete GPUs — never mmap tiled. |
+| [niri NVIDIA flicker](https://github.com/niri-wm/niri/issues/1432) | Screencast flicker on NVIDIA = missing frame-complete / explicit sync before reuse; fixed by wait-for-completion / SyncTimeline. |
+| Mutter !3876 | Producer-side `SPA_META_SyncTimeline`; consumers must wait acquire / signal release. |
+| [logical_monitor assert](https://github.com/ubuntu/Tiling-Assistant/issues/416) | Removing Meta-* while a window/extension still references it → gnome-shell ABRT → **logout**. |
+
+monaSphere therefore uses **SHM-only** for GNOME `live_virtual=1`. Teardown still moves the cursor/windows off Meta-* before `Session.Close`.
+
+#### Spare physical MONITOR (`live_virtual=0`)
+
+1. Set `live_virtual=0` and `live_output=` to a Displays name substring.
+2. Setup uses portal **RemoteDesktop + ScreenCast** MONITOR share + EIS.
+
+Package-only installs on a Plasma session do **not** exercise Mutter APIs —
+test on a GNOME Wayland session or VM.
 
 ### Fallback: window capture
 
@@ -277,8 +336,8 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
   modifiers, armed frames). First hard failure permanently falls back to CPU RGBA
   for that session (driver import-poisoning). Set nothing special to try it.
 - Capture is the **whole monitor** (or whole window). Not a single browser tab.
-- Managed virtual display needs **Plasma Wayland + krfb**. GNOME / X11 use a spare
-  MONITOR or WINDOW mode (`live_virtual=0`).
+- Managed virtual: Plasma = `krfb-virtualmonitor`; GNOME = portal **VIRTUAL** /
+  Mutter `RecordVirtual`. Spare MONITOR: `live_virtual=0` + `live_output=`.
 - Pointer: KDE uses KWin EIS; GNOME uses portal RemoteDesktop.ConnectToEIS.
 - `restore_token` behaviour differs by desktop (GNOME / KDE / wlroots).
 - DRM / EME titles that Chrome paints black stay black when captured.

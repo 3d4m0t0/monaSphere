@@ -84,8 +84,18 @@ class PipewireCapture {
    * @param consumer_modifiers DRM modifiers this process can sample (from Vulkan).
    *        Empty → LINEAR only. Do not include MOD_INVALID (forces SHM demote on NVIDIA).
    */
+  /**
+   * @param prefer_shm If true, announce MemFd/MemPtr only (no DMA-BUF modifiers).
+   *        Recommended for GNOME RecordVirtual / Meta-* — no KMS scanout; DMA-BUF
+   *        consumers commonly see stale/flicker frames (Fjarr ADR 0041, WebRTC notes).
+   */
+  /**
+   * @param pw_fd Portal OpenPipeWireRemote fd (owned). Pass -1 to connect the
+   *        default user PipeWire socket (Mutter ScreenCast node in-session).
+   */
   bool start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial = 0,
-             std::vector<uint64_t> consumer_modifiers = {}, int prefer_w = 0, int prefer_h = 0);
+             std::vector<uint64_t> consumer_modifiers = {}, int prefer_w = 0, int prefer_h = 0,
+             bool prefer_shm = false);
   void stop();
 
   bool running() const { return running_.load(std::memory_order_acquire); }
@@ -100,6 +110,19 @@ class PipewireCapture {
   /** Move latest dma-buf frame if newer than `seen_seq` (transfers FD ownership). */
   bool take_latest_dma(PipewireDmaFrame& out, uint64_t& seen_seq);
 
+  /**
+   * Return the PipeWire buffer for `seq` to the producer pool.
+   * Call after Vulkan is done with that dma-buf (slot destroyed / soft-skip).
+   * Safe from the XR thread — queued onto the PW loop.
+   */
+  void release_held_dma(uint64_t seq);
+
+  /** PW thread: track a dequeued buffer until release_held_dma(seq). */
+  void hold_pw_buffer(void* stream /* pw_stream* */, void* buf /* pw_buffer* */, uint64_t seq);
+  void flush_released(void* stream /* pw_stream* */);
+  void flush_released_on_loop();
+  void release_all_held(void* stream /* pw_stream* */);
+
   int width() const { return width_.load(std::memory_order_relaxed); }
   int height() const { return height_.load(std::memory_order_relaxed); }
 
@@ -108,7 +131,8 @@ class PipewireCapture {
 
   /** Called from PipeWire process callback. */
   void publish_frame(VideoFrame frame);
-  void publish_dma(PipewireDmaFrame frame);
+  /** Publish dma frame; returns assigned seq (also stored on the frame before move). */
+  uint64_t publish_dma(PipewireDmaFrame frame);
   void set_error_public(const std::string& e);
 
   /** Negotiated SPA video format / DRM fourcc / modifier (for logging). */
@@ -129,6 +153,7 @@ class PipewireCapture {
   std::vector<uint64_t> consumer_modifiers_;
   int prefer_w_ = 0;
   int prefer_h_ = 0;
+  bool prefer_shm_ = false;
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_{false};
   std::atomic<int> width_{0};
@@ -147,6 +172,18 @@ class PipewireCapture {
   std::string last_error_;
   mutable std::mutex status_mu_;
   std::deque<std::string> status_lines_;
+
+  struct HeldDma {
+    uint64_t seq = 0;
+    void* buf = nullptr;  // pw_buffer*
+  };
+  mutable std::mutex hold_mu_;
+  std::vector<HeldDma> held_dma_;
+  std::vector<void*> release_bufs_;  // pw_buffer* waiting to queue
+  /** Set on PW thread while loop runs; used to pw_loop_invoke flush from XR. */
+  std::atomic<void*> pw_loop_{nullptr};    // pw_loop*
+  std::atomic<void*> pw_stream_{nullptr};  // pw_stream*
+  void request_flush_released();
 };
 
 }  // namespace vrp

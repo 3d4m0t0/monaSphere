@@ -64,6 +64,13 @@ class ChromiumYtLauncher : public QObject {
   bool follow_output_scale() const { return follow_output_scale_; }
 
   /**
+   * Force Chromium --ozone-platform=x11 (GNOME place via X11 tree / window-position).
+   * Also honoured when MONASPHERE_YT_X11=1. Ignored for Firefox (already XWayland).
+   */
+  void set_force_x11(bool on) { force_x11_ = on; }
+  bool force_x11() const { return force_x11_; }
+
+  /**
    * true (default): system browser profile (subscription logins).
    * false: isolated ~/.config/monasphere/chromium-yt or firefox-yt.
    */
@@ -84,7 +91,7 @@ class ChromiumYtLauncher : public QObject {
   bool start();
   /**
    * Stop our live window. Shared (default) profile: do not kill system browser.
-   * Isolated: terminate the monasphere browser process.
+   * Isolated: terminate the monasphere browser process (+ children).
    */
   void stop();
 
@@ -93,6 +100,12 @@ class ChromiumYtLauncher : public QObject {
   static QString profileDir(LiveBrowser kind = LiveBrowser::Chrome);
   /** Default Chrome/Chromium user-data-dir if present. */
   static QString defaultUserDataDir(const QString& browser_path);
+  /**
+   * Kill every process using the monasphere isolated Live profile.
+   * GNOME Meta teardown must call this even if our QProcess already exited —
+   * zygote children left on Meta-* assert-crash gnome-shell → logout.
+   */
+  static void killIsolatedLiveBrowsers(LiveBrowser kind = LiveBrowser::Chrome);
 
  signals:
   void started();
@@ -112,6 +125,7 @@ class ChromiumYtLauncher : public QObject {
   bool start_minimized_ = false;
   float device_scale_ = 1.5f;
   bool follow_output_scale_ = false;
+  bool force_x11_ = false;
   bool use_default_profile_ = true;
   bool route_audio_to_yt_sink_ = false;
   bool shared_session_ = false;

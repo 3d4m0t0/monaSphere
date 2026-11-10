@@ -25,6 +25,8 @@ class ScreencastPortal : public QObject {
   enum class SourceKind : uint32_t {
     Monitor = 0x1,
     Window = 0x2,
+    /** New virtual MONITOR (portal → Mutter RecordVirtual on GNOME). */
+    Virtual = 0x4,
   };
 
   enum class SessionMode {

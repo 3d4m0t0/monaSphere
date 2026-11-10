@@ -1,6 +1,8 @@
 #include "video/pipewire_dma_texture.hpp"
 
 #include <drm/drm_fourcc.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -174,14 +176,16 @@ bool PipewireDmaTexture::init(VkPhysicalDevice phys, VkDevice device, VkQueue qu
 }
 
 void PipewireDmaTexture::destroy_slot(Slot& slot) {
-  if (!device_) {
-    slot = {};
-    return;
+  const uint64_t seq = slot.pw_seq;
+  if (device_) {
+    if (slot.view) vkDestroyImageView(device_, slot.view, nullptr);
+    if (slot.image) vkDestroyImage(device_, slot.image, nullptr);
+    if (slot.memory) vkFreeMemory(device_, slot.memory, nullptr);
   }
-  if (slot.view) vkDestroyImageView(device_, slot.view, nullptr);
-  if (slot.image) vkDestroyImage(device_, slot.image, nullptr);
-  if (slot.memory) vkFreeMemory(device_, slot.memory, nullptr);
   slot = {};
+  // Return the PipeWire buffer only after Vulkan dropped the import — earlier
+  // queue_buffer lets Mutter rewrite memory still sampled on the HMD.
+  if (seq != 0 && release_seq_) release_seq_(seq);
 }
 
 bool PipewireDmaTexture::dma_buf_key(int fd, uint64_t* out_key) {
@@ -198,9 +202,7 @@ void PipewireDmaTexture::reset() {
   (void)wait_fence();
   destroy_slot(slots_[0]);
   destroy_slot(slots_[1]);
-  destroy_slot(slots_[2]);
   display_slot_.store(0);
-  prev_slot_ = 0;
   valid_.store(false);
   width_ = 0;
   height_ = 0;
@@ -299,8 +301,11 @@ bool PipewireDmaTexture::modifier_ok(uint64_t modifier, VkFormat format,
   info.format = format;
   info.type = VK_IMAGE_TYPE_2D;
   info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   VkImageFormatProperties2 props{VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
+  if (vkGetPhysicalDeviceImageFormatProperties2(phys_, &info, &props) == VK_SUCCESS) return true;
+  // Some stacks reject TRANSFER_SRC on modifier images — sampled-only still ok for zero-copy.
+  info.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
   return vkGetPhysicalDeviceImageFormatProperties2(phys_, &info, &props) == VK_SUCCESS;
 }
 
@@ -330,7 +335,8 @@ bool PipewireDmaTexture::probe_handle_type(int fd, VkExternalMemoryHandleTypeFla
 
 bool PipewireDmaTexture::import_image(Slot& slot, int fd, uint64_t modifier, int width, int height,
                                       VkFormat format, bool force_opaque_alpha, VkDeviceSize offset,
-                                      VkDeviceSize row_pitch, VkDeviceSize size) {
+                                      VkDeviceSize row_pitch, VkDeviceSize size,
+                                      bool require_transfer_src) {
   destroy_slot(slot);
   if (fd < 0 || row_pitch == 0 || size == 0) {
     set_error("bad plane");
@@ -379,12 +385,19 @@ bool PipewireDmaTexture::import_image(Slot& slot, int fd, uint64_t modifier, int
   ici.arrayLayers = 1;
   ici.samples = VK_SAMPLE_COUNT_1_BIT;
   ici.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
-  ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+  // TRANSFER_SRC enables copy-out into a private OPTIMAL image (NVIDIA flicker fix).
+  ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (vkCreateImage(device_, &ici, nullptr, &slot.image) != VK_SUCCESS) {
-    // CreateImage failure is still risky on NVIDIA — abandon further attempts.
-    abandon("vkCreateImage");
-    return false;
+    if (require_transfer_src) {
+      set_error("vkCreateImage (TRANSFER_SRC)");
+      return false;
+    }
+    ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (vkCreateImage(device_, &ici, nullptr, &slot.image) != VK_SUCCESS) {
+      abandon("vkCreateImage");
+      return false;
+    }
   }
 
   VkMemoryRequirements req{};
@@ -479,11 +492,14 @@ bool PipewireDmaTexture::transition_slot(const Slot& slot) {
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   if (vkBeginCommandBuffer(cmd_, &bi) != VK_SUCCESS) return false;
 
+  // Acquire from the producer (Mutter/PipeWire) before sampling. Without the
+  // EXTERNAL ownership transfer, NVIDIA can keep sampling a buffer the
+  // compositor already recycled → flicker / dialog-frame loop / hard hang.
   VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
   b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-  b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-  b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  b.srcQueueFamilyIndex = slot.is_private ? VK_QUEUE_FAMILY_IGNORED : VK_QUEUE_FAMILY_EXTERNAL;
+  b.dstQueueFamilyIndex = slot.is_private ? VK_QUEUE_FAMILY_IGNORED : queue_family_;
   b.image = slot.image;
   b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   b.subresourceRange.levelCount = 1;
@@ -507,6 +523,207 @@ bool PipewireDmaTexture::transition_slot(const Slot& slot) {
   }
   if (qlock.owns_lock()) qlock.unlock();
   return wait_fence();
+}
+
+bool PipewireDmaTexture::ensure_private_slot(Slot& slot, int w, int h, VkFormat format,
+                                             bool force_opaque_alpha) {
+  if (slot.is_private && slot.image && slot.priv_w == w && slot.priv_h == h &&
+      slot.priv_fmt == format && slot.view) {
+    return true;
+  }
+  const uint64_t old_seq = slot.pw_seq;
+  slot.pw_seq = 0;
+  destroy_slot(slot);
+  if (old_seq != 0 && release_seq_) release_seq_(old_seq);
+
+  VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  ci.imageType = VK_IMAGE_TYPE_2D;
+  ci.format = format;
+  ci.extent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1};
+  ci.mipLevels = 1;
+  ci.arrayLayers = 1;
+  ci.samples = VK_SAMPLE_COUNT_1_BIT;
+  ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+  ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  if (vkCreateImage(device_, &ci, nullptr, &slot.image) != VK_SUCCESS) {
+    set_error("private CreateImage");
+    return false;
+  }
+  VkMemoryRequirements req{};
+  vkGetImageMemoryRequirements(device_, slot.image, &req);
+  VkPhysicalDeviceMemoryProperties mp{};
+  vkGetPhysicalDeviceMemoryProperties(phys_, &mp);
+  uint32_t mem_type = UINT32_MAX;
+  for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+    if ((req.memoryTypeBits & (1u << i)) == 0) continue;
+    if ((mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) continue;
+    mem_type = i;
+    break;
+  }
+  if (mem_type == UINT32_MAX) {
+    destroy_slot(slot);
+    set_error("private memory type");
+    return false;
+  }
+  VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  mai.allocationSize = req.size;
+  mai.memoryTypeIndex = mem_type;
+  if (vkAllocateMemory(device_, &mai, nullptr, &slot.memory) != VK_SUCCESS ||
+      vkBindImageMemory(device_, slot.image, slot.memory, 0) != VK_SUCCESS) {
+    destroy_slot(slot);
+    set_error("private Allocate/Bind");
+    return false;
+  }
+  VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+  vi.image = slot.image;
+  vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  vi.format = format;
+  vi.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+  vi.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+  vi.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+  vi.components.a = force_opaque_alpha ? VK_COMPONENT_SWIZZLE_ONE : VK_COMPONENT_SWIZZLE_IDENTITY;
+  vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  vi.subresourceRange.levelCount = 1;
+  vi.subresourceRange.layerCount = 1;
+  if (vkCreateImageView(device_, &vi, nullptr, &slot.view) != VK_SUCCESS) {
+    destroy_slot(slot);
+    set_error("private CreateImageView");
+    return false;
+  }
+  slot.is_private = true;
+  slot.priv_w = w;
+  slot.priv_h = h;
+  slot.priv_fmt = format;
+  slot.buf_key = 0;
+  slot.pw_seq = 0;
+  return true;
+}
+
+bool PipewireDmaTexture::import_copy_out(Slot& dst, const PipewireDmaFrame& frame, uint64_t mod,
+                                         VkFormat format, bool force_opaque_alpha) {
+  const int w = frame.width;
+  const int h = frame.height;
+  if (!ensure_private_slot(dst, w, h, format, force_opaque_alpha)) return false;
+
+  Slot ext{};
+  const VkDeviceSize pitch =
+      frame.stride > 0 ? static_cast<VkDeviceSize>(frame.stride) : static_cast<VkDeviceSize>(w) * 4u;
+  const VkDeviceSize off = static_cast<VkDeviceSize>(frame.offset);
+  VkDeviceSize size = frame.size > 0 ? static_cast<VkDeviceSize>(frame.size) : pitch * static_cast<VkDeviceSize>(h);
+  if (size < pitch * static_cast<VkDeviceSize>(h)) size = pitch * static_cast<VkDeviceSize>(h);
+  // Temporary external import — usage must allow TRANSFER_SRC for the blit.
+  // import_image currently creates SAMPLED-only; recreate with transfer via a
+  // one-shot path: import then copy using general layout acquire.
+  if (!import_image(ext, frame.fd, mod, w, h, format, force_opaque_alpha, off, pitch, size,
+                    /*require_transfer_src=*/true)) {
+    return false;
+  }
+
+  // Explicit READ sync on the dup'd dma-buf before GPU copy (implicit sync is
+  // not enough once the producer may also touch the same BO).
+  {
+    dma_buf_sync sync{};
+    sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+    (void)::ioctl(frame.fd, DMA_BUF_IOCTL_SYNC, &sync);
+  }
+
+  std::unique_lock<std::mutex> qlock;
+  if (queue_mu_) qlock = std::unique_lock<std::mutex>(*queue_mu_);
+  vkResetCommandBuffer(cmd_, 0);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(cmd_, &bi) != VK_SUCCESS) {
+    destroy_slot(ext);
+    return false;
+  }
+
+  VkImageMemoryBarrier barriers[2]{};
+  barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+  barriers[0].dstQueueFamilyIndex = queue_family_;
+  barriers[0].image = ext.image;
+  barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barriers[0].subresourceRange.levelCount = 1;
+  barriers[0].subresourceRange.layerCount = 1;
+  barriers[0].srcAccessMask = 0;
+  barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+  barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[1].image = dst.image;
+  barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barriers[1].subresourceRange.levelCount = 1;
+  barriers[1].subresourceRange.layerCount = 1;
+  barriers[1].srcAccessMask = 0;
+  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
+                       nullptr, 0, nullptr, 2, barriers);
+
+  VkImageCopy region{};
+  region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.srcSubresource.layerCount = 1;
+  region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.dstSubresource.layerCount = 1;
+  region.extent = {static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1};
+  vkCmdCopyImage(cmd_, ext.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+  VkImageMemoryBarrier to_sample{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+  to_sample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  to_sample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  to_sample.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_sample.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  to_sample.image = dst.image;
+  to_sample.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  to_sample.subresourceRange.levelCount = 1;
+  to_sample.subresourceRange.layerCount = 1;
+  to_sample.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                       0, nullptr, 0, nullptr, 1, &to_sample);
+
+  if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) {
+    destroy_slot(ext);
+    return false;
+  }
+  if (vkResetFences(device_, 1, &fence_) != VK_SUCCESS) {
+    destroy_slot(ext);
+    return false;
+  }
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd_;
+  if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) {
+    destroy_slot(ext);
+    set_error("copy-out submit");
+    return false;
+  }
+  if (qlock.owns_lock()) qlock.unlock();
+  if (!wait_fence()) {
+    destroy_slot(ext);
+    return false;
+  }
+
+  {
+    dma_buf_sync sync{};
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    (void)::ioctl(frame.fd, DMA_BUF_IOCTL_SYNC, &sync);
+  }
+
+  // Private image owns the pixels — drop import, then return pw_buffer to Mutter.
+  destroy_slot(ext);
+  dst.pw_seq = 0;
+  dst.is_private = true;
+  if (frame.seq != 0 && release_seq_) release_seq_(frame.seq);
+  return true;
 }
 
 bool PipewireDmaTexture::try_import(const PipewireDmaFrame& frame) {
@@ -556,85 +773,49 @@ bool PipewireDmaTexture::try_import(const PipewireDmaFrame& frame) {
     if (!wait_fence()) return false;
     destroy_slot(slots_[0]);
     destroy_slot(slots_[1]);
-    destroy_slot(slots_[2]);
     valid_.store(false);
     width_ = 0;
     height_ = 0;
-    prev_slot_ = 0;
     display_slot_.store(0);
   }
 
-  // Reuse: flip only — no QueueSubmit/fence (lightening 7). Image already
-  // SHADER_READ_ONLY from first import; dma-buf implicit sync for producer writes.
+  // PipeWire recycles ~2–3 dma-bufs. Matching inode reused to mean "same VkImage",
+  // but the producer has rewritten the memory — bare display_slot flip without a
+  // barrier loops stale/half-written frames (VIRTUAL dialog animation / flicker).
+  // NVIDIA: skip reuse entirely (re-import). Others: reuse image but re-transition.
   uint64_t key = 0;
   const bool have_key = dma_buf_key(frame.fd, &key);
-  if (have_key) {
-    for (int i = 0; i < 3; ++i) {
-      if (!slots_[i].image || slots_[i].buf_key != key) continue;
-      width_ = w;
-      height_ = h;
-      prev_slot_ = display_slot_.load(std::memory_order_relaxed);
-      display_slot_.store(i, std::memory_order_release);
-      valid_.store(true, std::memory_order_release);
-      present_gen_.fetch_add(1, std::memory_order_release);
-      return true;
-    }
-  }
-
   if (!wait_fence()) return false;
 
+  // Ping-pong: write the non-displayed slot (sync copy-out waits the fence).
   int write = 0;
   if (valid_.load()) {
-    const int cur = display_slot_.load(std::memory_order_relaxed);
-    write = (cur + 1) % 3;
-    if (write == prev_slot_) write = (write + 1) % 3;
+    write = 1 - display_slot_.load(std::memory_order_relaxed);
   }
   Slot& slot = slots_[write];
-  destroy_slot(slot);
 
-  const VkDeviceSize pitch =
-      frame.stride > 0 ? static_cast<VkDeviceSize>(frame.stride) : static_cast<VkDeviceSize>(w) * 4u;
-  const VkDeviceSize off = static_cast<VkDeviceSize>(frame.offset);
-  VkDeviceSize size = frame.size > 0 ? static_cast<VkDeviceSize>(frame.size) : pitch * static_cast<VkDeviceSize>(h);
-  if (size < pitch * static_cast<VkDeviceSize>(h)) size = pitch * static_cast<VkDeviceSize>(h);
-
-  if (!import_image(slot, frame.fd, mod, w, h, vkfmt, force_a, off, pitch, size)) {
-    destroy_slot(slot);
+  // Always copy-out into a private OPTIMAL image. PipeWire returns the pw_buffer
+  // right after we dup the FD; zero-copy would race the producer rewrite.
+  (void)have_key;
+  (void)key;
+  if (!import_copy_out(slot, frame, mod, vkfmt, force_a)) {
+    set_error(std::string("copy-out: ") + last_error_);
     if (!import_logged_) {
       import_logged_ = true;
-      VRP_LOG("PipeWire dma-buf import failed (%s, modifier=0x%llx)%s — CPU RGBA",
-              last_error_.c_str(), static_cast<unsigned long long>(mod),
-              import_abandoned() ? " [abandoned]" : " [soft]");
+      VRP_LOG("PipeWire dma-buf copy-out failed (%s, modifier=0x%llx) — CPU RGBA",
+              last_error_.c_str(), static_cast<unsigned long long>(mod));
     }
     return false;
   }
-  if (!transition_slot(slot)) {
-    destroy_slot(slot);
-    // Layout transition is post-import; abandon on NVIDIA to be safe.
-    if (nvidia_) {
-      abandon("layout transition");
-    } else {
-      set_error("layout transition");
-    }
-    if (!import_logged_) {
-      import_logged_ = true;
-      VRP_LOG("PipeWire dma-buf layout transition failed — CPU RGBA");
-    }
-    return false;
-  }
-
-  slot.buf_key = have_key ? key : 0;
   width_ = w;
   height_ = h;
-  prev_slot_ = display_slot_.load(std::memory_order_relaxed);
   display_slot_.store(write, std::memory_order_release);
   valid_.store(true, std::memory_order_release);
   present_gen_.fetch_add(1, std::memory_order_release);
   if (!import_logged_) {
     import_logged_ = true;
-    VRP_LOG("display path: PipeWire DMA-BUF zero-copy %dx%d modifier=0x%llx%s "
-            "(slot reuse, acquire skip)",
-            w, h, static_cast<unsigned long long>(mod), nvidia_ ? " (NVIDIA)" : "");
+    VRP_LOG("display path: PipeWire DMA-BUF copy-out %dx%d modifier=0x%llx%s", w, h,
+            static_cast<unsigned long long>(mod), nvidia_ ? " (NVIDIA)" : "");
   }
   return true;
 }

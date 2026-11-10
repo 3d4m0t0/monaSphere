@@ -334,6 +334,12 @@ add_executable(vrp_player
   src/capture/desktop_env.hpp
   src/capture/kde_virtual_display.cpp
   src/capture/kde_virtual_display.hpp
+  src/capture/gnome_virtual_display.cpp
+  src/capture/gnome_virtual_display.hpp
+  src/capture/gnome_portal_dialog.cpp
+  src/capture/gnome_portal_dialog.hpp
+  src/capture/mutter_virtual_screencast.cpp
+  src/capture/mutter_virtual_screencast.hpp
   src/capture/virtual_display_manager.cpp
   src/capture/virtual_display_manager.hpp
   src/capture/kwin_window_placer.cpp

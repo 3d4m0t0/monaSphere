@@ -20,6 +20,8 @@
 #include "video/video_decoder.hpp"
 #include "xr/xr_vulkan_app.hpp"
 #include "youtube_session.hpp"
+#include "capture/desktop_env.hpp"
+#include "capture/gnome_virtual_display.hpp"
 #include "capture/kde_virtual_display.hpp"
 #include "capture/kwin_window_placer.hpp"
 #if defined(VRP_HAS_PIPEWIRE)
@@ -187,6 +189,10 @@ void HostWindow::signalXrStop() {
 }
 
 bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
+  VRP_TEARDOWN_LOG("Host: shutdownXrSession BEGIN timeout=%d stop_monado=%d xr_running=%d in_frame=%d",
+                   timeout_ms, stop_monado ? 1 : 0,
+                   xr_running_.load(std::memory_order_acquire) ? 1 : 0,
+                   xr_in_frame_loop_.load(std::memory_order_acquire) ? 1 : 0);
   signalXrStop();
   // Do NOT kill Monado before XR teardown finishes. xrDestroySession / WaitIdle /
   // DestroyDevice need compositor IPC; stopping monado-service mid-teardown yields
@@ -202,6 +208,7 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
     if (!forced_exit && xr_in_frame_loop_.load(std::memory_order_acquire) &&
         std::chrono::steady_clock::now() >= force_exit_at) {
       forced_exit = true;
+      VRP_TEARDOWN_LOG("Host: shutdownXrSession force request_exit (WaitFrame still in loop)");
       std::lock_guard<std::mutex> lock(xr_app_mu_);
       if (xr_app_) xr_app_->request_exit();
     }
@@ -212,7 +219,9 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
   bool ok = false;
   if (xr_thread_.joinable()) {
     if (!xr_running_.load()) {
+      VRP_TEARDOWN_LOG("Host: shutdownXrSession joining XR thread…");
       xr_thread_.join();
+      VRP_TEARDOWN_LOG("Host: shutdownXrSession XR thread joined");
       ok = true;
     }
   } else {
@@ -224,19 +233,23 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
     if (!xr_in_frame_loop_.load(std::memory_order_acquire)) {
       // Past WaitFrame. Teardown is inside Vulkan/OpenXR destroy. Killing Monado
       // here is what wedges the next xrCreateVulkanInstanceKHR.
-      VRP_LOG("shutdownXrSession: frame loop left — waiting for teardown, not stopping Monado");
+      VRP_TEARDOWN_LOG(
+          "Host: shutdownXrSession frame loop left — waiting for teardown, not stopping Monado");
       const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(8);
       while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
         QThread::msleep(40);
         QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
       }
       if (!xr_running_.load() && xr_thread_.joinable()) {
+        VRP_TEARDOWN_LOG("Host: shutdownXrSession grace join XR thread…");
         xr_thread_.join();
+        VRP_TEARDOWN_LOG("Host: shutdownXrSession grace join done");
         ok = true;
       }
     } else {
       // Still inside xrWaitFrame — kill runtime to unblock hung IPC.
-      VRP_ERR("shutdownXrSession: XR still running after timeout — stopping Monado to unblock");
+      VRP_TEARDOWN_LOG(
+          "Host: shutdownXrSession XR still running after timeout — stopping Monado to unblock");
       stopMonadoProcess();
       const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(2);
       while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
@@ -249,9 +262,31 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
       }
     }
   } else if (ok && stop_monado && !monado_external_) {
+    // GNOME/Mutter: XR/Monado release of the HMD DRM lease races mutter's
+    // revoke path (ENOENT → SEGV in meta_device_file_get_fd → session logout).
+    // Settle after XR destroy so KMS can drop the lease before we SIGTERM Monado.
+    const QByteArray desk = qgetenv("XDG_CURRENT_DESKTOP").toUpper();
+    const bool gnome_wayland =
+        QGuiApplication::platformName() == QLatin1String("wayland") && desk.contains("GNOME");
+    if (gnome_wayland) {
+      constexpr int kLeaseSettleMs = 1500;
+      VRP_TEARDOWN_LOG("Host: shutdownXrSession GNOME DRM-lease settle %dms before stopMonado",
+                       kLeaseSettleMs);
+      const auto settle_deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(kLeaseSettleMs);
+      while (std::chrono::steady_clock::now() < settle_deadline) {
+        QThread::msleep(40);
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+      }
+      VRP_TEARDOWN_LOG("Host: shutdownXrSession GNOME DRM-lease settle done");
+    }
+    VRP_TEARDOWN_LOG("Host: shutdownXrSession stopMonadoProcess…");
     stopMonadoProcess();
+    VRP_TEARDOWN_LOG("Host: shutdownXrSession stopMonadoProcess done");
   }
 
+  VRP_TEARDOWN_LOG("Host: shutdownXrSession END ok=%d forced_exit=%d", ok ? 1 : 0,
+                   forced_exit ? 1 : 0);
   return ok;
 }
 
@@ -923,9 +958,23 @@ void HostWindow::stopMonadoProcess() {
     clearStaleMonadoSocket();
     return;
   }
+  // Prefer a clean SIGTERM so Monado can drop the DRM lease ordered.
+  // Hard kill on GNOME makes mutter's revoke path hit ENOENT and can SEGV.
+  const QByteArray desk = qgetenv("XDG_CURRENT_DESKTOP").toUpper();
+  const bool gnome_wayland =
+      QGuiApplication::platformName() == QLatin1String("wayland") && desk.contains("GNOME");
   monado_intentional_stop_ = true;
+  VRP_TEARDOWN_LOG("Host: stopMonadoProcess terminate (gnome_wayland=%d)", gnome_wayland ? 1 : 0);
   monado_->terminate();
-  if (!monado_->waitForFinished(1500)) {
+  const int term_ms = gnome_wayland ? 4000 : 1500;
+  if (!monado_->waitForFinished(term_ms)) {
+    if (gnome_wayland) {
+      // Leave Monado running rather than kill — next ensureMonadoReady cleans up.
+      VRP_TEARDOWN_LOG("Host: stopMonadoProcess GNOME soft-stop timeout — skip kill");
+      monado_intentional_stop_ = false;
+      return;
+    }
+    VRP_TEARDOWN_LOG("Host: stopMonadoProcess kill after terminate timeout");
     monado_->kill();
     monado_->waitForFinished(1000);
   }
@@ -933,6 +982,7 @@ void HostWindow::stopMonadoProcess() {
   clearStaleMonadoSocket();
   psvr2_compositor_ready_ms_ = 0;
   psvr2_grab_wait_logged_ = false;
+  VRP_TEARDOWN_LOG("Host: stopMonadoProcess done");
 }
 
 void HostWindow::stopSystemdMonadoForOwnedStart() {
@@ -2273,8 +2323,13 @@ vrp::VirtualDisplayManager::Spec HostWindow::virtualSpecForSpan(int span) const 
 }
 
 void HostWindow::destroyVirtualForLeaveLive() {
-  if (!vdisp_mgr_) return;
+  if (!vdisp_mgr_) {
+    VRP_TEARDOWN_LOG("Host: destroyVirtualForLeaveLive skip (no mgr)");
+    return;
+  }
+  VRP_TEARDOWN_LOG("Host: destroyVirtualForLeaveLive BEGIN");
   vdisp_mgr_->destroy();
+  VRP_TEARDOWN_LOG("Host: destroyVirtualForLeaveLive END");
 }
 
 void HostWindow::ensureYouTubeSession() {
@@ -2436,6 +2491,8 @@ void HostWindow::ensureYouTubeSession() {
   });
   connect(yt_session_, &vrp::YouTubeSession::stopped, this, [this] {
     // Live window and capture are gone. XR unmutes after the monitor buffers are clear.
+    // Persist past Session.Stop — prior logout freezes happened after teardown END.
+    vrp_persist_log("Host: YouTubeSession::stopped (post-Meta)");
     yt_live_unmute_req_.store(true, std::memory_order_release);
     pad_hook_.stop();
     pad_hook_active_ = false;
@@ -2447,6 +2504,7 @@ void HostWindow::ensureYouTubeSession() {
         yt_pending_kind_ == YtPendingKind::Video) {
       yt_pending_kind_ = YtPendingKind::None;
       yt_return_apps_menu_.store(false, std::memory_order_release);
+      vrp_persist_log("Host: stopped → remove Virtual before video");
       appendLog(tr("Live cleanup done — removing Virtual before video"));
       finishQueuedVideoAfterVirtualGone();
       return;
@@ -2454,12 +2512,15 @@ void HostWindow::ensureYouTubeSession() {
     if (yt_pending_kind_ != YtPendingKind::None) {
       // Next start() → VirtualDisplayManager::ensure (reuse or recreate by resolution).
       yt_return_apps_menu_.store(false, std::memory_order_release);
+      vrp_persist_log("Host: stopped → queued live session");
       appendLog(tr("Live cleanup done — starting queued session (Virtual manager decides)"));
       flushPendingLiveStart();
       return;
     }
     if (yt_return_apps_menu_.exchange(false, std::memory_order_acq_rel)) {
+      vrp_persist_log("Host: stopped → destroyVirtualForLeaveLive…");
       destroyVirtualForLeaveLive();
+      vrp_persist_log("Host: destroyVirtualForLeaveLive returned");
       if (yt_session_) yt_session_->clear_busy_status();
       yt_show_apps_after_stop_.store(true, std::memory_order_release);
       appendLog(tr("Live cleanup done — Virtual gone, opening [アプリ]"));
@@ -2495,7 +2556,9 @@ void HostWindow::ensureYouTubeSession() {
     // Plain stop (Tools / no queued switch): drop Virtual.
     // Never reach here after a switch — pending path returns above. A stale fallback
     // stop() used to land here and destroy Virtual under a new x3 session.
+    VRP_TEARDOWN_LOG("Host: stopped → plain destroyVirtualForLeaveLive…");
     destroyVirtualForLeaveLive();
+    VRP_TEARDOWN_LOG("Host: stopped → plain destroyVirtual done (post-Meta path idle)");
   });
 }
 
@@ -2654,7 +2717,10 @@ void HostWindow::startLiveFromHmd(const QString& url) {
   yt_hmd_suppress_live_.store(false, std::memory_order_release);
   yt_setup_phase_ = YtSetupPhase::None;
 
-  if (tokenForSpan(1).isEmpty()) {
+  // GNOME Mutter Meta has no ScreenCast restore token — skip KDE token gate.
+  const bool gnome_meta = vrp::detect_desktop_env() == vrp::DesktopEnv::Gnome &&
+                          vrp::GnomeVirtualDisplay::managedVirtualAvailable();
+  if (!gnome_meta && tokenForSpan(1).isEmpty()) {
     appendLog(tr("Live: no restore token — use Tools -> Set up live capture on the host first "
                  "(pick Virtual-monaSphere, enable Remember)"));
     showHudToast(tr("Host: Set up live capture first"));
@@ -2676,8 +2742,8 @@ void HostWindow::startLiveFromHmd(const QString& url) {
     yt_pending_args_.clear();
     yt_pending_label_.clear();
     yt_pending_span_ = 1;
-    const bool reuse =
-        vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(1));
+    const bool reuse = vdisp_mgr_ && vdisp_mgr_->reusable() &&
+                       vdisp_mgr_->matches(virtualSpecForSpan(1));
     yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
     appendLog(reuse ? tr("Live: queueing browser (Virtual reuse if same resolution)")
                     : tr("Live: queueing browser (Virtual will recreate on start)"));
@@ -2695,7 +2761,11 @@ void HostWindow::startLiveFromHmd(const QString& url) {
     return;
   }
 
-  appendLog(tr("Live HMD: %1 (token %2 chars)").arg(open_url).arg(live_restore_token_.size()));
+  if (gnome_meta) {
+    appendLog(tr("Live HMD: %1 (GNOME Meta — no restore token)").arg(open_url));
+  } else {
+    appendLog(tr("Live HMD: %1 (token %2 chars)").arg(open_url).arg(live_restore_token_.size()));
+  }
   beginYouTubeCapture(/*host_setup=*/false, open_url);
 }
 
@@ -2713,7 +2783,9 @@ void HostWindow::startLiveDesktopApp(const QString& exec, const QStringList& arg
   yt_setup_phase_ = YtSetupPhase::None;
 
   const QString tok = tokenForSpan(span);
-  if (tok.isEmpty()) {
+  const bool gnome_meta = vrp::detect_desktop_env() == vrp::DesktopEnv::Gnome &&
+                          vrp::GnomeVirtualDisplay::managedVirtualAvailable();
+  if (!gnome_meta && tok.isEmpty()) {
     appendLog(tr("Live: no restore token — use Tools -> Set up live capture on the host first "
                  "(pick Virtual-monaSphere, enable Remember)"));
     showHudToast(tr("Host: Set up live capture first"));
@@ -2735,8 +2807,8 @@ void HostWindow::startLiveDesktopApp(const QString& exec, const QStringList& arg
     yt_pending_args_ = args;
     yt_pending_span_ = span;
     yt_pending_label_ = label;
-    const bool reuse =
-        vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(span));
+    const bool reuse = vdisp_mgr_ && vdisp_mgr_->reusable() &&
+                       vdisp_mgr_->matches(virtualSpecForSpan(span));
     yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
     appendLog(reuse ? tr("Live: queueing desktop app (Virtual reuse if same resolution)")
                     : tr("Live: queueing desktop app (Virtual will recreate on start)"));
@@ -2883,12 +2955,21 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
     cfg.launch_title = cfg.desktop_label;
   }
   cfg.restore_token = host_setup ? QString() : tokenForSpan(span);
-  // Fixed Virtual-monaSphere; span only picks WxH. One ScreenCast Remember token.
-  cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
-  cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
   cfg.virtual_display = live_virtual_;
   cfg.virtual_w = use_w;
   cfg.virtual_h = use_h;
+  // KDE managed: fixed Virtual-monaSphere (span → WxH only). GNOME managed: portal
+  // VIRTUAL creates the output. Spare MONITOR: pass live_output= substring.
+  if (live_virtual_) {
+    cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
+    cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
+  } else if (!live_output_.isEmpty()) {
+    cfg.virtual_name.clear();
+    cfg.output_hint = live_output_;
+  } else {
+    cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
+    cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
+  }
   cfg.virtual_scale = live_virtual_scale_;
   cfg.chrome_scale = live_chrome_scale_;
   cfg.use_default_chrome_profile = live_chrome_default_profile_;
@@ -2948,6 +3029,8 @@ void HostWindow::stopYouTubeCapture() {
   }
   // Do not stop pad_hook here while XR still drains DMA — early stop made the XR
   // thread fall into pass-through mid-teardown. Hook/filter end in stopped().
+  vrp_persist_log("Host: stopYouTubeCapture BEGIN xr_running=%d",
+                  xr_running_.load(std::memory_order_acquire) ? 1 : 0);
   pad_filter_.stop();
   yt_audio_pending_log_ = false;
   yt_audio_fail_retries_ = 0;
@@ -3287,6 +3370,344 @@ QString UiTr(const QString& s) {
   const QByteArray u = s.toUtf8();
   return QCoreApplication::translate("HostWindow", u.constData());
 }
+
+/** Live Meta CPU path: bootstrap AUDIT of store order, then quiet unless disrupted. */
+struct LiveCpuDiag {
+  static constexpr int kRing = 24;
+  struct Ev {
+    char kind[12]{};
+    uint64_t a = 0;
+    uint64_t b = 0;
+    uint64_t fp = 0;
+    int slot = -1;
+    uint32_t ms = 0;
+  };
+  Ev ring[kRing]{};
+  int head = 0;
+  int count = 0;
+  uint64_t last_disp = 0;
+  uint64_t last_disp_fp = 0;
+  /**
+   * Last N fingerprints (displayed or pool-blocked). Must exceed SHM pool depth (8):
+   * banning only 4 lets a 5–8 cycle through; banning 8 still fails when one fresh
+   * frame ages the ring out and the next commits are the old pool cycle in order
+   * (L3524+: seq 39–43 fps reappear as seq 79–83, dseq=40 → hold then 前後ブレ).
+   * On drop_pp, refresh the ban (note_fp) so recycled buffers stay blocked.
+   * Do NOT time-escape pool hits — that reintroduced A-B-A (esc_pp in L8574+).
+   */
+  static constexpr int kRecentFp = 16;
+  uint64_t recent_fps_[kRecentFp]{};
+  int recent_fp_n_ = 0;
+  uint64_t last_upload = 0;
+  uint64_t last_upload_fp = 0;
+  uint64_t last_handled = 0;  // last pw seq we filtered or displayed (stall baseline)
+  uint64_t last_shown = 0;    // last seq actually flushed into eye descriptors
+  uint64_t last_shown_fp = 0;
+  int last_shown_slot = -1;
+  int display_audit_left = 32;  // only decremented when commit seq/fp/slot changes
+  int stall = 0;
+  int audit_left = 16;
+  int pingpong_drops = 0;
+  int same_drops = 0;
+  uint32_t t0_ms = 0;
+  uint32_t last_dump_ms = 0;
+  uint32_t hold_since_ms_ = 0;  // first drop_pp after a flip; 0 = not holding
+  uint32_t last_paint_kick_ms_ = 0;
+  uint32_t hold_drops_ = 0;  // drop_pp count in current hold episode
+  bool t0_set = false;
+
+  void note_displayed_fp(uint64_t fp) {
+    if (fp == 0) return;
+    int found = -1;
+    for (int i = 0; i < recent_fp_n_; ++i) {
+      if (recent_fps_[i] == fp) {
+        found = i;
+        break;
+      }
+    }
+    if (found == 0) return;
+    if (found > 0) {
+      // Move-to-front (sticky pool ban) — no duplicate slot waste.
+      for (int i = found; i > 0; --i) recent_fps_[i] = recent_fps_[i - 1];
+      recent_fps_[0] = fp;
+      return;
+    }
+    for (int i = kRecentFp - 1; i > 0; --i) recent_fps_[i] = recent_fps_[i - 1];
+    recent_fps_[0] = fp;
+    if (recent_fp_n_ < kRecentFp) ++recent_fp_n_;
+  }
+
+  bool fp_in_recent(uint64_t fp) const {
+    if (fp == 0) return false;
+    for (int i = 0; i < recent_fp_n_; ++i) {
+      if (recent_fps_[i] == fp) return true;
+    }
+    return false;
+  }
+
+  uint32_t now_ms() {
+    using clock = std::chrono::steady_clock;
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch())
+            .count();
+    if (!t0_set) {
+      t0_ms = static_cast<uint32_t>(ms);
+      t0_set = true;
+    }
+    return static_cast<uint32_t>(ms) - t0_ms;
+  }
+
+  void push(const char* kind, uint64_t a, uint64_t b = 0, int slot = -1, uint64_t fp = 0) {
+    Ev& e = ring[head];
+    std::snprintf(e.kind, sizeof(e.kind), "%s", kind ? kind : "?");
+    e.a = a;
+    e.b = b;
+    e.fp = fp;
+    e.slot = slot;
+    e.ms = now_ms();
+    head = (head + 1) % kRing;
+    if (count < kRing) ++count;
+  }
+
+  void dump(const char* reason) {
+    const uint32_t t = now_ms();
+    if (last_dump_ms != 0 && (t - last_dump_ms) < 500u) {
+      push("rate_lim", 0, 0, -1);
+      return;
+    }
+    last_dump_ms = t;
+    // Persist — logout/reboot drops stdout paste.
+    VRP_DISPLAY_LOG("live-cpu DISRUPT: %s", reason ? reason : "?");
+    const int n = count;
+    const int start = (head - n + kRing * 2) % kRing;
+    for (int i = 0; i < n; ++i) {
+      const Ev& e = ring[(start + i) % kRing];
+      VRP_DISPLAY_LOG("  +%u ms %s a=%llu b=%llu fp=0x%llx slot=%d", e.ms, e.kind,
+                      static_cast<unsigned long long>(e.a), static_cast<unsigned long long>(e.b),
+                      static_cast<unsigned long long>(e.fp), e.slot);
+    }
+  }
+
+  void audit_board(const char* stage, uint64_t seq, uint64_t fp, int slot, const vrp::VideoTexture& tex) {
+    if (audit_left <= 0) return;
+    --audit_left;
+    VRP_DISPLAY_LOG(
+        "live-cpu AUDIT %s seq=%llu fp=0x%llx -> slot=%d | d=%d(#%llu/0x%llx) p=%d(#%llu/0x%llx) "
+        "w=%d(#%llu/0x%llx) flight=%d | slots [0]=#%llu/0x%llx [1]=#%llu/0x%llx [2]=#%llu/0x%llx",
+        stage ? stage : "?", static_cast<unsigned long long>(seq),
+        static_cast<unsigned long long>(fp), slot, tex.display_slot(),
+        static_cast<unsigned long long>(tex.slot_content_seq(tex.display_slot())),
+        static_cast<unsigned long long>(tex.slot_content_fp(tex.display_slot())),
+        tex.prev_display_slot(),
+        static_cast<unsigned long long>(tex.slot_content_seq(tex.prev_display_slot())),
+        static_cast<unsigned long long>(tex.slot_content_fp(tex.prev_display_slot())),
+        tex.write_slot(),
+        static_cast<unsigned long long>(tex.slot_content_seq(tex.write_slot())),
+        static_cast<unsigned long long>(tex.slot_content_fp(tex.write_slot())),
+        tex.upload_in_flight() ? 1 : 0,
+        static_cast<unsigned long long>(tex.slot_content_seq(0)),
+        static_cast<unsigned long long>(tex.slot_content_fp(0)),
+        static_cast<unsigned long long>(tex.slot_content_seq(1)),
+        static_cast<unsigned long long>(tex.slot_content_fp(1)),
+        static_cast<unsigned long long>(tex.slot_content_seq(2)),
+        static_cast<unsigned long long>(tex.slot_content_fp(2)));
+  }
+
+  void on_take(uint64_t seq, uint64_t fp, const vrp::VideoTexture& tex) {
+    push("take", seq, 0, -1, fp);
+    audit_board("take", seq, fp, -1, tex);
+  }
+
+  void on_mailbox(uint64_t dropped_seq, uint64_t new_seq, uint64_t new_fp,
+                  const vrp::VideoTexture& tex) {
+    push("mbox", dropped_seq, new_seq, -1, new_fp);
+    audit_board("mbox", new_seq, new_fp, -1, tex);
+    if (dropped_seq != 0 && new_seq != 0 && new_seq < dropped_seq &&
+        (dropped_seq - new_seq) < 1000ull) {
+      dump("mailbox REWIND (kept newer pending)");
+    } else if (dropped_seq != 0 && new_seq > dropped_seq + 3ull) {
+      dump("mailbox DROP gap>3");
+    }
+  }
+
+  void on_upload(uint64_t seq, uint64_t fp, int slot, const vrp::VideoTexture& tex) {
+    push("upload", seq, last_upload, slot, fp);
+    audit_board("upload", seq, fp, slot, tex);
+    if (last_upload != 0 && seq != 0 && seq < last_upload && (last_upload - seq) < 1000ull) {
+      dump("upload REWIND");
+    }
+    if (seq != 0 && tex.slot_content_seq(slot) != seq) {
+      dump("upload slot seq mismatch after store");
+    }
+    if (seq != 0 && fp != 0 && tex.slot_content_fp(slot) != fp) {
+      dump("upload slot fp mismatch after store");
+    }
+    if (seq != 0) {
+      last_upload = seq;
+      last_upload_fp = fp;
+    }
+  }
+
+  void on_flip(uint64_t seq, uint64_t fp, int slot, const vrp::VideoTexture& tex) {
+    push("flip", seq, last_disp, slot, fp);
+    audit_board("flip", seq, fp, slot, tex);
+    if (last_disp != 0 && seq != 0 && seq < last_disp && (last_disp - seq) < 1000ull) {
+      dump("display REWIND");
+    } else if (last_disp != 0 && seq > last_disp + 8ull && last_handled <= last_disp + 2ull) {
+      // Real skip with no filter activity — intentional drop_same / drop_pp gaps are not jumps.
+      dump("display JUMP>8 (hitch?)");
+    }
+    if (seq != 0) {
+      last_disp = seq;
+      last_disp_fp = fp;
+      last_handled = seq;
+      note_displayed_fp(fp);
+    }
+    if (hold_since_ms_ != 0) {
+      const uint32_t held = now_ms() - hold_since_ms_;
+      // One summary per episode — avoids DISRUPT spam while sticky ban works as designed.
+      if (held >= 200u) {
+        VRP_DISPLAY_LOG("live-cpu HOLD end %ums drops=%u → show #%llu fp=0x%llx", held,
+                        hold_drops_, static_cast<unsigned long long>(seq),
+                        static_cast<unsigned long long>(fp));
+      }
+    }
+    hold_since_ms_ = 0;
+    hold_drops_ = 0;
+    stall = 0;
+  }
+
+  /** Drop Meta pool recycle / identical redraws before GPU upload. */
+  enum class Keep : uint8_t { Upload, DropSame, DropPingPong };
+  Keep filter_pending(uint64_t seq, uint64_t fp) {
+    if (fp == 0) return Keep::Upload;
+    if (last_disp_fp != 0 && fp == last_disp_fp) {
+      ++same_drops;
+      last_handled = seq;
+      // Quiet — identical static Meta is normal; do not DISRUPT.
+      if ((same_drops & 127) == 0) push("drop_same", seq, last_disp, -1, fp);
+      return Keep::DropSame;
+    }
+    // SHM pool recycle (depth≤8): re-uploading a recent fp is 前後ブレ / frame disorder.
+    // Refresh ban on every hit so one fresh frame cannot age the whole pool cycle out
+    // (L3577–3582: #76 unique then #79–83 = exact #39–43 fps).
+    if (fp_in_recent(fp)) {
+      ++pingpong_drops;
+      last_handled = seq;
+      note_displayed_fp(fp);
+      const uint32_t t = now_ms();
+      if (hold_since_ms_ == 0) {
+        hold_since_ms_ = t;
+        hold_drops_ = 0;
+      }
+      ++hold_drops_;
+      // Sticky ban working as designed — ring dump only on long holds (≥2s), rare.
+      if ((pingpong_drops & 31) == 0) {
+        push("drop_pp", seq, last_disp, -1, fp);
+        if (hold_since_ms_ != 0 && (t - hold_since_ms_) >= 2000u) {
+          dump("Meta pool-cycle hold≥2s (sticky ban)");
+        }
+      } else if ((pingpong_drops & 15) == 0) {
+        push("drop_pp", seq, last_disp, -1, fp);
+      }
+      return Keep::DropPingPong;
+    }
+    if (hold_since_ms_ != 0) {
+      const uint32_t held = now_ms() - hold_since_ms_;
+      if (held >= 200u) {
+        VRP_DISPLAY_LOG("live-cpu HOLD end %ums drops=%u → upload #%llu fp=0x%llx", held,
+                        hold_drops_, static_cast<unsigned long long>(seq),
+                        static_cast<unsigned long long>(fp));
+      }
+    }
+    hold_since_ms_ = 0;
+    hold_drops_ = 0;
+    return Keep::Upload;
+  }
+
+  /** True when pool-recycle hold has lasted long enough to need a Meta paint kick. */
+  bool should_kick_meta_paint() {
+    if (hold_since_ms_ == 0) return false;
+    const uint32_t t = now_ms();
+    if (t - hold_since_ms_ < 250u) return false;
+    if (last_paint_kick_ms_ != 0 && (t - last_paint_kick_ms_) < 100u) return false;
+    last_paint_kick_ms_ = t;
+    return true;
+  }
+
+  void on_bind_hold(uint64_t pw_seq, uint64_t disp_seq, bool in_flight) {
+    (void)disp_seq;
+    if (pw_seq == 0) {
+      stall = 0;
+      return;
+    }
+    // Stall only if PW advanced without us handling (filter or flip). Drop_same
+    // intentionally leaves display_seq behind — that is not a stall.
+    if (last_handled != 0 && pw_seq > last_handled + 8ull) {
+      ++stall;
+      if (stall == 30 || stall == 120) {
+        push(in_flight ? "stall_if" : "stall", pw_seq, last_handled, -1);
+        dump(in_flight ? "display STALL (upload in flight)" : "display STALL vs handled");
+      }
+    } else {
+      stall = 0;
+    }
+  }
+
+  /** After eye fence: descriptor flush — what both eyes actually sample this frame. */
+  void on_display_commit(uint64_t seq, uint64_t fp, int slot) {
+    const bool changed =
+        seq != last_shown || fp != last_shown_fp || slot != last_shown_slot;
+    if (changed) push("shown", seq, last_shown, slot, fp);
+    if (changed && display_audit_left > 0) {
+      --display_audit_left;
+      VRP_DISPLAY_LOG(
+          "live-disp AUDIT commit seq=%llu fp=0x%llx slot=%d (prev_shown=#%llu/0x%llx slot=%d)",
+          static_cast<unsigned long long>(seq), static_cast<unsigned long long>(fp), slot,
+          static_cast<unsigned long long>(last_shown),
+          static_cast<unsigned long long>(last_shown_fp), last_shown_slot);
+    }
+    if (last_shown != 0 && seq != 0 && seq < last_shown && (last_shown - seq) < 1000ull) {
+      dump("eye DESCRIPTOR REWIND (shown older seq)");
+    } else if (changed && last_shown != 0 && seq > last_shown + 8ull &&
+               last_handled <= last_shown + 2ull) {
+      dump("eye DESCRIPTOR JUMP>8");
+    }
+    // Texture slot front moved forward but flush still bound a prior generation.
+    if (last_disp != 0 && seq != 0 && seq < last_disp && (last_disp - seq) < 1000ull) {
+      dump("eye shows older than texture.display_seq");
+    }
+    if (seq != 0) {
+      last_shown = seq;
+      last_shown_fp = fp;
+      last_shown_slot = slot;
+    }
+  }
+
+  void reset() {
+    head = 0;
+    count = 0;
+    last_disp = 0;
+    last_disp_fp = 0;
+    for (uint64_t& x : recent_fps_) x = 0;
+    recent_fp_n_ = 0;
+    last_upload = 0;
+    last_upload_fp = 0;
+    last_handled = 0;
+    last_shown = 0;
+    last_shown_fp = 0;
+    last_shown_slot = -1;
+    display_audit_left = 32;
+    stall = 0;
+    audit_left = 16;
+    pingpong_drops = 0;
+    same_drops = 0;
+    last_dump_ms = 0;
+    hold_since_ms_ = 0;
+    last_paint_kick_ms_ = 0;
+    hold_drops_ = 0;
+  }
+};
 }  // namespace
 
 void HostWindow::setHealth(const QString& health, const QString& detail) {
@@ -4571,6 +4992,10 @@ void HostWindow::xrThreadMain() {
     vrp::PipewireDmaTexture pw_dma_tex;
 #endif
     vrp::VideoFrame pending_upload;
+    // Live CPU path: 1-frame mailbox so VideoTexture in_flight does not discard
+    // a take_latest() frame (that was the strong コマ飛び feel on Meta SHM).
+    vrp::VideoFrame live_cpu_pending;
+    LiveCpuDiag live_cpu_diag;
     texture.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
     vrp::VideoTexture seek_tex;
     seek_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
@@ -4594,6 +5019,11 @@ void HostWindow::xrThreadMain() {
                         xr.dma_buf_import());
     const bool pw_dma_nvidia = pw_dma && pw_dma_tex.nvidia();
     if (pw_dma) {
+      // After GPU copy-out: return pw_buffer via PW loop invoke (hold ≤2).
+      pw_dma_tex.set_release_seq_callback([this](uint64_t seq) {
+        if (!yt_session_) return;
+        if (vrp::PipewireCapture* c = yt_session_->capture()) c->release_held_dma(seq);
+      });
       live_drm_modifiers_ = pw_dma_tex.sampleable_modifiers();
     } else {
       live_drm_modifiers_ =
@@ -5567,10 +5997,13 @@ void HostWindow::xrThreadMain() {
       }
 
       // Provisional Live FSR cycle: □ / X while browser Live, menus closed.
-      // Off → UQ → Q → P → Off; writes conf live_fsr. Skips [アプリ].
+      // Off → UQ → Q → P → Off; writes conf live_fsr. Skips [アプリ] and GNOME Meta-*.
       const bool can_live_fsr_cycle =
-          yt_live && yt_session_ && !yt_session_->desktop_app_mode() && menus_closed;
-      if (can_live_fsr_cycle && pad_face_x) {
+          yt_live && yt_session_ && !yt_session_->desktop_app_mode() &&
+          !yt_session_->meta_live_path() && menus_closed;
+      if (yt_live && yt_session_ && yt_session_->meta_live_path() && pad_face_x && menus_closed) {
+        showHudToast(QStringLiteral("Live FSR: Meta path raw (disabled)"));
+      } else if (can_live_fsr_cycle && pad_face_x) {
         live_fsr_ = vrp::next_fsr_mode(live_fsr_);
         const auto mode = live_fsr_;
         QMetaObject::invokeMethod(
@@ -5608,11 +6041,19 @@ void HostWindow::xrThreadMain() {
       if (yt_live_mute_req_.exchange(false, std::memory_order_acq_rel))
         audio.begin_live_close_mute();
       {
-        const bool capture_dead =
-            yt_session_ && yt_session_->active() && yt_cap && !yt_cap->running();
+        // Only after first present (loading cleared). During startup a failed
+        // format negotiate can drop running_ before Chrome launches — that must
+        // not look like a silent Live 切替 stop (see minfps=60 regression).
+        const bool capture_dead = yt_session_ && yt_session_->active() &&
+                                  !yt_session_->loading() && yt_cap && !yt_cap->running();
         if (capture_dead) yt_stop_requested_.store(true, std::memory_order_release);
         if (yt_stop_requested_.exchange(false, std::memory_order_acq_rel)) {
           // Keep yt_return_apps_menu_ until YouTubeSession::stopped — then [アプリ] menu.
+          // Drop dma views from the scene *before* destroying imported images —
+          // NVIDIA hard-freezes if a still-bound view's memory is freed.
+          scene.set_content_cursor(0.f, 0.f, false);
+          if (texture.view() && texture.sampler())
+            scene.set_texture(texture.view(), texture.sampler());
           if (!scene.wait_previous_submit(0)) {
             while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
             }
@@ -5771,6 +6212,9 @@ void HostWindow::xrThreadMain() {
           scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
           menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
           scene.set_content_aspect(16.f / 9.f);
+          scene.set_content_cursor(0.f, 0.f, false);
+          if (texture.view() && texture.sampler())
+            scene.set_texture(texture.view(), texture.sampler());
           if (!scene.wait_previous_submit(0)) {
             while (!xr_stop_.load() && !scene.wait_previous_submit(50'000'000ull)) {
             }
@@ -5905,7 +6349,8 @@ void HostWindow::xrThreadMain() {
           }
         }
         // Options long opens/closes the VR menu without stopping live (handled by VrMenu).
-        // ○ never ends live; YouTube short ○ = browser Back. Loading: ○ cancels start.
+        // ○ never ends live; YouTube short ○/B = browser Back. Loading: ○ cancels start.
+        // Wayland Chrome has no X11 xid — can_inject (EIS) is enough; key_back uses EIS.
         if (yt_live && !live_menu_open && !desk_app_live && input.back &&
             yt_session_->x11().can_inject()) {
           (void)yt_session_->x11().key_back();
@@ -6013,6 +6458,7 @@ void HostWindow::xrThreadMain() {
         }
         if (decoder.is_open()) decoder.halt_decode();
         pending_upload = {};
+        live_cpu_pending = {};
         pending_video_rebind = false;
         have_pending_thumb = false;
         {
@@ -6641,40 +7087,56 @@ void HostWindow::xrThreadMain() {
                                    static_cast<float>(std::max(1, ah)));
         };
         // Browser Live (not [アプリ]): optional FSR from conf live_fsr. Desktop apps skip.
+        // GNOME Meta-*: FSR forced off — investigate SHM texture updates without upscale.
+        const bool meta_no_fsr = yt_session_ && yt_session_->meta_live_path();
         const bool live_browser_fsr = yt_live && yt_session_ && !yt_session_->desktop_app_mode() &&
-                                     live_fsr_ != vrp::FsrMode::Off;
+                                     !meta_no_fsr && live_fsr_ != vrp::FsrMode::Off;
         // Desktop capture is sRGB/gamma; Flat shader expects linear unless rgba_gamma.
-        // FSR output is also gamma RGBA → set_texture_gamma / queue_texture_gamma.
-        // DMA = UNORM gamma → FSR blit mode 3; CPU VideoTexture = VK_SRGB → mode 0.
+        // FSR output is also gamma RGBA → queue_texture_gamma (never set_* while the
+        // previous eye submit may still sample dset_ — that tears both eyes the same
+        // way: forward/back double image without L≠R).
+        // DMA = UNORM gamma → FSR blit mode 3; CPU VideoTexture = VK_SRGB → mode 0
+        // (sampler already linearizes — do NOT set/queue gamma on mode 0 or it darkens).
         auto bind_yt_rgba = [&](VkImageView view, VkSampler samp, int w, int h, bool fresh,
-                                int rgba_mode) -> bool {
+                                int rgba_mode, uint64_t dbg_seq = 0, uint64_t dbg_fp = 0,
+                                int dbg_slot = -1) -> bool {
           if (!view || !samp || w < 8 || h < 8) return false;
           set_yt_aspect(w, h);
           const bool want =
               live_browser_fsr && !vrp::fsr_locked_for_resolution(w, h);
           arm_live_fsr(want);
+          auto bind_raw = [&] {
+            if (rgba_mode == 3)
+              scene.queue_texture_gamma(view, samp);  // UNORM gamma (DMA)
+            else
+              scene.queue_texture(view, samp);  // VK_SRGB already linear from sampler
+          };
           if (!want) {
-            scene.set_texture_gamma(view, samp);
+            bind_raw();
             fsr_need_process = false;
-            return true;
-          }
-          // Prefer stable FSR front once published — avoid raw↔FSR brightness flicker.
-          if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
-            scene.set_texture_gamma(fsr.output_view(), fsr.output_sampler());
-            force_fsr_refresh = false;
-          } else if (fsr.output_view() && fsr.output_sampler()) {
-            scene.set_texture_gamma(fsr.output_view(), fsr.output_sampler());
           } else {
-            scene.set_texture_gamma(view, samp);
+            // Prefer stable FSR front once published — avoid raw↔FSR brightness flicker.
+            if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
+              scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+              force_fsr_refresh = false;
+            } else if (fsr.output_view() && fsr.output_sampler()) {
+              scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+            } else {
+              bind_raw();
+            }
+            if (fresh || force_fsr_refresh || !fsr.output_view()) {
+              fsr_src_y = view;
+              fsr_src_uv = view;
+              fsr_src_samp = samp;
+              fsr_src_w = w;
+              fsr_src_h = h;
+              fsr_src_nv12 = rgba_mode;
+              fsr_need_process = true;
+            }
           }
-          if (fresh || force_fsr_refresh || !fsr.output_view()) {
-            fsr_src_y = view;
-            fsr_src_uv = view;
-            fsr_src_samp = samp;
-            fsr_src_w = w;
-            fsr_src_h = h;
-            fsr_src_nv12 = rgba_mode;
-            fsr_need_process = true;
+          // Stamp what this queue will flush into eye descriptors (after fence).
+          if (dbg_seq != 0 || dbg_fp != 0 || dbg_slot >= 0) {
+            scene.set_queued_tex_debug(dbg_seq, dbg_fp, dbg_slot);
           }
           return true;
         };
@@ -6722,49 +7184,100 @@ void HostWindow::xrThreadMain() {
                   QMetaObject::invokeMethod(
                       this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
                 }
-              } else if (pw_dma_tex.import_abandoned()) {
-                // Hard fail only — soft skips (arming / missing modifier) keep CPU path.
-                if (yt_session_) yt_session_->dma_disabled() = true;
-                const QString err = QString::fromStdString(pw_dma_tex.last_error());
-                const QString note =
-                    tr("ScreenCast: DMA-BUF import failed (%1, modifier=0x%2) — CPU RGBA fallback")
-                        .arg(err.isEmpty() ? tr("unknown") : err)
-                        .arg(dma.modifier, 0, 16);
-                QMetaObject::invokeMethod(
-                    this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
+              } else {
+                yt_cap->release_held_dma(dma.seq);
+                if (pw_dma_tex.import_abandoned()) {
+                  if (yt_session_) yt_session_->dma_disabled() = true;
+                  const QString err = QString::fromStdString(pw_dma_tex.last_error());
+                  const QString note =
+                      tr("ScreenCast: DMA-BUF import failed (%1, modifier=0x%2) — CPU RGBA fallback")
+                          .arg(err.isEmpty() ? tr("unknown") : err)
+                          .arg(dma.modifier, 0, 16);
+                  QMetaObject::invokeMethod(
+                      this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
+                }
               }
             }
           }
           const bool dma_live =
               imported_dma || (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.has_valid_frame());
-          bool got_cpu = false;
           if (!dma_live) {
+            // Complete prior upload BEFORE taking a new write slot — otherwise
+            // in_flight blocks try_upload for a full XR frame and the back buffer
+            // ages into a visible hitch when it next rotates in.
+            const uint64_t disp_before = texture.display_seq();
+            const bool flipped = texture.poll_present();
+            if (flipped) {
+              const int ds = texture.display_slot();
+              live_cpu_diag.on_flip(texture.display_seq(), texture.slot_content_fp(ds), ds, texture);
+            } else if (texture.display_seq() != disp_before) {
+              // REJECT flip path leaves display unchanged; note if seq moved oddly.
+              live_cpu_diag.push("noflip", texture.display_seq(), disp_before, texture.display_slot());
+            }
             vrp::VideoFrame yf;
             if (yt_cap->take_latest(yf, yt_session_->frame_seq()) && !yf.rgba.empty()) {
-              (void)texture.try_upload(yf);
-              got_cpu = true;
+              if (yf.content_fp == 0) {
+                yf.content_fp = vrp::rgba_content_fp(yf.rgba.data(), yf.width, yf.height);
+              }
+              const auto keep = live_cpu_diag.filter_pending(yf.capture_seq, yf.content_fp);
+              if (keep != LiveCpuDiag::Keep::Upload) {
+                // Identical / Meta front-back bounce — do not rotate Vk slots.
+                // Long pool-recycle hold: poke Meta stage damage (producer starvation).
+                if (keep == LiveCpuDiag::Keep::DropPingPong &&
+                    live_cpu_diag.should_kick_meta_paint() && yt_session_) {
+                  yt_session_->kick_meta_paint();
+                }
+              } else if (!live_cpu_pending.rgba.empty() && live_cpu_pending.capture_seq != 0 &&
+                         yf.capture_seq != 0 && yf.capture_seq < live_cpu_pending.capture_seq &&
+                         (live_cpu_pending.capture_seq - yf.capture_seq) < 1000ull) {
+                // Keep newer mailbox; drop older take_latest (ordering glitch).
+                live_cpu_diag.on_mailbox(yf.capture_seq, live_cpu_pending.capture_seq,
+                                        live_cpu_pending.content_fp, texture);
+              } else {
+                if (!live_cpu_pending.rgba.empty()) {
+                  live_cpu_diag.on_mailbox(live_cpu_pending.capture_seq, yf.capture_seq, yf.content_fp,
+                                          texture);
+                } else {
+                  live_cpu_diag.on_take(yf.capture_seq, yf.content_fp, texture);
+                }
+                live_cpu_pending = std::move(yf);
+              }
             }
-          }
-          if (imported_dma && pw_dma_tex.poll_present() && pw_dma_tex.view()) {
-            yt_picture = bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
-                                      pw_dma_tex.height(), true, /*rgba_mode=*/3);
-          } else if (dma_live && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.view()) {
-            yt_picture = bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
-                                      pw_dma_tex.height(), false, /*rgba_mode=*/3);
-          } else if (got_cpu) {
-            if (texture.poll_present() && texture.view()) {
+            if (!live_cpu_pending.rgba.empty() && texture.upload_ready() &&
+                texture.try_upload(live_cpu_pending)) {
+              const uint64_t up_seq = live_cpu_pending.capture_seq;
+              const uint64_t up_fp = live_cpu_pending.content_fp;
+              const int up_slot = texture.write_slot();
+              live_cpu_diag.on_upload(up_seq, up_fp, up_slot, texture);
+              live_cpu_pending = {};
+            }
+            if ((flipped || texture.view()) && texture.view()) {
+              const int ds = texture.display_slot();
               yt_picture = bind_yt_rgba(texture.view(), texture.sampler(), texture.width(),
-                                        texture.height(), true, /*rgba_mode=*/0);
-            } else if (bind_last_yt()) {
+                                        texture.height(), flipped, /*rgba_mode=*/0,
+                                        texture.display_seq(), texture.slot_content_fp(ds), ds);
+              live_cpu_diag.on_bind_hold(yt_session_->frame_seq(), texture.display_seq(),
+                                         texture.upload_in_flight());
+            } else if (!yt_loading && bind_last_yt()) {
               yt_picture = true;
             }
-          } else if (!yt_loading && bind_last_yt()) {
-            yt_picture = true;
+          } else {
+            live_cpu_pending = {};
+            live_cpu_diag.reset();
+            if (imported_dma && pw_dma_tex.poll_present() && pw_dma_tex.view()) {
+              yt_picture = bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
+                                        pw_dma_tex.height(), true, /*rgba_mode=*/3);
+            } else if (pw_dma_tex.view()) {
+              yt_picture = bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
+                                        pw_dma_tex.height(), false, /*rgba_mode=*/3);
+            } else if (!yt_loading && bind_last_yt()) {
+              yt_picture = true;
+            }
           }
           if (yt_picture && yt_session_) yt_session_->mark_frame_presented();
           // Portal AvailableCursorModes=0 → Hidden stream; draw stick cursor on Flat.
-          if (yt_picture && yt_session_ && !yt_session_->embedded_cursor() &&
-              opt_.projection == vrp::ProjectionMode::Flat) {
+          if (yt_picture && yt_session_ && yt_session_->hmd_content_ready() &&
+              !yt_session_->embedded_cursor() && opt_.projection == vrp::ProjectionMode::Flat) {
             scene.set_content_cursor(yt_session_->x11().cursor_u(), yt_session_->x11().cursor_v(),
                                      true);
           } else {
@@ -6774,7 +7287,11 @@ void HostWindow::xrThreadMain() {
           scene.set_content_cursor(0.5f, 0.5f, false);
         }
 
-        if (yt_session_->show_busy_overlay() && !yt_picture) {
+        // GNOME Meta: PW frames exist (wallpaper) before Chrome — keep spinner on top
+        // until hmd_content_ready() (Chrome placed). KDE first frame is already browser.
+        const bool hold_meta_wallpaper =
+            yt_session_->show_busy_overlay() && !yt_session_->hmd_content_ready();
+        if (yt_session_->show_busy_overlay() && (!yt_picture || hold_meta_wallpaper)) {
           yt_spin_phase += static_cast<float>(dt) * 9.5f;
           if (yt_spin_phase > 6.2831853f) yt_spin_phase = std::fmod(yt_spin_phase, 6.2831853f);
           const QString status = yt_session_->busy_status();
@@ -7413,6 +7930,14 @@ void HostWindow::xrThreadMain() {
           rendered = scene.render_frame(xr, fi, proj_views, layer);
         }
       }
+      // What flush_queued_texture() bound for this eye submit (logout-safe file log).
+      {
+        uint64_t shown_seq = 0, shown_fp = 0;
+        int shown_slot = -1;
+        if (scene.take_flushed_tex_debug(shown_seq, shown_fp, shown_slot)) {
+          live_cpu_diag.on_display_commit(shown_seq, shown_fp, shown_slot);
+        }
+      }
       std::vector<XrCompositionLayerBaseHeader*> layers;
       if (rendered && layer.viewCount > 0) {
         layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer));
@@ -7564,11 +8089,12 @@ void HostWindow::xrThreadMain() {
     }
 
     xr_in_frame_loop_.store(false, std::memory_order_release);
+    VRP_TEARDOWN_LOG("XR teardown: left frame loop — stopping video/audio");
     decoder.stop_thumbnail_build();
     join_preview_worker();
     decoder.halt_decode();
     audio.close();
-    VRP_LOG("teardown: video, audio, live stopped");
+    VRP_TEARDOWN_LOG("XR teardown: video, audio, live stopped");
     cuda_tex.prepare_shutdown();
     cuda_tex.drain_copies();
     // Timed fence only — vkQueueWaitIdle hangs forever on a wedged graphics queue
@@ -7580,8 +8106,9 @@ void HostWindow::xrThreadMain() {
     // Shown frame's graphics submit, then the decode queue, while the
     // VkVideoSession still exists. NVIDIA's video thread exits on that
     // completion; destroying the session first leaves it until vkDestroyInstance.
-    VRP_LOG("teardown: vulkan display gpu");
+    VRP_TEARDOWN_LOG("XR teardown: vulkan display gpu wait…");
     vulkan_tex.wait_display_gpu(2'000'000'000ull);
+    VRP_TEARDOWN_LOG("XR teardown: vulkan display gpu done");
     if (VkQueue vq = xr.video_decode_queue()) {
       VkFence fence = VK_NULL_HANDLE;
       VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -7601,21 +8128,21 @@ void HostWindow::xrThreadMain() {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - t0)
                           .count();
-      VRP_LOG("teardown: vulkan decode idle %lld ms ok=%d", static_cast<long long>(ms),
-              submit == VK_SUCCESS ? 1 : 0);
+      VRP_TEARDOWN_LOG("XR teardown: vulkan decode idle %lld ms ok=%d",
+                       static_cast<long long>(ms), submit == VK_SUCCESS ? 1 : 0);
     }
     // AVVkFrames before avcodec_free_context, so the VkVideoSession is destroyed
     // with no outstanding images. CUDA imports before decoder.close(), while the
     // NVDEC CUcontext that imported them is still alive.
-    VRP_LOG("teardown: vulkan frames");
+    VRP_TEARDOWN_LOG("XR teardown: vulkan frames");
     vulkan_tex.shutdown();
-    VRP_LOG("teardown: reset NV12 slots (before decoder.close)");
+    VRP_TEARDOWN_LOG("XR teardown: reset NV12 slots (before decoder.close)");
     cuda_tex.reset_slots(decoder.cuda_context());
     decoder.close();
     bc7.shutdown();
-    VRP_LOG("teardown: decoder closed");
+    VRP_TEARDOWN_LOG("XR teardown: decoder closed");
     fsr.shutdown();
-    VRP_LOG("teardown: fsr done");
+    VRP_TEARDOWN_LOG("XR teardown: fsr done");
     cuda_tex.shutdown();
     vaapi_tex.shutdown();
     vulkan_tex.shutdown();
@@ -7626,20 +8153,20 @@ void HostWindow::xrThreadMain() {
     hud_tex.shutdown();
     seek_tex.shutdown();
     texture.shutdown();
-    VRP_LOG("teardown: scene shutdown");
+    VRP_TEARDOWN_LOG("XR teardown: scene shutdown");
     scene.shutdown();
-    VRP_LOG("teardown: monasphere xr shutdown");
-    VRP_LOG("teardown: finish_exit");
+    VRP_TEARDOWN_LOG("XR teardown: finish_exit…");
     xr.finish_exit();
-    VRP_LOG("teardown: finish_exit done");
-    VRP_LOG("teardown: xr.shutdown");
+    VRP_TEARDOWN_LOG("XR teardown: finish_exit done");
+    VRP_TEARDOWN_LOG("XR teardown: xr.shutdown…");
     xr.shutdown();
-    VRP_LOG("teardown: xr.shutdown done");
+    VRP_TEARDOWN_LOG("XR teardown: xr.shutdown done");
     // App exit joins once this drops. A normal session end keeps the flag set
     // until the thread returns, so reconnect does not overlap the unwind.
     if (shutting_down_.load()) xr_running_.store(false);
-    VRP_LOG("teardown: complete");
+    VRP_TEARDOWN_LOG("XR teardown: complete");
   } catch (const std::exception& e) {
+    VRP_TEARDOWN_LOG("XR teardown: EXCEPTION %s", e.what());
     const QString msg = QString::fromUtf8(e.what());
     if (!shutting_down_.load()) {
       QMetaObject::invokeMethod(
@@ -7659,6 +8186,7 @@ void HostWindow::xrThreadMain() {
     }
   }
   xr_running_.store(false);
+  VRP_TEARDOWN_LOG("XR teardown: xr_running cleared (thread exit)");
   if (!shutting_down_.load()) {
     QMetaObject::invokeMethod(
         this,

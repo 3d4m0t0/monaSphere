@@ -1,5 +1,6 @@
 #include "capture/virtual_display_manager.hpp"
 
+#include "capture/gnome_virtual_display.hpp"
 #include "capture/kwin_window_placer.hpp"
 #include "common.hpp"
 
@@ -10,6 +11,7 @@
 #include <QRegularExpression>
 #include <QScreen>
 #include <QThread>
+#include <QTimer>
 
 #include <algorithm>
 #include <cmath>
@@ -27,6 +29,8 @@ VirtualDisplayManager::VirtualDisplayManager(QObject* parent) : QObject(parent) 
     }
     emit logMessage(tr("Virtual display: %1").arg(e));
   });
+  mutter_ = new MutterVirtualScreencast(this);
+  connect(mutter_, &MutterVirtualScreencast::status, this, &VirtualDisplayManager::logMessage);
 }
 
 int VirtualDisplayManager::spanFromName(const QString& name_or_output) {
@@ -53,6 +57,7 @@ bool VirtualDisplayManager::spec_equal(const Spec& a, int w, int h, float sc, co
 }
 
 bool VirtualDisplayManager::alive() const {
+  if (gnome_meta_alive_) return true;
   // Guard: callers may race Host teardown (YouTubeSession dtor / deleteChildren).
   if (!vdisp_) return false;
   return vdisp_->owned() || vdisp_->running();
@@ -61,7 +66,19 @@ bool VirtualDisplayManager::alive() const {
 bool VirtualDisplayManager::matches(const Spec& want_in) const {
   if (!alive() || !have_current_) return false;
   const Spec want = normalize(want_in);
+  if (backend_ == Backend::GnomeMutter) {
+    // Meta name is compositor-assigned (Meta-0); match stream geometry only.
+    return std::abs(want.width - current_.width) <= 16 &&
+           std::abs(want.height - current_.height) <= 16 &&
+           std::abs(want.scale - current_.scale) <= 0.05f;
+  }
   return spec_equal(want, current_.width, current_.height, current_.scale, current_.name);
+}
+
+bool VirtualDisplayManager::reusable() const {
+  // RecordVirtual MONITOR dies with Session.Stop — never reuse across streams.
+  if (backend_ == Backend::GnomeMutter || gnome_meta_alive_) return false;
+  return alive();
 }
 
 QString VirtualDisplayManager::output_name() const {
@@ -326,12 +343,109 @@ bool VirtualDisplayManager::wait_ready(const Spec& want, QString* matched_out,
   return ready;
 }
 
+void VirtualDisplayManager::stopGnomeMetaUnlocked() {
+  if (mutter_) mutter_->stop();
+  gnome_meta_alive_ = false;
+  if (backend_ == Backend::GnomeMutter) {
+    backend_ = Backend::None;
+    have_current_ = false;
+    output_name_.clear();
+    screen_index_ = -1;
+  }
+  last_gnome_ = Result{};
+}
+
+VirtualDisplayManager::Result VirtualDisplayManager::ensureGnomeMeta(const Spec& want_in) {
+  Result r;
+  r.backend = Backend::GnomeMutter;
+  Spec want = normalize(want_in);
+  // Topology bookkeeping — Mutter assigns Meta-N; WxH comes from PW negotiate.
+  want.name = QStringLiteral("Meta");
+  active_span_ = want.span;
+  r.span = want.span;
+
+  if (!mutter_) {
+    r.error = tr("Mutter Virtual helper missing");
+    return r;
+  }
+  if (!GnomeVirtualDisplay::managedVirtualAvailable()) {
+    r.error = tr("GNOME managed Virtual needs portal VIRTUAL or Mutter.ScreenCast");
+    return r;
+  }
+
+  // Stream-tied: always Session.Stop then recreate (no krfb-style reuse).
+  begin_progress();
+  emit busyStatus(tr("Virtual 作成中"));
+  stopGnomeMetaUnlocked();
+  add_progress(15);
+
+  bool ok = false;
+  QString err;
+  MutterVirtualScreencast::Result mr;
+  QEventLoop loop;
+  const QMetaObject::Connection c_ok = connect(
+      mutter_, &MutterVirtualScreencast::started, &loop,
+      [&](const MutterVirtualScreencast::Result& res) {
+        mr = res;
+        ok = true;
+        loop.quit();
+      });
+  const QMetaObject::Connection c_fail =
+      connect(mutter_, &MutterVirtualScreencast::failed, &loop, [&](const QString& e) {
+        err = e;
+        loop.quit();
+      });
+  mutter_->start();
+  add_progress(25);
+  QTimer::singleShot(45000, &loop, &QEventLoop::quit);
+  loop.exec();
+  disconnect(c_ok);
+  disconnect(c_fail);
+
+  if (!ok) {
+    stopGnomeMetaUnlocked();
+    r.error = err.isEmpty() ? tr("Mutter Meta timed out") : err;
+    emit busyStatus(QString());
+    emit logMessage(r.error);
+    return r;
+  }
+  add_progress(45);
+
+  gnome_meta_alive_ = true;
+  backend_ = Backend::GnomeMutter;
+  have_current_ = true;
+  current_ = want;
+  output_name_ = GnomeVirtualDisplay::outputNameHint();
+  screen_index_ = -1;
+
+  r.ok = true;
+  r.action = Action::Created;
+  r.output_name = output_name_;
+  r.node_id = mr.node_id;
+  r.eis_fd = mr.eis_fd;
+  r.mapping_id = mr.mapping_id;
+  last_gnome_ = r;
+  // Clear eis_fd in last_gnome_ after copy — caller owns the fd from `r`.
+  last_gnome_.eis_fd = -1;
+  add_progress(15);
+  emit logMessage(tr("Virtual: created %1 (Mutter Meta node %2, EIS %3)")
+                      .arg(r.output_name)
+                      .arg(r.node_id)
+                      .arg(r.eis_fd >= 0 ? tr("yes") : tr("no")));
+  // Leave busyStatus "Virtual 作成中" — session sets title like KDE after ensure.
+  return r;
+}
+
 VirtualDisplayManager::Result VirtualDisplayManager::ensure(const Spec& want_in) {
   Result r;
+  r.backend = Backend::KdeKrfb;
+  // GNOME Meta must not leave a leftover Session if Host switched desktops.
+  stopGnomeMetaUnlocked();
   const Spec want = normalize(want_in);
   active_span_ = want.span;
   r.span = want.span;
   r.restore_token = token(want.span);
+  backend_ = Backend::KdeKrfb;
 
   // Same name + resolution + scale → reuse (x3→x3 must not delete).
   if (alive() && have_current_ &&
@@ -495,16 +609,33 @@ VirtualDisplayManager::Result VirtualDisplayManager::ensure(const Spec& want_in)
 }
 
 void VirtualDisplayManager::destroy() {
+  if (gnome_meta_alive_ || backend_ == Backend::GnomeMutter) {
+    begin_progress();
+    emit busyStatus(tr("Virtual 削除中"));
+    VRP_LOG("Virtual: destroy Meta (Mutter Session.Stop)");
+    emit logMessage(tr("Virtual: destroy Meta-* (tokens N/A)"));
+    add_progress(40);
+    stopGnomeMetaUnlocked();
+    add_progress(50);
+    // Mutter removes Meta asynchronously; brief settle for shell/lease.
+    QThread::msleep(600);
+    add_progress(10);
+    emit busyStatus(QString());
+    return;
+  }
+
   if (!vdisp_) {
     have_current_ = false;
     output_name_.clear();
     screen_index_ = -1;
+    backend_ = Backend::None;
     return;
   }
   if (!alive() && !KdeVirtualDisplay::anyManagedOutputExists()) {
     have_current_ = false;
     output_name_.clear();
     screen_index_ = -1;
+    backend_ = Backend::None;
     // Still scrub leftover rules from a prior aborted session.
     KwinWindowPlacer::clear_live_session_rules();
     emit busyStatus(QString());
@@ -524,6 +655,7 @@ void VirtualDisplayManager::destroy() {
   have_current_ = false;
   output_name_.clear();
   screen_index_ = -1;
+  backend_ = Backend::None;
   if (wait_gone(8000, 30)) {
     emit logMessage(tr("Virtual: removed"));
   } else {

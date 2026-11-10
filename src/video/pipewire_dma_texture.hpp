@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -19,12 +20,11 @@ namespace vrp {
  * try_import; XR thread only poll_present + view/sampler. On modifier or
  * format failure, try_import returns false and the host keeps CPU RGBA.
  *
- * Slot reuse (lightening 6): PipeWire recycles a small dma-buf pool. Matching
- * (st_dev, st_ino) reuses the existing VkImage / memory / view — no per-frame
- * CreateImage. New inodes still import into a free ping-pong slot.
- * Acquire skip (lightening 7): reuse flips display_slot only — no QueueSubmit
- * / fence. Layout stays SHADER_READ_ONLY from the first import; dma-buf implicit
- * sync covers producer writes. First import still transitions + waits.
+ * Slot identity: PipeWire recycles a small dma-buf pool (same st_dev/st_ino).
+ * The producer must not get a buffer back (queue_buffer) while a VkImage still
+ * samples it — that rewrites displayed memory and looks like a short flicker /
+ * dialog-close loop (stops when the cursor parks and damage ceases). Track
+ * frame.seq per slot and invoke the release callback from destroy_slot.
  *
  * NVIDIA experimental notes (discard if unstable):
  *  - Probe OPAQUE_FD then DMA_BUF (or reverse) before vkAllocateMemory.
@@ -70,6 +70,9 @@ class PipewireDmaTexture {
   bool poll_present();
   void reset();
 
+  /** Invoked when a slot's imported dma-buf is destroyed (seq from PipewireDmaFrame). */
+  void set_release_seq_callback(std::function<void(uint64_t)> cb) { release_seq_ = std::move(cb); }
+
   const std::string& last_error() const { return last_error_; }
 
  private:
@@ -79,6 +82,13 @@ class PipewireDmaTexture {
     VkImageView view = VK_NULL_HANDLE;
     /** fstat identity of imported dma-buf; 0 = unknown / not reusable. */
     uint64_t buf_key = 0;
+    /** PipewireDmaFrame.seq — release PW buffer when this slot is destroyed. */
+    uint64_t pw_seq = 0;
+    /** Private OPTIMAL copy (not external); safe after producer rewrites dma-buf. */
+    bool is_private = false;
+    int priv_w = 0;
+    int priv_h = 0;
+    VkFormat priv_fmt = VK_FORMAT_UNDEFINED;
   };
 
   bool enabled_ = false;
@@ -100,9 +110,10 @@ class PipewireDmaTexture {
   VkSampler sampler_ = VK_NULL_HANDLE;
   PFN_vkGetMemoryFdPropertiesKHR get_fd_props_ = nullptr;
 
-  Slot slots_[3]{};
+  // Ping-pong only (front display + back copy-out). Triple was +2 on top of a
+  // PW pool that already preferred 4 — excess "latest+3" latency on Live.
+  Slot slots_[2]{};
   std::atomic<int> display_slot_{0};
-  int prev_slot_ = 0;
   std::atomic<bool> valid_{false};
   std::atomic<bool> abandoned_{false};
   std::atomic<uint64_t> present_gen_{0};
@@ -115,6 +126,7 @@ class PipewireDmaTexture {
   uint64_t arm_mod_ = 0;
   uint32_t arm_fourcc_ = 0;
   int arm_hits_ = 0;
+  std::function<void(uint64_t)> release_seq_;
 
   void set_error(const std::string& e);
   void abandon(const std::string& e);
@@ -127,9 +139,13 @@ class PipewireDmaTexture {
                          VkMemoryFdPropertiesKHR* out_props) const;
   bool import_image(Slot& slot, int fd, uint64_t modifier, int width, int height, VkFormat format,
                     bool force_opaque_alpha, VkDeviceSize offset, VkDeviceSize row_pitch,
-                    VkDeviceSize size);
+                    VkDeviceSize size, bool require_transfer_src = false);
   /** First-time layout: UNDEFINED → SHADER_READ_ONLY. */
   bool transition_slot(const Slot& slot);
+  bool ensure_private_slot(Slot& slot, int w, int h, VkFormat format, bool force_opaque_alpha);
+  /** Import external → blit into private slot → drop import; releases frame.seq. */
+  bool import_copy_out(Slot& dst, const PipewireDmaFrame& frame, uint64_t mod, VkFormat format,
+                       bool force_opaque_alpha);
   /** @param force_opaque_alpha XRGB/XBGR → ImageView A=ONE (Flat uses SRC_ALPHA blend). */
   static bool map_drm_to_vk(uint32_t drm_fourcc, VkFormat& out_format, bool& force_opaque_alpha);
   static bool dma_buf_key(int fd, uint64_t* out_key);

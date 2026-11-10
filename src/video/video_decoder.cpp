@@ -2791,7 +2791,7 @@ bool VideoTexture::upload_idle_screen() {
   // XR compositor may still reference (live → idle used to force a 2×2 resize).
   VideoFrame ph;
   constexpr uint8_t r = 36, g = 42, b = 56, a = 90;
-  if (width_ >= 2 && height_ >= 2 && slots_[0].image && slots_[1].image) {
+  if (width_ >= 2 && height_ >= 2 && slots_[0].image && slots_[1].image && slots_[2].image) {
     ph.width = width_;
     ph.height = height_;
     ph.rgba.assign(static_cast<size_t>(ph.width) * static_cast<size_t>(ph.height) * 4u, 0);
@@ -3114,7 +3114,10 @@ void VideoTexture::destroy_slots() {
     if (s.memory) vkFreeMemory(device_, s.memory, nullptr);
     s = {};
   }
+  for (uint64_t& seq : slot_seq_) seq = 0;
+  upload_seq_ = 0;
   display_ = 0;
+  prev_display_ = 0;
   write_ = 1;
   valid_ = false;
 }
@@ -3162,7 +3165,9 @@ bool VideoTexture::create_slot(Slot& slot, int width, int height) {
 }
 
 void VideoTexture::ensure_size(int width, int height) {
-  if (width == width_ && height == height_ && slots_[0].image && slots_[1].image) return;
+  if (width == width_ && height == height_ && slots_[0].image && slots_[1].image &&
+      slots_[2].image)
+    return;
   wait_fence();
   in_flight_ = false;
   // Recreated images are UNDEFINED until the next upload finishes — force the sync path.
@@ -3171,8 +3176,17 @@ void VideoTexture::ensure_size(int width, int height) {
   destroy_slots();
   width_ = width;
   height_ = height;
+  for (int i = 0; i < kSlots; ++i) {
+    slot_seq_[i] = 0;
+    slot_fp_[i] = 0;
+  }
+  upload_seq_ = 0;
+  display_ = 0;
+  prev_display_ = 0;
+  write_ = 1;
   VRP_CHECK(create_slot(slots_[0], width, height), "video A");
   VRP_CHECK(create_slot(slots_[1], width, height), "video B");
+  VRP_CHECK(create_slot(slots_[2], width, height), "video C");
 
   const VkDeviceSize need = static_cast<VkDeviceSize>(width) * height * 4;
   if (need > staging_size_) {
@@ -3203,6 +3217,18 @@ void VideoTexture::ensure_size(int width, int height) {
 bool VideoTexture::poll_present() {
   bool changed = false;
   if (in_flight_ && fence_ready()) {
+    const uint64_t new_seq = slot_seq_[write_];
+    const uint64_t old_seq = slot_seq_[display_];
+    // Refuse mild rewind (stale hidden slot). Large drop = PipeWire seq_ reset after stop.
+    if (old_seq != 0 && new_seq != 0 && new_seq < old_seq && (old_seq - new_seq) < 1000ull) {
+      VRP_LOG("VideoTexture: REJECT flip write=%d seq=%llu < display=%d seq=%llu (keep front)",
+              write_, static_cast<unsigned long long>(new_seq), display_,
+              static_cast<unsigned long long>(old_seq));
+      in_flight_ = false;
+      return false;
+    }
+    // Retire the previous front — XR may still sample it for one more frame.
+    prev_display_ = display_;
     display_ = write_;
     in_flight_ = false;
     valid_ = true;
@@ -3220,9 +3246,19 @@ bool VideoTexture::try_upload(const VideoFrame& frame) {
   if (in_flight_ || !fence_ready()) return false;
 
   ensure_size(frame.width, frame.height);
-  if (!staging_mapped_ || !slots_[0].image || !slots_[1].image) return false;
+  if (!staging_mapped_ || !slots_[0].image || !slots_[1].image || !slots_[2].image) return false;
 
-  write_ = 1 - display_;
+  // Pick the only slot that is neither current display nor previous display.
+  // Writing the previous front while XR still samples it left stale/torn pixels
+  // that later rotated back into view ("old frame then jump").
+  write_ = -1;
+  for (int i = 0; i < kSlots; ++i) {
+    if (i != display_ && i != prev_display_) {
+      write_ = i;
+      break;
+    }
+  }
+  if (write_ < 0) write_ = (display_ + 1) % kSlots;
   Slot& slot = slots_[write_];
 
   std::memcpy(staging_mapped_, frame.rgba.data(),
@@ -3258,11 +3294,24 @@ bool VideoTexture::try_upload(const VideoFrame& frame) {
   if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return false;
   if (qlock.owns_lock()) qlock.unlock();
 
+  // Prefer capture_seq from Live so display order matches PipeWire generation.
+  if (frame.capture_seq != 0) {
+    slot_seq_[write_] = frame.capture_seq;
+    if (frame.capture_seq > upload_seq_) upload_seq_ = frame.capture_seq;
+  } else {
+    slot_seq_[write_] = ++upload_seq_;
+  }
+  slot_fp_[write_] =
+      frame.content_fp != 0
+          ? frame.content_fp
+          : (!frame.rgba.empty() ? rgba_content_fp(frame.rgba.data(), frame.width, frame.height)
+                                 : 0);
   in_flight_ = true;
 
   // First frame after create/resize: finish before XR samples UNDEFINED layouts.
   if (!valid_) {
     wait_fence();
+    prev_display_ = display_;
     display_ = write_;
     in_flight_ = false;
     valid_ = true;

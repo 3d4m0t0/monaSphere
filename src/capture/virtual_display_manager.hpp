@@ -1,6 +1,7 @@
 #pragma once
 
 #include "capture/kde_virtual_display.hpp"
+#include "capture/mutter_virtual_screencast.hpp"
 
 #include <QMap>
 #include <QObject>
@@ -12,32 +13,52 @@
 namespace vrp {
 
 /**
- * Owns monaSphere Virtual (krfb) + per-span ScreenCast restore tokens +
- * the live KWin identity (output name + screen index) for placement rules.
+ * Owns the live Virtual MONITOR topology for both desktops:
+ *  - KDE: krfb-virtualmonitor → Virtual-monaSphere (+ ScreenCast restore tokens)
+ *  - GNOME: Mutter RecordVirtual(is-platform) → Meta-* (stream-tied MONITOR)
  *
- * Virtual policy (ensure):
- *  - up + same name/resolution/scale → reuse
- *  - up + different → delete, then create
- *  - none → create
+ * ## Root causes this design absorbs (2026-11 Meta live)
  *
- * Identity (after ensure / refresh):
- *  - output_name: always Virtual-monaSphere (span only changes WxH)
- *  - screen_index: workspace.screens[] index for Window Rule Force screen
+ * 1. **SHM pool recycle / 前後ブレ** — RecordVirtual Hidden cursor only emits on
+ *    stage damage; PW then republishes the same ≤8 SHM buffers. Mitigations live
+ *    in the capture/display path (Embedded cursor, sticky content_fp ban, SHM
+ *    staging). The manager does not own those filters.
  *
- * Token policy:
- *  - one restore token for Virtual-monaSphere (conf: live_restore_token)
- *  - span x1–x3 share that token; resolution changes do not need re-auth
- *  - setToken() after portal Start; clearToken() on reject / wrong-stream
- *  - Host persists via tokenChanged (manager is in-memory source of truth)
+ * 2. **Cursor dead until Meta "glitches"** — Mutter ConnectToEIS runs *before*
+ *    PipeWire negotiates size, so Meta-* does not exist when libei snapshots
+ *    regions. Warps land on a stale primary region until Meta appears and the
+ *    device is re-added. Session must `EisPointer::repick_regions()` after Meta
+ *    is listed, then clear the spinner (see YouTubeSession gnome_live_ready_).
  *
- * Capture (portal / PipeWire / Chrome place) stays in YouTubeSession — different
- * lifetime (stream session) from display topology + auth grants.
+ * 3. **Early spinner clear** — first PW frame is Meta wallpaper; KDE's first
+ *    frame is already the browser. GNOME must keep busy/loading until Chrome is
+ *    on Meta and EIS is rebound (KDE-shaped ensure → place → first usable frame).
+ *
+ * 4. **Split ownership** — historically YouTubeSession owned MutterVirtual while
+ *    the manager only knew krfb. Host `matches()`/`destroy()` then lied on GNOME
+ *    (always 「削除中」, no reuse). Meta create/destroy now go through this
+ *    manager like KDE Virtual.
+ *
+ * Capture (PipeWire consumer / Chrome place) stays in YouTubeSession — different
+ * lifetime from display topology. On GNOME the MONITOR *is* the RecordVirtual
+ * session, so destroy() Session.Stop after clients/PW are stopped (session
+ * cleanupStreaming order).
+ *
+ * ## Why GNOME Live start often feels faster than KDE
+ *
+ * KDE ensure() waits on: kscreen describe/enable polls (≤10s, 150ms ticks),
+ * optional recreate path (wait_gone ≤8s + 400ms plasmashell settle), then
+ * Chrome place *before* ScreenCast, then portal Start (token/restore). GNOME
+ * ensureGnomeMeta is one Mutter D-Bus RecordVirtual + ConnectToEIS (no kscreen
+ * wait_ready); Chrome is deferred until after PW — fewer serial waits on the
+ * critical path to first HMD spinner, though Meta wallpaper is held off-HMD
+ * until Chrome places.
  */
 class VirtualDisplayManager : public QObject {
   Q_OBJECT
  public:
   struct Spec {
-    QString name;  // krfb --name (monaSphere; span ignored for naming)
+    QString name;  // krfb --name (monaSphere); GNOME uses Meta hint
     int width = 1280;
     int height = 720;
     float scale = 2.f;
@@ -51,97 +72,106 @@ class VirtualDisplayManager : public QObject {
     Recreated,
   };
 
+  enum class Backend {
+    None,
+    KdeKrfb,
+    GnomeMutter,
+  };
+
   struct Result {
     bool ok = false;
     Action action = Action::Created;
+    Backend backend = Backend::None;
     int span = 1;
     QString output_name;
-    /** KWin workspace.screens[] index; -1 if unresolved. */
+    /** KWin workspace.screens[] index; -1 if unresolved / GNOME. */
     int screen_index = -1;
-    /** ScreenCast restore token for this span (may be empty → interactive). */
+    /** ScreenCast restore token for this span (KDE; empty on GNOME). */
     QString restore_token;
+    /** GNOME Mutter: PipeWire node + EIS fd from RecordVirtual / RD. */
+    uint32_t node_id = 0;
+    int eis_fd = -1;  // ownership transfers to caller (EisPointer::start_from_fd)
+    QString mapping_id;
     QString error;
   };
 
   explicit VirtualDisplayManager(QObject* parent = nullptr);
 
-  /** Apply Virtual policy. Fills Result.restore_token from the span store. */
+  /** KDE Virtual policy (reuse / recreate / create). */
   Result ensure(const Spec& want);
-  /** Tear down Virtual only — tokens kept. Clears name/index. */
+  /**
+   * GNOME Meta-* via Mutter RecordVirtual(is-platform, cursor=embedded).
+   * Blocks (local QEventLoop) until PipeWireStreamAdded + ConnectToEIS succeed.
+   * Meta output itself appears only after the session starts the PW consumer.
+   * Emits busyStatus("Virtual 作成中") + progress like KDE ensure().
+   */
+  Result ensureGnomeMeta(const Spec& want);
+  /**
+   * Tear down Virtual / Meta. Tokens kept (KDE).
+   * GNOME: Mutter Session.Stop (removes Meta-*). Call only after clients + PW
+   * consumer are stopped (YouTubeSession::cleanupStreaming order).
+   */
   void destroy();
 
   bool alive() const;
   bool matches(const Spec& want) const;
+  /** False while a GNOME Meta RecordVirtual session is open (stream-tied). */
+  bool reusable() const;
 
-  /** Expected / last matched compositor output name (Virtual-monaSphere). */
+  Backend backend() const { return backend_; }
+  bool gnome_meta_alive() const { return gnome_meta_alive_; }
+  /** Last successful ensureGnomeMeta result (eis_fd may already be taken). */
+  const Result& last_gnome_result() const { return last_gnome_; }
+
+  MutterVirtualScreencast* mutter() { return mutter_; }
+  const MutterVirtualScreencast* mutter() const { return mutter_; }
+
+  /** Expected / last matched compositor output name. */
   QString output_name() const;
-  /** krfb --name (monaSphere). */
+  /** krfb --name (monaSphere) or Meta hint. */
   QString name() const;
-  /**
-   * KWin screen index for Window Rules. Valid after successful ensure/refresh.
-   * -1 if Virtual is down or index could not be resolved.
-   */
   int screen_index() const { return screen_index_; }
   int width() const;
   int height() const;
   float scale() const;
   int active_span() const { return active_span_; }
 
-  /**
-   * Re-resolve output_name (kscreen) + screen_index (KWin) for the current Virtual.
-   * Call before install Window Rule if topology may have changed.
-   */
   bool refresh_identity(QString* error_out = nullptr);
 
-  /** Legacy monaSphere-xN → 1–3; plain Virtual-monaSphere → 1. */
   static int spanFromName(const QString& name_or_output);
   static Spec normalize(Spec want);
 
-  // --- ScreenCast restore tokens (per span) ---
   QString token(int span) const;
-  /** Load from conf at startup (no tokenChanged). */
   void loadToken(int span, const QString& token);
-  /** Portal returned a token — emit tokenChanged for conf write. */
   void setToken(int span, const QString& token);
-  /** Drop one span (reject / wrong MONITOR). Other spans kept. */
   void clearToken(int span);
   void clearAllTokens();
 
   KdeVirtualDisplay* display() { return vdisp_; }
   const KdeVirtualDisplay* display() const { return vdisp_; }
 
-  /**
-   * Thread-safe. Called with 0–100 as each Virtual step's completion is confirmed.
-   * -1 is not used here; the sink owner clears the readout when busy status clears.
-   */
   void set_progress_sink(std::function<void(int)> sink);
 
  signals:
   void logMessage(const QString& msg);
   void busyStatus(const QString& status);
-  /** Persist live_restore_token (span arg kept for API; always the shared grant). */
   void tokenChanged(int span, const QString& token);
 
  private:
   static bool spec_equal(const Spec& a, int w, int h, float sc, const QString& name);
-  /**
-   * Poll until mode+rect match. screen_index_out, when non-null, receives a KWin
-   * index queried in parallel once the output name is known (-1 if that attempt
-   * missed and the caller must query again).
-   */
   bool wait_ready(const Spec& want, QString* matched_out, int* screen_index_out);
-  /** gone_budget is added across confirmed kscreen polls, remainder when the wait ends. */
   bool wait_gone(int timeout_ms, int gone_budget);
   void begin_progress();
   void add_progress(int delta);
-  /**
-   * Set cached name + KWin index. index_checked means known_index is the result
-   * of a query that ran after the output was listed — do not query again.
-   */
   void commit_identity(const Spec& want, const QString& matched, Result* r, int known_index,
                        bool index_checked);
+  void stopGnomeMetaUnlocked();
 
   KdeVirtualDisplay* vdisp_ = nullptr;
+  MutterVirtualScreencast* mutter_ = nullptr;
+  Backend backend_ = Backend::None;
+  bool gnome_meta_alive_ = false;
+  Result last_gnome_{};
   Spec current_{};
   bool have_current_ = false;
   int active_span_ = 1;

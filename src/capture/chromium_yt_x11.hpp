@@ -18,6 +18,15 @@ class ChromiumYtX11 {
   ChromiumYtX11& operator=(const ChromiumYtX11&) = delete;
 
   /**
+   * Prefer windows whose _NET_WM_PID is this process or a descendant
+   * (isolated Chrome zygote). 0 = class/title match only.
+   */
+  void set_prefer_pid(long pid) {
+    std::lock_guard<std::recursive_mutex> lock(mu_);
+    prefer_pid_ = pid;
+  }
+
+  /**
    * Find WM_CLASS monaSphereYT; size / place window.
    * If hide_host, park far off-screen (WINDOW capture). For MONITOR capture,
    * pass hide_host=false and set_place() to the target output origin.
@@ -106,8 +115,29 @@ class ChromiumYtX11 {
   /** Re-read XGetGeometry (fullscreen / resize). */
   bool refresh_geometry();
 
+  /**
+   * Ask the WM for _NET_WM_STATE_FULLSCREEN (after the window is on the Virtual
+   * output). Used on GNOME where --start-fullscreen would land on the primary.
+   */
+  bool request_fullscreen(bool on = true);
+
+  /**
+   * GNOME/Mutter: fullscreen on the XRandR monitor that matches place_x_/y_
+   * (Meta-*) via _NET_WM_FULLSCREEN_MONITORS — plain FS jumps to primary.
+   */
+  bool request_fullscreen_on_placed_output();
+
   /** Re-bind Chrome window if the previous xid died (shared profile / Wayland). */
   bool ensure_inject_target();
+
+  /**
+   * GNOME Meta-*: RecordVirtual SHM stays black until the stage gets damage.
+   * Map a 1×1 override-redirect window on the bound output and clear that
+   * root rectangle so Mutter composites wallpaper into the stream.
+   */
+  /** @param quiet Skip per-call VRP_LOG (periodic Streaming nudge). */
+  bool force_output_damage(bool quiet = false);
+  void destroy_damage_window();
 
   /** Root-window origin of the client (for verifying KWin moved it). */
   bool root_origin(int* root_x, int* root_y) const;
@@ -141,12 +171,17 @@ class ChromiumYtX11 {
   int place_y_ = 80;
   bool have_place_ = false;
   bool screen_input_ = false;
+  long prefer_pid_ = 0;
   float cursor_x_ = 640.f;
   float cursor_y_ = 360.f;
   std::string last_error_;
   EisPointer* eis_ = nullptr;  // not owned
   int eis_ox_ = 0;             // MONITOR logical origin (when not region-local)
   int eis_oy_ = 0;
+  unsigned long damage_window_ = 0;  // Window — Meta first-paint nudge
+  int damage_crtc_w_ = 0;
+  int damage_crtc_h_ = 0;
+  unsigned damage_tick_ = 0;  // cycles fill color so each nudge changes pixels
 
   /** Map MONITOR-space cursor into Chrome client pixels for XSendEvent. */
   void client_cursor(int* cx, int* cy) const;

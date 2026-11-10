@@ -3,6 +3,7 @@
 #include "common.hpp"
 
 #include <libei.h>
+#include <linux/input-event-codes.h>
 
 #include <unistd.h>
 
@@ -30,7 +31,17 @@ void EisPointer::teardown_unlocked() {
   if (device_ && emulating_) {
     ei_device_stop_emulating(static_cast<struct ei_device*>(device_));
     emulating_ = false;
+    if (keyboard_ == device_) kbd_emulating_ = false;
   }
+  if (keyboard_ && kbd_emulating_) {
+    ei_device_stop_emulating(static_cast<struct ei_device*>(keyboard_));
+    kbd_emulating_ = false;
+  }
+  if (keyboard_) {
+    ei_device_unref(static_cast<struct ei_device*>(keyboard_));
+    keyboard_ = nullptr;
+  }
+  kbd_resumed_ = false;
   if (device_) {
     ei_device_unref(static_cast<struct ei_device*>(device_));
     device_ = nullptr;
@@ -54,13 +65,27 @@ void EisPointer::pick_region_for_device(void* device) {
   if (!dev) return;
 
   struct ei_region* matched = nullptr;
+  struct ei_region* rightmost = nullptr;
+  struct ei_region* last = nullptr;
+  size_t nreg = 0;
+  uint32_t best_x = 0;
   for (size_t i = 0;; ++i) {
     struct ei_region* reg = ei_device_get_region(dev, i);
     if (!reg) break;
+    ++nreg;
+    last = reg;
+    const uint32_t rx = ei_region_get_x(reg);
+    const uint32_t ry = ei_region_get_y(reg);
     const char* mid = ei_region_get_mapping_id(reg);
     VRP_LOG("eis-pointer: region %zu %ux%u+%u+%u mapping_id=%s", i, ei_region_get_width(reg),
-            ei_region_get_height(reg), ei_region_get_x(reg), ei_region_get_y(reg),
-            mid && *mid ? mid : "(none)");
+            ei_region_get_height(reg), rx, ry, mid && *mid ? mid : "(none)");
+    // RecordVirtual Meta is usually the rightmost / non-origin output.
+    if (rx > 0 || ry > 0) {
+      if (!rightmost || rx >= best_x) {
+        rightmost = reg;
+        best_x = rx;
+      }
+    }
     if (matched || mapping_id_.empty() || !mid || !*mid) continue;
     const std::string m(mid);
     if (m == mapping_id_ || m.find(mapping_id_) != std::string::npos ||
@@ -71,9 +96,14 @@ void EisPointer::pick_region_for_device(void* device) {
 
   if (!matched && !mapping_id_.empty()) {
     // Single region → that MONITOR.
-    struct ei_region* only = ei_device_get_region(dev, 0);
-    if (only && !ei_device_get_region(dev, 1)) matched = only;
+    if (nreg == 1) matched = last;
   }
+  // Mutter RD often leaves mapping_id empty — pick Meta (rightmost non-origin).
+  if (!matched && rightmost) {
+    matched = rightmost;
+    VRP_LOG("eis-pointer: no mapping_id — using rightmost region as Meta");
+  }
+  if (!matched && last) matched = last;
 
   if (matched) {
     region_x_ = ei_region_get_x(matched);
@@ -87,6 +117,27 @@ void EisPointer::pick_region_for_device(void* device) {
               region_h_, region_x_, region_y_);
     }
   }
+}
+
+bool EisPointer::repick_regions() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ready_.load(std::memory_order_acquire)) return false;
+  for (int i = 0; i < 25; ++i) {
+    pump();
+    if (device_) {
+      pick_region_for_device(device_);
+      // pick_region prefers rightmost non-origin (Meta). Accept once sized + resumed.
+      if (resumed_ && region_w_ > 0 && region_h_ > 0) {
+        VRP_LOG("eis-pointer: repick -> %ux%u @%u,%u local=%d", region_w_, region_h_, region_x_,
+                region_y_, region_local_.load() ? 1 : 0);
+        return true;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+  }
+  VRP_LOG("eis-pointer: repick failed (region %ux%u @%u,%u resumed=%d)", region_w_, region_h_,
+          region_x_, region_y_, resumed_ ? 1 : 0);
+  return false;
 }
 
 bool EisPointer::start_from_fd(int eis_fd, const std::string& mapping_id) {
@@ -144,6 +195,12 @@ void EisPointer::pump() {
     if (t == EI_EVENT_DISCONNECT) {
       VRP_LOG("eis-pointer: disconnected by EIS");
       ready_.store(false, std::memory_order_release);
+      if (keyboard_ && keyboard_ != device_) {
+        ei_device_unref(static_cast<struct ei_device*>(keyboard_));
+      }
+      keyboard_ = nullptr;
+      kbd_resumed_ = false;
+      kbd_emulating_ = false;
       if (device_) {
         ei_device_unref(static_cast<struct ei_device*>(device_));
         device_ = nullptr;
@@ -157,12 +214,26 @@ void EisPointer::pump() {
                                 nullptr);
     } else if (t == EI_EVENT_DEVICE_ADDED) {
       struct ei_device* dev = ei_event_get_device(ev);
-      if (ei_device_has_capability(dev, EI_DEVICE_CAP_POINTER_ABSOLUTE)) {
-        if (device_) ei_device_unref(static_cast<struct ei_device*>(device_));
+      const bool abs = ei_device_has_capability(dev, EI_DEVICE_CAP_POINTER_ABSOLUTE);
+      const bool kbd = ei_device_has_capability(dev, EI_DEVICE_CAP_KEYBOARD);
+      if (abs) {
+        if (device_) {
+          ei_device_unref(static_cast<struct ei_device*>(device_));
+          device_ = nullptr;
+        }
         device_ = ei_device_ref(dev);
         resumed_ = false;
         emulating_ = false;
         pick_region_for_device(dev);
+      }
+      if (kbd) {
+        if (keyboard_ && keyboard_ != device_) {
+          ei_device_unref(static_cast<struct ei_device*>(keyboard_));
+        }
+        // Own a dedicated ref even when the same struct also has pointer caps.
+        keyboard_ = ei_device_ref(dev);
+        kbd_resumed_ = false;
+        kbd_emulating_ = false;
       }
     } else if (t == EI_EVENT_DEVICE_RESUMED) {
       struct ei_device* dev = ei_event_get_device(ev);
@@ -170,17 +241,30 @@ void EisPointer::pump() {
         device_ = ei_device_ref(dev);
         pick_region_for_device(dev);
       }
-      if (device_ && (dev == device_ ||
-                     ei_device_has_capability(dev, EI_DEVICE_CAP_POINTER_ABSOLUTE))) {
-        resumed_ = true;
+      if (!keyboard_ && ei_device_has_capability(dev, EI_DEVICE_CAP_KEYBOARD)) {
+        keyboard_ = ei_device_ref(dev);
       }
+      if (device_ && dev == device_) resumed_ = true;
+      if (keyboard_ && dev == keyboard_) kbd_resumed_ = true;
     } else if (t == EI_EVENT_DEVICE_PAUSED) {
-      if (ei_event_get_device(ev) == device_) {
+      struct ei_device* dev = ei_event_get_device(ev);
+      if (dev == device_) {
         resumed_ = false;
         emulating_ = false;
       }
+      if (dev == keyboard_) {
+        kbd_resumed_ = false;
+        kbd_emulating_ = false;
+      }
     } else if (t == EI_EVENT_DEVICE_REMOVED) {
-      if (ei_event_get_device(ev) == device_) {
+      struct ei_device* dev = ei_event_get_device(ev);
+      if (dev == keyboard_) {
+        ei_device_unref(static_cast<struct ei_device*>(keyboard_));
+        keyboard_ = nullptr;
+        kbd_resumed_ = false;
+        kbd_emulating_ = false;
+      }
+      if (dev == device_) {
         ei_device_unref(static_cast<struct ei_device*>(device_));
         device_ = nullptr;
         resumed_ = false;
@@ -198,6 +282,38 @@ bool EisPointer::ensure_device() {
     ei_device_start_emulating(static_cast<struct ei_device*>(device_), emu_seq_++);
     emulating_ = true;
   }
+  return true;
+}
+
+bool EisPointer::ensure_keyboard() {
+  pump();
+  if (!keyboard_ || !kbd_resumed_) return false;
+  if (!kbd_emulating_) {
+    // Pointer+keyboard on one device: start_emulating once.
+    if (keyboard_ == device_ && emulating_) {
+      kbd_emulating_ = true;
+    } else {
+      ei_device_start_emulating(static_cast<struct ei_device*>(keyboard_), emu_seq_++);
+      kbd_emulating_ = true;
+      if (keyboard_ == device_) emulating_ = true;
+    }
+  }
+  return true;
+}
+
+bool EisPointer::key_alt_left() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  // Evdev scancodes (keymap-independent): Alt+Left = browser Back.
+  ei_device_keyboard_key(kbd, KEY_LEFTALT, true);
+  ei_device_keyboard_key(kbd, KEY_LEFT, true);
+  ei_device_frame(kbd, ei_now(ei));
+  ei_device_keyboard_key(kbd, KEY_LEFT, false);
+  ei_device_keyboard_key(kbd, KEY_LEFTALT, false);
+  ei_device_frame(kbd, ei_now(ei));
+  pump();
   return true;
 }
 
@@ -227,6 +343,11 @@ void EisPointer::warp_desktop(double x, double y) {
 }
 
 void EisPointer::click_left() {
+  if (!buttons_enabled_.load(std::memory_order_acquire)) return;
+  click_left_forced();
+}
+
+void EisPointer::click_left_forced() {
   std::lock_guard<std::mutex> lock(mu_);
   if (!ei_ || !ensure_device()) return;
   auto* ei = static_cast<struct ei*>(ei_);
@@ -240,6 +361,7 @@ void EisPointer::click_left() {
 
 void EisPointer::scroll_discrete(int steps) {
   if (steps == 0) return;
+  if (!buttons_enabled_.load(std::memory_order_acquire)) return;
   std::lock_guard<std::mutex> lock(mu_);
   if (!ei_ || !ensure_device()) return;
   auto* ei = static_cast<struct ei*>(ei_);

@@ -959,6 +959,22 @@ void SceneRenderer::queue_nv12_texture(VkImageView y, VkImageView uv, VkSampler 
   queued_nv12_full_ = full_range;
 }
 
+void SceneRenderer::set_queued_tex_debug(uint64_t seq, uint64_t fp, int slot) {
+  queued_dbg_valid_ = true;
+  queued_dbg_seq_ = seq;
+  queued_dbg_fp_ = fp;
+  queued_dbg_slot_ = slot;
+}
+
+bool SceneRenderer::take_flushed_tex_debug(uint64_t& seq, uint64_t& fp, int& slot) {
+  if (!flushed_dbg_pending_) return false;
+  seq = flushed_dbg_seq_;
+  fp = flushed_dbg_fp_;
+  slot = flushed_dbg_slot_;
+  flushed_dbg_pending_ = false;
+  return true;
+}
+
 void SceneRenderer::flush_queued_texture() {
   if (queued_tex_ == QueuedTex::None) return;
   const QueuedTex kind = queued_tex_;
@@ -966,13 +982,25 @@ void SceneRenderer::flush_queued_texture() {
   const VkImageView uv = queued_uv_;
   const VkSampler samp = queued_samp_;
   const bool full = queued_nv12_full_;
+  const bool had_dbg = queued_dbg_valid_;
+  const uint64_t dbg_seq = queued_dbg_seq_;
+  const uint64_t dbg_fp = queued_dbg_fp_;
+  const int dbg_slot = queued_dbg_slot_;
   queued_tex_ = QueuedTex::None;
+  queued_dbg_valid_ = false;
   if (kind == QueuedTex::Nv12) {
     set_nv12_texture(y, uv, samp, full);
   } else if (kind == QueuedTex::RgbaGamma) {
     set_texture_gamma(y, samp);
   } else {
     set_texture(y, samp);
+  }
+  // Descriptor now matches what both eyes will sample this submit.
+  if (had_dbg) {
+    flushed_dbg_seq_ = dbg_seq;
+    flushed_dbg_fp_ = dbg_fp;
+    flushed_dbg_slot_ = dbg_slot;
+    flushed_dbg_pending_ = true;
   }
 }
 

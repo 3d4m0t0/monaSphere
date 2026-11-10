@@ -258,6 +258,13 @@ void ScreencastPortal::start(const QString& parent_window, const QString& restor
 
   const uint32_t want = static_cast<uint32_t>(kind_);
   if ((source_types_ & want) == 0) {
+    if (kind_ == SourceKind::Virtual) {
+      fail(QStringLiteral(
+          "Portal ScreenCast has no VIRTUAL source (AvailableSourceTypes=0x%1) — "
+          "need xdg-desktop-portal-gnome / Mutter RecordVirtual")
+               .arg(source_types_, 0, 16));
+      return;
+    }
     if (kind_ == SourceKind::Monitor && (source_types_ & kSourceWindow)) {
       kind_ = SourceKind::Window;
       VRP_LOG("screencast: MONITOR unavailable — falling back to WINDOW");
@@ -271,11 +278,13 @@ void ScreencastPortal::start(const QString& parent_window, const QString& restor
     }
   }
 
+  const char* kind_name = "MONITOR";
+  if (kind_ == SourceKind::Window) kind_name = "WINDOW";
+  else if (kind_ == SourceKind::Virtual) kind_name = "VIRTUAL";
   VRP_LOG("screencast: mode=%s ScreenCast v%u RemoteDesktop v%u sources=0x%x cursors=0x%x "
           "kind=%s restore=%s parent=%s",
           mode_ == SessionMode::RemoteDesktopWithVideo ? "RD+SC" : "SC", portal_version_,
-          remote_desktop_version_, source_types_, cursor_modes_,
-          kind_ == SourceKind::Monitor ? "MONITOR" : "WINDOW",
+          remote_desktop_version_, source_types_, cursor_modes_, kind_name,
           restore_token.isEmpty() ? "no" : "yes",
           parent_window.isEmpty() ? "(none)" : parent_window.toUtf8().constData());
   const QString st =
@@ -449,8 +458,10 @@ void ScreencastPortal::onSelectDevicesDone(QDBusPendingCallWatcher* w) {
 }
 
 void ScreencastPortal::callSelectSources() {
-  VRP_LOG("screencast: SelectSources (kind=%s)…",
-          kind_ == SourceKind::Monitor ? "MONITOR" : "WINDOW");
+  const char* kind_name = "MONITOR";
+  if (kind_ == SourceKind::Window) kind_name = "WINDOW";
+  else if (kind_ == SourceKind::Virtual) kind_name = "VIRTUAL";
+  VRP_LOG("screencast: SelectSources (kind=%s)…", kind_name);
   const QString handle = makeToken("monasphere_ss");
   const QString req_path = portalRequestPath(handle);
   watchRequest(req_path, [this](uint response, const QVariantMap&) {
@@ -477,16 +488,22 @@ void ScreencastPortal::callSelectSources() {
   opts.insert(QStringLiteral("types"), QVariant::fromValue<uint>(static_cast<uint>(kind_)));
   opts.insert(QStringLiteral("multiple"), false);
 
-  // Do not request Embedded when AvailableCursorModes=0 — portal returns
-  // "Unavailable cursor mode 2". Flat then draws a software stick cursor.
+  // Prefer Embedded when available (KDE Virtual + GNOME Meta same path): seat
+  // pointer from XR stick/D-pad is painted into SHM so frames stay unique.
+  // Sticky recent-fp ban blocks the old buffer-queue cursor trail. Flat soft
+  // stick is skipped when embedded_cursor() is true (same as Mutter path).
+  // Fallback Hidden → Host draws stick from x11_.cursor_u/v.
   embedded_cursor_ = false;
   if (cursor_modes_ & kCursorEmbedded) {
     opts.insert(QStringLiteral("cursor_mode"), QVariant::fromValue<uint>(kCursorEmbedded));
     embedded_cursor_ = true;
     VRP_LOG("screencast: cursor_mode=Embedded (DE cursor in stream)");
+  } else if (cursor_modes_ & kCursorHidden) {
+    opts.insert(QStringLiteral("cursor_mode"), QVariant::fromValue<uint>(kCursorHidden));
+    VRP_LOG("screencast: cursor_mode=Hidden (no Embedded — software cursor in HMD)");
   } else {
-    VRP_LOG("screencast: WARNING portal has no Embedded cursor (AvailableCursorModes=0x%x) — "
-            "HMD will draw a software cursor",
+    VRP_LOG("screencast: WARNING portal has no Embedded/Hidden cursor "
+            "(AvailableCursorModes=0x%x) — HMD will draw a software cursor",
             cursor_modes_);
   }
 
@@ -539,6 +556,9 @@ void ScreencastPortal::callStart() {
     if (response != 0) {
       if (!restore_token_in_.isEmpty()) {
         fail(QStringLiteral("Start restore rejected (%1)").arg(response));
+      } else if (kind_ == SourceKind::Virtual) {
+        fail(QStringLiteral("Start cancelled (%1) — approve creating a virtual MONITOR")
+                 .arg(response));
       } else if (kind_ == SourceKind::Monitor) {
         fail(QStringLiteral("Start cancelled (%1) — on the host, pick the live Virtual MONITOR")
                  .arg(response));

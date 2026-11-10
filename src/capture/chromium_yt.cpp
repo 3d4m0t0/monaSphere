@@ -20,20 +20,52 @@ void clearSingletonLocks(const QString& user_data_dir) {
   }
 }
 
-void killBrowsersForProfile(const QString& profile, LiveBrowser kind) {
-  if (profile.isEmpty()) return;
-  QProcess pkill;
+bool profileBrowsersAlive(const QString& profile, LiveBrowser kind) {
+  if (profile.isEmpty()) return false;
+  QProcess pgrep;
   if (kind == LiveBrowser::Firefox) {
-    // Match both "--profile /path" and "--profile=/path".
-    pkill.start(QStringLiteral("pkill"),
+    pgrep.start(QStringLiteral("pgrep"),
                 {QStringLiteral("-f"), QStringLiteral("--profile[= ]%1").arg(profile)});
   } else {
-    pkill.start(QStringLiteral("pkill"),
+    pgrep.start(QStringLiteral("pgrep"),
                 {QStringLiteral("-f"), QStringLiteral("user-data-dir=%1").arg(profile)});
   }
+  if (!pgrep.waitForFinished(1500) || pgrep.exitCode() != 0) return false;
+  return !QString::fromUtf8(pgrep.readAllStandardOutput()).trimmed().isEmpty();
+}
+
+void killBrowsersForProfile(const QString& profile, LiveBrowser kind, bool force_kill = false) {
+  if (profile.isEmpty()) return;
+  QStringList args;
+  if (force_kill) args << QStringLiteral("-9");
+  args << QStringLiteral("-f");
+  if (kind == LiveBrowser::Firefox) {
+    // Match both "--profile /path" and "--profile=/path".
+    args << QStringLiteral("--profile[= ]%1").arg(profile);
+  } else {
+    args << QStringLiteral("user-data-dir=%1").arg(profile);
+  }
+  QProcess pkill;
+  pkill.start(QStringLiteral("pkill"), args);
   (void)pkill.waitForFinished(2500);
-  QThread::msleep(150);
+  QThread::msleep(force_kill ? 80 : 150);
   if (kind != LiveBrowser::Firefox) clearSingletonLocks(profile);
+}
+
+void waitProfileBrowsersGone(const QString& profile, LiveBrowser kind) {
+  if (profile.isEmpty()) return;
+  for (int i = 0; i < 40; ++i) {
+    if (!profileBrowsersAlive(profile, kind)) return;
+    if (i == 12) {
+      VRP_LOG("live: isolated profile still alive — SIGKILL");
+      killBrowsersForProfile(profile, kind, /*force_kill=*/true);
+    }
+    QThread::msleep(100);
+  }
+  if (profileBrowsersAlive(profile, kind)) {
+    VRP_LOG("live: WARNING isolated profile processes still alive after kill (%s)",
+            profile.toUtf8().constData());
+  }
 }
 
 bool chromeProcessRunning() {
@@ -238,9 +270,9 @@ bool ChromiumYtLauncher::start() {
       args << QStringLiteral("--start-fullscreen");
     }
     // Default Wayland so Virtual live_virtual_scale matches desktop Chrome.
-    // Opt out: MONASPHERE_YT_X11=1 (old XWayland path; XTest fallback only).
+    // X11: MONASPHERE_YT_X11=1 or set_force_x11 (GNOME window-position place).
     if (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
-      if (!qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11")) {
+      if (force_x11_ || !qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11")) {
         args << QStringLiteral("--ozone-platform=x11");
       } else {
         args << QStringLiteral("--ozone-platform=wayland");
@@ -264,6 +296,17 @@ bool ChromiumYtLauncher::start() {
     // XWayland does not; keep WAYLAND_DISPLAY so XWayland can attach to the session.
     env.insert(QStringLiteral("MOZ_ENABLE_WAYLAND"), QStringLiteral("0"));
     VRP_LOG("live: Firefox → XWayland (MOZ_ENABLE_WAYLAND=0) + --new-instance");
+  }
+  if (!firefox && (force_x11_ || !qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11"))) {
+    // Belt-and-suspenders: some Chrome builds ignore --ozone-platform when a
+    // Wayland session Chrome is already running. Prefer X11 so Meta place +
+    // WM_CLASS are visible to our XQueryTree walker (Wayland surfaces are not).
+    env.insert(QStringLiteral("OZONE_PLATFORM"), QStringLiteral("x11"));
+    env.insert(QStringLiteral("GDK_BACKEND"), QStringLiteral("x11"));
+    // Drop Wayland so Chrome cannot attach as a wl surface (invisible to X11 find).
+    // DISPLAY stays set → XWayland. Keep XDG_SESSION_TYPE alone.
+    env.remove(QStringLiteral("WAYLAND_DISPLAY"));
+    env.remove(QStringLiteral("WAYLAND_SOCKET"));
   }
   if (route_audio_to_yt_sink_) {
     // Only when Flat live monitor owns the null sink (enable_audio).
@@ -310,27 +353,39 @@ bool ChromiumYtLauncher::start() {
   return true;
 }
 
+void ChromiumYtLauncher::killIsolatedLiveBrowsers(LiveBrowser kind) {
+  const QString profile = profileDir(kind);
+  killBrowsersForProfile(profile, kind, /*force_kill=*/false);
+  waitProfileBrowsersGone(profile, kind);
+}
+
 void ChromiumYtLauncher::stop() {
   // Window close is handled by KWin / X11 from the session. Never kill a shared
   // system browser — that would destroy the user's session.
   detached_pid_ = 0;
-  if (proc_.state() == QProcess::NotRunning) {
-    shared_session_ = false;
-    return;
-  }
   if (shared_session_) {
-    proc_.terminate();
-    (void)proc_.waitForFinished(800);
+    if (proc_.state() != QProcess::NotRunning) {
+      proc_.terminate();
+      (void)proc_.waitForFinished(800);
+    }
     shared_session_ = false;
     return;
   }
-  const QString profile = profileDir(browser_);
-  proc_.terminate();
-  if (!proc_.waitForFinished(1200)) {
-    proc_.kill();
-    (void)proc_.waitForFinished(400);
+  // Isolated: always scrub profile processes — even when our QProcess already
+  // exited. Chrome zygotes survive parent death and stay mapped on Meta-*.
+  const bool isolated = !use_default_profile_;
+  const QString profile = isolated ? profileDir(browser_) : QString();
+  if (proc_.state() != QProcess::NotRunning) {
+    proc_.terminate();
+    if (!proc_.waitForFinished(1200)) {
+      proc_.kill();
+      (void)proc_.waitForFinished(400);
+    }
   }
-  killBrowsersForProfile(profile, browser_);
+  if (isolated) {
+    killBrowsersForProfile(profile, browser_);
+    waitProfileBrowsersGone(profile, browser_);
+  }
   shared_session_ = false;
 }
 

@@ -4,6 +4,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -29,6 +30,46 @@ std::mutex& cuda_decode_mu();
 std::mutex& ffmpeg_offline_mu();
 class VaapiNv12Texture;
 
+/** Content fingerprint for Live CPU path (sparse grid + row checksums). */
+inline uint64_t rgba_content_fp(const uint8_t* rgba, int w, int h) {
+  if (!rgba || w < 2 || h < 2) return 0;
+  uint64_t x = 14695981039346656037ull;
+  auto mix = [&](uint32_t v) {
+    x ^= v;
+    x *= 1099511628211ull;
+  };
+  auto at = [&](int px, int py) {
+    const size_t o =
+        (static_cast<size_t>(py) * static_cast<size_t>(w) + static_cast<size_t>(px)) * 4u;
+    return static_cast<uint32_t>(rgba[o]) | (static_cast<uint32_t>(rgba[o + 1]) << 8) |
+           (static_cast<uint32_t>(rgba[o + 2]) << 16) | (static_cast<uint32_t>(rgba[o + 3]) << 24);
+  };
+  for (int gy = 0; gy < 4; ++gy) {
+    for (int gx = 0; gx < 4; ++gx) {
+      const int px = std::min(w - 1, (gx * (w - 1)) / 3);
+      const int py = std::min(h - 1, (gy * (h - 1)) / 3);
+      mix(at(px, py));
+    }
+  }
+  // Row checksums catch Meta double-buffer ping-pong the 4×4 grid can miss.
+  const int y_step = std::max(1, h / 32);
+  const int x_step = std::max(1, w / 64);
+  for (int y = 0; y < h; y += y_step) {
+    uint32_t row = 2166136261u;
+    const uint8_t* line = rgba + static_cast<size_t>(y) * static_cast<size_t>(w) * 4u;
+    for (int px = 0; px < w; px += x_step) {
+      const size_t o = static_cast<size_t>(px) * 4u;
+      row ^= static_cast<uint32_t>(line[o]) | (static_cast<uint32_t>(line[o + 1]) << 8) |
+             (static_cast<uint32_t>(line[o + 2]) << 16);
+      row *= 16777619u;
+    }
+    mix(row ^ static_cast<uint32_t>(y));
+  }
+  mix(static_cast<uint32_t>(w));
+  mix(static_cast<uint32_t>(h));
+  return x;
+}
+
 struct VideoFrame {
   int width = 0;
   int height = 0;
@@ -36,6 +77,10 @@ struct VideoFrame {
   double pts_sec = 0.0;
   bool gpu = false;  // true when CUDA→Vulkan path updated the shared texture
   bool full_range = false;  // AVCOL_RANGE_JPEG / PC levels
+  /** PipeWire / Live capture generation (monotonic). 0 = unset (file decode). */
+  uint64_t capture_seq = 0;
+  /** Sample fingerprint of rgba at publish time (Live CPU). */
+  uint64_t content_fp = 0;
 };
 
 /** Precomputed seek-preview strip. Each still is a JPEG, expanded to RGBA when shown. */
@@ -348,6 +393,8 @@ class VideoTexture {
 
   /** Non-blocking. Returns false if a previous upload is still in flight. */
   bool try_upload(const VideoFrame& frame);
+  /** False while a GPU upload fence is outstanding — caller should keep the frame. */
+  bool upload_ready() const { return !in_flight_ && fence_ready(); }
   /** True when the display slot changed — caller should set_texture(view(), sampler()). */
   bool poll_present();
   /**
@@ -393,6 +440,18 @@ class VideoTexture {
   VkSampler sampler() const { return sampler_; }
   int width() const { return width_; }
   int height() const { return height_; }
+  /** Content generation of the currently displayed slot (0 = never written). */
+  uint64_t display_seq() const { return slot_seq_[display_]; }
+  int display_slot() const { return display_; }
+  int write_slot() const { return write_; }
+  uint64_t slot_content_seq(int slot) const {
+    return (slot >= 0 && slot < kSlots) ? slot_seq_[slot] : 0;
+  }
+  uint64_t slot_content_fp(int slot) const {
+    return (slot >= 0 && slot < kSlots) ? slot_fp_[slot] : 0;
+  }
+  int prev_display_slot() const { return prev_display_; }
+  bool upload_in_flight() const { return in_flight_; }
 
  private:
   struct Slot {
@@ -400,6 +459,9 @@ class VideoTexture {
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
   };
+
+  /** Triple-buffer: display (sampled) + prev (XR may still read) + write. */
+  static constexpr int kSlots = 3;
 
   VkPhysicalDevice phys_ = VK_NULL_HANDLE;
   VkDevice device_ = VK_NULL_HANDLE;
@@ -412,8 +474,12 @@ class VideoTexture {
 
   int width_ = 0;
   int height_ = 0;
-  Slot slots_[2]{};
+  Slot slots_[kSlots]{};
+  uint64_t slot_seq_[kSlots]{};
+  uint64_t slot_fp_[kSlots]{};
+  uint64_t upload_seq_ = 0;
   int display_ = 0;
+  int prev_display_ = 0;  // may still be sampled by the previous XR frame
   int write_ = 1;
   bool in_flight_ = false;
   bool valid_ = false;

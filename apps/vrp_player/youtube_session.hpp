@@ -4,8 +4,10 @@
 #include "capture/chromium_yt_x11.hpp"
 #include "capture/desktop_env.hpp"
 #include "capture/eis_pointer.hpp"
+#include "capture/gnome_virtual_display.hpp"
 #include "capture/kde_eis_pointer.hpp"
 #include "capture/pipewire_capture.hpp"
+#include "capture/mutter_virtual_screencast.hpp"
 #include "capture/screencast_portal.hpp"
 #include "capture/virtual_display_manager.hpp"
 
@@ -29,7 +31,11 @@ namespace vrp {
  *
  * Idle → VDispReady → Placing → Placed → Portal → Streaming → Stopping → Idle
  *
- * KDE: ScreenCast-only + KWin EIS. GNOME: RemoteDesktop+ScreenCast + portal EIS.
+ * KDE: krfb Virtual → place → ScreenCast MONITOR + KWin EIS.
+ * GNOME managed Virtual: RD+ScreenCast VIRTUAL → Meta-* (after PW) → evacuate
+ *   portal dialogs to primary → (later) place browser. Soft HMD cursor while
+ *   ScreenCast cursor_mode=Hidden.
+ * GNOME spare MONITOR: live_virtual=0 + live_output= → place → portal MONITOR.
  */
 class YouTubeSession : public QObject {
   Q_OBJECT
@@ -92,7 +98,7 @@ class YouTubeSession : public QObject {
   ~YouTubeSession() override;
 
   /** Shared Virtual lifecycle (owned by Host). Required before start(). */
-  void set_virtual_manager(VirtualDisplayManager* mgr) { vdisp_mgr_ = mgr; }
+  void set_virtual_manager(VirtualDisplayManager* mgr);
   VirtualDisplayManager* virtual_manager() const { return vdisp_mgr_; }
 
   void start(const Config& cfg);
@@ -105,6 +111,12 @@ class YouTubeSession : public QObject {
   /** App quit: stop session. Virtual destroy is Host/manager policy. */
   void shutdown();
 
+  /**
+   * XR/filter thread: Meta SHM is stuck in pool-recycle hold — queue stage
+   * damage on the Qt thread (safe to call from any thread).
+   */
+  void kick_meta_paint();
+
   /** True while manager owns a running Virtual. */
   bool virtual_display_alive() const;
 
@@ -113,6 +125,13 @@ class YouTubeSession : public QObject {
   bool active() const { return active_.load(std::memory_order_acquire); }
   /** True when this session launched conf live_desktop_app (not Chromium). */
   bool desktop_app_mode() const { return !cfg_.exec.isEmpty(); }
+  /**
+   * GNOME RecordVirtual / Meta-* live path. FSR is forced off here while we
+   * investigate texture update issues (keep the pipeline as raw SHM → Flat).
+   */
+  bool meta_live_path() const {
+    return desk_ == DesktopEnv::Gnome && cfg_.virtual_display && !desktop_app_mode();
+  }
   bool audio_wanted() const { return audio_wanted_.load(std::memory_order_acquire); }
   void clear_audio_wanted() { audio_wanted_.store(false, std::memory_order_release); }
 
@@ -126,6 +145,14 @@ class YouTubeSession : public QObject {
   bool show_busy_overlay() const {
     return loading_.load(std::memory_order_acquire) || !busy_status().isEmpty();
   }
+  /**
+   * HMD may show the PipeWire texture. GNOME Meta: false until Chrome is on Meta
+   * (wallpaper must not replace the spinner — KDE's first frame is already the browser).
+   */
+  bool hmd_content_ready() const {
+    if (using_mutter_virtual_) return gnome_live_ready_;
+    return true;
+  }
   QString desktop_label() const { return desktop_label_; }
 
   QString output_name() const { return output_name_; }
@@ -138,7 +165,11 @@ class YouTubeSession : public QObject {
   int virtual_w() const { return cfg_.virtual_w; }
   int virtual_h() const { return cfg_.virtual_h; }
   /** False when portal ScreenCast has no Embedded cursor (Flat draws software). */
-  bool embedded_cursor() const { return portal_ && portal_->embedded_cursor(); }
+  /** True when DE cursor is baked into PW frames (skip Flat software stick). */
+  bool embedded_cursor() const {
+    if (using_mutter_virtual_) return true;  // Mutter RecordVirtual cursor=embedded
+    return portal_ && portal_->embedded_cursor();
+  }
 
   ChromiumYtX11& x11() { return x11_; }
   const ChromiumYtX11& x11() const { return x11_; }
@@ -151,8 +182,14 @@ class YouTubeSession : public QObject {
   bool& dma_disabled() { return dma_disabled_; }
 #endif
 
-  /** XR: first displayable frame → clear loading spinner. */
+  /**
+   * XR: first *usable* frame → clear loading spinner.
+   * GNOME Meta: ignored until gnome_live_ready_ (Chrome on Meta + EIS rebound);
+   * wallpaper frames must not clear the spinner (KDE parity).
+   */
   void mark_frame_presented();
+  /** Chrome on Meta (after place) — reveal PW stream + clear spinner (KDE parity). */
+  void mark_gnome_live_ready();
 
  signals:
   void logMessage(const QString& msg);
@@ -189,6 +226,18 @@ class YouTubeSession : public QObject {
   void onPortalStarted(const ScreencastPortal::Result& r);
   void onPortalFailed(const QString& e);
   void armPortalWatchdog(bool had_token);
+  /** Apply cfg_ → chrome_ window/scale/profile (shared by KDE/GNOME launch). */
+  void configureLiveBrowserLaunch();
+  /**
+   * After PipeWire negotiates portal VIRTUAL (Mutter Meta-* exists): launch + place.
+   * Call only once capture has started — RecordVirtual creates the MONITOR then.
+   */
+  void launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h);
+  /** Pick Mutter Meta-* via DisplayConfig / non-primary QScreen. */
+  bool resolveGnomeVirtualRect(int prefer_w, int prefer_h, QRect* geo, QString* matched);
+  /** Move portal/remote-control dialogs off Meta-* onto primary (GNOME). */
+  void armGnomePortalEvacuate();
+  int evacuateGnomePortalDialogsOnce();
   void stopDesktopAppProcess();
   void onDesktopAppFinished(int exit_code, QProcess::ExitStatus status);
   /** While Streaming: re-place PID windows (RetroArch content recreates the surface). */
@@ -217,6 +266,14 @@ class YouTubeSession : public QObject {
   ChromiumYtLauncher* chrome_ = nullptr;
   QProcess* desktop_app_ = nullptr;
   ScreencastPortal* portal_ = nullptr;
+  /** GNOME: Mutter RecordVirtual owned by VirtualDisplayManager (not this session). */
+  bool using_mutter_virtual_ = false;
+  /** GNOME: spinner stays until EIS rebound to Meta + Chrome launch. */
+  bool gnome_live_ready_ = false;
+  /** Pending ensureGnomeMeta products until onPortalStarted consumes eis_fd. */
+  uint32_t gnome_node_id_ = 0;
+  int gnome_eis_fd_ = -1;
+  QString gnome_mapping_id_;
   KdeEisPointer* kde_eis_ = nullptr;
   EisPointer* portal_eis_ = nullptr;
   /** Not owned — HostWindow VirtualDisplayManager. */
@@ -238,6 +295,9 @@ class YouTubeSession : public QObject {
   int place_y_ = 0;
   int place_w_ = 1280;
   int place_h_ = 720;
+  /** GNOME: logical window size on Meta-* (EIS region); place_w_/h_ stay stream pixels. */
+  int place_win_w_ = 0;
+  int place_win_h_ = 0;
   /** Desktop-global logical seat cursor before live capture stole it onto Virtual. */
   bool have_saved_cursor_ = false;
   double saved_cursor_x_ = 0;
@@ -249,9 +309,28 @@ class YouTubeSession : public QObject {
   int portal_restore_retries_ = 0;
   /** True after falling back to interactive picker once this start(). */
   bool portal_retry_used_ = false;
+  /**
+   * GNOME managed Virtual: portal Start creates the MONITOR first; browser launch
+   * waits until onPortalStarted (see launchBrowserAfterGnomeVirtual).
+   */
+  bool gnome_defer_browser_ = false;
+  /**
+   * Legacy Plan B: Meta wallpaper + soft cursor only (no Chrome). Kept false —
+   * Chrome on Meta supplies stage damage for Mutter SHM streams.
+   */
+  bool gnome_capture_only_ = false;
+  /** Bumped on start/stop so evacuate timers from a prior session die. */
+  int gnome_evacuate_gen_ = 0;
   QTimer place_timer_;
   /** Desktop [アプリ]: keep new windows on Virtual after content start. */
   QTimer desk_maintain_timer_;
+  /**
+   * GNOME Meta-*: periodic stage damage so RecordVirtual SHM does not idle into
+   * multi-second pool-recycle holds (unique burst → freeze → jump).
+   */
+  QTimer meta_paint_timer_;
+  /** Set from XR when drop_pp hold stretches — consumed by meta_paint_timer_. */
+  std::atomic<bool> meta_paint_kick_{false};
 };
 
 }  // namespace vrp
