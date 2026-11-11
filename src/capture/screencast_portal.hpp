@@ -95,6 +95,8 @@ class ScreencastPortal : public QObject {
   bool busy_ = false;
   bool closing_session_ = false;
   bool watching_session_closed_ = false;
+  /** Bumped on start/stop/fail so stale Request Response callbacks no-op. */
+  uint64_t epoch_ = 0;
   QString parent_window_;
   QString restore_token_in_;
   uint32_t persist_mode_ = 2;

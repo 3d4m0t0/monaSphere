@@ -204,6 +204,7 @@ ScreencastPortal::~ScreencastPortal() { stop(); }
 
 void ScreencastPortal::fail(const QString& err) {
   VRP_LOG("screencast: FAIL %s", err.toUtf8().constData());
+  ++epoch_;
   if (eis_fd_ >= 0) {
     ::close(eis_fd_);
     eis_fd_ = -1;
@@ -221,6 +222,7 @@ void ScreencastPortal::start(const QString& parent_window, const QString& restor
             restore_token.isEmpty() ? "no" : "yes");
     return;
   }
+  ++epoch_;
   if (!session_path_.isEmpty()) {
     QDBusMessage msg = QDBusMessage::createMethodCall(
         QString::fromLatin1(kPortal), session_path_, QStringLiteral("org.freedesktop.portal.Session"),
@@ -302,6 +304,7 @@ void ScreencastPortal::start(const QString& parent_window, const QString& restor
 
 void ScreencastPortal::stop() {
   closing_session_ = true;
+  ++epoch_;
   unwatchSessionClosed();
   if (eis_fd_ >= 0) {
     ::close(eis_fd_);
@@ -359,7 +362,19 @@ void ScreencastPortal::onSessionClosed() {
 void ScreencastPortal::watchRequest(const QString& path,
                                     std::function<void(uint, const QVariantMap&)> cb) {
   VRP_LOG("screencast: watching Request %s (before method call)", path.toUtf8().constData());
-  new PortalRequestWatcher(path, std::move(cb), this);
+  const uint64_t ep = epoch_;
+  new PortalRequestWatcher(
+      path,
+      [this, ep, cb = std::move(cb)](uint response, const QVariantMap& results) {
+        if (ep != epoch_) {
+          VRP_LOG("screencast: ignore stale Request Response (epoch %llu≠%llu)",
+                  static_cast<unsigned long long>(ep),
+                  static_cast<unsigned long long>(epoch_));
+          return;
+        }
+        if (cb) cb(response, results);
+      },
+      this);
 }
 
 void ScreencastPortal::callCreateSession() {
@@ -403,6 +418,7 @@ void ScreencastPortal::callCreateSession() {
 
 void ScreencastPortal::onCreateSessionDone(QDBusPendingCallWatcher* w) {
   w->deleteLater();
+  if (!busy_) return;
   QDBusPendingReply<QDBusObjectPath> reply = *w;
   if (reply.isError()) {
     fail(reply.error().message());
@@ -449,6 +465,7 @@ void ScreencastPortal::callSelectDevices() {
 
 void ScreencastPortal::onSelectDevicesDone(QDBusPendingCallWatcher* w) {
   w->deleteLater();
+  if (!busy_) return;
   QDBusPendingReply<QDBusObjectPath> reply = *w;
   if (reply.isError()) {
     fail(reply.error().message());
@@ -458,6 +475,10 @@ void ScreencastPortal::onSelectDevicesDone(QDBusPendingCallWatcher* w) {
 }
 
 void ScreencastPortal::callSelectSources() {
+  if (session_path_.isEmpty()) {
+    fail(QStringLiteral("SelectSources: empty session path"));
+    return;
+  }
   const char* kind_name = "MONITOR";
   if (kind_ == SourceKind::Window) kind_name = "WINDOW";
   else if (kind_ == SourceKind::Virtual) kind_name = "VIRTUAL";
@@ -537,6 +558,7 @@ void ScreencastPortal::callSelectSources() {
 
 void ScreencastPortal::onSelectSourcesDone(QDBusPendingCallWatcher* w) {
   w->deleteLater();
+  if (!busy_) return;
   QDBusPendingReply<QDBusObjectPath> reply = *w;
   if (reply.isError()) {
     fail(reply.error().message());
@@ -547,6 +569,10 @@ void ScreencastPortal::onSelectSourcesDone(QDBusPendingCallWatcher* w) {
 
 void ScreencastPortal::callStart() {
   const bool rd = mode_ == SessionMode::RemoteDesktopWithVideo;
+  if (session_path_.isEmpty()) {
+    fail(QStringLiteral("Start: empty session path"));
+    return;
+  }
   VRP_LOG("screencast: %s.Start (parent=%s)…", rd ? "RemoteDesktop" : "ScreenCast",
           parent_window_.isEmpty() ? "(none)" : parent_window_.toUtf8().constData());
   const QString handle = makeToken("monasphere_st");
@@ -606,6 +632,7 @@ void ScreencastPortal::callStart() {
 
 void ScreencastPortal::onStartDone(QDBusPendingCallWatcher* w) {
   w->deleteLater();
+  if (!busy_) return;
   QDBusPendingReply<QDBusObjectPath> reply = *w;
   if (reply.isError()) {
     fail(reply.error().message());

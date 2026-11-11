@@ -112,6 +112,15 @@ class PipewireCapture {
              bool prefer_shm = false);
   void stop();
 
+  /**
+   * Mutter RecordVirtual can queue unpainted recycled BOs (empty VideoDamage /
+   * CURSOR_ONLY chunk). Skip those before publish. KDE ScreenCast often leaves
+   * DMA chunk size=0 on *valid* buffers — leave this off there or Live never
+   * publishes and the HMD spinner spins forever.
+   */
+  void set_skip_unpainted_bo(bool on) { skip_unpainted_bo_.store(on, std::memory_order_relaxed); }
+  bool skip_unpainted_bo() const { return skip_unpainted_bo_.load(std::memory_order_relaxed); }
+
   bool running() const { return running_.load(std::memory_order_acquire); }
   std::string last_error() const;
 
@@ -183,6 +192,7 @@ class PipewireCapture {
   int prefer_w_ = 0;
   int prefer_h_ = 0;
   bool prefer_shm_ = false;
+  std::atomic<bool> skip_unpainted_bo_{false};
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_{false};
   std::atomic<int> width_{0};

@@ -476,8 +476,12 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
   //   publish a dup FD after queue_buffer — that lets Mutter rewrite pixels
   //   under a still-pending import (old frames on screen).
   //   SHM/CPU: 8 (memcpy + mailbox + spare).
-  // Prefer SPA_META_SyncTimeline (Mutter !3876 / niri NVIDIA fix) so we wait the
-  // producer acquire point before publish; fall back to plain DmaBuf + Header.
+  // Prefer SPA_META_SyncTimeline on Mutter (skip_unpainted_bo_) so we wait the
+  // producer acquire point before publish. KDE ScreenCast: do not mandate
+  // SyncTimeline — mandatory + drain-without-release stalled the pool and left
+  // Live on the spinner with streaming-but-no-buffers.
+  const bool want_sync_timeline =
+      negotiated_mod && st->self && st->self->skip_unpainted_bo();
   const int want_bufs = negotiated_mod ? 4 : 8;
   const int want_bufs_min = negotiated_mod ? 3 : 4;
   st->requested_buffers = want_bufs;
@@ -492,8 +496,8 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
   const spa_pod* params[6];
   uint32_t n_params = 0;
   spa_pod_frame f{};
-  if (negotiated_mod) {
-    // Option A: DmaBuf + SyncTimeline (mandatory on this buffers choice).
+  if (want_sync_timeline) {
+    // Option A (Mutter): DmaBuf + SyncTimeline (mandatory on this buffers choice).
     spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
     spa_pod_builder_add(&b, SPA_PARAM_BUFFERS_buffers,
                         SPA_POD_CHOICE_RANGE_Int(want_bufs, want_bufs_min, want_bufs),
@@ -513,7 +517,7 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
     spa_pod_builder_int(&b, SPA_META_FEATURE_SYNC_TIMELINE_RELEASE);
     params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_pop(&b, &f));
   }
-  // Fallback / SHM: plain buffers without SyncTimeline requirement.
+  // Plain DmaBuf / SHM buffers (KDE path; also Mutter fallback if SyncTimeline declined).
   params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_add_object(
       &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers, SPA_PARAM_BUFFERS_buffers,
       SPA_POD_CHOICE_RANGE_Int(want_bufs, want_bufs_min, want_bufs), SPA_PARAM_BUFFERS_blocks,
@@ -524,8 +528,7 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
   params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_add_object(
       &b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
       SPA_POD_Id(SPA_META_Header), SPA_PARAM_META_size, SPA_POD_Int(sizeof(spa_meta_header))));
-  // VideoDamage: discriminate "Mutter skipped paint / empty damage" vs real updates.
-  // Mutter often writes a full-frame region when priv->damage is empty — not zero rects.
+  // VideoDamage: Mutter unpainted-BO discrimination (harmless if producer ignores).
   params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_add_object(
       &b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
       SPA_POD_Id(SPA_META_VideoDamage), SPA_PARAM_META_size,
@@ -536,7 +539,8 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
     VRP_LOG("pipewire: request %d buffers (min %d) dataType=%s syncTimeline=%s "
             "VideoDamage=yes (Vk images present+staging=%d)",
             want_bufs, want_bufs_min, negotiated_mod ? "DmaBuf" : "MemFd/MemPtr",
-            negotiated_mod ? "preferred" : "n/a", negotiated_mod ? 2 : 3);
+            want_sync_timeline ? "mandatory" : (negotiated_mod ? "off" : "n/a"),
+            negotiated_mod ? 2 : 3);
   }
 
   if (st->self) {
@@ -627,22 +631,44 @@ void on_process(void* data) {
   st->self->flush_released(st->stream);
 
   // WebRTC pattern: drain to newest, return older buffers immediately.
+  // SyncTimeline: must signal RELEASE before queue_buffer or the producer pool
+  // stalls (KDE ScreenCast then never delivers → Live spinner forever).
+  if (st->drm_fd < 0) st->drm_fd = open_drm_render_fd();
   pw_buffer* b = nullptr;
+  int drained = 0;
   for (;;) {
     pw_buffer* next = pw_stream_dequeue_buffer(st->stream);
     if (!next) break;
-    if (b) pw_stream_queue_buffer(st->stream, b);
+    ++drained;
+    if (b) {
+      if (b->buffer) signal_sync_timeline_release(b->buffer, st->drm_fd);
+      pw_stream_queue_buffer(st->stream, b);
+    }
     b = next;
   }
-  if (!b) return;
+  if (!b) {
+    static int empty_proc = 0;
+    if (empty_proc < 5) {
+      ++empty_proc;
+      VRP_LOG("pipewire: process with no dequeued buffer (streaming but empty)");
+    }
+    return;
+  }
   spa_buffer* buf = b->buffer;
   if (!buf || buf->n_datas < 1) {
+    if (buf) signal_sync_timeline_release(buf, st->drm_fd);
     pw_stream_queue_buffer(st->stream, b);
     return;
   }
   spa_meta_header* hdr = static_cast<spa_meta_header*>(
       spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(spa_meta_header)));
   if (hdr && (hdr->flags & SPA_META_HEADER_FLAG_CORRUPTED)) {
+    static int corr = 0;
+    if (corr < 8) {
+      ++corr;
+      VRP_LOG("pipewire: drop CORRUPTED header (drained=%d)", drained);
+    }
+    signal_sync_timeline_release(buf, st->drm_fd);
     pw_stream_queue_buffer(st->stream, b);
     return;
   }
@@ -651,23 +677,23 @@ void on_process(void* data) {
   const int w = static_cast<int>(st->info.size.width);
   const int h = static_cast<int>(st->info.size.height);
   if (w <= 0 || h <= 0) {
+    signal_sync_timeline_release(buf, st->drm_fd);
     pw_stream_queue_buffer(st->stream, b);
     return;
   }
 
-  // Mutter may queue an unpainted recycled pool BO (empty VideoDamage, or
-  // CURSOR_ONLY chunk size=0/CORRUPTED). Copy-out would paste stale scene into
-  // present — skip publish, keep present[0], return the buffer immediately.
-  // Non-zero damage (incl. tiny) is allowed through to avoid video latency.
-  const VideoDamageInfo dmg = inspect_video_damage(buf, w, h);
-  {
+  // Mutter-only: unpainted recycled pool BO (empty VideoDamage, or damage meta
+  // present with CURSOR_ONLY chunk size=0+CORRUPTED). KDE leaves DMA chunk size=0
+  // on valid buffers — skip_unpainted_bo_ must stay false there.
+  if (st->self && st->self->skip_unpainted_bo()) {
+    const VideoDamageInfo dmg = inspect_video_damage(buf, w, h);
     const uint32_t chunk_flags = d->chunk ? d->chunk->flags : 0u;
     const uint32_t chunk_size = d->chunk ? static_cast<uint32_t>(d->chunk->size) : 0u;
-    const bool chunk_unpainted =
-        d->chunk && (chunk_size == 0 || (chunk_flags & SPA_CHUNK_FLAG_CORRUPTED) != 0);
     const bool empty_skip = dmg.meta_present && dmg.n_valid == 0;
-    const bool skip_publish = empty_skip || chunk_unpainted;
-    if (skip_publish) {
+    const bool mutter_chunk_unpainted =
+        dmg.meta_present && d->chunk && chunk_size == 0 &&
+        (chunk_flags & SPA_CHUNK_FLAG_CORRUPTED) != 0;
+    if (empty_skip || mutter_chunk_unpainted) {
       // Quiet by default — enable live_display_log=1 for rare breadcrumbs.
       static int skip_log = 0;
       if (vrp_persist_display_enabled() && (skip_log < 3 || (skip_log & 255) == 0)) {
@@ -675,7 +701,7 @@ void on_process(void* data) {
         VRP_DISPLAY_LOG(
             "live-dma skip-unpainted spa_seq=%llu n_valid=%d chunk=%u/0x%x (%s)",
             static_cast<unsigned long long>(spa_seq), dmg.n_valid, chunk_size, chunk_flags,
-            chunk_unpainted ? "chunk" : "empty-damage");
+            mutter_chunk_unpainted ? "chunk" : "empty-damage");
       }
       ++skip_log;
       if (st->drm_fd < 0) st->drm_fd = open_drm_render_fd();

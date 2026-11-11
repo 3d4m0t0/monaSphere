@@ -1580,20 +1580,18 @@ void YouTubeSession::armPortalWatchdog(bool had_token) {
     }
     if (had_token && !portal_retry_used_) {
       portal_->stop();
-      if (portal_restore_retries_ < 2) {
-        ++portal_restore_retries_;
-        emit logMessage(tr("ScreenCast restore hung — silent retry %1/2 (token kept)")
-                            .arg(portal_restore_retries_));
-        QTimer::singleShot(0, this, [this] {
-          if (!loading_.load() || active_.load()) return;
-          setState(State::Placed);
-          beginPortal(false);
-        });
-        return;
-      }
       portal_retry_used_ = true;
-      emit logMessage(tr("ScreenCast restore hung — opening host picker (conf token kept)"));
+      ++portal_restore_retries_;
       restore_token_.clear();
+      if (vdisp_mgr_) {
+        const int span = vdisp_mgr_->active_span() > 0
+                             ? vdisp_mgr_->active_span()
+                             : VirtualDisplayManager::spanFromName(output_name_);
+        vdisp_mgr_->clearToken(span);
+      } else {
+        emit restoreTokenChanged(QString());
+      }
+      emit logMessage(tr("ScreenCast restore hung — opening host picker (stale token cleared)"));
       emit toast(tr("Host: pick Virtual-monaSphere"));
       QTimer::singleShot(0, this, [this] {
         if (!loading_.load() || active_.load()) return;
@@ -1854,16 +1852,20 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
   }
   if (!capture_) capture_ = std::make_unique<PipewireCapture>();
   // Prefer configured Virtual-* pixels so KWin does not resize the stream down
-  // to a hardcoded 1080p default during PipeWire format negotiation.
+  // to a hardcoded 1080p default (or portal logical size under scale≠1) during
+  // PipeWire format negotiation.
   const int prefer_w = cfg_.virtual_w > 0 ? cfg_.virtual_w : r.width;
   const int prefer_h = cfg_.virtual_h > 0 ? cfg_.virtual_h : r.height;
   // GNOME Meta-* / RecordVirtual: negotiate DMA-BUF first (same as KDE); SHM is
   // the EnumFormat fallback. Surface hitching matched SHM once pool/filter work
   // landed — no longer force prefer_shm.
+  // Mutter-only unpainted-BO skip — KDE DMA often has chunk size=0 on valid frames.
+  const bool gnome_meta = desk_ == DesktopEnv::Gnome && cfg_.virtual_display;
+  capture_->set_skip_unpainted_bo(gnome_meta);
   if (r.pw_fd < 0) {
     VRP_LOG("pipewire: Mutter node %u via default socket (no portal fd)", r.node_id);
   }
-  if (desk_ == DesktopEnv::Gnome && cfg_.virtual_display) {
+  if (gnome_meta) {
     emit logMessage(cfg_.drm_modifiers.empty()
                         ? tr("PipeWire: GNOME VIRTUAL — DMA-BUF + SHM fallback (no consumer mods yet)")
                         : tr("PipeWire: GNOME VIRTUAL — DMA-BUF preferred (%1 mods), SHM fallback")
@@ -2087,6 +2089,15 @@ void YouTubeSession::onPortalFailed(const QString& e) {
     VRP_LOG("live: ignoring overlapping ScreenCast start");
     return;
   }
+  // Stale Request callbacks after stop/retry (empty session_path, parallel Start).
+  if (e.contains(QStringLiteral("Sources not selected"), Qt::CaseInsensitive) ||
+      e.contains(QStringLiteral("Invalid object path"), Qt::CaseInsensitive) ||
+      e.contains(QStringLiteral("Marshalling failed"), Qt::CaseInsensitive)) {
+    if (portal_retry_used_ || portal_restore_retries_ > 0 || (portal_ && portal_->busy())) {
+      VRP_LOG("live: ignoring stale ScreenCast failure: %s", e.toUtf8().constData());
+      return;
+    }
+  }
   KwinWindowPlacer::disarm_portal_dialog_on_primary();
   // Cancel restore/hung watchdogs before scheduling another Start.
   ++portal_gen_;
@@ -2096,57 +2107,31 @@ void YouTubeSession::onPortalFailed(const QString& e) {
       (portal_ && portal_->used_restore_token() &&
        e.contains(QStringLiteral("cancelled"), Qt::CaseInsensitive));
 
-  if (restore_rejected && !restore_token_.isEmpty() && loading_.load()) {
-    // Portal session is dead after Response≠0 — drop it before retry.
+  // Stale / wrong-DE / revoked token never succeeds on silent retry — drop it and
+  // open the host picker once so Live can continue instead of failing out.
+  if (restore_rejected && loading_.load() && !portal_retry_used_) {
     if (portal_) portal_->stop();
-    if (portal_restore_retries_ < 3 && !portal_retry_used_) {
-      ++portal_restore_retries_;
-      emit logMessage(tr("ScreenCast restore rejected — silent retry %1/3 when ready (token kept)")
-                          .arg(portal_restore_retries_));
-      // Proceed as soon as portal is idle and Virtual output is listed (cap 8s).
-      const qint64 t0 = QDateTime::currentMSecsSinceEpoch();
-      const int gen = portal_gen_;
-      auto* tick = new QTimer(this);
-      tick->setInterval(50);
-      connect(tick, &QTimer::timeout, this, [this, tick, t0, gen] {
-        if (gen != portal_gen_ || !loading_.load() || active_.load()) {
-          tick->stop();
-          tick->deleteLater();
-          return;
-        }
-        if (portal_ && portal_->busy()) {
-          if (QDateTime::currentMSecsSinceEpoch() - t0 < 8000) return;
-          portal_->stop();
-        }
-        if (!output_name_.isEmpty() &&
-            !KdeVirtualDisplay::outputExists(output_name_) &&
-            QDateTime::currentMSecsSinceEpoch() - t0 < 8000) {
-          return;
-        }
-        tick->stop();
-        tick->deleteLater();
-        setState(State::Placed);
-        beginPortal(false);
-      });
-      tick->start();
-      return;
+    portal_retry_used_ = true;
+    ++portal_restore_retries_;
+    restore_token_.clear();
+    if (vdisp_mgr_) {
+      const int span = vdisp_mgr_->active_span() > 0
+                           ? vdisp_mgr_->active_span()
+                           : VirtualDisplayManager::spanFromName(output_name_);
+      vdisp_mgr_->clearToken(span);
+    } else {
+      emit restoreTokenChanged(QString());
     }
-    if (!portal_retry_used_) {
-      portal_retry_used_ = true;
-      // Memory only — keep conf token until a successful Start replaces it.
-      emit logMessage(tr("ScreenCast restore still rejected — opening host picker "
-                         "(conf token kept until a new one is saved). "
-                         "If Virtual size/scale changed, re-run Tools -> Set up live capture."));
-      restore_token_.clear();
-      emit toast(tr("Host: pick Virtual-monaSphere"));
-      QTimer::singleShot(0, this, [this] {
-        if (!loading_.load() || active_.load()) return;
-        if (portal_ && portal_->busy()) portal_->stop();
-        setState(State::Placed);
-        beginPortal(true);
-      });
-      return;
-    }
+    emit logMessage(tr("ScreenCast restore rejected — opening host picker "
+                       "(stale token cleared; pick Virtual-monaSphere and Remember)"));
+    emit toast(tr("Host: pick Virtual-monaSphere"));
+    QTimer::singleShot(0, this, [this] {
+      if (!loading_.load() || active_.load()) return;
+      if (portal_ && portal_->busy()) portal_->stop();
+      setState(State::Placed);
+      beginPortal(true);
+    });
+    return;
   }
 
   fail(tr("ScreenCast failed: %1").arg(e));
