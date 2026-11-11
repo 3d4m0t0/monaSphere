@@ -2,6 +2,7 @@
 
 #include <drm/drm_fourcc.h>
 #include <linux/dma-buf.h>
+#include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -16,6 +17,31 @@ constexpr uint64_t kDrmModInvalid = DRM_FORMAT_MOD_INVALID;
 /** NVIDIA: wait this many identical frames before first vkAllocateMemory. */
 constexpr int kNvidiaArmHits = 2;
 constexpr uint32_t kVendorNvidia = 0x10DEu;
+
+/**
+ * Wait until outstanding GPU writers on this dma-buf have signaled.
+ * DMA_BUF_IOCTL_SYNC alone does not wait on NVIDIA's implicit GPU timeline;
+ * EXPORT_SYNC_FILE (READ) returns a sync_file that does.
+ * @return true if waited or ioctl unsupported (caller still uses SYNC ioctl).
+ */
+enum class DmabufSyncResult { Ok, IoctlFail, Timeout };
+
+DmabufSyncResult wait_dmabuf_writers(int dmabuf_fd, int timeout_ms = 150) {
+  if (dmabuf_fd < 0) return DmabufSyncResult::IoctlFail;
+  dma_buf_export_sync_file exp{};
+  exp.flags = DMA_BUF_SYNC_READ;
+  exp.fd = -1;
+  if (::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) != 0 || exp.fd < 0) {
+    return DmabufSyncResult::IoctlFail;
+  }
+  pollfd pfd{};
+  pfd.fd = exp.fd;
+  pfd.events = POLLIN;
+  const int pr = ::poll(&pfd, 1, timeout_ms);
+  ::close(exp.fd);
+  if (pr > 0) return DmabufSyncResult::Ok;
+  return DmabufSyncResult::Timeout;
+}
 
 void append_mods_for_format(VkPhysicalDevice phys, VkFormat format, std::vector<uint64_t>* out) {
   if (!phys || !out) return;
@@ -209,11 +235,27 @@ void PipewireDmaTexture::reset() {
   present_gen_.store(0);
   bound_gen_ = 0;
   import_logged_ = false;
+  last_write_slot_ = 0;
+  eye_done_epoch_ = 0;
+  present_hold_until_epoch_ = 0;
+  slots_[0].busy_until_epoch = 0;
+  slots_[1].busy_until_epoch = 0;
   arm_w_ = arm_h_ = 0;
   arm_mod_ = 0;
   arm_fourcc_ = 0;
   arm_hits_ = 0;
-  // Keep abandoned_ across reset within the same VkDevice — poisoning is instance-wide.
+  // Keep abandoned_ / dmabuf_sync_ever_ok_ across reset within the same VkDevice.
+}
+
+void PipewireDmaTexture::mark_eye_done() {
+  // SceneRenderer submit fence signaled — same role as per-slot VkFence for the
+  // image that was sampled by that submit (and any slot waiting on this epoch).
+  ++eye_done_epoch_;
+}
+
+bool PipewireDmaTexture::pending_eye_retire() const {
+  if (!valid_.load(std::memory_order_acquire)) return false;
+  return eye_done_epoch_ < slots_[0].busy_until_epoch;
 }
 
 void PipewireDmaTexture::shutdown() {
@@ -261,6 +303,38 @@ bool PipewireDmaTexture::poll_present() {
   if (g == bound_gen_) return false;
   bound_gen_ = g;
   return valid_.load(std::memory_order_acquire);
+}
+
+uint64_t PipewireDmaTexture::display_seq() const {
+  if (!valid_.load(std::memory_order_acquire)) return 0;
+  const int i = display_slot_.load(std::memory_order_acquire);
+  if (i < 0 || i > 1) return 0;
+  return slots_[i].content_seq;
+}
+
+uint64_t PipewireDmaTexture::slot_content_seq(int slot) const {
+  if (slot < 0 || slot > 1) return 0;
+  return slots_[slot].content_seq;
+}
+
+uint64_t PipewireDmaTexture::slot_content_key(int slot) const {
+  if (slot < 0 || slot > 1) return 0;
+  return slots_[slot].content_key;
+}
+
+uint64_t PipewireDmaTexture::slot_spa_seq(int slot) const {
+  if (slot < 0 || slot > 1) return 0;
+  return slots_[slot].spa_seq;
+}
+
+int64_t PipewireDmaTexture::slot_spa_pts(int slot) const {
+  if (slot < 0 || slot > 1) return 0;
+  return slots_[slot].spa_pts;
+}
+
+bool PipewireDmaTexture::slot_has_spa(int slot) const {
+  if (slot < 0 || slot > 1) return false;
+  return slots_[slot].has_spa_meta;
 }
 
 bool PipewireDmaTexture::frame_ready_to_import(const PipewireDmaFrame& frame,
@@ -528,7 +602,7 @@ bool PipewireDmaTexture::transition_slot(const Slot& slot) {
 bool PipewireDmaTexture::ensure_private_slot(Slot& slot, int w, int h, VkFormat format,
                                              bool force_opaque_alpha) {
   if (slot.is_private && slot.image && slot.priv_w == w && slot.priv_h == h &&
-      slot.priv_fmt == format && slot.view) {
+      slot.priv_fmt == format && slot.force_opaque == force_opaque_alpha && slot.view) {
     return true;
   }
   const uint64_t old_seq = slot.pw_seq;
@@ -544,7 +618,9 @@ bool PipewireDmaTexture::ensure_private_slot(Slot& slot, int w, int h, VkFormat 
   ci.arrayLayers = 1;
   ci.samples = VK_SAMPLE_COUNT_1_BIT;
   ci.tiling = VK_IMAGE_TILING_OPTIMAL;
-  ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  // TRANSFER_SRC: staging→present promote copy.
+  ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+             VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
   ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   if (vkCreateImage(device_, &ci, nullptr, &slot.image) != VK_SUCCESS) {
@@ -596,6 +672,7 @@ bool PipewireDmaTexture::ensure_private_slot(Slot& slot, int w, int h, VkFormat 
   slot.priv_w = w;
   slot.priv_h = h;
   slot.priv_fmt = format;
+  slot.force_opaque = force_opaque_alpha;
   slot.buf_key = 0;
   slot.pw_seq = 0;
   return true;
@@ -603,6 +680,7 @@ bool PipewireDmaTexture::ensure_private_slot(Slot& slot, int w, int h, VkFormat 
 
 bool PipewireDmaTexture::import_copy_out(Slot& dst, const PipewireDmaFrame& frame, uint64_t mod,
                                          VkFormat format, bool force_opaque_alpha) {
+  // Caller passes staging (slots_[1]). Path: dma-buf FD → temporary ext → dst.
   const int w = frame.width;
   const int h = frame.height;
   if (!ensure_private_slot(dst, w, h, format, force_opaque_alpha)) return false;
@@ -621,13 +699,30 @@ bool PipewireDmaTexture::import_copy_out(Slot& dst, const PipewireDmaFrame& fram
     return false;
   }
 
-  // Explicit READ sync on the dup'd dma-buf before GPU copy (implicit sync is
-  // not enough once the producer may also touch the same BO).
-  {
-    dma_buf_sync sync{};
-    sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
-    (void)::ioctl(frame.fd, DMA_BUF_IOCTL_SYNC, &sync);
+  // Producer GPU timeline (fallback when PW-thread SyncTimeline wait did not run).
+  // Prefer frame.producer_synced from capture; still refuse timeout / late ioctl-fail.
+  if (!frame.producer_synced) {
+    static int sync_log = 0;
+    const DmabufSyncResult sr = wait_dmabuf_writers(frame.fd);
+    if (sr == DmabufSyncResult::Ok) dmabuf_sync_ever_ok_ = true;
+    if (sync_log < 8) {
+      ++sync_log;
+      VRP_LOG("dma-buf EXPORT_SYNC_FILE wait (blit): %s",
+              sr == DmabufSyncResult::Ok       ? "ok"
+              : sr == DmabufSyncResult::Timeout ? "timeout"
+                                                : "ioctl-fail (driver/uapi)");
+    }
+    if (sr == DmabufSyncResult::Timeout ||
+        (sr == DmabufSyncResult::IoctlFail && dmabuf_sync_ever_ok_)) {
+      destroy_slot(ext);
+      set_error(sr == DmabufSyncResult::Timeout ? "skip: dmabuf sync timeout"
+                                                : "skip: dmabuf sync ioctl-fail");
+      return false;
+    }
   }
+  // DMA_BUF_IOCTL_SYNC is for CPU mmap coherence — not required for GPU→GPU
+  // vkCmdCopyImage. On NVIDIA it can mis-trigger CPU-access paths; keep only
+  // EXPORT_SYNC_FILE / SyncTimeline waits (done above or on PW thread).
 
   std::unique_lock<std::mutex> qlock;
   if (queue_mu_) qlock = std::unique_lock<std::mutex>(*queue_mu_);
@@ -652,8 +747,13 @@ bool PipewireDmaTexture::import_copy_out(Slot& dst, const PipewireDmaFrame& fram
   barriers[0].srcAccessMask = 0;
   barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
+  // Back slot may already hold the previous generation in SHADER_READ. Prefer
+  // that oldLayout over UNDEFINED so a mistaken front write cannot black-flash.
+  const bool dst_had_sample =
+      dst.is_private && dst.view != VK_NULL_HANDLE && dst.content_seq != 0;
   barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  barriers[1].oldLayout =
+      dst_had_sample ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
   barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
   barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -661,11 +761,14 @@ bool PipewireDmaTexture::import_copy_out(Slot& dst, const PipewireDmaFrame& fram
   barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
   barriers[1].subresourceRange.levelCount = 1;
   barriers[1].subresourceRange.layerCount = 1;
-  barriers[1].srcAccessMask = 0;
+  barriers[1].srcAccessMask = dst_had_sample ? VK_ACCESS_SHADER_READ_BIT : 0;
   barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
-  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,
-                       nullptr, 0, nullptr, 2, barriers);
+  const VkPipelineStageFlags src_stages =
+      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT |
+      (dst_had_sample ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : 0);
+  vkCmdPipelineBarrier(cmd_, src_stages, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                       2, barriers);
 
   VkImageCopy region{};
   region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -712,17 +815,129 @@ bool PipewireDmaTexture::import_copy_out(Slot& dst, const PipewireDmaFrame& fram
     return false;
   }
 
-  {
-    dma_buf_sync sync{};
-    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-    (void)::ioctl(frame.fd, DMA_BUF_IOCTL_SYNC, &sync);
-  }
-
-  // Private image owns the pixels — drop import, then return pw_buffer to Mutter.
+  // Private image owns the pixels. Hold ends here (release_seq → queue_buffer).
   destroy_slot(ext);
   dst.pw_seq = 0;
   dst.is_private = true;
   if (frame.seq != 0 && release_seq_) release_seq_(frame.seq);
+  return true;
+}
+
+bool PipewireDmaTexture::promote_staging_to_present() {
+  // Path: staging slots_[1] → present slots_[0] (view() always samples present).
+  Slot& src = slots_[1];
+  Slot& dst = slots_[0];
+  if (!src.image || !src.view || !src.is_private || src.priv_w <= 0 || src.priv_h <= 0) {
+    set_error("promote: empty staging");
+    return false;
+  }
+  // Recreate present if geometry/swizzle diverge from staging (XRGB A=ONE).
+  if (dst.is_private && dst.image &&
+      (dst.priv_w != src.priv_w || dst.priv_h != src.priv_h || dst.priv_fmt != src.priv_fmt ||
+       dst.force_opaque != src.force_opaque)) {
+    destroy_slot(dst);
+  }
+  if (!ensure_private_slot(dst, src.priv_w, src.priv_h, src.priv_fmt, src.force_opaque)) {
+    return false;
+  }
+
+  const bool dst_had =
+      dst.is_private && dst.view != VK_NULL_HANDLE && dst.content_seq != 0;
+
+  std::unique_lock<std::mutex> qlock;
+  if (queue_mu_) qlock = std::unique_lock<std::mutex>(*queue_mu_);
+  vkResetCommandBuffer(cmd_, 0);
+  VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(cmd_, &bi) != VK_SUCCESS) return false;
+
+  VkImageMemoryBarrier barriers[2]{};
+  barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[0].image = src.image;
+  barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barriers[0].subresourceRange.levelCount = 1;
+  barriers[0].subresourceRange.layerCount = 1;
+  barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+  barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  barriers[1].oldLayout =
+      dst_had ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+  barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barriers[1].image = dst.image;
+  barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  barriers[1].subresourceRange.levelCount = 1;
+  barriers[1].subresourceRange.layerCount = 1;
+  barriers[1].srcAccessMask = dst_had ? VK_ACCESS_SHADER_READ_BIT : 0;
+  barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+  const VkPipelineStageFlags src_stages =
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+      (dst_had ? static_cast<VkPipelineStageFlags>(0) : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+  vkCmdPipelineBarrier(cmd_, src_stages, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                       2, barriers);
+
+  VkImageCopy region{};
+  region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.srcSubresource.layerCount = 1;
+  region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  region.dstSubresource.layerCount = 1;
+  region.extent = {static_cast<uint32_t>(src.priv_w), static_cast<uint32_t>(src.priv_h), 1};
+  vkCmdCopyImage(cmd_, src.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.image,
+                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+  VkImageMemoryBarrier after[2]{};
+  after[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  after[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+  after[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  after[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  after[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  after[0].image = src.image;
+  after[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  after[0].subresourceRange.levelCount = 1;
+  after[0].subresourceRange.layerCount = 1;
+  after[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+  after[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+  after[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  after[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+  after[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  after[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  after[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  after[1].image = dst.image;
+  after[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+  after[1].subresourceRange.levelCount = 1;
+  after[1].subresourceRange.layerCount = 1;
+  after[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  after[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                       0, nullptr, 0, nullptr, 2, after);
+
+  if (vkEndCommandBuffer(cmd_) != VK_SUCCESS) return false;
+  if (vkResetFences(device_, 1, &fence_) != VK_SUCCESS) return false;
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd_;
+  if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) {
+    set_error("promote submit");
+    return false;
+  }
+  if (qlock.owns_lock()) qlock.unlock();
+  if (!wait_fence()) return false;
+
+  dst.content_seq = src.content_seq;
+  dst.content_key = src.content_key;
+  dst.buf_key = src.buf_key;
+  dst.spa_seq = src.spa_seq;
+  dst.spa_pts = src.spa_pts;
+  dst.has_spa_meta = src.has_spa_meta;
+  dst.is_private = true;
   return true;
 }
 
@@ -777,29 +992,39 @@ bool PipewireDmaTexture::try_import(const PipewireDmaFrame& frame) {
     width_ = 0;
     height_ = 0;
     display_slot_.store(0);
+    eye_done_epoch_ = 0;
+    present_hold_until_epoch_ = 0;
   }
 
-  // PipeWire recycles ~2–3 dma-bufs. Matching inode reused to mean "same VkImage",
-  // but the producer has rewritten the memory — bare display_slot flip without a
-  // barrier loops stale/half-written frames (VIRTUAL dialog animation / flicker).
-  // NVIDIA: skip reuse entirely (re-import). Others: reuse image but re-transition.
   uint64_t key = 0;
   const bool have_key = dma_buf_key(frame.fd, &key);
   if (!wait_fence()) return false;
 
-  // Ping-pong: write the non-displayed slot (sync copy-out waits the fence).
-  int write = 0;
-  if (valid_.load()) {
-    write = 1 - display_slot_.load(std::memory_order_relaxed);
-  }
-  Slot& slot = slots_[write];
+  const bool had = valid_.load(std::memory_order_acquire);
+  Slot& staging = slots_[1];
+  last_write_slot_ = 1;  // dma copy-out destination (present remains slots_[0])
 
-  // Always copy-out into a private OPTIMAL image. PipeWire returns the pw_buffer
-  // right after we dup the FD; zero-copy would race the producer rewrite.
-  (void)have_key;
-  (void)key;
-  if (!import_copy_out(slot, frame, mod, vkfmt, force_a)) {
-    set_error(std::string("copy-out: ") + last_error_);
+  // Stage any seq newer than staging (present may still show an older held frame).
+  const uint64_t stage_seq = staging.content_seq;
+  if (frame.seq != 0 && stage_seq != 0 && frame.seq <= stage_seq) {
+    set_error("skip: stale seq");
+    return false;
+  }
+
+  // Do not burn a full 1080p GPU copy-out when promote cannot land yet.
+  // Capture keep-latest will hand a fresher BO after the hold/eye gate opens.
+  if (had) {
+    if (eye_done_epoch_ < slots_[0].busy_until_epoch) {
+      set_error("skip: waiting eye fence");
+      return false;
+    }
+    if (eye_done_epoch_ < present_hold_until_epoch_) {
+      set_error("skip: present hold");
+      return false;
+    }
+  }
+
+  if (!import_copy_out(staging, frame, mod, vkfmt, force_a)) {
     if (!import_logged_) {
       import_logged_ = true;
       VRP_LOG("PipeWire dma-buf copy-out failed (%s, modifier=0x%llx) — CPU RGBA",
@@ -807,17 +1032,72 @@ bool PipewireDmaTexture::try_import(const PipewireDmaFrame& frame) {
     }
     return false;
   }
+  staging.content_seq = frame.seq;
+  staging.content_key = have_key ? key : 0;
+  staging.buf_key = staging.content_key;
+  staging.has_spa_meta = frame.has_spa_meta;
+  staging.spa_seq = frame.spa_seq;
+  staging.spa_pts = frame.spa_pts;
   width_ = w;
   height_ = h;
-  display_slot_.store(write, std::memory_order_release);
-  valid_.store(true, std::memory_order_release);
-  present_gen_.fetch_add(1, std::memory_order_release);
-  if (!import_logged_) {
+
+  // Staging updated; present promote is gated so pool BO rotation cannot thrash
+  // the sampled image every XR commit.
+  (void)had;
+  (void)promote_staging_if_allowed();
+  if (!valid_.load(std::memory_order_acquire) && !import_logged_) {
+    // First frame must promote; surface hard failure once.
+    if (last_error_.find("skip:") == std::string::npos) {
+      import_logged_ = true;
+      VRP_LOG("PipeWire dma-buf promote failed (%s) — CPU RGBA", last_error_.c_str());
+    }
+  }
+  if (!import_logged_ && valid_.load(std::memory_order_acquire)) {
     import_logged_ = true;
-    VRP_LOG("display path: PipeWire DMA-BUF copy-out %dx%d modifier=0x%llx%s", w, h,
+    VRP_LOG("display path: PipeWire DMA-BUF staging→present (hold=%llu epochs) %dx%d "
+            "modifier=0x%llx%s",
+            static_cast<unsigned long long>(kPresentHoldEpochs), w, h,
             static_cast<unsigned long long>(mod), nvidia_ ? " (NVIDIA)" : "");
   }
+  // Staging always accepted (dma released in import_copy_out).
   return true;
+}
+
+bool PipewireDmaTexture::promote_staging_if_allowed() {
+  Slot& staging = slots_[1];
+  if (!staging.image || !staging.view || staging.content_seq == 0) {
+    set_error("skip: no staging");
+    return false;
+  }
+  const bool had = valid_.load(std::memory_order_acquire);
+  if (had && staging.content_seq != 0 && slots_[0].content_seq != 0 &&
+      staging.content_seq <= slots_[0].content_seq) {
+    set_error("skip: staging not ahead");
+    return false;
+  }
+  if (had && eye_done_epoch_ < slots_[0].busy_until_epoch) {
+    set_error("skip: waiting eye fence");
+    return false;
+  }
+  if (had && eye_done_epoch_ < present_hold_until_epoch_) {
+    set_error("skip: present hold");
+    return false;
+  }
+  if (!wait_fence()) return false;
+  if (!promote_staging_to_present()) return false;
+
+  slots_[0].busy_until_epoch = eye_done_epoch_ + 1;
+  present_hold_until_epoch_ = eye_done_epoch_ + kPresentHoldEpochs;
+  display_slot_.store(0, std::memory_order_release);
+  present_gen_.fetch_add(1, std::memory_order_release);
+  valid_.store(true, std::memory_order_release);
+  return true;
+}
+
+bool PipewireDmaTexture::try_promote_pending() {
+  if (!enabled_ || dying_) return false;
+  if (abandoned_.load(std::memory_order_acquire)) return false;
+  return promote_staging_if_allowed();
 }
 
 }  // namespace vrp

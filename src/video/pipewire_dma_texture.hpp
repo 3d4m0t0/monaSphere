@@ -16,22 +16,23 @@ namespace vrp {
 
 /**
  * Single-plane PipeWire ScreenCast dma-buf (BGRA/XRGB/…) → sampled VkImage.
- * Same ping-pong contract as VaapiNv12Texture: capture/import thread owns
- * try_import; XR thread only poll_present + view/sampler. On modifier or
- * format failure, try_import returns false and the host keeps CPU RGBA.
  *
- * Slot identity: PipeWire recycles a small dma-buf pool (same st_dev/st_ino).
- * The producer must not get a buffer back (queue_buffer) while a VkImage still
- * samples it — that rewrites displayed memory and looks like a short flicker /
- * dialog-close loop (stops when the cursor parks and damage ceases). Track
- * frame.seq per slot and invoke the release callback from destroy_slot.
+ * Staging + fixed present (two private VkImages):
+ *  - view() / display_slot_ always slots_[0] (present). Never ping-pong the
+ *    bound image — latching 0↔1 every commit looked like ABAB flicker.
+ *  - try_import copy-out → slots_[1] (staging). Promote → slots_[0] after
+ *    eye_done + present hold so pool BO rotation cannot thrash every XR commit.
+ *  - Host skips while Live FSR samples present.
+ *  - pw_buffer held until staging blit completes (PipewireCapture hold Cap=2).
  *
- * NVIDIA experimental notes (discard if unstable):
- *  - Probe OPAQUE_FD then DMA_BUF (or reverse) before vkAllocateMemory.
- *  - Always use VkImageDrmFormatModifierExplicitCreateInfoEXT with the
- *    producer modifier — never invent LINEAR when the SPA flag is missing.
- *  - Soft-skip unstable frames; hard-fail once → import_abandoned() so the
- *    host never retries (NVIDIA VkInstance import-poisoning).
+ * Root cause of Live "old frame / reorder" (Mutter GNOME RecordVirtual):
+ *  dma_seq and pool key (p#) stay monotonic, but Mutter may queue an unpainted
+ *  recycled BO (empty VideoDamage, or chunk size=0 / CORRUPTED on CURSOR_ONLY).
+ *  Copy-out of that BO pastes stale scene pixels into staging→present. Capture
+ *  must skip those buffers (keep present[0], pw_stream_queue_buffer) before
+ *  publish; SyncTimeline / EXPORT_SYNC_FILE alone do not fix unpainted content.
+ *
+ * NVIDIA: never sample producer BOs zero-copy. Same copy-out path on other GPUs.
  */
 class PipewireDmaTexture {
  public:
@@ -64,16 +65,45 @@ class PipewireDmaTexture {
   VkSampler sampler() const { return sampler_; }
 
   /** Import a dma-buf frame. Does not take ownership of `frame.fd` (dups internally).
-   *  Soft skips (unstable / waiting for modifier) return false without abandoning. */
+   *  Soft skips (unstable / waiting for modifier) return false without abandoning.
+   *  May update staging only (present held) and still return true. */
   bool try_import(const PipewireDmaFrame& frame);
+
+  /**
+   * If staging is ahead of present and eye/hold gates allow, promote staging→present.
+   * Call once per XR tick so a hold-skipped stage still reaches the HMD.
+   */
+  bool try_promote_pending();
 
   bool poll_present();
   void reset();
+
+  /**
+   * Prior XR eye submit finished (host: wait_previous_submit). Advances the
+   * per-slot epoch so a previously displayed slot may be overwritten.
+   */
+  void mark_eye_done();
+  /** True if the present image is still busy for the next import. */
+  bool pending_eye_retire() const;
 
   /** Invoked when a slot's imported dma-buf is destroyed (seq from PipewireDmaFrame). */
   void set_release_seq_callback(std::function<void(uint64_t)> cb) { release_seq_ = std::move(cb); }
 
   const std::string& last_error() const { return last_error_; }
+
+  /** Display diag (same role as VideoTexture slot_content_* for SHM). */
+  int display_slot() const { return display_slot_.load(std::memory_order_acquire); }
+  /** Slot last try_import wrote (staging = 1). Present is always 0. */
+  int last_write_slot() const { return last_write_slot_; }
+  uint64_t display_seq() const;
+  uint64_t slot_content_seq(int slot) const;
+  uint64_t slot_content_key(int slot) const;
+  /** SPA_META_Header carried with the last copy into this slot (0 if absent). */
+  uint64_t slot_spa_seq(int slot) const;
+  int64_t slot_spa_pts(int slot) const;
+  bool slot_has_spa(int slot) const;
+  /** fstat identity of a dma-buf FD (pool recycle key). */
+  static bool dma_buf_key(int fd, uint64_t* out_key);
 
  private:
   struct Slot {
@@ -84,11 +114,25 @@ class PipewireDmaTexture {
     uint64_t buf_key = 0;
     /** PipewireDmaFrame.seq — release PW buffer when this slot is destroyed. */
     uint64_t pw_seq = 0;
-    /** Private OPTIMAL copy (not external); safe after producer rewrites dma-buf. */
+    /** Last PW seq / pool key copied into this private image. */
+    uint64_t content_seq = 0;
+    uint64_t content_key = 0;
+    /** Producer SPA_META_Header (content generation; independent of dma-buf BO id). */
+    uint64_t spa_seq = 0;
+    int64_t spa_pts = 0;
+    bool has_spa_meta = false;
+    /** Private OPTIMAL copy; safe after producer rewrites dma-buf. */
     bool is_private = false;
+    /**
+     * Slot may be overwritten only when eye_done_epoch_ >= busy_until_epoch_.
+     * Set to eye_done_epoch_+1 when content is installed for display.
+     */
+    uint64_t busy_until_epoch = 0;
     int priv_w = 0;
     int priv_h = 0;
     VkFormat priv_fmt = VK_FORMAT_UNDEFINED;
+    /** ImageView A=ONE (XRGB/XBGR). Copied present must match staging. */
+    bool force_opaque = false;
   };
 
   bool enabled_ = false;
@@ -110,8 +154,7 @@ class PipewireDmaTexture {
   VkSampler sampler_ = VK_NULL_HANDLE;
   PFN_vkGetMemoryFdPropertiesKHR get_fd_props_ = nullptr;
 
-  // Ping-pong only (front display + back copy-out). Triple was +2 on top of a
-  // PW pool that already preferred 4 — excess "latest+3" latency on Live.
+  // slots_[0] = present (always sampled). slots_[1] = staging (dma copy-out).
   Slot slots_[2]{};
   std::atomic<int> display_slot_{0};
   std::atomic<bool> valid_{false};
@@ -119,6 +162,18 @@ class PipewireDmaTexture {
   std::atomic<uint64_t> present_gen_{0};
   uint64_t bound_gen_ = 0;
   bool import_logged_ = false;
+  int last_write_slot_ = 0;
+  /** Advanced in mark_eye_done; compared to Slot::busy_until_epoch. */
+  uint64_t eye_done_epoch_ = 0;
+  /**
+   * Present may be promoted only when eye_done_epoch_ >= this.
+   * Set to eye_done+kPresentHoldEpochs on each successful promote so pool-BO
+   * thrash cannot flash a new image every XR commit.
+   */
+  uint64_t present_hold_until_epoch_ = 0;
+  static constexpr uint64_t kPresentHoldEpochs = 2;
+  /** Once EXPORT_SYNC_FILE has succeeded, later ioctl-fail soft-skips the blit. */
+  bool dmabuf_sync_ever_ok_ = false;
 
   // Arming: identical geometry/modifier for N frames before first Vulkan import.
   int arm_w_ = 0;
@@ -146,9 +201,12 @@ class PipewireDmaTexture {
   /** Import external → blit into private slot → drop import; releases frame.seq. */
   bool import_copy_out(Slot& dst, const PipewireDmaFrame& frame, uint64_t mod, VkFormat format,
                        bool force_opaque_alpha);
+  /** GPU copy staging → present (both private OPTIMAL images). */
+  bool promote_staging_to_present();
+  /** Shared gate + promote + present_gen bump. */
+  bool promote_staging_if_allowed();
   /** @param force_opaque_alpha XRGB/XBGR → ImageView A=ONE (Flat uses SRC_ALPHA blend). */
   static bool map_drm_to_vk(uint32_t drm_fourcc, VkFormat& out_format, bool& force_opaque_alpha);
-  static bool dma_buf_key(int fd, uint64_t* out_key);
 };
 
 }  // namespace vrp
