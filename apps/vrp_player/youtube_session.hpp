@@ -112,7 +112,7 @@ class YouTubeSession : public QObject {
   void shutdown();
 
   /**
-   * XR/filter thread: Meta SHM is stuck in pool-recycle hold — queue stage
+   * XR/filter thread: Meta capture stuck in pool-recycle hold — queue stage
    * damage on the Qt thread (safe to call from any thread).
    */
   void kick_meta_paint();
@@ -127,7 +127,7 @@ class YouTubeSession : public QObject {
   bool desktop_app_mode() const { return !cfg_.exec.isEmpty(); }
   /**
    * GNOME RecordVirtual / Meta-* live path. FSR is forced off here while we
-   * investigate texture update issues (keep the pipeline as raw SHM → Flat).
+   * investigate texture update issues (keep the pipeline as raw capture → Flat).
    */
   bool meta_live_path() const {
     return desk_ == DesktopEnv::Gnome && cfg_.virtual_display && !desktop_app_mode();
@@ -316,7 +316,7 @@ class YouTubeSession : public QObject {
   bool gnome_defer_browser_ = false;
   /**
    * Legacy Plan B: Meta wallpaper + soft cursor only (no Chrome). Kept false —
-   * Chrome on Meta supplies stage damage for Mutter SHM streams.
+   * Chrome on Meta supplies stage damage for Mutter RecordVirtual streams.
    */
   bool gnome_capture_only_ = false;
   /** Bumped on start/stop so evacuate timers from a prior session die. */
@@ -325,7 +325,7 @@ class YouTubeSession : public QObject {
   /** Desktop [アプリ]: keep new windows on Virtual after content start. */
   QTimer desk_maintain_timer_;
   /**
-   * GNOME Meta-*: periodic stage damage so RecordVirtual SHM does not idle into
+   * GNOME Meta-*: periodic stage damage so RecordVirtual does not idle into
    * multi-second pool-recycle holds (unique burst → freeze → jump).
    */
   QTimer meta_paint_timer_;

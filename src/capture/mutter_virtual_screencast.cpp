@@ -134,11 +134,9 @@ void MutterVirtualScreencast::callScreenCastCreate() {
 
 void MutterVirtualScreencast::callRecordVirtual() {
   // cursor-mode: 0=hidden 1=embedded 2=metadata (Mutter MetaScreenCastCursorMode).
-  // Hidden only emits PW frames on stage damage — Meta SHM then idles into
-  // multi-second pool-recycle holds (live-display ~2.5–3s unique-burst→freeze).
-  // Embedded paints the seat cursor into every buffer; EIS pointer motion from
-  // XR keeps content_fp unique. Sticky recent-fp ban blocks the old Embedded
-  // cursor-trail A-B-A that made us prefer Hidden before.
+  // Hidden only emits on stage damage (long idle / pool-recycle freeze).
+  // Embedded keeps the stream alive via seat cursor; CURSOR_ONLY frames may still
+  // queue unpainted BOs — capture drops those (empty damage / corrupted chunk).
   VRP_LOG("mutter-virtual: RecordVirtual (is-platform=true, cursor=embedded)…");
   QDBusMessage msg = scCall(sc_session_, QString::fromLatin1(kScSessionIface),
                             QStringLiteral("RecordVirtual"));

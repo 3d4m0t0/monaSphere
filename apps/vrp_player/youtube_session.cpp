@@ -1484,12 +1484,8 @@ void YouTubeSession::beginPortal(bool after_reject) {
       }
     }
     if (desk_ == DesktopEnv::Gnome && cfg_.virtual_display) {
-      // VIRTUAL often still prompts even with a token (old Meta-* is gone).
-      emit toast(tr("Host: approve Remote Desktop on the primary screen "
-                    "(GNOME may place the dialog on Meta — avoid HMD clicks)"));
-      emit logMessage(tr("ScreenCast: GNOME VIRTUAL — live grant UI expected "
-                         "(restore rarely skips Start for a new Meta-*)"));
-      armGnomePortalEvacuate();
+      // Mutter RecordVirtual already owns Meta — no portal grant UI / HUD toast.
+      emit logMessage(tr("ScreenCast: GNOME VIRTUAL — manager-owned Meta (no portal toast)"));
     } else {
       emit toast(tr("Host: share ONLY “%1” (not whole desktop)").arg(output_name_));
       emit logMessage(tr("ScreenCast: pick MONITOR “%1” only — do not share the full desktop / both screens")
@@ -1497,12 +1493,7 @@ void YouTubeSession::beginPortal(bool after_reject) {
     }
   } else {
     emit logMessage(tr("ScreenCast: restoring previous share…"));
-    if (desk_ == DesktopEnv::Gnome && cfg_.virtual_display) {
-      emit logMessage(tr("GNOME VIRTUAL: token present — Start may still show a live "
-                         "grant dialog (new Meta-* cannot be restored)"));
-      emit toast(tr("Host: if a Remote Desktop dialog appears, use the primary monitor"));
-      armGnomePortalEvacuate();
-    }
+    // GNOME Meta path never uses portal Start — no grant toast.
   }
 
   auto launch = [this, interactive, after_reject] {
@@ -1866,17 +1857,20 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
   // to a hardcoded 1080p default during PipeWire format negotiation.
   const int prefer_w = cfg_.virtual_w > 0 ? cfg_.virtual_w : r.width;
   const int prefer_h = cfg_.virtual_h > 0 ? cfg_.virtual_h : r.height;
-  // GNOME Meta-* / RecordVirtual: prefer SHM (see README_live DMA / research notes).
-  const bool prefer_shm = (desk_ == DesktopEnv::Gnome && cfg_.virtual_display);
-  if (prefer_shm) {
-    emit logMessage(tr("PipeWire: SHM capture for GNOME VIRTUAL (avoid DMA-BUF flicker on Meta-*)"));
-  }
+  // GNOME Meta-* / RecordVirtual: negotiate DMA-BUF first (same as KDE); SHM is
+  // the EnumFormat fallback. Surface hitching matched SHM once pool/filter work
+  // landed — no longer force prefer_shm.
   if (r.pw_fd < 0) {
     VRP_LOG("pipewire: Mutter node %u via default socket (no portal fd)", r.node_id);
   }
-  if (!capture_->start(r.pw_fd, r.node_id, r.pipewire_serial,
-                       prefer_shm ? std::vector<uint64_t>{} : cfg_.drm_modifiers, prefer_w, prefer_h,
-                       prefer_shm)) {
+  if (desk_ == DesktopEnv::Gnome && cfg_.virtual_display) {
+    emit logMessage(cfg_.drm_modifiers.empty()
+                        ? tr("PipeWire: GNOME VIRTUAL — DMA-BUF + SHM fallback (no consumer mods yet)")
+                        : tr("PipeWire: GNOME VIRTUAL — DMA-BUF preferred (%1 mods), SHM fallback")
+                              .arg(cfg_.drm_modifiers.size()));
+  }
+  if (!capture_->start(r.pw_fd, r.node_id, r.pipewire_serial, cfg_.drm_modifiers, prefer_w, prefer_h,
+                       /*prefer_shm=*/false)) {
     const QString err = QString::fromStdString(capture_->last_error());
     if (r.pw_fd >= 0) ::close(r.pw_fd);
     if (r.eis_fd >= 0) ::close(r.eis_fd);
@@ -1890,7 +1884,7 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
   }
   setState(State::Streaming);
   if (desk_ == DesktopEnv::Gnome && cfg_.virtual_display) {
-    // Keep RecordVirtual SHM from idling into pool-recycle storms (~2.5s holds).
+    // Keep RecordVirtual from idling (Hidden cursor → no damage → pool holds).
     if (!meta_paint_timer_.isActive()) meta_paint_timer_.start();
     (void)x11_.force_output_damage(/*quiet=*/false);
   }

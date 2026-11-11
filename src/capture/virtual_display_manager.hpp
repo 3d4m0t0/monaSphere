@@ -19,10 +19,10 @@ namespace vrp {
  *
  * ## Root causes this design absorbs (2026-11 Meta live)
  *
- * 1. **SHM pool recycle / 前後ブレ** — RecordVirtual Hidden cursor only emits on
- *    stage damage; PW then republishes the same ≤8 SHM buffers. Mitigations live
- *    in the capture/display path (Embedded cursor, sticky content_fp ban, SHM
- *    staging). The manager does not own those filters.
+ * 1. **PW pool recycle / 前後ブレ** — Mutter may queue unpainted recycled BOs
+ *    (empty VideoDamage / CURSOR_ONLY chunk). Capture skips those before DMA
+ *    copy-out (keep present). Also: Embedded cursor, staging→present hold.
+ *    Meta negotiates DMA-BUF first with SHM/CPU fallback.
  *
  * 2. **Cursor dead until Meta "glitches"** — Mutter ConnectToEIS runs *before*
  *    PipeWire negotiates size, so Meta-* does not exist when libei snapshots

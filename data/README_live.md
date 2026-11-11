@@ -151,7 +151,7 @@ Procedure (portal + Mutter; KDE-parity goal — Virtual creation differs):
    overlay), not the desktop arrow — intentional while Embedded trails/flicker
    on VIRTUAL. Pad **clicks** stay disabled briefly until evacuate settles.
 6. After Meta-* appears, Chrome (isolated X11) is placed onto Meta with
-   `_NET_WM_FULLSCREEN_MONITORS` — that paint keeps the SHM stream alive.
+   `_NET_WM_FULLSCREEN_MONITORS` — that paint keeps the capture stream alive.
 
 **GNOME Virtual (monaSphere path):** call Mutter directly —
 
@@ -162,7 +162,7 @@ Procedure (portal + Mutter; KDE-parity goal — Virtual creation differs):
    stream (wallpaper-only HMD).
 3. `ScreenCast.Start` → `PipeWireStreamAdded`
 4. `Mutter.RemoteDesktop` CreateSession/Start/`ConnectToEIS`
-5. Connect default PipeWire socket to the node (SHM for Meta)
+5. Connect default PipeWire socket to the node (DMA-BUF preferred, SHM fallback)
 6. Place Chrome on Meta-0; enable EIS
 
 **Portal RD+SC VIRTUAL** (not used for monaSphere GNOME virtual anymore; kept
@@ -185,13 +185,13 @@ you out if a window still references a removed logical monitor).
 
 | Source | Finding |
 |--------|---------|
-| [Fjarr ADR 0041](https://fjarr.io/adr/0041-desktop-capture-dmabuf/) | **Meta- / RecordVirtual → prefer SHM**; virtual monitors have no KMS CRTC, DMA-BUF path not validated. Physical monitors: DMA-BUF + hold until consumer done. |
+| [Fjarr ADR 0041](https://fjarr.io/adr/0041-desktop-capture-dmabuf/) | Meta- / RecordVirtual historically preferred SHM (no KMS CRTC). Physical monitors: DMA-BUF + hold until consumer done. |
 | [WebRTC SharedScreenCastStream](https://webrtc.googlesource.com/src) | Dequeue (keep newest), **ProcessBuffer, `queue_buffer` in the same `on_process`**. DMA via EGL import+readback on discrete GPUs — never mmap tiled. |
 | [niri NVIDIA flicker](https://github.com/niri-wm/niri/issues/1432) | Screencast flicker on NVIDIA = missing frame-complete / explicit sync before reuse; fixed by wait-for-completion / SyncTimeline. |
 | Mutter !3876 | Producer-side `SPA_META_SyncTimeline`; consumers must wait acquire / signal release. |
 | [logical_monitor assert](https://github.com/ubuntu/Tiling-Assistant/issues/416) | Removing Meta-* while a window/extension still references it → gnome-shell ABRT → **logout**. |
 
-monaSphere therefore uses **SHM-only** for GNOME `live_virtual=1`. Teardown still moves the cursor/windows off Meta-* before `Session.Close`.
+monaSphere negotiates **DMA-BUF first** for GNOME `live_virtual=1` (same EnumFormat order as KDE), with MemFd/MemPtr as fallback. Consumer path is **Pattern A staging→present**: dma copy-out into private staging, then GPU-promote into fixed present (`display_slot` always 0). Latching 0↔1 every commit caused ABAB; staging isolates producer blit from the bound view. **Root cause of old-frame / reorder flashes:** Mutter can queue an *unpainted* recycled pool BO (empty `VideoDamage`, or CURSOR_ONLY `chunk` size=0/CORRUPTED) while `dma_seq`/`p#` stay monotonic — copy-out would paste stale pixels. Capture skips those buffers (keep present, `queue_buffer`) before publish; `maxFramerate`≤60; SyncTimeline / EXPORT_SYNC wait before blit. Pool **4**, hold `pw_buffer` until staging blit completes, XR keep-latest. Promote gated by eye-epoch + present hold. Hard import failure → CPU RGBA (`dma_disabled`). Teardown moves cursor/windows off Meta-* before `Session.Close`.
 
 #### Spare physical MONITOR (`live_virtual=0`)
 
@@ -278,6 +278,15 @@ Same Soft + `StereoSurround` path as local file 2ch. Shared knobs:
 `~/.config/monasphere/monasphere.conf` and restart the HMD session.
 Missing `audio_normalize` is written as `1`, and missing `hrtf_trim_db` as `12`,
 on the next launch. Retired keys such as `volume_uncap` are commented out.
+
+### Persist logs (optional)
+
+| Conf | File | Default |
+|------|------|---------|
+| `live_display_log=1` | `~/.config/monasphere/live-display.log` (+ `/tmp/monasphere-live-display.log`) | `0` off |
+| `live_teardown_log=1` | `~/.config/monasphere/live-teardown.log` (+ `/tmp/…`) | `0` off |
+
+These are the only two durable Live breadcrumb files. Ordinary `[vrp]` stdout is unaffected.
 
 ### Startup order (must keep)
 
