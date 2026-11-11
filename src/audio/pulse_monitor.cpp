@@ -484,7 +484,14 @@ std::string PulseMonitor::ensure_yt_null_sink() {
     (void)pclose(p);
   }
   g_yt_null_module.store(mod, std::memory_order_release);
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  // Wait until Pulse lists the sink (no fixed 250ms settle).
+  {
+    const auto t0 = std::chrono::steady_clock::now();
+    while (!sink_exists(ps, sink.c_str())) {
+      if (std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(2000)) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+  }
   if (!sink_exists(ps, sink.c_str())) {
     VRP_LOG("PulseMonitor: failed to create null sink %s", sink.c_str());
     g_yt_null_module.store(0, std::memory_order_release);

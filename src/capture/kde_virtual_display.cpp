@@ -2,6 +2,7 @@
 
 #include "common.hpp"
 
+#include <QElapsedTimer>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -220,11 +221,34 @@ int KdeVirtualDisplay::killAllManaged() {
   for (qint64 pid : pids) {
     QProcess::execute(QStringLiteral("kill"), {QStringLiteral("-TERM"), QString::number(pid)});
   }
-  QThread::msleep(400);
-  for (qint64 pid : pids) {
+  // Wait until processes are gone (no fixed settle). KILL leftovers that ignore TERM.
+  auto pids_alive = [](const QList<qint64>& list) {
+    QList<qint64> alive;
+    for (qint64 pid : list) {
+      if (pid <= 1) continue;
+      if (QProcess::execute(QStringLiteral("kill"),
+                            {QStringLiteral("-0"), QString::number(pid)}) == 0) {
+        alive.push_back(pid);
+      }
+    }
+    return alive;
+  };
+  QElapsedTimer term_wait;
+  term_wait.start();
+  while (term_wait.elapsed() < 2000) {
+    if (pids_alive(pids).isEmpty()) break;
+    QThread::msleep(40);
+  }
+  const QList<qint64> leftovers = pids_alive(pids);
+  for (qint64 pid : leftovers) {
     QProcess::execute(QStringLiteral("kill"), {QStringLiteral("-KILL"), QString::number(pid)});
   }
-  QThread::msleep(200);
+  QElapsedTimer kill_wait;
+  kill_wait.start();
+  while (kill_wait.elapsed() < 1000) {
+    if (pids_alive(pids).isEmpty()) break;
+    QThread::msleep(40);
+  }
   VRP_LOG("live: killed %d orphan krfb-virtualmonitor (all managed names)", pids.size());
   return pids.size();
 }
@@ -355,15 +379,47 @@ int KdeVirtualDisplay::killOrphans(const QString& name) {
     ++killed;
   }
   if (killed > 0) {
-    QThread::msleep(400);
-    // Force leftovers.
+    auto pid_alive = [](qint64 pid) {
+      return pid > 1 &&
+             QProcess::execute(QStringLiteral("kill"),
+                               {QStringLiteral("-0"), QString::number(pid)}) == 0;
+    };
+    QElapsedTimer term_wait;
+    term_wait.start();
+    while (term_wait.elapsed() < 2000) {
+      bool any = false;
+      for (const QString& ps : pids) {
+        bool ok = false;
+        const qint64 pid = ps.toLongLong(&ok);
+        if (ok && pid_alive(pid)) {
+          any = true;
+          break;
+        }
+      }
+      if (!any) break;
+      QThread::msleep(40);
+    }
     for (const QString& ps : pids) {
       bool ok = false;
       const qint64 pid = ps.toLongLong(&ok);
-      if (!ok || pid <= 1) continue;
+      if (!ok || !pid_alive(pid)) continue;
       QProcess::execute(QStringLiteral("kill"), {QStringLiteral("-KILL"), QString::number(pid)});
     }
-    QThread::msleep(200);
+    QElapsedTimer kill_wait;
+    kill_wait.start();
+    while (kill_wait.elapsed() < 1000) {
+      bool any = false;
+      for (const QString& ps : pids) {
+        bool ok = false;
+        const qint64 pid = ps.toLongLong(&ok);
+        if (ok && pid_alive(pid)) {
+          any = true;
+          break;
+        }
+      }
+      if (!any) break;
+      QThread::msleep(40);
+    }
     VRP_LOG("live: killed %d orphan krfb-virtualmonitor (%s)", killed, name.toUtf8().constData());
   }
   return killed;

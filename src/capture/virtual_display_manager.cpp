@@ -557,8 +557,20 @@ VirtualDisplayManager::Result VirtualDisplayManager::ensure(const Spec& want_in)
     if (!wait_gone(8000, 30)) {
       emit logMessage(tr("Virtual: still listed after stop — continuing"));
     }
-    // Let plasmashell finish screenRemoved before a new Virtual appears.
-    QThread::msleep(400);
+    // Confirm gone stays gone (no fixed plasmashell settle sleep).
+    {
+      int streak = 0;
+      QElapsedTimer stab;
+      stab.start();
+      while (stab.elapsed() < 2000 && streak < 3) {
+        if (!KdeVirtualDisplay::anyManagedOutputExists()) {
+          ++streak;
+        } else {
+          streak = 0;
+        }
+        if (streak < 3) QThread::msleep(40);
+      }
+    }
     add_progress(10);
   }
 
@@ -661,8 +673,20 @@ void VirtualDisplayManager::destroy() {
   } else {
     emit logMessage(tr("Virtual: still listed after destroy — continuing"));
   }
-  // Brief settle so plasmashell can drop containments for the gone output.
-  QThread::msleep(400);
+  // Confirm gone stays gone (no fixed plasmashell settle sleep).
+  {
+    int streak = 0;
+    QElapsedTimer stab;
+    stab.start();
+    while (stab.elapsed() < 2000 && streak < 3) {
+      if (!KdeVirtualDisplay::anyManagedOutputExists()) {
+        ++streak;
+      } else {
+        streak = 0;
+      }
+      if (streak < 3) QThread::msleep(40);
+    }
+  }
   add_progress(10);
   emit busyStatus(QString());
 }

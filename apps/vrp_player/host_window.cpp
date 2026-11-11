@@ -2625,6 +2625,19 @@ QString HostWindow::firstLiveAppUrl() const {
   return QStringLiteral("https://www.youtube.com/");
 }
 
+QString HostWindow::liveAppLabelForUrl(const QString& url) const {
+  const QString u = url.trimmed();
+  for (const LiveAppEntry& a : live_apps_) {
+    if (a.url.trimmed() == u && !a.name.trimmed().isEmpty()) return a.name.trimmed();
+  }
+  return QStringLiteral("YouTube");
+}
+
+QString HostWindow::liveLaunchBusyText(const QString& label) const {
+  // Match first-launch post-Virtual spinner (e.g. "YouTube"), not 「…起動中」.
+  return label.trimmed().isEmpty() ? tr("Live") : label.trimmed();
+}
+
 void HostWindow::flushPendingLiveStart() {
   if (yt_pending_kind_ == YtPendingKind::None) return;
   if (!xr_running_.load(std::memory_order_acquire)) {
@@ -2750,15 +2763,28 @@ void HostWindow::startLiveFromHmd(const QString& url) {
   if (yt_session_ &&
       (yt_session_->active() || yt_session_->loading() ||
        yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
+    // Fast path: same Virtual + streaming browser → Chrome relaunch only.
+    const bool reuse = vdisp_mgr_ && vdisp_mgr_->reusable() &&
+                       vdisp_mgr_->matches(virtualSpecForSpan(1));
+    const QString dest_label = liveAppLabelForUrl(open_url);
+    if (reuse && yt_session_->active() && !yt_session_->desktop_app_mode() &&
+        yt_session_->state() == vrp::YouTubeSession::State::Streaming &&
+        yt_session_->switch_live_url(open_url, dest_label)) {
+      appendLog(tr("Live: switch in place (Virtual/ScreenCast kept) → %1").arg(open_url));
+      return;
+    }
+    appendLog(tr("Live: switch in place skipped (reuse=%1 active=%2 desk=%3 state=%4) — full restart")
+                  .arg(reuse ? QStringLiteral("1") : QStringLiteral("0"))
+                  .arg(yt_session_->active() ? QStringLiteral("1") : QStringLiteral("0"))
+                  .arg(yt_session_->desktop_app_mode() ? QStringLiteral("1") : QStringLiteral("0"))
+                  .arg(static_cast<int>(yt_session_->state())));
     yt_pending_kind_ = YtPendingKind::Live;
     yt_pending_url_ = open_url;
     yt_pending_exec_.clear();
     yt_pending_args_.clear();
-    yt_pending_label_.clear();
+    yt_pending_label_ = dest_label;
     yt_pending_span_ = 1;
-    const bool reuse = vdisp_mgr_ && vdisp_mgr_->reusable() &&
-                       vdisp_mgr_->matches(virtualSpecForSpan(1));
-    yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
+    yt_session_->set_busy_status(reuse ? liveLaunchBusyText(dest_label) : tr("Virtual 削除中"));
     appendLog(reuse ? tr("Live: queueing browser (Virtual reuse if same resolution)")
                     : tr("Live: queueing browser (Virtual will recreate on start)"));
     if (yt_session_->state() != vrp::YouTubeSession::State::Stopping) {
@@ -2823,7 +2849,7 @@ void HostWindow::startLiveDesktopApp(const QString& exec, const QStringList& arg
     yt_pending_label_ = label;
     const bool reuse = vdisp_mgr_ && vdisp_mgr_->reusable() &&
                        vdisp_mgr_->matches(virtualSpecForSpan(span));
-    yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
+    yt_session_->set_busy_status(reuse ? liveLaunchBusyText(label) : tr("Virtual 削除中"));
     appendLog(reuse ? tr("Live: queueing desktop app (Virtual reuse if same resolution)")
                     : tr("Live: queueing desktop app (Virtual will recreate on start)"));
     if (yt_session_->state() != vrp::YouTubeSession::State::Stopping) {
@@ -6398,7 +6424,12 @@ void HostWindow::xrThreadMain() {
             const bool reuse_next =
                 yt_pending_kind_ != YtPendingKind::None && vdisp_mgr_ &&
                 vdisp_mgr_->matches(virtualSpecForSpan(yt_pending_span_));
-            yt_session_->set_busy_status(reuse_next ? tr("切替中") : tr("Virtual 削除中"));
+            const QString next_label =
+                !yt_pending_label_.trimmed().isEmpty()
+                    ? yt_pending_label_
+                    : liveAppLabelForUrl(yt_pending_url_);
+            yt_session_->set_busy_status(reuse_next ? liveLaunchBusyText(next_label)
+                                                   : tr("Virtual 削除中"));
           }
           opt_.projection = vrp::ProjectionMode::Flat;
           opt_.stereo = vrp::StereoLayout::Mono;
@@ -6431,7 +6462,12 @@ void HostWindow::xrThreadMain() {
                   const bool reuse_next =
                       yt_pending_kind_ != YtPendingKind::None && vdisp_mgr_ &&
                       vdisp_mgr_->matches(virtualSpecForSpan(yt_pending_span_));
-                  yt_session_->set_busy_status(reuse_next ? tr("切替中") : tr("Virtual 削除中"));
+                  const QString next_label =
+                      !yt_pending_label_.trimmed().isEmpty()
+                          ? yt_pending_label_
+                          : liveAppLabelForUrl(yt_pending_url_);
+                  yt_session_->set_busy_status(reuse_next ? liveLaunchBusyText(next_label)
+                                                         : tr("Virtual 削除中"));
                   yt_session_->stop();
                   appendLog(tr("Live capture stopped (after DMA settle)"));
                 });
@@ -6814,7 +6850,8 @@ void HostWindow::xrThreadMain() {
             (yt_session_->active() || yt_session_->loading() ||
              yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
           const bool reuse = vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(1));
-          yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
+          yt_session_->set_busy_status(reuse ? liveLaunchBusyText(liveAppLabelForUrl(live_url))
+                                             : tr("Virtual 削除中"));
           show_idle_screen = false;
         }
         QMetaObject::invokeMethod(
@@ -6836,7 +6873,8 @@ void HostWindow::xrThreadMain() {
             (yt_session_->active() || yt_session_->loading() ||
              yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
           const bool reuse = vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(desk_span));
-          yt_session_->set_busy_status(reuse ? tr("切替中") : tr("Virtual 削除中"));
+          yt_session_->set_busy_status(reuse ? liveLaunchBusyText(desk_label)
+                                             : tr("Virtual 削除中"));
           show_idle_screen = false;
         }
         QMetaObject::invokeMethod(
@@ -7477,12 +7515,14 @@ void HostWindow::xrThreadMain() {
           return false;
         };
 
-        // Skip DMA only while tearing down (切替/削除/終了). 「起動中」must still import
-        // so mark_frame_presented() can clear the spinner — otherwise it spins forever.
+        // Skip DMA while tearing down ScreenCast/Virtual. In-place Live↔Live
+        // (switching_live) keeps capture running and must still import so
+        // mark_frame_presented() can clear switch_hold / spinner.
         const QString yt_busy = yt_session_->busy_status();
         const bool yt_busy_teardown =
-            yt_busy.contains(QStringLiteral("切替")) || yt_busy.contains(QStringLiteral("削除")) ||
-            yt_busy.contains(QStringLiteral("終了"));
+            yt_session_->state() == vrp::YouTubeSession::State::Stopping ||
+            yt_busy.contains(QStringLiteral("削除")) || yt_busy.contains(QStringLiteral("終了")) ||
+            (yt_busy.contains(QStringLiteral("切替")) && !yt_session_->switching_live());
         if (yt_live && yt_cap && yt_cap->running() && !yt_busy_teardown) {
           {
             const auto status = yt_cap->drain_status();

@@ -329,6 +329,8 @@ void YouTubeSession::cleanupStreaming() {
   stopDesktopAppMaintain();
   meta_paint_timer_.stop();
   ++gnome_evacuate_gen_;  // cancel pending Chrome launch / Meta paint timers
+  switch_hold_content_ = false;
+  pending_switch_reveal_ = false;
   KwinWindowPlacer::disarm_place_on_open();
   KwinWindowPlacer::disarm_portal_dialog_on_primary();
 
@@ -464,10 +466,74 @@ void YouTubeSession::cleanupStreaming() {
 void YouTubeSession::mark_frame_presented() {
   // GNOME Meta: first PW frames are wallpaper — keep spinner until Chrome + EIS ready.
   if (using_mutter_virtual_ && !gnome_live_ready_) return;
+  // Live↔Live: ignore frames until the new browser is placed.
+  if (switch_hold_content_) {
+    if (!pending_switch_reveal_) return;
+    switch_hold_content_ = false;
+    pending_switch_reveal_ = false;
+  }
   if (loading_.load(std::memory_order_acquire)) {
     loading_.store(false, std::memory_order_release);
   }
   clear_busy_status();
+}
+
+void YouTubeSession::closeLiveBrowserWindow() {
+  place_timer_.stop();
+  KwinWindowPlacer::disarm_place_on_open();
+  QString err;
+  bool closed = false;
+  if (desk_ == DesktopEnv::Kde) {
+    if (!kwin_window_id_.isEmpty()) {
+      closed = KwinWindowPlacer::close_window_by_id(kwin_window_id_, &err);
+    }
+    if (!closed) closed = KwinWindowPlacer::close_youtube_window(&err);
+    if (!closed && kwin_window_id_.isEmpty()) {
+      closed = KwinWindowPlacer::close_chrome_except(chrome_ids_before_, &err);
+    }
+  }
+  if (!closed && x11_.have_window()) closed = x11_.close_window();
+  // clear() drops the EIS inject pointer — keep ScreenCast EIS across Chrome relaunch.
+  x11_.clear();
+  if (EisPointer* eis = activeEis()) x11_.set_eis_inject(eis);
+  kwin_window_id_.clear();
+  chrome_ids_before_.clear();
+  if (chrome_) chrome_->stop();
+  emit logMessage(closed ? tr("Live: browser window closed for switch")
+                         : tr("Live: browser close for switch: %1")
+                               .arg(err.isEmpty() ? tr("not found") : err));
+}
+
+bool YouTubeSession::switch_live_url(const QString& url, const QString& label) {
+  const QString next = url.trimmed();
+  if (next.isEmpty()) return false;
+  if (desktopAppMode()) return false;
+  if (!active_.load(std::memory_order_acquire)) return false;
+  if (state_ != State::Streaming && state_ != State::Placed) return false;
+#if defined(VRP_HAS_PIPEWIRE)
+  if (!capture_ || !capture_->running()) return false;
+#else
+  return false;
+#endif
+
+  emit logMessage(tr("Live: switch URL (keep Virtual/ScreenCast) → %1").arg(next));
+  cfg_.url = next;
+  if (!label.trimmed().isEmpty()) cfg_.launch_title = label.trimmed();
+  switch_hold_content_ = true;
+  pending_switch_reveal_ = false;
+  if (using_mutter_virtual_) gnome_live_ready_ = false;
+  loading_.store(true, std::memory_order_release);
+  // Same spinner text as first-launch after Virtual is up (title only, no 「起動中」).
+  set_busy_status(!cfg_.launch_title.isEmpty() ? cfg_.launch_title : tr("Live"));
+
+  closeLiveBrowserWindow();
+  configureLiveBrowserLaunch();
+  if (desk_ == DesktopEnv::Gnome && cfg_.virtual_display) {
+    beginPlaceGnome();
+  } else {
+    beginPlace();
+  }
+  return true;
 }
 
 void YouTubeSession::mark_gnome_live_ready() {
@@ -828,7 +894,6 @@ void YouTubeSession::stop() {
   audio_wanted_.store(false, std::memory_order_release);
   // Capture + app only. Virtual stays up; VirtualDisplayManager::ensure/destroy owns it.
   emit logMessage(tr("Live stop: capture + app (Virtual left to manager)"));
-  set_busy_status(tr("切替中"));
   cleanupStreaming();
   clear_busy_status();
   setState(State::Idle);
@@ -1424,6 +1489,8 @@ void YouTubeSession::onPlaced() {
     }
     (void)x11_.refresh_geometry();
   }
+  // In-place switch may have cleared x11_; re-attach EIS before cursor/activate.
+  if (EisPointer* eis = activeEis()) x11_.set_eis_inject(eis);
   x11_.set_cursor(place_w_ * 0.5f, place_h_ * 0.5f);
   if (desk_ == DesktopEnv::Kde) {
     QString act_err;
@@ -1433,19 +1500,25 @@ void YouTubeSession::onPlaced() {
     }
   }
 
-  // GNOME managed Virtual: portal already streaming; browser was deferred.
+  // Capture already streaming (GNOME Meta first place, or Live↔Live Chrome switch).
   if (active_.load(std::memory_order_acquire)) {
     setState(State::Streaming);
+    if (switch_hold_content_) {
+      // Reveal on next usable frame (no fixed settle sleep).
+      pending_switch_reveal_ = true;
+      if (using_mutter_virtual_) {
+        gnome_live_ready_ = true;
+        emit logMessage(tr("Live: Chrome placed — waiting for frame to reveal"));
+      } else {
+        emit logMessage(tr("Live: Chrome placed — waiting for frame to reveal"));
+      }
+      return;
+    }
     if (using_mutter_virtual_) {
-      // Brief settle so Chrome's first paint is in SHM before HMD leaves the spinner
-      // (KDE: capture starts only after place — first frame is already the browser).
-      const int gen = gnome_evacuate_gen_;
-      QTimer::singleShot(450, this, [this, gen] {
-        if (gen != gnome_evacuate_gen_) return;
-        if (!active_.load(std::memory_order_acquire)) return;
-        mark_gnome_live_ready();
-        emit logMessage(tr("GNOME: Chrome on Meta — showing live stream"));
-      });
+      // First GNOME place: reveal when a frame arrives (same gate as KDE switch).
+      gnome_live_ready_ = true;
+      emit logMessage(tr("GNOME: Chrome on Meta — showing live stream"));
+      mark_frame_presented();
     }
     return;
   }

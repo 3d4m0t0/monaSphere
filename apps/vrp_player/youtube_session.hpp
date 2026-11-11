@@ -104,6 +104,12 @@ class YouTubeSession : public QObject {
   void start(const Config& cfg);
   void stop();
   /**
+   * Live↔Live (browser): keep Virtual/ScreenCast/PW, hide HMD content, close and
+   * relaunch Chrome with a new URL on the same Virtual, then reveal on first frame.
+   * Returns false if a full stop/restart is required (desktop app, not streaming, …).
+   */
+  bool switch_live_url(const QString& url, const QString& label = {});
+  /**
    * XR thread: drop active/loading and stop PipeWire only (after DMA texture reset).
    * Portal / Chrome / KWin cleanup must follow on the Qt thread via stop().
    */
@@ -132,7 +138,7 @@ class YouTubeSession : public QObject {
   bool audio_wanted() const { return audio_wanted_.load(std::memory_order_acquire); }
   void clear_audio_wanted() { audio_wanted_.store(false, std::memory_order_release); }
 
-  /** Short status under Flat spinner (「Name 起動中」など). Empty = no busy overlay. */
+  /** Short status under Flat spinner (「Live 起動中」→「YouTube」など). Empty = no overlay. */
   void set_busy_status(const QString& status);
   void clear_busy_status();
   QString busy_status() const;
@@ -147,9 +153,12 @@ class YouTubeSession : public QObject {
    * (wallpaper must not replace the spinner — KDE's first frame is already the browser).
    */
   bool hmd_content_ready() const {
+    if (switch_hold_content_) return false;
     if (using_mutter_virtual_) return gnome_live_ready_;
     return true;
   }
+  /** Live↔Live Chrome relaunch — keep importing DMA so reveal can clear busy. */
+  bool switching_live() const { return switch_hold_content_; }
   QString desktop_label() const { return desktop_label_; }
 
   QString output_name() const { return output_name_; }
@@ -225,6 +234,8 @@ class YouTubeSession : public QObject {
   void armPortalWatchdog(bool had_token);
   /** Apply cfg_ → chrome_ window/scale/profile (shared by KDE/GNOME launch). */
   void configureLiveBrowserLaunch();
+  /** Close Live browser window / launcher state without tearing down capture. */
+  void closeLiveBrowserWindow();
   /**
    * After PipeWire negotiates portal VIRTUAL (Mutter Meta-* exists): launch + place.
    * Call only once capture has started — RecordVirtual creates the MONITOR then.
@@ -318,6 +329,13 @@ class YouTubeSession : public QObject {
   bool gnome_capture_only_ = false;
   /** Bumped on start/stop so evacuate timers from a prior session die. */
   int gnome_evacuate_gen_ = 0;
+  /**
+   * Live↔Live Chrome relaunch: hide HMD content (wallpaper/black stream) until
+   * the new browser is placed and a frame arrives.
+   */
+  bool switch_hold_content_ = false;
+  /** After place during switch — next mark_frame_presented may reveal. */
+  bool pending_switch_reveal_ = false;
   QTimer place_timer_;
   /** Desktop [アプリ]: keep new windows on Virtual after content start. */
   QTimer desk_maintain_timer_;

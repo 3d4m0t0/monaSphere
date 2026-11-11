@@ -440,6 +440,10 @@ class HostWindow : public QMainWindow {
   /** From conf live_desktop_app[N]=Name|exec and .title[M]=Name|x1…x3|args… */
   QVector<LiveDesktopAppEntry> live_desktop_apps_;
   QString firstLiveAppUrl() const;
+  /** Conf live_app name for URL (fallback YouTube). */
+  QString liveAppLabelForUrl(const QString& url) const;
+  /** Spinner label while switching Live (destination name only, e.g. YouTube). */
+  QString liveLaunchBusyText(const QString& label) const;
   bool live_capture_monitor_ = true;
   bool live_virtual_ = true;
   /**
