@@ -1183,6 +1183,10 @@ bool monasphereConfAssignmentOk(const QString& code, bool allow_legacy) {
   if (confKeyIs(code, QStringLiteral("volume"), &v)) return confFloat(v, 0.f, 1.f);
   if (confKeyIs(code, QStringLiteral("fsr"), &v)) return confInt(v, 0, 3);
   if (confKeyIs(code, QStringLiteral("live_fsr"), &v)) return confInt(v, 0, 3);
+  if (confKeyIs(code, QStringLiteral("live_display_log"), &v))
+    return v == QLatin1String("0") || v == QLatin1String("1");
+  if (confKeyIs(code, QStringLiteral("live_teardown_log"), &v))
+    return v == QLatin1String("0") || v == QLatin1String("1");
   if (confKeyIs(code, QStringLiteral("hz"), &v)) {
     bool ok = false;
     const int n = v.toInt(&ok);
@@ -1711,6 +1715,10 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("live_chrome_scale"), QStringLiteral("1")},
       {QStringLiteral("live_cursor_scale"), QStringLiteral("1")},
       {QStringLiteral("live_chrome_profile"), QStringLiteral("default")},
+      // Persist breadcrumbs under ~/.config/monasphere/ (also /tmp/monasphere-*).
+      // 0=off (default). 1=append live-display.log / live-teardown.log.
+      {QStringLiteral("live_display_log"), QStringLiteral("0")},
+      {QStringLiteral("live_teardown_log"), QStringLiteral("0")},
   };
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   migrateYoutubeConfKeysToLive();
@@ -1754,6 +1762,12 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const int v = line.mid(9).toInt(&ok);
       if (ok && v >= 0 && v <= 3) live_fsr_ = static_cast<vrp::FsrMode>(v);
+    } else if (line.startsWith(QStringLiteral("live_display_log="))) {
+      const QString v = line.mid(QStringLiteral("live_display_log=").size()).trimmed();
+      vrp_set_persist_display_log(v == QLatin1String("1"));
+    } else if (line.startsWith(QStringLiteral("live_teardown_log="))) {
+      const QString v = line.mid(QStringLiteral("live_teardown_log=").size()).trimmed();
+      vrp_set_persist_teardown_log(v == QLatin1String("1"));
     } else if (line.startsWith(QStringLiteral("hz="))) {
       bool ok = false;
       const int v = line.mid(3).toInt(&ok);
@@ -3708,6 +3722,307 @@ struct LiveCpuDiag {
     hold_drops_ = 0;
   }
 };
+
+/**
+ * DMA path mirror of LiveCpuDiag. Each dma-buf inode (pool member) gets a stable
+ * unique id p1..pN on first sight; gen increments every take. Logs only — do not
+ * sticky-ban on key (reuse with new pixels is normal).
+ */
+struct LiveDmaDiag {
+  static constexpr int kRing = 16;
+  static constexpr int kMaxPool = 32;
+  struct Ev {
+    char kind[12]{};
+    uint64_t a = 0;
+    uint64_t b = 0;
+    uint64_t key = 0;
+    int pid = 0;
+    uint32_t gen = 0;
+    int slot = -1;
+    uint32_t ms = 0;
+  };
+  struct PoolEnt {
+    uint64_t key = 0;
+    int pid = 0;
+    uint32_t gen = 0;
+    uint64_t last_seq = 0;
+  };
+  Ev ring[kRing]{};
+  int head = 0;
+  int count = 0;
+  PoolEnt pool_[kMaxPool]{};
+  int pool_n_ = 0;
+  int next_pid_ = 1;
+  uint64_t last_disp = 0;
+  uint64_t last_disp_key = 0;
+  int last_disp_pid = 0;
+  uint64_t last_upload = 0;
+  uint64_t last_handled = 0;
+  uint64_t last_shown = 0;
+  uint64_t last_shown_key = 0;
+  int last_shown_pid = 0;
+  int last_shown_slot = -1;
+  int stall = 0;
+  int skip_hits = 0;
+  uint32_t t0_ms = 0;
+  uint32_t last_dump_ms = 0;
+  uint32_t last_flip_ms_ = 0;
+  uint64_t last_flip_seq_ = 0;
+  uint32_t flip_log_count_ = 0;
+  uint64_t last_take_spa_seq_ = 0;
+  uint64_t last_stage_spa_seq_ = 0;
+  uint64_t last_promote_spa_seq_ = 0;
+  bool t0_set = false;
+
+  void note_spa(const char* where, uint64_t dma_seq, uint64_t spa_seq, int64_t spa_pts,
+                bool has_spa, uint64_t& last_spa) {
+    if (!has_spa || (spa_seq == 0 && spa_pts == 0)) return;
+    if (last_spa != 0 && spa_seq != 0 && spa_seq < last_spa && (last_spa - spa_seq) < 100000ull) {
+      VRP_DISPLAY_LOG(
+          "live-dma spa REWIND at %s +%ums dma_seq=%llu spa=%llu←%llu pts=%lld",
+          where ? where : "?", now_ms(), static_cast<unsigned long long>(dma_seq),
+          static_cast<unsigned long long>(spa_seq), static_cast<unsigned long long>(last_spa),
+          static_cast<long long>(spa_pts));
+      dump("spa REWIND");
+    }
+    if (spa_seq != 0) last_spa = spa_seq;
+  }
+
+  PoolEnt* find_pool(uint64_t key) {
+    if (key == 0) return nullptr;
+    for (int i = 0; i < pool_n_; ++i) {
+      if (pool_[i].key == key) return &pool_[i];
+    }
+    return nullptr;
+  }
+
+  PoolEnt* touch_pool(uint64_t key, uint64_t seq, bool bump_gen) {
+    if (key == 0) return nullptr;
+    if (PoolEnt* e = find_pool(key)) {
+      if (bump_gen) ++e->gen;
+      e->last_seq = seq;
+      return e;
+    }
+    if (pool_n_ >= kMaxPool) return nullptr;
+    PoolEnt& e = pool_[pool_n_++];
+    e.key = key;
+    e.pid = next_pid_++;
+    e.gen = bump_gen ? 1u : 0u;
+    e.last_seq = seq;
+    VRP_DISPLAY_LOG("live-dma pool assign p%d key=0x%llx (pool_n=%d)", e.pid,
+                    static_cast<unsigned long long>(key), pool_n_);
+    return &e;
+  }
+
+  int pid_of(uint64_t key) const {
+    if (key == 0) return 0;
+    for (int i = 0; i < pool_n_; ++i) {
+      if (pool_[i].key == key) return pool_[i].pid;
+    }
+    return 0;
+  }
+
+  uint32_t gen_of(uint64_t key) const {
+    if (key == 0) return 0;
+    for (int i = 0; i < pool_n_; ++i) {
+      if (pool_[i].key == key) return pool_[i].gen;
+    }
+    return 0;
+  }
+
+  uint32_t now_ms() {
+    using clock = std::chrono::steady_clock;
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now().time_since_epoch())
+            .count();
+    if (!t0_set) {
+      t0_ms = static_cast<uint32_t>(ms);
+      t0_set = true;
+    }
+    return static_cast<uint32_t>(ms) - t0_ms;
+  }
+
+  void push(const char* kind, uint64_t a, uint64_t b = 0, int slot = -1, uint64_t key = 0) {
+    Ev& e = ring[head];
+    std::snprintf(e.kind, sizeof(e.kind), "%s", kind ? kind : "?");
+    e.a = a;
+    e.b = b;
+    e.key = key;
+    e.pid = pid_of(key);
+    e.gen = gen_of(key);
+    e.slot = slot;
+    e.ms = now_ms();
+    head = (head + 1) % kRing;
+    if (count < kRing) ++count;
+  }
+
+  void dump(const char* reason) {
+    const uint32_t t = now_ms();
+    if (last_dump_ms != 0 && (t - last_dump_ms) < 500u) {
+      push("rate_lim", 0, 0, -1);
+      return;
+    }
+    last_dump_ms = t;
+    VRP_DISPLAY_LOG("live-dma DISRUPT: %s", reason ? reason : "?");
+    const int n = count;
+    const int start = (head - n + kRing * 2) % kRing;
+    for (int i = 0; i < n; ++i) {
+      const Ev& e = ring[(start + i) % kRing];
+      VRP_DISPLAY_LOG("  +%u ms %s a=%llu b=%llu p%d g%u key=0x%llx slot=%d", e.ms, e.kind,
+                      static_cast<unsigned long long>(e.a), static_cast<unsigned long long>(e.b),
+                      e.pid, e.gen, static_cast<unsigned long long>(e.key), e.slot);
+    }
+  }
+
+  void on_take(uint64_t seq, uint64_t key, const vrp::PipewireDmaTexture& tex, uint64_t spa_seq = 0,
+               int64_t spa_pts = 0, bool has_spa = false) {
+    (void)tex;
+    (void)touch_pool(key, seq, /*bump_gen=*/false);
+    push("take", seq, spa_seq, -1, key);
+    note_spa("take", seq, spa_seq, spa_pts, has_spa, last_take_spa_seq_);
+  }
+
+  void on_skip(uint64_t seq, uint64_t key, const char* why) {
+    PoolEnt* e = touch_pool(key, seq, /*bump_gen=*/false);
+    ++skip_hits;
+    last_handled = seq;
+    // Routine mailbox / hold noise — keep rare. Unexpected skips log more often.
+    const bool routine =
+        why && (std::strstr(why, "staged-only") || std::strstr(why, "keep-latest") ||
+                std::strstr(why, "present hold") || std::strstr(why, "waiting eye"));
+    if (routine ? ((skip_hits & 63) == 1) : ((skip_hits & 15) == 1)) {
+      push("skip", seq, 0, -1, key);
+      VRP_DISPLAY_LOG("live-dma skip +%ums seq=%llu p%d g%u (%s)", now_ms(),
+                      static_cast<unsigned long long>(seq), e ? e->pid : 0, e ? e->gen : 0u,
+                      why ? why : "?");
+    }
+  }
+
+  void on_upload(uint64_t seq, uint64_t key, int slot, const vrp::PipewireDmaTexture& tex,
+                 uint64_t spa_seq = 0, int64_t spa_pts = 0, bool has_spa = false) {
+    (void)touch_pool(key, seq, /*bump_gen=*/true);
+    if (!has_spa && tex.slot_has_spa(1)) {
+      has_spa = true;
+      spa_seq = tex.slot_spa_seq(1);
+      spa_pts = tex.slot_spa_pts(1);
+    }
+    push("stage", seq, spa_seq, slot, key);
+    note_spa("stage", seq, spa_seq, spa_pts, has_spa, last_stage_spa_seq_);
+    if (last_upload != 0 && seq != 0 && seq < last_upload && (last_upload - seq) < 1000ull) {
+      dump("upload REWIND");
+    }
+    if (seq != 0) {
+      last_upload = seq;
+      last_handled = seq;
+    }
+  }
+
+  void on_flip(uint64_t seq, uint64_t key, int slot, const vrp::PipewireDmaTexture& tex) {
+    const uint32_t t = now_ms();
+    const uint32_t dt = (last_flip_ms_ != 0) ? (t - last_flip_ms_) : 0;
+    const int64_t dseq =
+        (last_flip_seq_ != 0 && seq != 0) ? static_cast<int64_t>(seq) - static_cast<int64_t>(last_flip_seq_)
+                                         : 0;
+    const bool has_spa = tex.slot_has_spa(0);
+    const uint64_t spa_seq = has_spa ? tex.slot_spa_seq(0) : 0;
+    const int64_t dspa =
+        (has_spa && last_promote_spa_seq_ != 0 && spa_seq != 0)
+            ? static_cast<int64_t>(spa_seq) - static_cast<int64_t>(last_promote_spa_seq_)
+            : 0;
+    push("promote", seq, spa_seq, slot, key);
+    note_spa("promote", seq, spa_seq, has_spa ? tex.slot_spa_pts(0) : 0, has_spa,
+             last_promote_spa_seq_);
+    ++flip_log_count_;
+    // Anomalies only — no heartbeat (live_display_log=1 still stays quiet in steady state).
+    if ((dt >= 200u) || (dseq < 0) || (dseq >= 8) || (dspa < 0)) {
+      VRP_DISPLAY_LOG(
+          "live-dma PROMOTE +%ums dt=%ums dseq=%lld dspa=%lld seq=%llu spa=%llu p%d g%u "
+          "present=%d prev_p%d",
+          t, dt, static_cast<long long>(dseq), static_cast<long long>(dspa),
+          static_cast<unsigned long long>(seq), static_cast<unsigned long long>(spa_seq),
+          pid_of(key), gen_of(key), slot, last_disp_pid);
+    }
+    if (last_disp != 0 && seq != 0 && seq < last_disp && (last_disp - seq) < 1000ull) {
+      dump("display REWIND");
+    } else if (last_disp != 0 && seq > last_disp + 8ull && last_handled <= last_disp + 2ull) {
+      dump("display JUMP>8 (hitch?)");
+    }
+    if (seq != 0) {
+      last_disp = seq;
+      last_disp_key = key;
+      last_disp_pid = pid_of(key);
+      last_handled = seq;
+      last_flip_ms_ = t;
+      last_flip_seq_ = seq;
+    }
+    stall = 0;
+  }
+
+  void on_bind_hold(uint64_t pw_seq, uint64_t disp_seq) {
+    (void)disp_seq;
+    if (pw_seq == 0) {
+      stall = 0;
+      return;
+    }
+    if (last_handled != 0 && pw_seq > last_handled + 8ull) {
+      ++stall;
+      if (stall == 30 || stall == 120) {
+        push("stall", pw_seq, last_handled, -1);
+        dump("display STALL vs handled");
+      }
+    } else {
+      stall = 0;
+    }
+  }
+
+  void on_display_commit(uint64_t seq, uint64_t key, int slot) {
+    (void)touch_pool(key, seq, /*bump_gen=*/false);
+    const bool changed = seq != last_shown || key != last_shown_key || slot != last_shown_slot;
+    if (changed) push("shown", seq, last_shown, slot, key);
+    if (last_shown != 0 && seq != 0 && seq < last_shown && (last_shown - seq) < 1000ull) {
+      dump("eye DESCRIPTOR REWIND (shown older seq)");
+    } else if (changed && last_shown != 0 && seq > last_shown + 8ull &&
+               last_handled <= last_shown + 2ull) {
+      dump("eye DESCRIPTOR JUMP>8");
+    }
+    if (last_disp != 0 && seq != 0 && seq < last_disp && (last_disp - seq) < 1000ull) {
+      dump("eye shows older than dma.display_seq");
+    }
+    if (seq != 0) {
+      last_shown = seq;
+      last_shown_key = key;
+      last_shown_pid = pid_of(key);
+      last_shown_slot = slot;
+    }
+  }
+
+  void reset() {
+    head = 0;
+    count = 0;
+    pool_n_ = 0;
+    next_pid_ = 1;
+    for (PoolEnt& e : pool_) e = {};
+    last_disp = 0;
+    last_disp_key = 0;
+    last_disp_pid = 0;
+    last_upload = 0;
+    last_handled = 0;
+    last_shown = 0;
+    last_shown_key = 0;
+    last_shown_pid = 0;
+    last_shown_slot = -1;
+    stall = 0;
+    skip_hits = 0;
+    last_dump_ms = 0;
+    last_flip_ms_ = 0;
+    last_flip_seq_ = 0;
+    flip_log_count_ = 0;
+    last_take_spa_seq_ = 0;
+    last_stage_spa_seq_ = 0;
+    last_promote_spa_seq_ = 0;
+  }
+};
+
 }  // namespace
 
 void HostWindow::setHealth(const QString& health, const QString& detail) {
@@ -4995,7 +5310,19 @@ void HostWindow::xrThreadMain() {
     // Live CPU path: 1-frame mailbox so VideoTexture in_flight does not discard
     // a take_latest() frame (that was the strong コマ飛び feel on Meta SHM).
     vrp::VideoFrame live_cpu_pending;
+#if defined(VRP_HAS_PIPEWIRE)
+    // Live DMA: keep-latest mailbox. try_import only on a paced display tick —
+    // PW bursts must not drive vkAllocateMemory every few ms (NVIDIA stalls).
+    vrp::PipewireDmaFrame live_dma_pending;
+    auto last_dma_import_at = std::chrono::steady_clock::time_point{};
+    uint64_t last_dma_import_key = 0;
+    int64_t last_dma_import_spa_pts = 0;
+    uint64_t last_dma_import_spa_seq = 0;
+    bool last_dma_import_has_spa = false;
+#endif
     LiveCpuDiag live_cpu_diag;
+    LiveDmaDiag live_dma_diag;
+    bool live_dma_path = false;
     texture.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
     vrp::VideoTexture seek_tex;
     seek_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
@@ -5019,7 +5346,7 @@ void HostWindow::xrThreadMain() {
                         xr.dma_buf_import());
     const bool pw_dma_nvidia = pw_dma && pw_dma_tex.nvidia();
     if (pw_dma) {
-      // After GPU copy-out: return pw_buffer via PW loop invoke (hold ≤2).
+      // Hold until copy-out: release_seq → queue_buffer (do not queue after dup).
       pw_dma_tex.set_release_seq_callback([this](uint64_t seq) {
         if (!yt_session_) return;
         if (vrp::PipewireCapture* c = yt_session_->capture()) c->release_held_dma(seq);
@@ -5062,9 +5389,9 @@ void HostWindow::xrThreadMain() {
           else if (vaapi_nv12) appendLog(tr("Video: VA-API dma-buf"));
           else appendLog(tr("Video: CPU RGBA"));
           if (pw_dma_nvidia)
-            appendLog(tr("ScreenCast: DMA-BUF import armed (NVIDIA experimental)"));
+            appendLog(tr("ScreenCast: DMA-BUF staging→present + sync_file wait (NVIDIA)"));
           else if (pw_dma)
-            appendLog(tr("ScreenCast: DMA-BUF import armed"));
+            appendLog(tr("ScreenCast: DMA-BUF staging→present + sync_file wait"));
         },
         Qt::QueuedConnection);
     scene.set_texture(texture.view(), texture.sampler());
@@ -6059,6 +6386,7 @@ void HostWindow::xrThreadMain() {
             }
           }
 #if defined(VRP_HAS_PIPEWIRE)
+          pw_dma_tex.mark_eye_done();
           pw_dma_tex.reset();
 #endif
           audio.request_stop_live_monitor();
@@ -6223,6 +6551,7 @@ void HostWindow::xrThreadMain() {
           clear_fsr_src();
           (void)fsr.poll();
 #if defined(VRP_HAS_PIPEWIRE)
+          pw_dma_tex.mark_eye_done();
           pw_dma_tex.reset();
 #endif
           thumb_latched = false;
@@ -7087,7 +7416,7 @@ void HostWindow::xrThreadMain() {
                                    static_cast<float>(std::max(1, ah)));
         };
         // Browser Live (not [アプリ]): optional FSR from conf live_fsr. Desktop apps skip.
-        // GNOME Meta-*: FSR forced off — investigate SHM texture updates without upscale.
+        // GNOME Meta-*: FSR forced off — keep raw capture → Flat while Meta polish continues.
         const bool meta_no_fsr = yt_session_ && yt_session_->meta_live_path();
         const bool live_browser_fsr = yt_live && yt_session_ && !yt_session_->desktop_app_mode() &&
                                      !meta_no_fsr && live_fsr_ != vrp::FsrMode::Off;
@@ -7167,40 +7496,167 @@ void HostWindow::xrThreadMain() {
                   this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
             }
           }
+          live_dma_path = false;
           bool imported_dma = false;
           if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) &&
               !pw_dma_tex.import_abandoned()) {
-            vrp::PipewireDmaFrame dma;
-            if (yt_cap->take_latest_dma(dma, yt_session_->dma_seq())) {
-              if (pw_dma_tex.try_import(dma)) {
+            // 1) Keep-latest mailbox. Unread older FD → release held pw_buffer.
+            {
+              vrp::PipewireDmaFrame dma;
+              if (yt_cap->take_latest_dma(dma, yt_session_->dma_seq())) {
+                if (live_dma_pending) {
+                  uint64_t old_key = 0;
+                  (void)vrp::PipewireDmaTexture::dma_buf_key(live_dma_pending.fd, &old_key);
+                  live_dma_diag.on_skip(live_dma_pending.seq, old_key, "discard: keep-latest");
+                  yt_cap->release_held_dma(live_dma_pending.seq);
+                }
+                live_dma_pending = std::move(dma);
+              }
+            }
+            // 2) Ghost / A-A guard. dma_buf_key is BO identity (pool recycle is normal);
+            //    only reject (a) consecutive same BO as last import, or (b) same SPA
+            //    pts/seq stamp as last import for that BO (Mutter re-exported unwritten).
+            if (live_dma_pending) {
+              uint64_t dma_key = 0;
+              (void)vrp::PipewireDmaTexture::dma_buf_key(live_dma_pending.fd, &dma_key);
+              const bool same_bo = dma_key != 0 && dma_key == last_dma_import_key;
+              // spa pts/seq=0 is useless (many producers leave them unset).
+              const bool spa_usable = live_dma_pending.has_spa_meta &&
+                                      (live_dma_pending.spa_seq != 0 || live_dma_pending.spa_pts != 0);
+              const bool same_spa =
+                  same_bo && spa_usable && last_dma_import_has_spa &&
+                  live_dma_pending.spa_pts == last_dma_import_spa_pts &&
+                  live_dma_pending.spa_seq == last_dma_import_spa_seq;
+              // Without a usable SPA stamp: only reject A→A (no other BO imported between).
+              const bool consecutive_aa = same_bo && !spa_usable;
+              if (same_spa || consecutive_aa) {
+                live_dma_diag.on_skip(live_dma_pending.seq, dma_key,
+                                     same_spa ? "discard: ghost spa stamp"
+                                              : "discard: consecutive same-bo");
+                yt_cap->release_held_dma(live_dma_pending.seq);
+                live_dma_pending = {};
+              }
+            }
+            // 3) Display-paced import: ≤~60Hz (first frame immediate).
+            //    Live FSR samples the present image async — do not overwrite it
+            //    while that pass still reads it (in-place rewrite flicker).
+            constexpr auto kMinDmaImportGap = std::chrono::milliseconds(15);
+            const bool need_first = !pw_dma_tex.has_valid_frame();
+            const bool paced =
+                need_first || last_dma_import_at == std::chrono::steady_clock::time_point{} ||
+                (now - last_dma_import_at) >= kMinDmaImportGap;
+            const bool fsr_blocks_import = live_fsr_armed && fsr.busy();
+            // mark_eye_done at most once per XR tick. A second mark in the same
+            // tick (old try_promote path) burned present-hold and rewrote present
+            // while the eye still sampled it → black/old flash (looked like slot1).
+            bool dma_eye_marked = false;
+            auto mark_dma_eye_once = [&] {
+              if (dma_eye_marked) return;
+              if (scene.wait_previous_submit(0)) {
+                pw_dma_tex.mark_eye_done();
+                dma_eye_marked = true;
+              } else if (pw_dma_tex.pending_eye_retire() &&
+                         scene.wait_previous_submit(8'000'000ull)) {
+                pw_dma_tex.mark_eye_done();
+                dma_eye_marked = true;
+              }
+            };
+            bool defer_promote_this_tick = false;
+            if (live_dma_pending && paced && fsr_blocks_import) {
+              static auto last_fsr_skip_log = std::chrono::steady_clock::time_point{};
+              if (last_fsr_skip_log.time_since_epoch().count() == 0 ||
+                  (now - last_fsr_skip_log) >= std::chrono::milliseconds(500)) {
+                uint64_t dma_key = 0;
+                (void)vrp::PipewireDmaTexture::dma_buf_key(live_dma_pending.fd, &dma_key);
+                live_dma_diag.on_skip(live_dma_pending.seq, dma_key, "skip: fsr sampling present");
+                last_fsr_skip_log = now;
+              }
+            } else if (live_dma_pending && paced) {
+              mark_dma_eye_once();
+              uint64_t dma_key = 0;
+              (void)vrp::PipewireDmaTexture::dma_buf_key(live_dma_pending.fd, &dma_key);
+              {
+                const bool take_spa = live_dma_pending.has_spa_meta &&
+                                     (live_dma_pending.spa_seq != 0 || live_dma_pending.spa_pts != 0);
+                live_dma_diag.on_take(live_dma_pending.seq, dma_key, pw_dma_tex,
+                                      live_dma_pending.spa_seq, live_dma_pending.spa_pts, take_spa);
+              }
+              const uint64_t present_seq_before = pw_dma_tex.display_seq();
+              bool ok = pw_dma_tex.try_import(live_dma_pending);
+              if (!ok && pw_dma_tex.last_error().find("waiting eye fence") != std::string::npos) {
+                if (!dma_eye_marked && scene.wait_previous_submit(8'000'000ull)) {
+                  pw_dma_tex.mark_eye_done();
+                  dma_eye_marked = true;
+                  ok = pw_dma_tex.try_import(live_dma_pending);
+                }
+              }
+              // Present-hold / eye-busy refuse before copy-out (return false).
+              // A rare post-blit promote miss still returns true (staged-only).
+              if (ok) {
                 imported_dma = true;
+                last_dma_import_at = now;
+                last_dma_import_key = dma_key;
+                last_dma_import_has_spa =
+                    live_dma_pending.has_spa_meta &&
+                    (live_dma_pending.spa_seq != 0 || live_dma_pending.spa_pts != 0);
+                last_dma_import_spa_pts = live_dma_pending.spa_pts;
+                last_dma_import_spa_seq = live_dma_pending.spa_seq;
+                const int up_slot = pw_dma_tex.last_write_slot();
+                const uint64_t up_key =
+                    dma_key != 0 ? dma_key : pw_dma_tex.slot_content_key(up_slot);
+                live_dma_diag.on_upload(live_dma_pending.seq, up_key, up_slot, pw_dma_tex,
+                                        live_dma_pending.spa_seq, live_dma_pending.spa_pts,
+                                        last_dma_import_has_spa);
+                const bool promoted_now = pw_dma_tex.display_seq() != present_seq_before;
+                if (!promoted_now && present_seq_before != 0) {
+                  // Present unchanged — defer promote to next XR tick.
+                  defer_promote_this_tick = true;
+                  const std::string& err = pw_dma_tex.last_error();
+                  const char* why = "staged-only: present unchanged";
+                  if (err.find("present hold") != std::string::npos)
+                    why = "staged-only: present hold";
+                  else if (err.find("waiting eye fence") != std::string::npos)
+                    why = "staged-only: waiting eye fence";
+                  live_dma_diag.on_skip(live_dma_pending.seq, dma_key, why);
+                }
                 if (yt_session_ && !yt_session_->dma_logged()) {
                   yt_session_->dma_logged() = true;
                   const QString note =
-                      tr("display path: PipeWire DMA-BUF zero-copy %1x%2 modifier=0x%3")
-                          .arg(dma.width)
-                          .arg(dma.height)
-                          .arg(dma.modifier, 0, 16);
+                      tr("display path: PipeWire DMA-BUF staging→present %1x%2 modifier=0x%3")
+                          .arg(live_dma_pending.width)
+                          .arg(live_dma_pending.height)
+                          .arg(live_dma_pending.modifier, 0, 16);
                   QMetaObject::invokeMethod(
                       this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
                 }
+                live_dma_pending = {};
               } else {
-                yt_cap->release_held_dma(dma.seq);
+                const uint64_t fail_mod = live_dma_pending.modifier;
+                live_dma_diag.on_skip(live_dma_pending.seq, dma_key, pw_dma_tex.last_error().c_str());
+                yt_cap->release_held_dma(live_dma_pending.seq);
+                live_dma_pending = {};
                 if (pw_dma_tex.import_abandoned()) {
                   if (yt_session_) yt_session_->dma_disabled() = true;
                   const QString err = QString::fromStdString(pw_dma_tex.last_error());
                   const QString note =
                       tr("ScreenCast: DMA-BUF import failed (%1, modifier=0x%2) — CPU RGBA fallback")
                           .arg(err.isEmpty() ? tr("unknown") : err)
-                          .arg(dma.modifier, 0, 16);
+                          .arg(fail_mod, 0, 16);
                   QMetaObject::invokeMethod(
                       this, [this, note] { appendLog(note); }, Qt::QueuedConnection);
                 }
               }
             }
+            // Promote held staging on a later tick only (never same tick as stage-only).
+            if (!defer_promote_this_tick && pw_dma &&
+                !(yt_session_ && yt_session_->dma_disabled()) && !pw_dma_tex.import_abandoned()) {
+              mark_dma_eye_once();
+              if (pw_dma_tex.try_promote_pending()) imported_dma = true;
+            }
           }
           const bool dma_live =
               imported_dma || (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.has_valid_frame());
+          live_dma_path = dma_live;
           if (!dma_live) {
             // Complete prior upload BEFORE taking a new write slot — otherwise
             // in_flight blocks try_upload for a full XR frame and the back buffer
@@ -7262,14 +7718,22 @@ void HostWindow::xrThreadMain() {
               yt_picture = true;
             }
           } else {
+            // DMA path: take → stage[1] → promote[0] → commit (key ≈ Mutter pw pool BO).
             live_cpu_pending = {};
-            live_cpu_diag.reset();
-            if (imported_dma && pw_dma_tex.poll_present() && pw_dma_tex.view()) {
-              yt_picture = bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
-                                        pw_dma_tex.height(), true, /*rgba_mode=*/3);
-            } else if (pw_dma_tex.view()) {
-              yt_picture = bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
-                                        pw_dma_tex.height(), false, /*rgba_mode=*/3);
+            // Keep live_dma_pending across frames (display-paced import).
+            const bool promoted = imported_dma && pw_dma_tex.poll_present();
+            if (promoted) {
+              const int ds = pw_dma_tex.display_slot();  // always 0 (present)
+              live_dma_diag.on_flip(pw_dma_tex.display_seq(), pw_dma_tex.slot_content_key(ds), ds,
+                                    pw_dma_tex);
+            }
+            if ((promoted || pw_dma_tex.view()) && pw_dma_tex.view()) {
+              const int ds = pw_dma_tex.display_slot();
+              yt_picture =
+                  bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
+                               pw_dma_tex.height(), promoted, /*rgba_mode=*/3,
+                               pw_dma_tex.display_seq(), pw_dma_tex.slot_content_key(ds), ds);
+              live_dma_diag.on_bind_hold(yt_session_->dma_seq(), pw_dma_tex.display_seq());
             } else if (!yt_loading && bind_last_yt()) {
               yt_picture = true;
             }
@@ -7935,7 +8399,10 @@ void HostWindow::xrThreadMain() {
         uint64_t shown_seq = 0, shown_fp = 0;
         int shown_slot = -1;
         if (scene.take_flushed_tex_debug(shown_seq, shown_fp, shown_slot)) {
-          live_cpu_diag.on_display_commit(shown_seq, shown_fp, shown_slot);
+          if (live_dma_path)
+            live_dma_diag.on_display_commit(shown_seq, shown_fp, shown_slot);
+          else
+            live_cpu_diag.on_display_commit(shown_seq, shown_fp, shown_slot);
         }
       }
       std::vector<XrCompositionLayerBaseHeader*> layers;

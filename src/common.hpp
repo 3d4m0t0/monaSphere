@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -11,6 +12,33 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+
+/**
+ * Persist log gates (monasphere.conf):
+ *   live_display_log=0|1  → ~/.config/monasphere/live-display.log (+ /tmp/…)
+ *   live_teardown_log=0|1 → ~/.config/monasphere/live-teardown.log (+ /tmp/…)
+ * Defaults: both off (Live dma breadcrumbs were heavy; teardown optional).
+ */
+inline std::atomic<bool>& vrp_persist_display_enabled_flag() {
+  static std::atomic<bool> on{false};
+  return on;
+}
+inline std::atomic<bool>& vrp_persist_teardown_enabled_flag() {
+  static std::atomic<bool> on{false};
+  return on;
+}
+inline void vrp_set_persist_display_log(bool on) {
+  vrp_persist_display_enabled_flag().store(on, std::memory_order_release);
+}
+inline void vrp_set_persist_teardown_log(bool on) {
+  vrp_persist_teardown_enabled_flag().store(on, std::memory_order_release);
+}
+inline bool vrp_persist_display_enabled() {
+  return vrp_persist_display_enabled_flag().load(std::memory_order_acquire);
+}
+inline bool vrp_persist_teardown_enabled() {
+  return vrp_persist_teardown_enabled_flag().load(std::memory_order_acquire);
+}
 
 /**
  * Append one line to durable files that survive GNOME logout (stdout alone dies
@@ -66,20 +94,23 @@ inline void vrp_persist_named_log(const char* name, const char* fmt, ...) {
   va_end(ap);
 }
 
-/** Meta teardown breadcrumbs (logout-safe). */
+/** Meta teardown breadcrumbs (logout-safe). No-op when live_teardown_log=0. */
 inline void vrp_persist_logv(const char* fmt, va_list ap) {
+  if (!vrp_persist_teardown_enabled()) return;
   vrp_persist_named_logv("live-teardown.log", fmt, ap);
 }
 
 inline void vrp_persist_log(const char* fmt, ...) {
+  if (!vrp_persist_teardown_enabled()) return;
   va_list ap;
   va_start(ap, fmt);
   vrp_persist_logv(fmt, ap);
   va_end(ap);
 }
 
-/** Live display-order breadcrumbs (logout-safe). */
+/** Live display-order breadcrumbs (logout-safe). No-op when live_display_log=0. */
 inline void vrp_persist_display_log(const char* fmt, ...) {
+  if (!vrp_persist_display_enabled()) return;
   va_list ap;
   va_start(ap, fmt);
   vrp_persist_named_logv("live-display.log", fmt, ap);
@@ -94,18 +125,22 @@ inline void vrp_persist_display_log(const char* fmt, ...) {
     std::fflush(stdout);                     \
   } while (0)
 
-/** stdout + durable files (logout-safe). Prefer for Meta teardown steps. */
+/** stdout + durable files when live_teardown_log=1. Prefer for Meta teardown. */
 #define VRP_TEARDOWN_LOG(...)                \
   do {                                       \
-    VRP_LOG(__VA_ARGS__);                    \
-    vrp_persist_log(__VA_ARGS__);            \
+    if (vrp_persist_teardown_enabled()) {    \
+      VRP_LOG(__VA_ARGS__);                  \
+      vrp_persist_log(__VA_ARGS__);          \
+    }                                        \
   } while (0)
 
-/** stdout + live-display.log (logout-safe). Present/flush order probes. */
+/** stdout + live-display.log when live_display_log=1. Present/flush probes. */
 #define VRP_DISPLAY_LOG(...)                 \
   do {                                       \
-    VRP_LOG(__VA_ARGS__);                    \
-    vrp_persist_display_log(__VA_ARGS__);    \
+    if (vrp_persist_display_enabled()) {     \
+      VRP_LOG(__VA_ARGS__);                  \
+      vrp_persist_display_log(__VA_ARGS__);  \
+    }                                        \
   } while (0)
 
 #define VRP_ERR(...)                         \
