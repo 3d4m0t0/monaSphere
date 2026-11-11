@@ -125,10 +125,7 @@ class YouTubeSession : public QObject {
   bool active() const { return active_.load(std::memory_order_acquire); }
   /** True when this session launched conf live_desktop_app (not Chromium). */
   bool desktop_app_mode() const { return !cfg_.exec.isEmpty(); }
-  /**
-   * GNOME RecordVirtual / Meta-* live path. FSR is forced off here while we
-   * investigate texture update issues (keep the pipeline as raw capture → Flat).
-   */
+  /** GNOME RecordVirtual / Meta-* browser Live (DMA or SHM). */
   bool meta_live_path() const {
     return desk_ == DesktopEnv::Gnome && cfg_.virtual_display && !desktop_app_mode();
   }

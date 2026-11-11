@@ -6324,13 +6324,10 @@ void HostWindow::xrThreadMain() {
       }
 
       // Provisional Live FSR cycle: □ / X while browser Live, menus closed.
-      // Off → UQ → Q → P → Off; writes conf live_fsr. Skips [アプリ] and GNOME Meta-*.
+      // Off → UQ → Q → P → Off; writes conf live_fsr. Skips [アプリ] only.
       const bool can_live_fsr_cycle =
-          yt_live && yt_session_ && !yt_session_->desktop_app_mode() &&
-          !yt_session_->meta_live_path() && menus_closed;
-      if (yt_live && yt_session_ && yt_session_->meta_live_path() && pad_face_x && menus_closed) {
-        showHudToast(QStringLiteral("Live FSR: Meta path raw (disabled)"));
-      } else if (can_live_fsr_cycle && pad_face_x) {
+          yt_live && yt_session_ && !yt_session_->desktop_app_mode() && menus_closed;
+      if (can_live_fsr_cycle && pad_face_x) {
         live_fsr_ = vrp::next_fsr_mode(live_fsr_);
         const auto mode = live_fsr_;
         QMetaObject::invokeMethod(
@@ -7416,10 +7413,9 @@ void HostWindow::xrThreadMain() {
                                    static_cast<float>(std::max(1, ah)));
         };
         // Browser Live (not [アプリ]): optional FSR from conf live_fsr. Desktop apps skip.
-        // GNOME Meta-*: FSR forced off — keep raw capture → Flat while Meta polish continues.
-        const bool meta_no_fsr = yt_session_ && yt_session_->meta_live_path();
+        // Includes GNOME Meta-* (RecordVirtual / DMA) — same live_fsr path as KDE Live.
         const bool live_browser_fsr = yt_live && yt_session_ && !yt_session_->desktop_app_mode() &&
-                                     !meta_no_fsr && live_fsr_ != vrp::FsrMode::Off;
+                                     live_fsr_ != vrp::FsrMode::Off;
         // Desktop capture is sRGB/gamma; Flat shader expects linear unless rgba_gamma.
         // FSR output is also gamma RGBA → queue_texture_gamma (never set_* while the
         // previous eye submit may still sample dset_ — that tears both eyes the same
