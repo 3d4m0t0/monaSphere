@@ -12,18 +12,168 @@
 #include <spa/utils/result.h>
 
 #include <drm/drm_fourcc.h>
+#include <linux/dma-buf.h>
+#include <xf86drm.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
+#include <poll.h>
 #include <string>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <vector>
 
 namespace vrp {
 namespace {
 
 constexpr uint64_t kDrmModInvalid = DRM_FORMAT_MOD_INVALID;
+constexpr int64_t kSyncTimeoutNs = 100'000'000ll;  // 100ms
+int open_drm_render_fd() {
+  static const char* kNodes[] = {"/dev/dri/renderD128", "/dev/dri/renderD129", "/dev/dri/card0",
+                                 nullptr};
+  for (int i = 0; kNodes[i]; ++i) {
+    const int fd = ::open(kNodes[i], O_RDWR | O_CLOEXEC);
+    if (fd >= 0) return fd;
+  }
+  return -1;
+}
+
+/** Wait for SPA_META_SyncTimeline acquire (DRM syncobj timeline or eventfd-style). */
+bool wait_sync_timeline_acquire(spa_buffer* buf, int drm_fd) {
+  if (!buf) return true;
+  auto* stl = static_cast<spa_meta_sync_timeline*>(
+      spa_buffer_find_meta_data(buf, SPA_META_SyncTimeline, sizeof(spa_meta_sync_timeline)));
+  if (!stl || stl->acquire_point == 0) return true;
+
+  // Prefer SPA_DATA_SyncObj planes (Mutter / explicit-sync producers).
+  for (uint32_t i = 0; i < buf->n_datas; ++i) {
+    spa_data& d = buf->datas[i];
+    if (d.type != SPA_DATA_SyncObj || d.fd < 0) continue;
+    if (drm_fd < 0) break;
+    uint32_t handle = 0;
+    if (drmSyncobjFDToHandle(drm_fd, static_cast<int>(d.fd), &handle) != 0) continue;
+    uint64_t point = stl->acquire_point;
+    const int wr =
+        drmSyncobjTimelineWait(drm_fd, &handle, &point, 1, kSyncTimeoutNs,
+                               DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, nullptr);
+    drmSyncobjDestroy(drm_fd, handle);
+    if (wr == 0) return true;
+    VRP_LOG("pipewire: SyncTimeline acquire wait failed point=%llu err=%d",
+            static_cast<unsigned long long>(stl->acquire_point), wr);
+    return false;
+  }
+
+  // PipeWire video-play-sync style: datas[1] is an eventfd / sync fd to read.
+  if (buf->n_datas > 1 && buf->datas[1].fd >= 0) {
+    pollfd pfd{};
+    pfd.fd = static_cast<int>(buf->datas[1].fd);
+    pfd.events = POLLIN;
+    const int pr = ::poll(&pfd, 1, static_cast<int>(kSyncTimeoutNs / 1'000'000ll));
+    if (pr <= 0) {
+      VRP_LOG("pipewire: SyncTimeline acquire poll timeout/err");
+      return false;
+    }
+    uint64_t cmd = 0;
+    if (::read(pfd.fd, &cmd, sizeof(cmd)) < 0) {
+      VRP_LOG("pipewire: SyncTimeline acquire read failed");
+      return false;
+    }
+    return true;
+  }
+  return true;
+}
+
+void signal_sync_timeline_release(spa_buffer* buf, int drm_fd) {
+  if (!buf) return;
+  auto* stl = static_cast<spa_meta_sync_timeline*>(
+      spa_buffer_find_meta_data(buf, SPA_META_SyncTimeline, sizeof(spa_meta_sync_timeline)));
+  if (!stl || stl->release_point == 0) return;
+
+  SPA_FLAG_CLEAR(stl->flags, SPA_META_SYNC_TIMELINE_UNSCHEDULED_RELEASE);
+
+  // Release SyncObj is typically the last SyncObj plane (acquire first, release second).
+  int release_fd = -1;
+  int syncobj_count = 0;
+  for (uint32_t i = 0; i < buf->n_datas; ++i) {
+    if (buf->datas[i].type == SPA_DATA_SyncObj && buf->datas[i].fd >= 0) {
+      ++syncobj_count;
+      release_fd = static_cast<int>(buf->datas[i].fd);
+    }
+  }
+  if (syncobj_count >= 2 && release_fd >= 0 && drm_fd >= 0) {
+    uint32_t handle = 0;
+    if (drmSyncobjFDToHandle(drm_fd, release_fd, &handle) == 0) {
+      uint64_t point = stl->release_point;
+      (void)drmSyncobjTimelineSignal(drm_fd, &handle, &point, 1);
+      drmSyncobjDestroy(drm_fd, handle);
+      return;
+    }
+  }
+  if (buf->n_datas > 2 && buf->datas[2].fd >= 0) {
+    uint64_t cmd = 1;
+    (void)::write(static_cast<int>(buf->datas[2].fd), &cmd, sizeof(cmd));
+  }
+}
+
+enum class DmabufSyncResult { Ok, IoctlFail, Timeout };
+
+/** Inspect SPA_META_VideoDamage for skipped-paint discrimination. */
+struct VideoDamageInfo {
+  bool meta_present = false;
+  int n_valid = 0;
+  bool full_frame = false;
+  uint32_t area = 0;
+  int32_t first_w = 0;
+  int32_t first_h = 0;
+};
+
+VideoDamageInfo inspect_video_damage(spa_buffer* buf, int stream_w, int stream_h) {
+  VideoDamageInfo out{};
+  if (!buf) return out;
+  spa_meta* m = spa_buffer_find_meta(buf, SPA_META_VideoDamage);
+  if (!m || !m->data || m->size < sizeof(spa_meta_region)) return out;
+  out.meta_present = true;
+  spa_meta_region* r = static_cast<spa_meta_region*>(spa_meta_first(m));
+  for (; spa_meta_check(r, m); ++r) {
+    if (!spa_meta_region_is_valid(r)) break;  // end marker (0×0) or invalid
+    ++out.n_valid;
+    if (out.n_valid == 1) {
+      out.first_w = static_cast<int32_t>(r->region.size.width);
+      out.first_h = static_cast<int32_t>(r->region.size.height);
+    }
+    const uint32_t a = static_cast<uint32_t>(r->region.size.width) *
+                       static_cast<uint32_t>(r->region.size.height);
+    out.area += a;
+    if (stream_w > 0 && stream_h > 0 &&
+        r->region.position.x == 0 && r->region.position.y == 0 &&
+        static_cast<int>(r->region.size.width) >= stream_w &&
+        static_cast<int>(r->region.size.height) >= stream_h) {
+      out.full_frame = true;
+    }
+  }
+  return out;
+}
+
+DmabufSyncResult wait_dmabuf_export_sync(int dmabuf_fd, int timeout_ms = 100) {
+  if (dmabuf_fd < 0) return DmabufSyncResult::IoctlFail;
+  dma_buf_export_sync_file exp{};
+  exp.flags = DMA_BUF_SYNC_READ;
+  exp.fd = -1;
+  if (::ioctl(dmabuf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) != 0 || exp.fd < 0) {
+    return DmabufSyncResult::IoctlFail;
+  }
+  pollfd pfd{};
+  pfd.fd = exp.fd;
+  pfd.events = POLLIN;
+  const int pr = ::poll(&pfd, 1, timeout_ms);
+  ::close(exp.fd);
+  if (pr > 0) return DmabufSyncResult::Ok;
+  return DmabufSyncResult::Timeout;
+}
 
 uint32_t spa_to_drm_fourcc(spa_video_format fmt) {
   switch (fmt) {
@@ -130,6 +280,10 @@ struct PwState {
   /** Live pool size from add_buffer/remove_buffer (must match ParamBuffers request). */
   int n_buffers = 0;
   int requested_buffers = 0;
+  /** DRM render node for SyncTimeline syncobj waits (opened lazily). */
+  int drm_fd = -1;
+  bool sync_timeline_logged = false;
+  bool export_sync_ok = false;
 };
 
 void on_core_done(void* data, uint32_t /*id*/, int seq) {
@@ -158,17 +312,26 @@ const pw_core_events kCoreEvents = {
     .remove_mem = nullptr,
 };
 
+/**
+ * ScreenCast EnumFormat rate model (Mutter / xdpw):
+ *  - framerate = 0/1 (variable / damage-driven). Fixed 60/1 fights Mutter and
+ *    historically failed Live negotiate when min was forced to 60.
+ *  - maxFramerate caps producer pacing (VR virtual display needs ≤60).
+ */
+constexpr spa_fraction kVarFps{0, 1};
+constexpr spa_fraction kMaxFpsDef{60, 1};
+constexpr spa_fraction kMaxFpsMin{1, 1};
+constexpr spa_fraction kMaxFpsCap{60, 1};
+
 /** Plain EnumFormat (MemFd-friendly). Keep this first in connect params. */
 spa_pod* build_format_plain(spa_pod_builder* b, uint32_t prefer_w, uint32_t prefer_h) {
   spa_rectangle def_size{prefer_w, prefer_h};
   spa_rectangle min_size{64, 64};
   spa_rectangle max_size{8192, 8192};
-  spa_fraction def_fps{60, 1};
-  // Keep min=0 — Mutter RecordVirtual often only offers variable/0 fps. Forcing
-  // min=60 made format negotiate fail → PW thread exit → Host capture_dead stop
-  // before Chrome launch (Live 切替で即停止).
-  spa_fraction min_fps{0, 1};
-  spa_fraction max_fps{240, 1};
+  spa_fraction var_fps = kVarFps;
+  spa_fraction max_def = kMaxFpsDef;
+  spa_fraction max_min = kMaxFpsMin;
+  spa_fraction max_cap = kMaxFpsCap;
   return static_cast<spa_pod*>(spa_pod_builder_add_object(
       b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat, SPA_FORMAT_mediaType,
       SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
@@ -176,7 +339,8 @@ spa_pod* build_format_plain(spa_pod_builder* b, uint32_t prefer_w, uint32_t pref
       SPA_POD_CHOICE_ENUM_Id(5, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRA,
                              SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_RGBA),
       SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&def_size, &min_size, &max_size),
-      SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&def_fps, &min_fps, &max_fps)));
+      SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&var_fps), SPA_FORMAT_VIDEO_maxFramerate,
+      SPA_POD_CHOICE_RANGE_Fraction(&max_def, &max_min, &max_cap)));
 }
 
 /**
@@ -193,9 +357,10 @@ spa_pod* build_format_modifier(spa_pod_builder* b, const std::vector<uint64_t>& 
   spa_rectangle def_size{prefer_w, prefer_h};
   spa_rectangle min_size{64, 64};
   spa_rectangle max_size{8192, 8192};
-  spa_fraction def_fps{60, 1};
-  spa_fraction min_fps{0, 1};
-  spa_fraction max_fps{240, 1};
+  spa_fraction var_fps = kVarFps;
+  spa_fraction max_def = kMaxFpsDef;
+  spa_fraction max_min = kMaxFpsMin;
+  spa_fraction max_cap = kMaxFpsCap;
 
   std::vector<uint64_t> list = mods;
   if (list.empty()) list.push_back(DRM_FORMAT_MOD_LINEAR);
@@ -224,8 +389,9 @@ spa_pod* build_format_modifier(spa_pod_builder* b, const std::vector<uint64_t>& 
                       0);
   spa_pod_builder_add(b, SPA_FORMAT_VIDEO_size,
                       SPA_POD_CHOICE_RANGE_Rectangle(&def_size, &min_size, &max_size), 0);
-  spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate,
-                      SPA_POD_CHOICE_RANGE_Fraction(&def_fps, &min_fps, &max_fps), 0);
+  spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate, SPA_POD_Fraction(&var_fps), 0);
+  spa_pod_builder_add(b, SPA_FORMAT_VIDEO_maxFramerate,
+                      SPA_POD_CHOICE_RANGE_Fraction(&max_def, &max_min, &max_cap), 0);
   spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier,
                        SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
   spa_pod_builder_push_choice(b, &f[1], SPA_CHOICE_Enum, 0);
@@ -292,9 +458,11 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
     st->logged_demote = true;
     VRP_LOG("pipewire: producer demoted DMA-BUF -> SHM (modifier alloc failed?)");
   }
-  VRP_LOG("pipewire: format %s %ux%u modifier=0x%llx drm=0x%x negotiated_mod=%d",
-          spa_fmt_name(st->format), w, h, static_cast<unsigned long long>(st->modifier),
-          st->drm_fourcc, negotiated_mod ? 1 : 0);
+  VRP_LOG("pipewire: format %s %ux%u fps=%u/%u maxFps=%u/%u modifier=0x%llx drm=0x%x "
+          "negotiated_mod=%d",
+          spa_fmt_name(st->format), w, h, info.info.raw.framerate.num, info.info.raw.framerate.denom,
+          info.info.raw.max_framerate.num, info.info.raw.max_framerate.denom,
+          static_cast<unsigned long long>(st->modifier), st->drm_fourcc, negotiated_mod ? 1 : 0);
   if (st->self) {
     char line[192];
     std::snprintf(line, sizeof(line), "pipewire: format %s %ux%u modifier=0x%llx%s",
@@ -304,33 +472,71 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
   }
 
   // Docs: modifiers negotiated → DmaBuf only; else MemFd/MemPtr.
-  //   DMA copy-out: 2  (Meta write + consumer hold; Vk ping-pong owns pixels after blit)
-  //   SHM/CPU:      8  (Meta write + fast staging memcpy + XR mailbox + spare). Pool=4
-  //                  let Mutter republish the same 4 images for seconds → recent-fp hold.
-  //                  Prefer 8 via CHOICE_RANGE (min 4) so older Mutter can still settle at 4.
-  const int want_bufs = negotiated_mod ? 2 : 8;
-  const int want_bufs_min = negotiated_mod ? 2 : 4;
+  //   DMA copy-out: 4 (quad). Hold until blit (mailbox + in-flight ≤2); never
+  //   publish a dup FD after queue_buffer — that lets Mutter rewrite pixels
+  //   under a still-pending import (old frames on screen).
+  //   SHM/CPU: 8 (memcpy + mailbox + spare).
+  // Prefer SPA_META_SyncTimeline (Mutter !3876 / niri NVIDIA fix) so we wait the
+  // producer acquire point before publish; fall back to plain DmaBuf + Header.
+  const int want_bufs = negotiated_mod ? 4 : 8;
+  const int want_bufs_min = negotiated_mod ? 3 : 4;
   st->requested_buffers = want_bufs;
   st->n_buffers = 0;
   const uint32_t stride = w * 4u;
   const uint32_t size = stride * h;
-  uint8_t buffer[1024];
+  uint8_t buffer[2048];
   spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
   const uint32_t data_types =
       negotiated_mod ? (1u << SPA_DATA_DmaBuf)
                      : ((1u << SPA_DATA_MemFd) | (1u << SPA_DATA_MemPtr));
-  const spa_pod* params[] = {static_cast<spa_pod*>(spa_pod_builder_add_object(
+  const spa_pod* params[6];
+  uint32_t n_params = 0;
+  spa_pod_frame f{};
+  if (negotiated_mod) {
+    // Option A: DmaBuf + SyncTimeline (mandatory on this buffers choice).
+    spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
+    spa_pod_builder_add(&b, SPA_PARAM_BUFFERS_buffers,
+                        SPA_POD_CHOICE_RANGE_Int(want_bufs, want_bufs_min, want_bufs),
+                        SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1), SPA_PARAM_BUFFERS_size,
+                        SPA_POD_CHOICE_RANGE_Int(static_cast<int>(size), 0, INT32_MAX),
+                        SPA_PARAM_BUFFERS_stride,
+                        SPA_POD_CHOICE_RANGE_Int(static_cast<int>(stride), 0, INT32_MAX),
+                        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_types), 0);
+    spa_pod_builder_prop(&b, SPA_PARAM_BUFFERS_metaType, SPA_POD_PROP_FLAG_MANDATORY);
+    spa_pod_builder_int(&b, 1 << SPA_META_SyncTimeline);
+    params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_pop(&b, &f));
+
+    spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta);
+    spa_pod_builder_add(&b, SPA_PARAM_META_type, SPA_POD_Id(SPA_META_SyncTimeline),
+                        SPA_PARAM_META_size, SPA_POD_Int(sizeof(spa_meta_sync_timeline)), 0);
+    spa_pod_builder_prop(&b, SPA_PARAM_META_features, SPA_POD_PROP_FLAG_DROP);
+    spa_pod_builder_int(&b, SPA_META_FEATURE_SYNC_TIMELINE_RELEASE);
+    params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_pop(&b, &f));
+  }
+  // Fallback / SHM: plain buffers without SyncTimeline requirement.
+  params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_add_object(
       &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers, SPA_PARAM_BUFFERS_buffers,
       SPA_POD_CHOICE_RANGE_Int(want_bufs, want_bufs_min, want_bufs), SPA_PARAM_BUFFERS_blocks,
       SPA_POD_Int(1), SPA_PARAM_BUFFERS_size,
       SPA_POD_CHOICE_RANGE_Int(static_cast<int>(size), 0, INT32_MAX), SPA_PARAM_BUFFERS_stride,
       SPA_POD_CHOICE_RANGE_Int(static_cast<int>(stride), 0, INT32_MAX),
-      SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_types)))};
-  if (pw_stream_update_params(st->stream, params, 1) < 0) {
-    VRP_LOG("pipewire: update_params(Buffers) failed — using stream defaults");
+      SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(data_types)));
+  params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_add_object(
+      &b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
+      SPA_POD_Id(SPA_META_Header), SPA_PARAM_META_size, SPA_POD_Int(sizeof(spa_meta_header))));
+  // VideoDamage: discriminate "Mutter skipped paint / empty damage" vs real updates.
+  // Mutter often writes a full-frame region when priv->damage is empty — not zero rects.
+  params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_add_object(
+      &b, SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta, SPA_PARAM_META_type,
+      SPA_POD_Id(SPA_META_VideoDamage), SPA_PARAM_META_size,
+      SPA_POD_Int(static_cast<int>(sizeof(spa_meta_region) * 16))));
+  if (pw_stream_update_params(st->stream, params, n_params) < 0) {
+    VRP_LOG("pipewire: update_params(Buffers/Meta) failed — using stream defaults");
   } else {
-    VRP_LOG("pipewire: request %d buffers (min %d) dataType=%s (display Vk triple=%d)", want_bufs,
-            want_bufs_min, negotiated_mod ? "DmaBuf" : "MemFd/MemPtr", negotiated_mod ? 2 : 3);
+    VRP_LOG("pipewire: request %d buffers (min %d) dataType=%s syncTimeline=%s "
+            "VideoDamage=yes (Vk images present+staging=%d)",
+            want_bufs, want_bufs_min, negotiated_mod ? "DmaBuf" : "MemFd/MemPtr",
+            negotiated_mod ? "preferred" : "n/a", negotiated_mod ? 2 : 3);
   }
 
   if (st->self) {
@@ -434,12 +640,11 @@ void on_process(void* data) {
     pw_stream_queue_buffer(st->stream, b);
     return;
   }
-  if (auto* hdr = static_cast<spa_meta_header*>(
-          spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(spa_meta_header)))) {
-    if (hdr->flags & SPA_META_HEADER_FLAG_CORRUPTED) {
-      pw_stream_queue_buffer(st->stream, b);
-      return;
-    }
+  spa_meta_header* hdr = static_cast<spa_meta_header*>(
+      spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(spa_meta_header)));
+  if (hdr && (hdr->flags & SPA_META_HEADER_FLAG_CORRUPTED)) {
+    pw_stream_queue_buffer(st->stream, b);
+    return;
   }
 
   spa_data* d = &buf->datas[0];
@@ -448,6 +653,36 @@ void on_process(void* data) {
   if (w <= 0 || h <= 0) {
     pw_stream_queue_buffer(st->stream, b);
     return;
+  }
+
+  // Mutter may queue an unpainted recycled pool BO (empty VideoDamage, or
+  // CURSOR_ONLY chunk size=0/CORRUPTED). Copy-out would paste stale scene into
+  // present — skip publish, keep present[0], return the buffer immediately.
+  // Non-zero damage (incl. tiny) is allowed through to avoid video latency.
+  const VideoDamageInfo dmg = inspect_video_damage(buf, w, h);
+  {
+    const uint32_t chunk_flags = d->chunk ? d->chunk->flags : 0u;
+    const uint32_t chunk_size = d->chunk ? static_cast<uint32_t>(d->chunk->size) : 0u;
+    const bool chunk_unpainted =
+        d->chunk && (chunk_size == 0 || (chunk_flags & SPA_CHUNK_FLAG_CORRUPTED) != 0);
+    const bool empty_skip = dmg.meta_present && dmg.n_valid == 0;
+    const bool skip_publish = empty_skip || chunk_unpainted;
+    if (skip_publish) {
+      // Quiet by default — enable live_display_log=1 for rare breadcrumbs.
+      static int skip_log = 0;
+      if (vrp_persist_display_enabled() && (skip_log < 3 || (skip_log & 255) == 0)) {
+        const uint64_t spa_seq = hdr ? hdr->seq : 0ull;
+        VRP_DISPLAY_LOG(
+            "live-dma skip-unpainted spa_seq=%llu n_valid=%d chunk=%u/0x%x (%s)",
+            static_cast<unsigned long long>(spa_seq), dmg.n_valid, chunk_size, chunk_flags,
+            chunk_unpainted ? "chunk" : "empty-damage");
+      }
+      ++skip_log;
+      if (st->drm_fd < 0) st->drm_fd = open_drm_render_fd();
+      signal_sync_timeline_release(buf, st->drm_fd);
+      pw_stream_queue_buffer(st->stream, b);
+      return;
+    }
   }
 
   if (!st->logged_dma && !st->logged_cpu) {
@@ -467,10 +702,64 @@ void on_process(void* data) {
       d->chunk && d->chunk->size > 0 ? static_cast<uint32_t>(d->chunk->size) : stride * static_cast<uint32_t>(h);
   if (size == 0) size = stride * static_cast<uint32_t>(h);
 
-  // DMA-BUF: dup fd for Vulkan import (zero-copy). Skip CPU when DMA is used —
+  // DMA-BUF: dup fd for Vulkan copy-out. Skip CPU when DMA is used —
   // mmap/convert of tiled NVIDIA buffers is slow and caused stutter + false CPU logs.
   bool published_dma = false;
   if (d->type == SPA_DATA_DmaBuf && d->fd >= 0 && st->drm_fourcc != 0) {
+    // Cap holds at 2 (XR mailbox + in-flight blit). If full, return the pw_buffer
+    // without publishing a dup — publishing then queueing was the stale-frame bug:
+    // Mutter rewrote the BO while XR still blitted from the unprotected FD.
+    if (!st->self->can_hold_new_dma()) {
+      static int hold_full_log = 0;
+      if (hold_full_log < 8) {
+        ++hold_full_log;
+        VRP_LOG("pipewire: dma drop (hold full) — keep protected pending, skip unprotected publish");
+      }
+      signal_sync_timeline_release(buf, st->drm_fd);
+      pw_stream_queue_buffer(st->stream, b);
+      return;
+    }
+
+    // Wait producer completion BEFORE publishing. Incomplete BO pixels are the
+    // root cause of visual reorder (monotonic dma_seq with stale content).
+    if (st->drm_fd < 0) st->drm_fd = open_drm_render_fd();
+    bool synced = false;
+    auto* stl = static_cast<spa_meta_sync_timeline*>(
+        spa_buffer_find_meta_data(buf, SPA_META_SyncTimeline, sizeof(spa_meta_sync_timeline)));
+    if (stl && stl->acquire_point != 0) {
+      if (!st->sync_timeline_logged) {
+        st->sync_timeline_logged = true;
+        VRP_LOG("pipewire: SPA_META_SyncTimeline acquire_point=%llu (explicit producer sync)",
+                static_cast<unsigned long long>(stl->acquire_point));
+        st->self->push_status("pipewire: SyncTimeline acquire wait enabled");
+      }
+      if (!wait_sync_timeline_acquire(buf, st->drm_fd)) {
+        // Incomplete frame — do not publish; return buffer to pool.
+        signal_sync_timeline_release(buf, st->drm_fd);
+        pw_stream_queue_buffer(st->stream, b);
+        return;
+      }
+      synced = true;
+    } else {
+      // Fallback: EXPORT_SYNC_FILE on the dma-buf (NVIDIA implicit sync is unreliable).
+      const DmabufSyncResult sr = wait_dmabuf_export_sync(d->fd);
+      if (sr == DmabufSyncResult::Ok) {
+        st->export_sync_ok = true;
+        synced = true;
+      } else if (sr == DmabufSyncResult::Timeout ||
+                 (sr == DmabufSyncResult::IoctlFail && st->export_sync_ok)) {
+        static int sync_drop_log = 0;
+        if (sync_drop_log < 8) {
+          ++sync_drop_log;
+          VRP_LOG("pipewire: drop dma (EXPORT_SYNC %s) — refuse unsynced publish",
+                  sr == DmabufSyncResult::Timeout ? "timeout" : "ioctl-fail");
+        }
+        signal_sync_timeline_release(buf, st->drm_fd);
+        pw_stream_queue_buffer(st->stream, b);
+        return;
+      }
+    }
+
     const int dupfd = ::dup(d->fd);
     if (dupfd >= 0) {
       PipewireDmaFrame dma;
@@ -484,6 +773,7 @@ void on_process(void* data) {
       dma.stride = stride;
       dma.offset = offset;
       dma.size = size;
+      dma.producer_synced = synced;
       if (!st->logged_dma) {
         st->logged_dma = true;
         VRP_LOG("pipewire: DMA-BUF path %dx%d fourcc=0x%x modifier=0x%llx stride=%u", w, h,
@@ -505,11 +795,22 @@ void on_process(void* data) {
                 static_cast<unsigned long long>(st->locked_modifier));
       }
       st->self->set_negotiated(static_cast<uint32_t>(st->format), st->drm_fourcc, st->modifier, true);
-      // Hold until GPU copy-out finishes — dup shares backing pages with the
-      // producer, so queue_buffer before copy lets Mutter rewrite mid-blit (flicker).
-      // Cap holds at 1; XR release_seq returns the buffer right after blit.
+      if (hdr) {
+        dma.has_spa_meta = true;
+        dma.spa_pts = hdr->pts;
+        dma.spa_seq = hdr->seq;
+      }
+      // Hold until GPU copy-out finishes (release_seq). Never queue before blit.
       const uint64_t seq = st->self->publish_dma(std::move(dma));
-      st->self->hold_pw_buffer(st->stream, b, seq);
+      if (!st->self->hold_pw_buffer(st->stream, b, seq)) {
+        // Race: capacity vanished between can_hold and hold. Retract publish + queue.
+        st->self->unpublish_dma(seq);
+        VRP_LOG("pipewire: dma hold failed after publish seq=%llu — queue without blit",
+                static_cast<unsigned long long>(seq));
+        signal_sync_timeline_release(buf, st->drm_fd);
+        pw_stream_queue_buffer(st->stream, b);
+        return;
+      }
       published_dma = true;
     }
   }
@@ -552,22 +853,30 @@ void on_state_changed(void* data, pw_stream_state /*old*/, pw_stream_state state
   }
 }
 
-void on_add_buffer(void* data, pw_buffer* /*buffer*/) {
+void on_add_buffer(void* data, pw_buffer* buffer) {
   auto* st = static_cast<PwState*>(data);
   ++st->n_buffers;
-  VRP_LOG("pipewire: add_buffer pool=%d (requested %d)", st->n_buffers, st->requested_buffers);
+  if (st->self) st->self->note_pw_buffer_alive(buffer);
+  // pool=N here is PipeWire dma-buf BO count (Mutter), not Vk present/staging.
+  VRP_LOG("pipewire: add_buffer pw_pool=%d (requested %d)", st->n_buffers, st->requested_buffers);
   if (st->requested_buffers > 0 && st->n_buffers == st->requested_buffers) {
-    VRP_LOG("pipewire: buffer pool matched request (%d)", st->n_buffers);
+    VRP_LOG("pipewire: pw_pool matched request (%d)", st->n_buffers);
   } else if (st->requested_buffers > 0 && st->n_buffers > st->requested_buffers) {
-    VRP_LOG("pipewire: WARNING pool %d > requested %d — display depth mismatch risk",
+    VRP_LOG("pipewire: WARNING pw_pool %d > requested %d (producer BO count, not Vk images)",
             st->n_buffers, st->requested_buffers);
   }
 }
 
-void on_remove_buffer(void* data, pw_buffer* /*buffer*/) {
+void on_remove_buffer(void* data, pw_buffer* buffer) {
   auto* st = static_cast<PwState*>(data);
   if (st->n_buffers > 0) --st->n_buffers;
-  VRP_LOG("pipewire: remove_buffer pool=%d", st->n_buffers);
+  VRP_LOG("pipewire: remove_buffer pw_pool=%d", st->n_buffers);
+  // Pool rebuild / Live switch: pw_buffer* is freed here. Any hold or pending
+  // release that still queues it → SEGV in pw_stream_queue_buffer.
+  if (st->self) {
+    if (st->n_buffers == 0) st->self->forget_all_pw_buffers();
+    else st->self->forget_pw_buffer(buffer);
+  }
 }
 
 const pw_stream_events kStreamEvents = {
@@ -587,7 +896,13 @@ const pw_stream_events kStreamEvents = {
 
 }  // namespace
 
-PipewireCapture::~PipewireCapture() { stop(); }
+PipewireCapture::~PipewireCapture() {
+  stop();
+  if (drm_render_fd_ >= 0) {
+    ::close(drm_render_fd_);
+    drm_render_fd_ = -1;
+  }
+}
 
 void PipewireCapture::set_error(const std::string& e) {
   std::lock_guard<std::mutex> lock(err_mu_);
@@ -666,13 +981,82 @@ uint64_t PipewireCapture::publish_dma(PipewireDmaFrame frame) {
   return seq;
 }
 
+void PipewireCapture::unpublish_dma(uint64_t seq) {
+  if (seq == 0) return;
+  {
+    std::lock_guard<std::mutex> lock(frame_mu_);
+    if (latest_dma_ && latest_dma_.seq == seq) latest_dma_ = {};
+  }
+  release_held_dma(seq);
+}
+
+bool PipewireCapture::can_hold_new_dma() const {
+  uint64_t supersede_seq = 0;
+  {
+    std::lock_guard<std::mutex> lock(frame_mu_);
+    if (latest_dma_) supersede_seq = latest_dma_.seq;
+  }
+  std::lock_guard<std::mutex> lock(hold_mu_);
+  size_t n = held_dma_.size();
+  if (supersede_seq != 0) {
+    for (const auto& h : held_dma_) {
+      if (h.seq == supersede_seq) {
+        if (n > 0) --n;
+        break;
+      }
+    }
+  }
+  // 2 = XR keep-latest mailbox + one in-flight copy-out.
+  return n < 2;
+}
+
+bool PipewireCapture::pw_buf_dead_locked(void* buf) const {
+  if (!buf) return true;
+  for (void* d : dead_pw_bufs_) {
+    if (d == buf) return true;
+  }
+  return false;
+}
+
+void PipewireCapture::note_pw_buffer_alive(void* buf) {
+  if (!buf) return;
+  std::lock_guard<std::mutex> lock(hold_mu_);
+  dead_pw_bufs_.erase(std::remove(dead_pw_bufs_.begin(), dead_pw_bufs_.end(), buf),
+                      dead_pw_bufs_.end());
+}
+
+void PipewireCapture::forget_pw_buffer(void* buf) {
+  if (!buf) return;
+  std::lock_guard<std::mutex> lock(hold_mu_);
+  held_dma_.erase(std::remove_if(held_dma_.begin(), held_dma_.end(),
+                                 [buf](const HeldDma& h) { return h.buf == buf; }),
+                  held_dma_.end());
+  release_bufs_.erase(std::remove(release_bufs_.begin(), release_bufs_.end(), buf),
+                      release_bufs_.end());
+  if (!pw_buf_dead_locked(buf)) dead_pw_bufs_.push_back(buf);
+}
+
+void PipewireCapture::forget_all_pw_buffers() {
+  std::lock_guard<std::mutex> lock(hold_mu_);
+  // Mark every outstanding pointer dead so an in-flight flush (already swapped
+  // into a local vector) still skips queue_buffer after remove_buffer×N.
+  for (const HeldDma& h : held_dma_) {
+    if (h.buf && !pw_buf_dead_locked(h.buf)) dead_pw_bufs_.push_back(h.buf);
+  }
+  for (void* p : release_bufs_) {
+    if (p && !pw_buf_dead_locked(p)) dead_pw_bufs_.push_back(p);
+  }
+  held_dma_.clear();
+  release_bufs_.clear();
+}
+
 void PipewireCapture::release_held_dma(uint64_t seq) {
   if (seq == 0) return;
   {
     std::lock_guard<std::mutex> lock(hold_mu_);
     for (auto it = held_dma_.begin(); it != held_dma_.end(); ++it) {
       if (it->seq != seq) continue;
-      if (it->buf) release_bufs_.push_back(it->buf);
+      if (it->buf && !pw_buf_dead_locked(it->buf)) release_bufs_.push_back(it->buf);
       held_dma_.erase(it);
       break;
     }
@@ -708,32 +1092,28 @@ bool stream_can_queue(pw_stream* s) {
 }
 }  // namespace
 
-void PipewireCapture::hold_pw_buffer(void* stream, void* buf, uint64_t seq) {
+bool PipewireCapture::hold_pw_buffer(void* stream, void* buf, uint64_t seq) {
   auto* s = static_cast<pw_stream*>(stream);
   auto* b = static_cast<pw_buffer*>(buf);
-  if (!s || !b) return;
+  if (!s || !b) return false;
   if (seq == 0) {
-    pw_stream_queue_buffer(s, b);
-    return;
+    {
+      std::lock_guard<std::mutex> lock(hold_mu_);
+      if (pw_buf_dead_locked(buf)) return false;
+    }
+    if (stream_can_queue(s)) pw_stream_queue_buffer(s, b);
+    return false;
   }
-  std::vector<void*> overflow;
   {
     std::lock_guard<std::mutex> lock(hold_mu_);
+    if (pw_buf_dead_locked(buf)) return false;
+    // Cap 2: mailbox pending + in-flight blit. Never queue here on overflow —
+    // caller must drop the publish so XR never blits an unprotected BO.
+    if (held_dma_.size() >= 2) return false;
     held_dma_.push_back(HeldDma{seq, buf});
-    // At most 1 held pw_buffer: copy-out returns it as soon as the GPU blit
-    // finishes. A second hold was "latest waiting" but publish_dma already
-    // supersedes latest_dma_ — extra dequeued buffers just starve Mutter.
-    while (held_dma_.size() > 1) {
-      overflow.push_back(held_dma_.front().buf);
-      held_dma_.erase(held_dma_.begin());
-    }
-  }
-  if (stream_can_queue(s)) {
-    for (void* p : overflow) {
-      if (p) pw_stream_queue_buffer(s, static_cast<pw_buffer*>(p));
-    }
   }
   flush_released(stream);
+  return true;
 }
 
 void PipewireCapture::flush_released(void* stream) {
@@ -743,9 +1123,19 @@ void PipewireCapture::flush_released(void* stream) {
     std::lock_guard<std::mutex> lock(hold_mu_);
     q.swap(release_bufs_);
   }
-  if (!stream_can_queue(s)) return;  // drop — stream already dead / disconnecting
+  // Teardown / disconnecting: drop — do not queue dangling pw_buffer*.
+  if (!stream_can_queue(s)) return;
+  if (drm_render_fd_ < 0) drm_render_fd_ = open_drm_render_fd();
   for (void* p : q) {
-    if (p) pw_stream_queue_buffer(s, static_cast<pw_buffer*>(p));
+    if (!p) continue;
+    {
+      std::lock_guard<std::mutex> lock(hold_mu_);
+      // remove_buffer may have raced after the swap above (Live switch).
+      if (pw_buf_dead_locked(p)) continue;
+    }
+    auto* pb = static_cast<pw_buffer*>(p);
+    if (pb->buffer) signal_sync_timeline_release(pb->buffer, drm_render_fd_);
+    pw_stream_queue_buffer(s, pb);
   }
 }
 
@@ -755,17 +1145,27 @@ void PipewireCapture::release_all_held(void* stream) {
   {
     std::lock_guard<std::mutex> lock(hold_mu_);
     for (auto& h : held_dma_) {
-      if (h.buf) q.push_back(h.buf);
+      if (h.buf && !pw_buf_dead_locked(h.buf)) q.push_back(h.buf);
     }
     held_dma_.clear();
-    q.insert(q.end(), release_bufs_.begin(), release_bufs_.end());
+    for (void* p : release_bufs_) {
+      if (p && !pw_buf_dead_locked(p)) q.push_back(p);
+    }
     release_bufs_.clear();
   }
   // Teardown / ERROR / UNCONNECTED: never queue — pw_buffer* are often dangling
   // after portal Session.Close and queue_buffer SEGVs (see coredump).
   if (!stream_can_queue(s)) return;
+  if (drm_render_fd_ < 0) drm_render_fd_ = open_drm_render_fd();
   for (void* p : q) {
-    if (p) pw_stream_queue_buffer(s, static_cast<pw_buffer*>(p));
+    if (!p) continue;
+    {
+      std::lock_guard<std::mutex> lock(hold_mu_);
+      if (pw_buf_dead_locked(p)) continue;
+    }
+    auto* pb = static_cast<pw_buffer*>(p);
+    if (pb->buffer) signal_sync_timeline_release(pb->buffer, drm_render_fd_);
+    pw_stream_queue_buffer(s, pb);
   }
 }
 
@@ -924,14 +1324,13 @@ void PipewireCapture::thread_main(int pw_fd, uint32_t node_id, uint64_t serial) 
 
   uint8_t pod_buf[8192];
   spa_pod_builder builder = SPA_POD_BUILDER_INIT(pod_buf, sizeof(pod_buf));
-  // GNOME RecordVirtual (Meta-*): SHM-only. Virtual monitors have no KMS CRTC;
-  // DMA-BUF + NVIDIA implicit sync is a known flicker class (niri/WebRTC/Fjarr).
-  // WebRTC processes + queue_buffer in the same on_process; SHM makes that safe.
+  // Default: DMA-BUF modifiers first, MemFd/MemPtr plain as fallback (KDE + GNOME
+  // Meta). prefer_shm_ skips modifiers (debug / emergency only).
   const spa_pod* params[2];
   uint32_t n_params = 0;
   if (prefer_shm_) {
     params[n_params++] = build_format_plain(&builder, st.prefer_w, st.prefer_h);
-    VRP_LOG("pipewire: SHM-only EnumFormat (prefer_shm — GNOME VIRTUAL / Meta-*)");
+    VRP_LOG("pipewire: SHM-only EnumFormat (prefer_shm override)");
   } else {
     params[n_params++] =
         build_format_modifier(&builder, st.consumer_modifiers, st.prefer_w, st.prefer_h);
@@ -973,7 +1372,7 @@ void PipewireCapture::thread_main(int pw_fd, uint32_t node_id, uint64_t serial) 
   pw_loop_.store(nullptr, std::memory_order_release);
   pw_stream_.store(nullptr, std::memory_order_release);
   // Drop holds without queue_buffer — loop has quit; stream may already be ERROR.
-  release_all_held(nullptr);
+  forget_all_pw_buffers();
   std::this_thread::sleep_for(std::chrono::milliseconds(50));
   pw_stream_disconnect(st.stream);
   pw_stream_destroy(st.stream);
@@ -981,6 +1380,10 @@ void PipewireCapture::thread_main(int pw_fd, uint32_t node_id, uint64_t serial) 
   pw_core_disconnect(st.core);
   pw_context_destroy(st.context);
   pw_main_loop_destroy(st.loop);
+  if (st.drm_fd >= 0) {
+    ::close(st.drm_fd);
+    st.drm_fd = -1;
+  }
   pw_deinit();
 }
 

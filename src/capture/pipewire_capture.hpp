@@ -28,6 +28,15 @@ struct PipewireDmaFrame {
   uint32_t offset = 0;
   uint32_t size = 0;
   uint64_t seq = 0;
+  /** SPA_META_Header when present — content generation (not dma-buf BO identity). */
+  int64_t spa_pts = 0;
+  uint64_t spa_seq = 0;
+  bool has_spa_meta = false;
+  /**
+   * True when PipeWire-thread wait (SPA_META_SyncTimeline acquire and/or
+   * EXPORT_SYNC_FILE) completed before publish — blit may skip a second wait.
+   */
+  bool producer_synced = false;
 
   PipewireDmaFrame() = default;
   ~PipewireDmaFrame() { release(); }
@@ -49,8 +58,14 @@ struct PipewireDmaFrame {
     offset = o.offset;
     size = o.size;
     seq = o.seq;
+    spa_pts = o.spa_pts;
+    spa_seq = o.spa_seq;
+    has_spa_meta = o.has_spa_meta;
+    producer_synced = o.producer_synced;
     o.fd = -1;
     o.has_modifier = false;
+    o.has_spa_meta = false;
+    o.producer_synced = false;
     return *this;
   }
 
@@ -86,8 +101,7 @@ class PipewireCapture {
    */
   /**
    * @param prefer_shm If true, announce MemFd/MemPtr only (no DMA-BUF modifiers).
-   *        Recommended for GNOME RecordVirtual / Meta-* — no KMS scanout; DMA-BUF
-   *        consumers commonly see stale/flicker frames (Fjarr ADR 0041, WebRTC notes).
+   *        Debug/emergency override — GNOME Meta defaults to DMA-BUF + SHM fallback.
    */
   /**
    * @param pw_fd Portal OpenPipeWireRemote fd (owned). Pass -1 to connect the
@@ -117,11 +131,24 @@ class PipewireCapture {
    */
   void release_held_dma(uint64_t seq);
 
-  /** PW thread: track a dequeued buffer until release_held_dma(seq). */
-  void hold_pw_buffer(void* stream /* pw_stream* */, void* buf /* pw_buffer* */, uint64_t seq);
+  /**
+   * PW thread: track a dequeued buffer until release_held_dma(seq).
+   * @return false if hold table is full — caller must NOT publish the dup FD
+   *         (Mutter would rewrite the BO while XR still blits from it).
+   */
+  bool hold_pw_buffer(void* stream /* pw_stream* */, void* buf /* pw_buffer* */, uint64_t seq);
+  /** True if a new DMA publish can be protected (≤2 holds: mailbox + blit). */
+  bool can_hold_new_dma() const;
   void flush_released(void* stream /* pw_stream* */);
   void flush_released_on_loop();
   void release_all_held(void* stream /* pw_stream* */);
+  /**
+   * remove_buffer / pool rebuild: drop hold+pending without queue_buffer.
+   * Queuing a removed pw_buffer* SEGVs (Live switch → remove_buffer×N → flush).
+   */
+  void forget_pw_buffer(void* buf /* pw_buffer* */);
+  void forget_all_pw_buffers();
+  void note_pw_buffer_alive(void* buf /* pw_buffer* */);
 
   int width() const { return width_.load(std::memory_order_relaxed); }
   int height() const { return height_.load(std::memory_order_relaxed); }
@@ -133,6 +160,8 @@ class PipewireCapture {
   void publish_frame(VideoFrame frame);
   /** Publish dma frame; returns assigned seq (also stored on the frame before move). */
   uint64_t publish_dma(PipewireDmaFrame frame);
+  /** Retract a just-published dma frame if hold failed (drops latest if seq matches). */
+  void unpublish_dma(uint64_t seq);
   void set_error_public(const std::string& e);
 
   /** Negotiated SPA video format / DRM fourcc / modifier (for logging). */
@@ -180,10 +209,15 @@ class PipewireCapture {
   mutable std::mutex hold_mu_;
   std::vector<HeldDma> held_dma_;
   std::vector<void*> release_bufs_;  // pw_buffer* waiting to queue
+  /** Buffers PipeWire already destroyed via remove_buffer — never queue these. */
+  std::vector<void*> dead_pw_bufs_;
   /** Set on PW thread while loop runs; used to pw_loop_invoke flush from XR. */
   std::atomic<void*> pw_loop_{nullptr};    // pw_loop*
   std::atomic<void*> pw_stream_{nullptr};  // pw_stream*
+  /** DRM render node for SyncTimeline syncobj signal on queue_buffer. */
+  int drm_render_fd_{-1};
   void request_flush_released();
+  bool pw_buf_dead_locked(void* buf) const;
 };
 
 }  // namespace vrp
