@@ -210,7 +210,41 @@ void ScreencastPortal::fail(const QString& err) {
     eis_fd_ = -1;
   }
   busy_ = false;
+  defer_start_ = false;
+  sources_selected_ = false;
+  finish_pending_ = false;
   emit failed(err);
+}
+
+void ScreencastPortal::prepare(const QString& parent_window, const QString& restore_token,
+                               uint32_t persist_mode, SourceKind kind, SessionMode mode) {
+  defer_start_ = true;
+  sources_selected_ = false;
+  finish_pending_ = false;
+  start(parent_window, restore_token, persist_mode, kind, mode);
+  // start() may have early-failed; keep defer flags only while busy.
+  if (!busy_) {
+    defer_start_ = false;
+    sources_selected_ = false;
+    finish_pending_ = false;
+  } else {
+    VRP_LOG("screencast: prepare — CreateSession/SelectSources now; Start deferred until place");
+  }
+}
+
+void ScreencastPortal::finishStart() {
+  if (!busy_ || !defer_start_) {
+    VRP_LOG("screencast: finishStart ignored (busy=%d defer=%d)", busy_ ? 1 : 0,
+            defer_start_ ? 1 : 0);
+    return;
+  }
+  if (sources_selected_) {
+    VRP_LOG("screencast: finishStart — SelectSources ready, calling Start");
+    callStart();
+    return;
+  }
+  VRP_LOG("screencast: finishStart — waiting for SelectSources…");
+  finish_pending_ = true;
 }
 
 void ScreencastPortal::start(const QString& parent_window, const QString& restore_token,
@@ -235,6 +269,11 @@ void ScreencastPortal::start(const QString& parent_window, const QString& restor
     eis_fd_ = -1;
   }
   busy_ = true;
+  // prepare() sets defer_start_ before calling start(); plain start() clears it.
+  if (!defer_start_) {
+    sources_selected_ = false;
+    finish_pending_ = false;
+  }
   parent_window_ = parent_window;
   restore_token_in_ = restore_token;
   persist_mode_ = persist_mode;
@@ -319,6 +358,9 @@ void ScreencastPortal::stop() {
   }
   const bool was_busy = busy_;
   busy_ = false;
+  defer_start_ = false;
+  sources_selected_ = false;
+  finish_pending_ = false;
   closing_session_ = false;
   if (was_busy) emit stopped();
 }
@@ -492,6 +534,21 @@ void ScreencastPortal::callSelectSources() {
       return;
     }
     const bool rd = mode_ == SessionMode::RemoteDesktopWithVideo;
+    if (defer_start_) {
+      sources_selected_ = true;
+      VRP_LOG("screencast: SelectSources ok — Start deferred (place first)");
+      emit sourcesReady();
+      if (finish_pending_) {
+        finish_pending_ = false;
+        const QString st =
+            rd ? QStringLiteral("ScreenCast+input: starting restored share…")
+               : QStringLiteral("ScreenCast: starting restored share…");
+        VRP_LOG("screencast: %s", st.toUtf8().constData());
+        emit status(st);
+        callStart();
+      }
+      return;
+    }
     const QString st =
         restore_token_in_.isEmpty()
             ? (rd ? QStringLiteral("ScreenCast+input: waiting for host approval…")

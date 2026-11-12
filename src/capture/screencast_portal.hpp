@@ -55,9 +55,21 @@ class ScreencastPortal : public QObject {
   void start(const QString& parent_window, const QString& restore_token = {},
              uint32_t persist_mode = 2, SourceKind kind = SourceKind::Monitor,
              SessionMode mode = SessionMode::VideoOnly);
+  /**
+   * Like start(), but stops after SelectSources. Call finishStart() once the
+   * Live window is on Virtual (place-before-Start contract). Overlaps Chrome
+   * cold-start with CreateSession/SelectSources.
+   */
+  void prepare(const QString& parent_window, const QString& restore_token = {},
+               uint32_t persist_mode = 2, SourceKind kind = SourceKind::Monitor,
+               SessionMode mode = SessionMode::VideoOnly);
+  /** Run ScreenCast.Start after prepare (queues if SelectSources still in flight). */
+  void finishStart();
   void stop();
 
   bool busy() const { return busy_; }
+  bool prepare_ready() const { return sources_selected_; }
+  bool preparing() const { return busy_ && defer_start_ && !sources_selected_; }
   SourceKind active_kind() const { return kind_; }
   SessionMode session_mode() const { return mode_; }
   /** True if the in-flight / last start used a restore_token. */
@@ -69,6 +81,8 @@ class ScreencastPortal : public QObject {
   void started(vrp::ScreencastPortal::Result result);
   void failed(const QString& error);
   void stopped();
+  /** prepare() finished SelectSources — finishStart() may call Start immediately. */
+  void sourcesReady();
   /** Progress for the host log / HMD toast. */
   void status(const QString& message);
 
@@ -95,6 +109,10 @@ class ScreencastPortal : public QObject {
   bool busy_ = false;
   bool closing_session_ = false;
   bool watching_session_closed_ = false;
+  /** prepare() path: hold Start until finishStart(). */
+  bool defer_start_ = false;
+  bool sources_selected_ = false;
+  bool finish_pending_ = false;
   /** Bumped on start/stop/fail so stale Request Response callbacks no-op. */
   uint64_t epoch_ = 0;
   QString parent_window_;
