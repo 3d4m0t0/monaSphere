@@ -2,11 +2,13 @@
 
 #include "common.hpp"
 
+#include <QCoreApplication>
 #include <QDBusConnection>
 #include <QDBusMessage>
 #include <QDBusReply>
 #include <QDir>
 #include <QElapsedTimer>
+#include <QEventLoop>
 #include <QFile>
 #include <QFileInfo>
 #include <QMutex>
@@ -17,8 +19,16 @@
 #include <QTemporaryDir>
 #include <QTextStream>
 #include <QThread>
+#include <QTimer>
+
+#include <functional>
+#include <mutex>
 
 namespace vrp {
+
+/** Nested QEventLoop while waiting for KWin report — place/poll must not re-enter. */
+thread_local int g_kwin_script_wait_depth = 0;
+
 namespace {
 
 constexpr const char* kTempRuleId = "monaSphereYT";
@@ -38,10 +48,9 @@ class PlaceReporter : public QObject {
  public:
   QString last;
  public slots:
-  Q_SCRIPTABLE void report(const QString& msg) {
-    last = msg;
-    VRP_LOG("kwin-place: script reports: %s", msg.toUtf8().constData());
-  }
+  Q_SCRIPTABLE void report(const QString& msg);
+ signals:
+  void reported(const QString& msg);
 };
 
 /**
@@ -51,6 +60,10 @@ class PlaceReporter : public QObject {
  */
 struct PlaceHub {
   PlaceReporter reporter;
+  std::mutex ok_cb_mu;
+  std::function<void()> ok_cb;
+  /** ok: arrived while in_script_wait — run cb after outermost wait ends. */
+  bool ok_cb_deferred = false;
   bool ok = false;
   PlaceHub() {
     auto bus = QDBusConnection::sessionBus();
@@ -68,6 +81,50 @@ struct PlaceHub {
 PlaceHub& placeHub() {
   static PlaceHub hub;
   return hub;
+}
+
+void flushDeferredOkCallback();
+
+struct ScriptWaitGuard {
+  ScriptWaitGuard() { ++g_kwin_script_wait_depth; }
+  ~ScriptWaitGuard() {
+    --g_kwin_script_wait_depth;
+    if (g_kwin_script_wait_depth == 0) flushDeferredOkCallback();
+  }
+  ScriptWaitGuard(const ScriptWaitGuard&) = delete;
+  ScriptWaitGuard& operator=(const ScriptWaitGuard&) = delete;
+};
+
+void PlaceReporter::report(const QString& msg) {
+  last = msg;
+  VRP_LOG("kwin-place: script reports: %s", msg.toUtf8().constData());
+  emit reported(msg);
+  // Live place success — wake poll immediately (no 200/350ms timer wait).
+  if (!msg.startsWith(QLatin1String("ok:"))) return;
+  // During script wait, QueuedConnection pollPlace would re-enter loadAndRunScript
+  // → stack overflow. Defer until the outermost wait finishes.
+  if (g_kwin_script_wait_depth > 0) {
+    std::lock_guard<std::mutex> lock(placeHub().ok_cb_mu);
+    placeHub().ok_cb_deferred = true;
+    return;
+  }
+  std::function<void()> cb;
+  {
+    std::lock_guard<std::mutex> lock(placeHub().ok_cb_mu);
+    cb = placeHub().ok_cb;
+  }
+  if (cb) cb();
+}
+
+void flushDeferredOkCallback() {
+  std::function<void()> cb;
+  {
+    std::lock_guard<std::mutex> lock(placeHub().ok_cb_mu);
+    if (!placeHub().ok_cb_deferred) return;
+    placeHub().ok_cb_deferred = false;
+    cb = placeHub().ok_cb;
+  }
+  if (cb) cb();
 }
 
 struct BusGuard {
@@ -190,14 +247,35 @@ int loadAndRunScript(const QString& script, QString* error_out, bool keep_loaded
     *error_out = run_reply.error().message();
   }
   if (!keep_loaded) {
-    // Wait until the script reports (or short cap) — no nested QEventLoop.
+    // One-shot scripts callDBus(report) asynchronously after run() returns.
+    // Wait until that report arrives — fixed short budgets miss on slow KWin /
+    // session bus and then unload kills the script before it can answer.
+    // Safety ceiling only (slow env → slower start, not a false miss).
+    // ScriptWaitGuard blocks place/poll re-entry (nested exec → stack overflow).
+    ScriptWaitGuard wait_guard;
+    constexpr int kReportSafetyMs = 15000;
     const QString prior = placeHub().reporter.last;
-    QElapsedTimer wait;
-    wait.start();
-    while (wait.elapsed() < 800) {
+    auto have_new = [&] {
       const QString cur = placeHub().reporter.last;
-      if (!cur.isEmpty() && cur != prior) break;
-      QThread::msleep(10);
+      return !cur.isEmpty() && cur != prior;
+    };
+    if (!have_new()) {
+      QEventLoop loop;
+      QTimer safety;
+      safety.setSingleShot(true);
+      QObject::connect(&safety, &QTimer::timeout, &loop, &QEventLoop::quit);
+      const QMetaObject::Connection conn = QObject::connect(
+          &placeHub().reporter, &PlaceReporter::reported, &loop, [&](const QString& msg) {
+            if (!msg.isEmpty() && msg != prior) loop.quit();
+          });
+      safety.start(kReportSafetyMs);
+      // Delivers D-Bus report; place/poll must check in_script_wait().
+      loop.exec(QEventLoop::ExcludeUserInputEvents);
+      QObject::disconnect(conn);
+      if (!have_new()) {
+        VRP_LOG("kwin-place: one-shot report still missing after %dms (prior empty=%d)",
+                kReportSafetyMs, prior.isEmpty() ? 1 : 0);
+      }
     }
     (void)unloadScript(script_id, plugin_name);
     delete heap_dir;
@@ -617,7 +695,13 @@ PortalArmState& portalArm() {
   return s;
 }
 
+void clearArmedOkCallbackLocked() {
+  std::lock_guard<std::mutex> lock(placeHub().ok_cb_mu);
+  placeHub().ok_cb = nullptr;
+}
+
 void disarmLocked(bool keep_fullscreen_rule) {
+  clearArmedOkCallbackLocked();
   if (arm().script_id >= 0 || arm().script_dir) {
     (void)unloadScript(arm().script_id, QString::fromUtf8(kScriptNamePlace));
     arm().script_id = -1;
@@ -1413,6 +1497,20 @@ bool KwinWindowPlacer::poll_armed_place(QString* out_window_id, QString* error_o
     *out_window_id = colon >= 0 ? rest.left(colon) : rest;
   }
   return true;
+}
+
+bool KwinWindowPlacer::in_script_wait() { return g_kwin_script_wait_depth > 0; }
+
+void KwinWindowPlacer::set_armed_ok_callback(std::function<void()> cb) {
+  std::lock_guard<std::mutex> lock(placeHub().ok_cb_mu);
+  placeHub().ok_cb = std::move(cb);
+  placeHub().ok_cb_deferred = false;
+}
+
+void KwinWindowPlacer::clear_armed_ok_callback() {
+  std::lock_guard<std::mutex> lock(placeHub().ok_cb_mu);
+  placeHub().ok_cb = nullptr;
+  placeHub().ok_cb_deferred = false;
 }
 
 void KwinWindowPlacer::disarm_place_on_open(bool keep_fullscreen_rule) {

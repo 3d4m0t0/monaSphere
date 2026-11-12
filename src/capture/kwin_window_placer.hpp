@@ -4,6 +4,8 @@
 #include <QString>
 #include <QStringList>
 
+#include <functional>
+
 namespace vrp {
 
 /**
@@ -100,8 +102,20 @@ class KwinWindowPlacer {
    * (that churn leaves plasmashell chasing "unexisting screen geometry").
    */
   static void clear_live_session_rules();
+  /**
+   * True while a one-shot KWin script is waiting for its D-Bus report.
+   * Callers must not re-enter place/poll (nested QEventLoop would recurse).
+   */
+  static bool in_script_wait();
+
   /** Non-blocking: true once placement reported success. */
   static bool poll_armed_place(QString* out_window_id, QString* error_out = nullptr);
+  /**
+   * Fired when the armed KWin script reports ok:… (windowAdded place).
+   * Cleared by clear_armed_ok_callback / disarm_place_on_open.
+   */
+  static void set_armed_ok_callback(std::function<void()> cb);
+  static void clear_armed_ok_callback();
   /**
    * Unload place script. If keep_fullscreen_rule, leave a Force fullscreen /
    * noborder / screen Window Rule for the session; otherwise remove it.
