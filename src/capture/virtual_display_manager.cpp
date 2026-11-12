@@ -195,10 +195,35 @@ void VirtualDisplayManager::commit_identity(const Spec& want, const QString& mat
       if (screen_index_ >= 0) output_name_ = expected;
     }
   }
+  // Index is required for Window Rules. Keep querying until KWin lists the
+  // output — slow compositors just take longer; do not proceed as "unknown".
+  if (screen_index_ < 0) {
+    emit logMessage(tr("Virtual: waiting for KWin screen index of %1…")
+                        .arg(output_name_));
+    QElapsedTimer idx_wait;
+    idx_wait.start();
+    constexpr int kIndexSafetyMs = 60000;
+    int attempt = 0;
+    while (screen_index_ < 0 && idx_wait.elapsed() < kIndexSafetyMs) {
+      QThread::msleep(attempt == 0 ? 50 : 200);
+      ++attempt;
+      idx_err.clear();
+      screen_index_ = KwinWindowPlacer::query_output_index(output_name_, &idx_err);
+      if (screen_index_ < 0 && output_name_ != expected) {
+        screen_index_ = KwinWindowPlacer::query_output_index(expected, &idx_err);
+        if (screen_index_ >= 0) output_name_ = expected;
+      }
+      if (screen_index_ < 0 && (attempt == 1 || attempt % 10 == 0)) {
+        VRP_LOG("Virtual: index still unresolved for %s (%s) after %lldms",
+                output_name_.toUtf8().constData(), idx_err.toUtf8().constData(),
+                static_cast<long long>(idx_wait.elapsed()));
+      }
+    }
+  }
   if (screen_index_ < 0) {
     VRP_LOG("Virtual: identity name=%s index unresolved (%s)",
             output_name_.toUtf8().constData(), idx_err.toUtf8().constData());
-    emit logMessage(tr("Virtual: KWin screen index unresolved for %1 (%2)")
+    emit logMessage(tr("Virtual: KWin screen index unresolved for %1 (%2) — place will use name match")
                         .arg(output_name_, idx_err.isEmpty() ? tr("no report") : idx_err));
   } else {
     VRP_LOG("Virtual: identity name=%s index=%d", output_name_.toUtf8().constData(),
@@ -241,6 +266,19 @@ bool VirtualDisplayManager::refresh_identity(QString* error_out) {
   if (screen_index_ < 0 && output_name_ != needle) {
     screen_index_ = KwinWindowPlacer::query_output_index(output_name_, &idx_err);
   }
+  // Same policy as commit_identity: monitor until KWin answers.
+  if (screen_index_ < 0) {
+    QElapsedTimer idx_wait;
+    idx_wait.start();
+    while (screen_index_ < 0 && idx_wait.elapsed() < 60000) {
+      QThread::msleep(200);
+      idx_err.clear();
+      screen_index_ = KwinWindowPlacer::query_output_index(output_name_, &idx_err);
+      if (screen_index_ < 0 && output_name_ != needle) {
+        screen_index_ = KwinWindowPlacer::query_output_index(needle, &idx_err);
+      }
+    }
+  }
   if (screen_index_ < 0) {
     if (error_out) *error_out = idx_err.isEmpty() ? QStringLiteral("no screen index") : idx_err;
     return false;
@@ -267,11 +305,12 @@ bool VirtualDisplayManager::wait_ready(const Spec& want, QString* matched_out,
   // snapshot runs beside it. A miss is not final — commit_identity queries
   // again after the output is actually up.
   int early_index = -1;
-  bool index_done = false;
+  bool index_credited = false;
   // Do NOT call enableOutput every poll tick — each call runs 3× kscreen-doctor and
   // thrashs KWin/plasmashell (unexisting screen geometry / delayed input).
   int enable_count = 0;
   qint64 last_enable_ms = -100000;
+  qint64 last_ready_log_ms = -100000;
   bool ready = false;
   // Create-phase shares, summed with the caller's start/identity credits to 100:
   // index 15, snapshots 20, enable 30.
@@ -287,17 +326,23 @@ bool VirtualDisplayManager::wait_ready(const Spec& want, QString* matched_out,
     enable_left -= step;
     add_progress(step);
   };
-  while (wait.elapsed() < 10000) {
+  // Monitor until output+mode appear. Slow kscreen/KWin just takes longer —
+  // a short fixed budget used to abort ensure() on cold machines.
+  constexpr int kReadySafetyMs = 90000;
+  while (wait.elapsed() < kReadySafetyMs) {
     auto snap = std::async(std::launch::async, [&] {
       const KdeVirtualDisplay::OutputInfo info = KdeVirtualDisplay::describeOutput(out);
       credit_snap();
       return info;
     });
-    if (!index_done) {
+    // Keep querying index until KWin knows the output (not a one-shot).
+    if (early_index < 0) {
       QString idx_err;
       early_index = KwinWindowPlacer::query_output_index(out, &idx_err);
-      index_done = true;
-      add_progress(15);
+      if (early_index >= 0 && !index_credited) {
+        add_progress(15);
+        index_credited = true;
+      }
     }
     const KdeVirtualDisplay::OutputInfo info = snap.get();
     const bool have_rect = info.listed && !info.rect.isEmpty();
@@ -334,6 +379,13 @@ bool VirtualDisplayManager::wait_ready(const Spec& want, QString* matched_out,
       enable_left = 0;
       ready = true;
       break;
+    }
+
+    if (wait.elapsed() - last_ready_log_ms >= 5000) {
+      last_ready_log_ms = wait.elapsed();
+      emit logMessage(tr("Virtual: still waiting for %1 ready… (%2s)")
+                          .arg(out)
+                          .arg(wait.elapsed() / 1000));
     }
 
     QThread::msleep(150);
