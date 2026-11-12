@@ -2350,14 +2350,18 @@ void HostWindow::ensureYouTubeSession() {
   if (!vdisp_mgr_) {
     vdisp_mgr_ = new vrp::VirtualDisplayManager(this);
     connect(vdisp_mgr_, &vrp::VirtualDisplayManager::logMessage, this, &HostWindow::appendLog);
-    vdisp_mgr_->set_progress_sink([this](int percent) {
-      if (yt_session_) yt_session_->set_busy_progress(percent);
-    });
+    // Progress % no longer shown on the busy panel.
+    vdisp_mgr_->set_progress_sink([](int) {});
     connect(vdisp_mgr_, &vrp::VirtualDisplayManager::busyStatus, this, [this](const QString& s) {
-      // Empty must clear — otherwise 「切替中」/「削除中」stick and XR skips DMA forever.
+      // Keep YouTube/app title during create — do not flash 「Virtual 作成中」.
+      // Empty / 削除中 still update (teardown must clear or XR skips DMA).
       if (!yt_session_) return;
-      if (s.isEmpty()) yt_session_->clear_busy_status();
-      else yt_session_->set_busy_status(s);
+      if (s.isEmpty()) {
+        yt_session_->clear_busy_status();
+        return;
+      }
+      if (s.contains(QStringLiteral("作成"))) return;
+      yt_session_->set_busy_status(s);
     });
     connect(vdisp_mgr_, &vrp::VirtualDisplayManager::tokenChanged, this,
             [this](int /*span*/, const QString& t) {
@@ -3358,7 +3362,10 @@ void HostWindow::onHandAction(QAction* action) {
 
 void HostWindow::appendLog(const QString& line) {
   if (shutting_down_.load() || !log_) return;
-  log_->appendPlainText(line);
+  const QString stamped =
+      QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz")) + QLatin1Char(' ') +
+      line;
+  log_->appendPlainText(stamped);
 }
 
 void HostWindow::presentToFront(const QString& activation_token) {
@@ -6280,7 +6287,7 @@ void HostWindow::xrThreadMain() {
         gamepad_seen_name_.clear();
       }
       gamepad_was = want_gamepad;
-      // L3+R3 recenter before live handlers (works during 起動中).
+      // L3+R3 recenter before live handlers (works during Live busy/spinner).
       if (input.recenter && xr.recenter()) {
         look_yaw = 0.f;
         look_pitch = 0.f;
@@ -7516,13 +7523,15 @@ void HostWindow::xrThreadMain() {
         };
 
         // Skip DMA while tearing down ScreenCast/Virtual. In-place Live↔Live
-        // (switching_live) keeps capture running and must still import so
-        // mark_frame_presented() can clear switch_hold / spinner.
+        // freezes the last picture until Chrome is placed (do not show Virtual
+        // wallpaper), then imports again so mark_frame_presented can reveal.
         const QString yt_busy = yt_session_->busy_status();
         const bool yt_busy_teardown =
             yt_session_->state() == vrp::YouTubeSession::State::Stopping ||
             yt_busy.contains(QStringLiteral("削除")) || yt_busy.contains(QStringLiteral("終了")) ||
             (yt_busy.contains(QStringLiteral("切替")) && !yt_session_->switching_live());
+        const bool switch_freeze =
+            yt_session_->switching_live() && yt_session_->switch_freeze_frames();
         if (yt_live && yt_cap && yt_cap->running() && !yt_busy_teardown) {
           {
             const auto status = yt_cap->drain_status();
@@ -7534,7 +7543,29 @@ void HostWindow::xrThreadMain() {
           }
           live_dma_path = false;
           bool imported_dma = false;
-          if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) &&
+          // Live↔Live gap: drain PW mailbox but do not promote wallpaper frames.
+          if (switch_freeze) {
+            if (pw_dma && !(yt_session_ && yt_session_->dma_disabled())) {
+              vrp::PipewireDmaFrame dma;
+              while (yt_cap->take_latest_dma(dma, yt_session_->dma_seq())) {
+                yt_cap->release_held_dma(dma.seq);
+                dma = {};
+              }
+              if (live_dma_pending) {
+                yt_cap->release_held_dma(live_dma_pending.seq);
+                live_dma_pending = {};
+              }
+            } else {
+              vrp::VideoFrame yf;
+              while (yt_cap->take_latest(yf, yt_session_->frame_seq()) && !yf.rgba.empty()) {
+                yf = {};
+              }
+              live_cpu_pending = {};
+            }
+            if (bind_last_yt()) yt_picture = true;
+            live_dma_path =
+                pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.has_valid_frame();
+          } else if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) &&
               !pw_dma_tex.import_abandoned()) {
             // 1) Keep-latest mailbox. Unread older FD → release held pw_buffer.
             {
@@ -7690,10 +7721,13 @@ void HostWindow::xrThreadMain() {
               if (pw_dma_tex.try_promote_pending()) imported_dma = true;
             }
           }
+          // switch_freeze already bound the last picture — do not ingest wallpaper.
           const bool dma_live =
-              imported_dma || (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.has_valid_frame());
-          live_dma_path = dma_live;
-          if (!dma_live) {
+              !switch_freeze &&
+              (imported_dma || (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) &&
+                                pw_dma_tex.has_valid_frame()));
+          if (!switch_freeze) live_dma_path = dma_live;
+          if (!switch_freeze && !dma_live) {
             // Complete prior upload BEFORE taking a new write slot — otherwise
             // in_flight blocks try_upload for a full XR frame and the back buffer
             // ages into a visible hitch when it next rotates in.
@@ -7753,7 +7787,7 @@ void HostWindow::xrThreadMain() {
             } else if (!yt_loading && bind_last_yt()) {
               yt_picture = true;
             }
-          } else {
+          } else if (!switch_freeze) {
             // DMA path: take → stage[1] → promote[0] → commit (key ≈ Mutter pw pool BO).
             live_cpu_pending = {};
             // Keep live_dma_pending across frames (display-paced import).
@@ -7774,7 +7808,8 @@ void HostWindow::xrThreadMain() {
               yt_picture = true;
             }
           }
-          if (yt_picture && yt_session_) yt_session_->mark_frame_presented();
+          // Freeze: do not clear hold on the frozen last frame.
+          if (yt_picture && yt_session_ && !switch_freeze) yt_session_->mark_frame_presented();
           // Portal AvailableCursorModes=0 → Hidden stream; draw stick cursor on Flat.
           if (yt_picture && yt_session_ && yt_session_->hmd_content_ready() &&
               !yt_session_->embedded_cursor() && opt_.projection == vrp::ProjectionMode::Flat) {
@@ -7789,8 +7824,11 @@ void HostWindow::xrThreadMain() {
 
         // GNOME Meta: PW frames exist (wallpaper) before Chrome — keep spinner on top
         // until hmd_content_ready() (Chrome placed). KDE first frame is already browser.
+        // Live↔Live freeze already holds the last browser frame — do not replace it
+        // with the busy panel (that looked like a flash when wallpaper sneaked in).
         const bool hold_meta_wallpaper =
-            yt_session_->show_busy_overlay() && !yt_session_->hmd_content_ready();
+            yt_session_->show_busy_overlay() && !yt_session_->hmd_content_ready() &&
+            !yt_session_->switch_freeze_frames();
         if (yt_session_->show_busy_overlay() && (!yt_picture || hold_meta_wallpaper)) {
           yt_spin_phase += static_cast<float>(dt) * 9.5f;
           if (yt_spin_phase > 6.2831853f) yt_spin_phase = std::fmod(yt_spin_phase, 6.2831853f);
