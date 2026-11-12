@@ -619,19 +619,24 @@ int PulseMonitor::route_browser_to_yt_sink() {
     }
     ++browser_seen;
     const bool on_yt = have_sink && sink_idx == yt_idx;
+    char cmd[192];
     if (!on_yt) {
-      char cmd[192];
+      // Mute first: shared Chrome often plays on the HMD/default sink at full
+      // level for ~0.5–1s before Soft (hrtf_trim) owns the path via yt.monitor.
+      std::snprintf(cmd, sizeof(cmd), "pactl set-sink-input-mute %d 1 2>/dev/null", cur);
+      (void)std::system(cmd);
       std::snprintf(cmd, sizeof(cmd), "pactl move-sink-input %d %s 2>/dev/null", cur, kYtSinkName);
       if (std::system(cmd) == 0) {
         ++moved;
         VRP_LOG("PulseMonitor: move sink-input #%d (%s / %s) -> %s", cur,
                 app_name.empty() ? "?" : app_name.c_str(),
                 app_bin.empty() ? "?" : app_bin.c_str(), kYtSinkName);
+        std::snprintf(cmd, sizeof(cmd), "pactl set-sink-input-mute %d 0 2>/dev/null", cur);
+        (void)std::system(cmd);
       }
-    }
-    // Keep browser unmuted on yt (never mute HMD competitors — Soft/Chrome race → silence).
-    {
-      char cmd[128];
+      // Move failed → stay muted; next poll retries. Do not unmute onto HMD.
+    } else {
+      // Already on yt — Soft monitor needs the stream unmuted.
       std::snprintf(cmd, sizeof(cmd), "pactl set-sink-input-mute %d 0 2>/dev/null", cur);
       (void)std::system(cmd);
     }

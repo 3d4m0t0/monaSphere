@@ -54,7 +54,8 @@ class PulseMonitor {
   /**
    * Move browser sink-inputs onto monaSphereYt (pactl; no Pulse mainloop).
    * Soft start must not await this — call from an async retry worker only.
-   * Does not mute HMD competitors (that raced Soft/Chrome into silence).
+   * Streams still on a real/HMD sink are muted until the move succeeds (avoids
+   * a loud unattenuated burst before Soft HRTF owns the path).
    * @return >0 moved count; 0 no browser yet; <0 browsers already on yt (stable).
    */
   static int route_browser_to_yt_sink();

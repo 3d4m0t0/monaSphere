@@ -1986,7 +1986,10 @@ void AudioPlayer::request_start_live_monitor() {
       fail("could not create monaSphereYt null sink");
       return;
     }
-    VRP_LOG("Audio: live start — Soft first (monitor=%s); browser route async", monitor.c_str());
+    VRP_LOG("Audio: live start — Soft (monitor=%s); mute+route HMD browser ASAP", monitor.c_str());
+    // Before Soft configure: mute/move any guest already playing on the HMD so the
+    // first second is not full-level direct output (hrtf_trim only applies on Soft).
+    (void)PulseMonitor::route_browser_to_yt_sink();
 
     VRP_LOG("Audio: live start — configuring Soft HRTF");
     {
@@ -2004,19 +2007,19 @@ void AudioPlayer::request_start_live_monitor() {
         return;
       }
     }
-    // Soft is up. Shared Chrome ignores PULSE_SINK and creates sink-inputs only
-    // when media plays — move onto yt off the Soft critical path (backoff, early exit).
+    // Shared Chrome ignores PULSE_SINK and creates sink-inputs only when media
+    // plays — keep polling; mute-until-yt prevents loud HMD leaks between ticks.
     const uint64_t route_gen = gen;
     std::thread([this, route_gen] {
       VRP_LOG("Audio: live route worker start");
       (void)PulseMonitor::route_browser_to_yt_sink();
       int stable_on_yt = 0;
       int elapsed_ms = 0;
-      for (int i = 0; i < 40; ++i) {
+      for (int i = 0; i < 80; ++i) {
         if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
         if (!live_monitor_.load(std::memory_order_acquire)) return;
-        // 500ms ×5, then 1s — fewer pactl forks once the guest is quiet.
-        const int sleep_ms = (i < 5) ? 500 : 1000;
+        // Fast at first (catch media start), then back off.
+        const int sleep_ms = (i < 20) ? 100 : (i < 40) ? 250 : 500;
         std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
         elapsed_ms += sleep_ms;
         if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
