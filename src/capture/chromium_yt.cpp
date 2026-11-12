@@ -364,9 +364,11 @@ void ChromiumYtLauncher::stop() {
   // system browser — that would destroy the user's session.
   detached_pid_ = 0;
   if (shared_session_) {
+    // Shared Live uses startDetached + KWin closeWindow; do not wait on a helper
+    // QProcess (would stall Live↔Live switch for up to waitForFinished).
     if (proc_.state() != QProcess::NotRunning) {
       proc_.terminate();
-      (void)proc_.waitForFinished(800);
+      (void)proc_.waitForFinished(100);
     }
     shared_session_ = false;
     return;
