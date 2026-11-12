@@ -25,7 +25,12 @@
 #include <QWindow>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <functional>
+#include <future>
+#include <memory>
+#include <optional>
 #include <thread>
 #include <unistd.h>
 
@@ -106,19 +111,20 @@ EisPointer* YouTubeSession::activeEis() {
 
 void YouTubeSession::rememberSeatCursor() {
   if (have_saved_cursor_) return;  // keep first snapshot (before Virtual warp)
+  // Prefer QCursor first (instant). KWin script is a refinement when it answers
+  // quickly — never block portal Start on a missed D-Bus report.
+  const QPoint p = QCursor::pos();
+  saved_cursor_x_ = p.x();
+  saved_cursor_y_ = p.y();
+  have_saved_cursor_ = true;
   double kx = 0, ky = 0;
   QString err;
   if (desk_ == DesktopEnv::Kde && KwinWindowPlacer::query_cursor_pos(&kx, &ky, &err)) {
     saved_cursor_x_ = kx;
     saved_cursor_y_ = ky;
-    have_saved_cursor_ = true;
     VRP_LOG("live: saved KWin seat cursor at %.0f,%.0f", saved_cursor_x_, saved_cursor_y_);
     return;
   }
-  const QPoint p = QCursor::pos();
-  saved_cursor_x_ = p.x();
-  saved_cursor_y_ = p.y();
-  have_saved_cursor_ = true;
   VRP_LOG("live: saved QCursor at %.0f,%.0f (%s)", saved_cursor_x_, saved_cursor_y_,
           err.isEmpty() ? "no KWin" : err.toUtf8().constData());
 }
@@ -181,6 +187,7 @@ void YouTubeSession::setState(State s) {
 void YouTubeSession::fail(const QString& err) {
   place_timer_.stop();
   ++portal_gen_;
+  ++audio_route_gen_;
   KwinWindowPlacer::disarm_place_on_open();
   KwinWindowPlacer::disarm_portal_dialog_on_primary();
   cleanupStreaming();
@@ -256,6 +263,8 @@ void YouTubeSession::stopDesktopAppMaintain() {
     KwinWindowPlacer::remove_desktop_window_rule();
     desktop_rule_installed_ = false;
   }
+  desktop_rule_installing_ = false;
+  desktop_place_finishing_ = false;
   desktop_wmclass_.clear();
 }
 
@@ -269,8 +278,11 @@ void YouTubeSession::startDesktopAppMaintain() {
 
 void YouTubeSession::installDesktopAppSessionRule() {
   if (!desktopAppMode() || kwin_window_id_.isEmpty()) return;
+  if (desktop_rule_installing_ || desktop_rule_installed_) return;
+  desktop_rule_installing_ = true;
   QString rc, rn, err;
   if (!KwinWindowPlacer::query_window_wmclass(kwin_window_id_, &rc, &rn, &err)) {
+    desktop_rule_installing_ = false;
     emit logMessage(tr("Desktop app: wmclass query failed (%1) — sticky arm only")
                         .arg(err.isEmpty() ? tr("unknown") : err));
     return;
@@ -278,19 +290,19 @@ void YouTubeSession::installDesktopAppSessionRule() {
   // KWin complete Exact: "resourceName resourceClass" (e.g. "retroarch retroarch").
   const QString name = rn.isEmpty() ? rc : rn;
   const QString cls = rc.isEmpty() ? rn : rc;
-  if (name.isEmpty() && cls.isEmpty()) return;
+  if (name.isEmpty() && cls.isEmpty()) {
+    desktop_rule_installing_ = false;
+    return;
+  }
   const QString complete =
       (name.isEmpty() || cls.isEmpty() || name.compare(cls, Qt::CaseInsensitive) == 0)
           ? (cls.isEmpty() ? name : cls)
           : (name + QLatin1Char(' ') + cls);
-  if (desktop_rule_installed_ &&
-      desktop_wmclass_.compare(complete, Qt::CaseInsensitive) == 0) {
-    return;
-  }
   desktop_wmclass_ = complete;
-  if (vdisp_mgr_) (void)vdisp_mgr_->refresh_identity();
-  QString rule_err;
+  // Prefer cached screen index — refresh_identity runs KWin scripts and must not
+  // nest under an in-flight place/poll (reentrancy).
   const int scr = vdisp_mgr_ ? vdisp_mgr_->screen_index() : -1;
+  QString rule_err;
   const bool ok = (scr >= 0)
                       ? KwinWindowPlacer::install_desktop_window_rule(complete, scr, &rule_err)
                       : KwinWindowPlacer::install_desktop_window_rule(complete, output_name_,
@@ -304,6 +316,7 @@ void YouTubeSession::installDesktopAppSessionRule() {
     emit logMessage(tr("Desktop app: Window Rule install failed (%1)")
                         .arg(rule_err.isEmpty() ? tr("unknown") : rule_err));
   }
+  desktop_rule_installing_ = false;
 }
 
 void YouTubeSession::maintainDesktopAppWindows() {
@@ -331,6 +344,7 @@ void YouTubeSession::cleanupStreaming() {
   ++gnome_evacuate_gen_;  // cancel pending Chrome launch / Meta paint timers
   switch_hold_content_ = false;
   pending_switch_reveal_ = false;
+  switch_reveal_seen_ = 0;
   KwinWindowPlacer::disarm_place_on_open();
   KwinWindowPlacer::disarm_portal_dialog_on_primary();
 
@@ -466,11 +480,16 @@ void YouTubeSession::cleanupStreaming() {
 void YouTubeSession::mark_frame_presented() {
   // GNOME Meta: first PW frames are wallpaper — keep spinner until Chrome + EIS ready.
   if (using_mutter_virtual_ && !gnome_live_ready_) return;
-  // Live↔Live: ignore frames until the new browser is placed.
+  // Live↔Live: freeze until place, then skip a few post-place frames (empty Virtual
+  // / first Chrome map still looks like wallpaper if we reveal on frame 1).
   if (switch_hold_content_) {
     if (!pending_switch_reveal_) return;
+    ++switch_reveal_seen_;
+    constexpr int kPostPlaceFrames = 4;
+    if (switch_reveal_seen_ < kPostPlaceFrames) return;
     switch_hold_content_ = false;
     pending_switch_reveal_ = false;
+    switch_reveal_seen_ = 0;
   }
   if (loading_.load(std::memory_order_acquire)) {
     loading_.store(false, std::memory_order_release);
@@ -521,6 +540,7 @@ bool YouTubeSession::switch_live_url(const QString& url, const QString& label) {
   if (!label.trimmed().isEmpty()) cfg_.launch_title = label.trimmed();
   switch_hold_content_ = true;
   pending_switch_reveal_ = false;
+  switch_reveal_seen_ = 0;
   if (using_mutter_virtual_) gnome_live_ready_ = false;
   loading_.store(true, std::memory_order_release);
   // Same spinner text as first-launch after Virtual is up (title only, no 「起動中」).
@@ -569,13 +589,17 @@ void YouTubeSession::start(const Config& cfg) {
   dma_logged_ = false;
   dma_disabled_ = false;
   audio_wanted_.store(false, std::memory_order_release);
+  ++audio_route_gen_;
   active_.store(false, std::memory_order_release);
   loading_.store(true, std::memory_order_release);
   {
-    const QString label = desktop_label_.isEmpty()
-                              ? (desktopAppMode() ? tr("アプリ") : tr("Live"))
-                              : desktop_label_;
-    set_busy_status(tr("%1 起動中").arg(label));
+    // Title + spinner only — no 「起動中」 / no percent.
+    const QString title = !cfg_.launch_title.isEmpty()
+                              ? cfg_.launch_title
+                              : (desktopAppMode()
+                                     ? (desktop_label_.isEmpty() ? tr("アプリ") : desktop_label_)
+                                     : QStringLiteral("YouTube"));
+    set_busy_status(title);
   }
 
   // Clients first — never Session.Stop / PW-stop Meta while Chrome still maps
@@ -615,6 +639,8 @@ void YouTubeSession::start(const Config& cfg) {
   gnome_node_id_ = 0;
   gnome_mapping_id_.clear();
   desktop_rule_installed_ = false;
+  desktop_rule_installing_ = false;
+  desktop_place_finishing_ = false;
   desktop_wmclass_.clear();
 
   desk_ = detect_desktop_env();
@@ -625,6 +651,17 @@ void YouTubeSession::start(const Config& cfg) {
   gnome_capture_only_ = false;
   gnome_live_ready_ = false;
   ++gnome_evacuate_gen_;
+
+  // Sink ∥ Virtual: create monaSphereYt while krfb/Meta comes up (join before guest).
+  std::future<std::string> sink_fut;
+#if defined(VRP_HAS_PULSE)
+  if (cfg_.enable_audio) {
+    sink_fut = std::async(std::launch::async, [] { return PulseMonitor::ensure_yt_null_sink(); });
+  } else {
+    std::thread([] { (void)PulseMonitor::restore_browser_routing(); }).detach();
+  }
+#endif
+
   if (cfg_.virtual_display) {
     if (desk_ == DesktopEnv::Gnome) {
       // GNOME Meta-* via VirtualDisplayManager (same ensure → title spinner as KDE).
@@ -731,33 +768,31 @@ void YouTubeSession::start(const Config& cfg) {
     place_h_ = cfg_.virtual_h > 0 ? cfg_.virtual_h : (geo.height() > 0 ? geo.height() : 720);
   }
 
-  if (!cfg_.enable_audio) {
 #if defined(VRP_HAS_PULSE)
-    // Scrub orphan monaSphereYt so Plasma does not keep a filter sink around.
-    std::thread([] { (void)PulseMonitor::restore_browser_routing(); }).detach();
-#endif
-  } else {
-#if defined(VRP_HAS_PULSE)
-    // Sink before guest so PULSE_SINK / PIPEWIRE_NODE can bind at process start.
-    const std::string mon = PulseMonitor::ensure_yt_null_sink();
+  if (sink_fut.valid()) {
+    const std::string mon = sink_fut.get();
     if (mon.empty()) {
       emit logMessage(tr("Live audio: could not create monaSphereYt — system sink only"));
     } else {
       emit logMessage(tr("Live audio: monaSphereYt ready before guest (%1)")
                           .arg(QString::fromStdString(mon)));
     }
+  }
 #endif
-  }
-  // XTest must use Xrandr/X11 geometry (not kscreen logical) when scale≠1.
-  if (!x11_.bind_output_by_name(output_name_.toStdString(), place_w_, place_h_)) {
-    x11_.set_screen_rect(place_x_, place_y_, place_w_, place_h_);
-  }
+
+  auto bind_x11_output = [this] {
+    // XTest must use Xrandr/X11 geometry (not kscreen logical) when scale≠1.
+    if (!x11_.bind_output_by_name(output_name_.toStdString(), place_w_, place_h_)) {
+      x11_.set_screen_rect(place_x_, place_y_, place_w_, place_h_);
+    }
+  };
 
   if (desktopAppMode()) {
     if (desk_ != DesktopEnv::Kde) {
       fail(tr("Desktop apps ([アプリ]) require KDE Plasma for window placement"));
       return;
     }
+    bind_x11_output();
     emit logMessage(tr("Desktop app -> %1 (%2×%3): %4")
                         .arg(output_name_)
                         .arg(place_w_)
@@ -778,6 +813,7 @@ void YouTubeSession::start(const Config& cfg) {
   chrome_->set_force_x11(desk_ == DesktopEnv::Gnome);
   configureLiveBrowserLaunch();
   if (desk_ == DesktopEnv::Gnome) {
+    bind_x11_output();
     chrome_->set_window_position(place_x_, place_y_);
     emit logMessage(tr("Live browser -> %1 (%2×%3) @%4,%5 (GNOME / X11 place)")
                         .arg(output_name_)
@@ -787,11 +823,14 @@ void YouTubeSession::start(const Config& cfg) {
                         .arg(place_y_));
     beginPlaceGnome();
   } else {
+    // KDE: arm+Chrome (+ portal prefetch) before X11 bind — bind is only for
+    // later EIS/XTest and can overlap Chrome cold-start.
     emit logMessage(tr("Live browser -> %1 (%2×%3) via KWin")
                         .arg(output_name_)
                         .arg(place_w_)
                         .arg(place_h_));
     beginPlace();
+    bind_x11_output();
   }
 #endif
 }
@@ -858,6 +897,7 @@ void YouTubeSession::stop_capture_from_xr() {
   // XR already reset DMA textures. Stop PipeWire before FDs/buffers are revoked underfoot.
   place_timer_.stop();
   ++portal_gen_;
+  ++audio_route_gen_;
   loading_.store(false, std::memory_order_release);
   active_.store(false, std::memory_order_release);
   audio_wanted_.store(false, std::memory_order_release);
@@ -888,6 +928,7 @@ void YouTubeSession::stop() {
   }
   place_timer_.stop();
   ++portal_gen_;
+  ++audio_route_gen_;
   setState(State::Stopping);
   loading_.store(false, std::memory_order_release);
   active_.store(false, std::memory_order_release);
@@ -1025,16 +1066,30 @@ void YouTubeSession::beginPlace() {
     w->activateWindow();
   }
 
+  place_tries_ = 0;
+  // ok: from KWin windowAdded wakes poll immediately; timer is fallback only.
+  KwinWindowPlacer::set_armed_ok_callback([this] {
+    QMetaObject::invokeMethod(
+        this,
+        [this] {
+          if (state_ != State::Placing) return;
+          place_timer_.stop();
+          pollPlace();
+        },
+        Qt::QueuedConnection);
+  });
   if (!chrome_->start()) {
     KwinWindowPlacer::disarm_place_on_open();
     fail(tr("Could not start Chromium/Chrome for live capture"));
     return;
   }
-  place_tries_ = 0;
-  // Faster first poll than legacy 400ms — KWin arm is already sticky; this only
-  // backs the X11/xid path. GNOME Meta path is quicker partly because it skips
-  // wait_ready/kscreen + this place-before-portal sequencing.
-  place_timer_.start(200);
+  kickEarlyYtAudioRoute();
+  // Cold start only. Prefetch CreateSession during Live↔Live tears down the
+  // live PipeWire stream (new portal session → remove_buffer → frozen HMD).
+  if (!active_.load(std::memory_order_acquire) && !switch_hold_content_) {
+    prefetchPortalRestore();
+  }
+  place_timer_.start(80);
 }
 
 void YouTubeSession::beginPlaceGnome() {
@@ -1048,6 +1103,7 @@ void YouTubeSession::beginPlaceGnome() {
     fail(tr("Could not start Chromium/Chrome for live capture"));
     return;
   }
+  kickEarlyYtAudioRoute();
   place_tries_ = 0;
   place_timer_.start(400);
 }
@@ -1063,6 +1119,8 @@ void YouTubeSession::beginPlaceDesktopApp() {
 
   desktop_want_names_.clear();
   desktop_rule_installed_ = false;
+  desktop_rule_installing_ = false;
+  desktop_place_finishing_ = false;
   desktop_wmclass_.clear();
   {
     const QFileInfo fi(cfg_.exec);
@@ -1090,6 +1148,18 @@ void YouTubeSession::beginPlaceDesktopApp() {
   if (QWidget* w = qobject_cast<QWidget*>(QObject::parent())) {
     w->activateWindow();
   }
+
+  place_tries_ = 0;
+  KwinWindowPlacer::set_armed_ok_callback([this] {
+    QMetaObject::invokeMethod(
+        this,
+        [this] {
+          if (state_ != State::Placing) return;
+          place_timer_.stop();
+          pollPlace();
+        },
+        Qt::QueuedConnection);
+  });
 
   {
     QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
@@ -1141,13 +1211,17 @@ void YouTubeSession::beginPlaceDesktopApp() {
   }
   emit logMessage(tr("Desktop app started (pid %1)")
                       .arg(desktop_app_->processId()));
-
-  place_tries_ = 0;
-  place_timer_.start(200);
+  kickEarlyYtAudioRoute();
+  place_timer_.start(80);
 }
 
 void YouTubeSession::pollPlaceDesktopApp() {
   if (state_ != State::Placing) return;
+  // Nested KWin script wait must not re-enter (coredump via QEventLoop recursion).
+  if (KwinWindowPlacer::in_script_wait() || desktop_place_finishing_) {
+    if (!desktop_place_finishing_) place_timer_.start(80);
+    return;
+  }
 
   QString wid;
   QString err;
@@ -1159,7 +1233,10 @@ void YouTubeSession::pollPlaceDesktopApp() {
   }
 
   if (!kwin_window_id_.isEmpty()) {
-    // Window seen → one shove + post-map Rule → portal (no fixed extra ticks).
+    // Window seen → one shove + post-map Rule → portal (exactly once).
+    desktop_place_finishing_ = true;
+    place_timer_.stop();
+    KwinWindowPlacer::clear_armed_ok_callback();
     {
       const qint64 root_pid = desktop_app_ ? desktop_app_->processId() : 0;
       const QList<qint64> pids = KwinWindowPlacer::pid_tree(root_pid);
@@ -1206,20 +1283,18 @@ void YouTubeSession::pollPlaceDesktopApp() {
     }
   }
 
-  if (place_tries_ < 40) {
-    if (place_tries_ == 1 || place_tries_ % 10 == 0) {
-      emit logMessage(tr("KWin: waiting for desktop app on %1…").arg(output_name_));
-    }
-    place_timer_.start(200);
-    return;
+  // Keep monitoring while the process is alive — slow map must not abort Live.
+  if (place_tries_ == 1 || place_tries_ % 10 == 0) {
+    emit logMessage(tr("KWin: waiting for desktop app on %1…").arg(output_name_));
   }
-
-  KwinWindowPlacer::disarm_place_on_open();
-  fail(tr("KWin place failed — desktop app was not moved to %1 (ScreenCast not started)")
-           .arg(output_name_));
+  place_timer_.start(150);
 }
 
 void YouTubeSession::pollPlace() {
+  if (KwinWindowPlacer::in_script_wait()) {
+    place_timer_.start(80);
+    return;
+  }
   // GNOME deferred browser: capture is already Streaming while place still runs.
   if (desk_ == DesktopEnv::Gnome && !desktopAppMode()) {
     pollPlaceGnome();
@@ -1266,17 +1341,18 @@ void YouTubeSession::pollPlace() {
     }
   }
 
-  if (place_tries_ < 30) {
-    if (place_tries_ == 1 || place_tries_ % 5 == 0) {
-      emit logMessage(tr("KWin: waiting for live browser on %1…").arg(output_name_));
-    }
-    place_timer_.start(350);
+  // Chrome still starting / mapping — keep polling. Only fail if the process died
+  // (checked below). Fixed try caps used to abort slow environments mid-start.
+  if (chrome_ && !chrome_->running() && place_tries_ >= 8) {
+    KwinWindowPlacer::disarm_place_on_open();
+    fail(tr("KWin place failed — browser exited before it reached %1").arg(output_name_));
     return;
   }
-
-  KwinWindowPlacer::disarm_place_on_open();
-  fail(tr("KWin place failed — browser was not moved to %1 (ScreenCast not started)")
-           .arg(output_name_));
+  if (place_tries_ == 1 || place_tries_ % 8 == 0) {
+    emit logMessage(tr("KWin: waiting for live browser on %1…").arg(output_name_));
+  }
+  // Fallback poll only — primary path is armed ok: callback → pollPlace.
+  place_timer_.start(150);
 }
 
 void YouTubeSession::pollPlaceGnome() {
@@ -1403,36 +1479,24 @@ void YouTubeSession::pollPlaceGnome() {
   }
 
   ++place_tries_;
-  if (place_tries_ < 60) {
-    if (place_tries_ == 1 || place_tries_ % 5 == 0) {
-      VRP_LOG("GNOME: waiting for live browser… (try %d pid=%lld)", place_tries_,
-              static_cast<long long>(chrome_ ? chrome_->process_id() : 0));
-      emit logMessage(tr("GNOME: waiting for live browser…"));
-    }
-    // Chrome still alive? If the wrapper died, stream continues without place.
-    if (chrome_ && !chrome_->running() && place_tries_ >= 8) {
-      VRP_LOG("GNOME: Chrome process exited before window bind");
-      emit logMessage(tr("GNOME: Chrome exited before a window appeared"));
-      if (active_.load(std::memory_order_acquire)) {
-        setState(State::Streaming);
-        mark_gnome_live_ready();
-        return;
-      }
-      fail(tr("GNOME place failed — Chrome exited before window appeared"));
+  if (place_tries_ == 1 || place_tries_ % 5 == 0) {
+    VRP_LOG("GNOME: waiting for live browser… (try %d pid=%lld)", place_tries_,
+            static_cast<long long>(chrome_ ? chrome_->process_id() : 0));
+    emit logMessage(tr("GNOME: waiting for live browser…"));
+  }
+  // Keep monitoring while Chrome is alive. Fixed try caps used to fail slow maps.
+  if (chrome_ && !chrome_->running() && place_tries_ >= 8) {
+    VRP_LOG("GNOME: Chrome process exited before window bind");
+    emit logMessage(tr("GNOME: Chrome exited before a window appeared"));
+    if (active_.load(std::memory_order_acquire)) {
+      setState(State::Streaming);
+      mark_gnome_live_ready();
       return;
     }
-    place_timer_.start(350);
+    fail(tr("GNOME place failed — Chrome exited before window appeared"));
     return;
   }
-  if (active_.load(std::memory_order_acquire)) {
-    VRP_LOG("GNOME place: browser window not found — stream continues");
-    emit logMessage(tr("GNOME place: browser window not found yet — stream continues"));
-    setState(State::Streaming);
-    // Avoid infinite spinner if place timed out while capture is live.
-    mark_gnome_live_ready();
-    return;
-  }
-  fail(tr("GNOME place failed — browser window not found (ScreenCast not started)"));
+  place_timer_.start(350);
 }
 
 void YouTubeSession::onPlaced() {
@@ -1492,26 +1556,26 @@ void YouTubeSession::onPlaced() {
   // In-place switch may have cleared x11_; re-attach EIS before cursor/activate.
   if (EisPointer* eis = activeEis()) x11_.set_eis_inject(eis);
   x11_.set_cursor(place_w_ * 0.5f, place_h_ * 0.5f);
-  if (desk_ == DesktopEnv::Kde) {
+
+  auto activate_kde = [this] {
+    if (desk_ != DesktopEnv::Kde) return;
     QString act_err;
     const bool force_fs = cfg_.browser != LiveBrowser::Firefox;
     if (KwinWindowPlacer::activate_youtube_window(kwin_window_id_, &act_err, force_fs)) {
       emit logMessage(tr("KWin: activated live browser for pointer input"));
     }
-  }
+  };
 
   // Capture already streaming (GNOME Meta first place, or Live↔Live Chrome switch).
   if (active_.load(std::memory_order_acquire)) {
+    activate_kde();
     setState(State::Streaming);
     if (switch_hold_content_) {
-      // Reveal on next usable frame (no fixed settle sleep).
+      // Resume PW import; hold clears after a few post-place frames (not wallpaper).
       pending_switch_reveal_ = true;
-      if (using_mutter_virtual_) {
-        gnome_live_ready_ = true;
-        emit logMessage(tr("Live: Chrome placed — waiting for frame to reveal"));
-      } else {
-        emit logMessage(tr("Live: Chrome placed — waiting for frame to reveal"));
-      }
+      switch_reveal_seen_ = 0;
+      if (using_mutter_virtual_) gnome_live_ready_ = true;
+      emit logMessage(tr("Live: Chrome placed — waiting for frames to reveal"));
       return;
     }
     if (using_mutter_virtual_) {
@@ -1522,8 +1586,56 @@ void YouTubeSession::onPlaced() {
     }
     return;
   }
-  // KDE / GNOME spare MONITOR: Virtual ready — start ScreenCast now.
+  // KDE: ScreenCast first (window already on Virtual). Activate after so a
+  // blocking KWin one-shot cannot delay portal Start.
   beginPortal(false);
+  if (desk_ == DesktopEnv::Kde) {
+    QTimer::singleShot(0, this, [activate_kde] { activate_kde(); });
+  }
+}
+
+QString YouTubeSession::portalParentWindow() const {
+  QWidget* host = qobject_cast<QWidget*>(QObject::parent());
+  if (!host) return {};
+  host->winId();
+  const QString plat = QGuiApplication::platformName();
+  if (plat == QLatin1String("xcb")) {
+    return QStringLiteral("x11:") + QString::number(static_cast<qulonglong>(host->winId()));
+  }
+  if (plat.contains(QLatin1String("wayland"))) {
+    return QStringLiteral("wayland:") + QString::number(static_cast<qulonglong>(host->winId()));
+  }
+  return {};
+}
+
+void YouTubeSession::kickEarlyYtAudioRoute() {
+#if !defined(VRP_HAS_PULSE)
+  return;
+#else
+  if (!cfg_.enable_audio) return;
+  const int gen = ++audio_route_gen_;
+  std::thread([this, gen] {
+    for (int i = 0; i < 60; ++i) {
+      if (audio_route_gen_.load(std::memory_order_acquire) != gen) return;
+      if (state_ == State::Idle || state_ == State::Failed || state_ == State::Stopping) return;
+      (void)PulseMonitor::route_browser_to_yt_sink();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }).detach();
+#endif
+}
+
+void YouTubeSession::prefetchPortalRestore() {
+  if (!portal_ || desk_ != DesktopEnv::Kde || desktopAppMode()) return;
+  if (restore_token_.isEmpty()) return;
+  if (portal_->busy()) return;
+  // Streaming / switch must keep the existing ScreenCast node.
+  if (active_.load(std::memory_order_acquire) || switch_hold_content_) return;
+  const QString parent = portalParentWindow();
+  emit logMessage(tr("ScreenCast: prefetch CreateSession while Chrome starts…"));
+  portal_->prepare(parent, restore_token_, /*persist_mode*/ 2,
+                   ScreencastPortal::SourceKind::Monitor,
+                   ScreencastPortal::SessionMode::VideoOnly);
 }
 
 void YouTubeSession::beginPortal(bool after_reject) {
@@ -1532,6 +1644,15 @@ void YouTubeSession::beginPortal(bool after_reject) {
 
   // Snapshot host seat before ScreenCast / Virtual pointer steal it.
   rememberSeatCursor();
+
+  // Prefetch during Chrome launch: only Start remains (place-before-Start kept).
+  if (portal_ && (portal_->preparing() || portal_->prepare_ready()) &&
+      desk_ == DesktopEnv::Kde && !restore_token_.isEmpty()) {
+    emit logMessage(tr("ScreenCast: finishing prefetched restore (Start)…"));
+    portal_->finishStart();
+    armPortalWatchdog(!restore_token_.isEmpty() && !after_reject);
+    return;
+  }
 
   const bool interactive = restore_token_.isEmpty();
   if (interactive) {
@@ -1632,26 +1753,49 @@ void YouTubeSession::beginPortal(bool after_reject) {
 
 void YouTubeSession::armPortalWatchdog(bool had_token) {
   const int gen = ++portal_gen_;
-  // Interactive: picker should appear within a few seconds after Start.
-  // Keep shorter than before so a missed Request Response cannot leave Chrome up.
-  const int wait_ms = had_token ? 12000 : 25000;
-  QTimer::singleShot(wait_ms, this, [this, gen, had_token] {
+  // Poll portal progress instead of a single short deadline. Busy → keep waiting
+  // (slow portals just take longer). Fail only when idle with no stream, or after
+  // a long absolute safety ceiling while still busy.
+  const auto started = std::chrono::steady_clock::now();
+  constexpr int kTickMs = 2000;
+  constexpr int kBusySafetyMs = 180000;  // still negotiating
+  constexpr int kIdleGraceMs = 20000;    // finished but no stream callback
+  constexpr int kRestoreStuckMs = 45000; // restore hung → fall back to picker
+
+  auto idle_since = std::make_shared<std::optional<std::chrono::steady_clock::time_point>>();
+  auto tick = std::make_shared<std::function<void()>>();
+  *tick = [this, gen, had_token, started, tick, idle_since]() {
     if (gen != portal_gen_) return;
     if (active_.load() || state_ != State::Portal) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto elapsed_ms = static_cast<int>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count());
     const bool mutter_busy = vdisp_mgr_ && vdisp_mgr_->mutter() && vdisp_mgr_->mutter()->busy();
     const bool portal_busy = portal_ && portal_->busy();
+
     if (!portal_busy && !mutter_busy) {
+      // Portal finished without starting — grace from becoming idle (not from Start).
+      if (!idle_since->has_value()) *idle_since = now;
+      const auto idle_ms = static_cast<int>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - **idle_since).count());
+      if (idle_ms < kIdleGraceMs) {
+        QTimer::singleShot(kTickMs, this, [tick] { (*tick)(); });
+        return;
+      }
       if (loading_.load() && !active_.load()) {
         fail(tr("ScreenCast: no stream after wait"));
       }
       return;
     }
-    if (mutter_busy) {
+    idle_since->reset();
+
+    if (mutter_busy && elapsed_ms >= kBusySafetyMs) {
       if (vdisp_mgr_) vdisp_mgr_->destroy();
       fail(tr("Mutter virtual MONITOR timed out"));
       return;
     }
-    if (had_token && !portal_retry_used_) {
+
+    if (had_token && !portal_retry_used_ && portal_busy && elapsed_ms >= kRestoreStuckMs) {
       portal_->stop();
       portal_retry_used_ = true;
       ++portal_restore_retries_;
@@ -1673,9 +1817,19 @@ void YouTubeSession::armPortalWatchdog(bool had_token) {
       });
       return;
     }
-    portal_->stop();
-    fail(tr("ScreenCast timed out — approve on the host desktop"));
-  });
+
+    if (portal_busy && elapsed_ms >= kBusySafetyMs) {
+      portal_->stop();
+      fail(tr("ScreenCast timed out — approve on the host desktop"));
+      return;
+    }
+
+    if (elapsed_ms >= 10000 && ((elapsed_ms / 10000) != ((elapsed_ms - kTickMs) / 10000))) {
+      emit logMessage(tr("ScreenCast: still waiting… (%1s)").arg(elapsed_ms / 1000));
+    }
+    QTimer::singleShot(kTickMs, this, [tick] { (*tick)(); });
+  };
+  QTimer::singleShot(kTickMs, this, [tick] { (*tick)(); });
 }
 
 void YouTubeSession::launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h) {

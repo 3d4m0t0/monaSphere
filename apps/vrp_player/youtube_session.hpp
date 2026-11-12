@@ -59,9 +59,9 @@ class YouTubeSession : public QObject {
      */
     QString exec;
     QStringList exec_args;
-    /** Display name for the 「起動中」 line (app or title). */
+    /** Display name under the spinner (app or title). */
     QString desktop_label;
-    /** Shown under the spinner once Virtual setup reaches 100%. No percent. */
+    /** Shown under the spinner (e.g. YouTube). No percent. */
     QString launch_title;
     /**
      * Legacy PadFilter uinput node. Prefer pad_hook_sock + LD_PRELOAD (no uinput).
@@ -138,11 +138,11 @@ class YouTubeSession : public QObject {
   bool audio_wanted() const { return audio_wanted_.load(std::memory_order_acquire); }
   void clear_audio_wanted() { audio_wanted_.store(false, std::memory_order_release); }
 
-  /** Short status under Flat spinner (「Live 起動中」→「YouTube」など). Empty = no overlay. */
+  /** Short status under Flat spinner (e.g. 「YouTube」). Empty = no overlay. */
   void set_busy_status(const QString& status);
   void clear_busy_status();
   QString busy_status() const;
-  /** -1 hides the readout. 0–100 is drawn in the same centered line as the status. */
+  /** Progress % is unused (spinner + title only). Kept for call-site compatibility. */
   void set_busy_progress(int percent);
   int busy_progress() const;
   bool show_busy_overlay() const {
@@ -157,8 +157,19 @@ class YouTubeSession : public QObject {
     if (using_mutter_virtual_) return gnome_live_ready_;
     return true;
   }
-  /** Live↔Live Chrome relaunch — keep importing DMA so reveal can clear busy. */
+  /** Live↔Live Chrome relaunch — hold last HMD frame until reveal. */
   bool switching_live() const { return switch_hold_content_; }
+  /**
+   * True while the old browser is gone and the new one is not placed yet.
+   * XR must not import PW frames (Virtual wallpaper) — freeze the last picture.
+   */
+  bool switch_freeze_frames() const {
+    return switch_hold_content_ && !pending_switch_reveal_;
+  }
+  /** Chrome placed — resume import; hold clears after a few post-place frames. */
+  bool switch_reveal_armed() const {
+    return switch_hold_content_ && pending_switch_reveal_;
+  }
   QString desktop_label() const { return desktop_label_; }
 
   QString output_name() const { return output_name_; }
@@ -232,6 +243,15 @@ class YouTubeSession : public QObject {
   void onPortalStarted(const ScreencastPortal::Result& r);
   void onPortalFailed(const QString& e);
   void armPortalWatchdog(bool had_token);
+  /** Wayland/X11 parent handle string for xdg-desktop-portal. */
+  QString portalParentWindow() const;
+  /** KDE restore: CreateSession+SelectSources while Chrome is cold-starting. */
+  void prefetchPortalRestore();
+  /**
+   * Mute+move guest audio onto monaSphereYt before Soft starts (shared Chrome
+   * ignores PULSE_SINK and can blast the HMD for ~1s otherwise).
+   */
+  void kickEarlyYtAudioRoute();
   /** Apply cfg_ → chrome_ window/scale/profile (shared by KDE/GNOME launch). */
   void configureLiveBrowserLaunch();
   /** Close Live browser window / launcher state without tearing down capture. */
@@ -263,6 +283,9 @@ class YouTubeSession : public QObject {
   /** True while we are intentionally stopping the desktop app (avoid re-entrant stop). */
   bool desktop_app_stopping_ = false;
   bool desktop_rule_installed_ = false;
+  bool desktop_rule_installing_ = false;
+  /** One-shot latch: desktop window found → rule/portal (no re-entrant poll). */
+  bool desktop_place_finishing_ = false;
   QString desktop_wmclass_;
   /** resourceClass/Name substrings for KWin place (e.g. retroarch). */
   QStringList desktop_want_names_;
@@ -334,8 +357,10 @@ class YouTubeSession : public QObject {
    * the new browser is placed and a frame arrives.
    */
   bool switch_hold_content_ = false;
-  /** After place during switch — next mark_frame_presented may reveal. */
+  /** After place during switch — mark_frame_presented may start counting reveal frames. */
   bool pending_switch_reveal_ = false;
+  /** Post-place PW frames seen while still holding (skip wallpaper still in flight). */
+  int switch_reveal_seen_ = 0;
   QTimer place_timer_;
   /** Desktop [アプリ]: keep new windows on Virtual after content start. */
   QTimer desk_maintain_timer_;
@@ -346,6 +371,8 @@ class YouTubeSession : public QObject {
   QTimer meta_paint_timer_;
   /** Set from XR when drop_pp hold stretches — consumed by meta_paint_timer_. */
   std::atomic<bool> meta_paint_kick_{false};
+  /** Bumped on stop/start so early yt-route workers exit. */
+  std::atomic<int> audio_route_gen_{0};
 };
 
 }  // namespace vrp
