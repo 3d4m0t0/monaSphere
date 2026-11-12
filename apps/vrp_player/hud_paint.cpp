@@ -1158,13 +1158,8 @@ QImage paint_live_busy_panel(int width, int height, const QString& status, int p
   p.setFont(font);
   p.setPen(QColor(230, 240, 255, 240));
   const QRect tr(0, kOy + kSpin + 2, w, 40);
-  QString line = status;
-  if (percent >= 0) {
-    line += QStringLiteral("  ");
-    line += QString::number(std::clamp(percent, 0, 100));
-    line += QLatin1Char('%');
-  }
-  p.drawText(tr, Qt::AlignHCenter | Qt::AlignTop, line);
+  (void)percent;  // Progress % removed — title + spinner only.
+  p.drawText(tr, Qt::AlignHCenter | Qt::AlignTop, status);
   return img;
 }
 
