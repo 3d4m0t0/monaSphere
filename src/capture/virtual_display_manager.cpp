@@ -676,7 +676,7 @@ void VirtualDisplayManager::destroy() {
   if (gnome_meta_alive_ || backend_ == Backend::GnomeMutter) {
     begin_progress();
     emit busyStatus(tr("Virtual 削除中"));
-    VRP_LOG("Virtual: destroy Meta (Mutter Session.Stop)");
+    VRP_TEARDOWN_LOG("Live teardown: Virtual destroy BEGIN — Meta (Mutter Session.Stop)");
     emit logMessage(tr("Virtual: destroy Meta-* (tokens N/A)"));
     add_progress(40);
     stopGnomeMetaUnlocked();
@@ -685,6 +685,7 @@ void VirtualDisplayManager::destroy() {
     QThread::msleep(600);
     add_progress(10);
     emit busyStatus(QString());
+    VRP_TEARDOWN_LOG("Live teardown: Virtual destroy END — Meta");
     return;
   }
 
@@ -703,12 +704,13 @@ void VirtualDisplayManager::destroy() {
     // Still scrub leftover rules from a prior aborted session.
     KwinWindowPlacer::clear_live_session_rules();
     emit busyStatus(QString());
+    VRP_TEARDOWN_LOG("Live teardown: Virtual destroy — already gone (rules scrubbed)");
     return;
   }
   // Delete: rules 20, stop 25, orphans 15, output gone 30, settle 10.
   begin_progress();
   emit busyStatus(tr("Virtual 削除中"));
-  VRP_LOG("Virtual: destroy (tokens kept)");
+  VRP_TEARDOWN_LOG("Live teardown: Virtual destroy BEGIN — KDE krfb (tokens kept)");
   emit logMessage(tr("Virtual: destroy (tokens kept)"));
   KwinWindowPlacer::clear_live_session_rules();
   add_progress(20);
@@ -722,8 +724,10 @@ void VirtualDisplayManager::destroy() {
   backend_ = Backend::None;
   if (wait_gone(8000, 30)) {
     emit logMessage(tr("Virtual: removed"));
+    VRP_TEARDOWN_LOG("Live teardown: Virtual destroy END — removed");
   } else {
     emit logMessage(tr("Virtual: still listed after destroy — continuing"));
+    VRP_TEARDOWN_LOG("Live teardown: Virtual destroy END — still listed, continuing");
   }
   // Confirm gone stays gone (no fixed plasmashell settle sleep).
   {

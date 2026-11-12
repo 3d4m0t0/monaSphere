@@ -351,15 +351,19 @@ void YouTubeSession::cleanupStreaming() {
   // GNOME RecordVirtual: Meta-* must not be torn down while ANY monasphere
   // client still references it (Chrome Wayland/X11, Meta paint window, seat).
   // Order: clients → cursor off Meta → settle → PW consumer → Session.Stop.
-  // VRP_TEARDOWN_LOG writes ~/.config/monasphere/live-teardown.log + /tmp/…
-  // so breadcrumbs survive a shell logout mid-teardown.
+  // VRP_TEARDOWN_LOG (live_teardown_log=1) matches the GNOME breadcrumb form:
+  //   Live teardown BEGIN — … / Live teardown: step… / Live teardown END
   const bool gnome_meta = (desk_ == DesktopEnv::Gnome && cfg_.virtual_display);
+  const char* desk_tag = desktop_env_name(desk_);
+  VRP_TEARDOWN_LOG(
+      "Live teardown BEGIN — desk=%s mutter=%d chrome=%d desk_app=%d pid=%lld x11_win=%d "
+      "eis=%d virtual=%s",
+      desk_tag, using_mutter_virtual_ ? 1 : 0, (chrome_ && chrome_->running()) ? 1 : 0,
+      desktopAppMode() ? 1 : 0, static_cast<long long>(chrome_ ? chrome_->process_id() : 0),
+      x11_.have_window() ? 1 : 0,
+      ((portal_eis_ && portal_eis_->ready()) || (kde_eis_ && kde_eis_->ready())) ? 1 : 0,
+      output_name_.isEmpty() ? "-" : output_name_.toUtf8().constData());
   if (gnome_meta) {
-    VRP_TEARDOWN_LOG(
-        "GNOME teardown BEGIN — mutter=%d chrome_running=%d pid=%lld x11_win=%d eis=%d",
-        using_mutter_virtual_ ? 1 : 0, (chrome_ && chrome_->running()) ? 1 : 0,
-        static_cast<long long>(chrome_ ? chrome_->process_id() : 0), x11_.have_window() ? 1 : 0,
-        (portal_eis_ && portal_eis_->ready()) ? 1 : 0);
     emit logMessage(tr("GNOME: closing Live clients before Meta teardown"));
   }
 
@@ -371,7 +375,7 @@ void YouTubeSession::cleanupStreaming() {
       (void)x11_.request_fullscreen(false);
       (void)x11_.prepare_window(std::max(320, g.width() / 2), std::max(240, g.height() / 2),
                                 /*hide_host=*/false, /*move=*/true);
-      VRP_TEARDOWN_LOG("GNOME teardown: moved X11 live window off Meta → primary");
+      VRP_TEARDOWN_LOG("Live teardown: moved X11 live window off Meta → primary");
       emit logMessage(tr("GNOME: moved live window off virtual before teardown"));
     }
   }
@@ -399,9 +403,7 @@ void YouTubeSession::cleanupStreaming() {
     // Meta paint nudge window sits on Meta-* — destroy before Session.Stop.
     x11_.destroy_damage_window();
     x11_.clear();
-    if (gnome_meta) {
-      VRP_TEARDOWN_LOG("GNOME teardown: window close done closed=%d damage cleared", closed ? 1 : 0);
-    }
+    VRP_TEARDOWN_LOG("Live teardown: window close done closed=%d damage cleared", closed ? 1 : 0);
     emit logMessage(closed ? tr("Live window closed")
                            : tr("Live window close: %1")
                                  .arg(err.isEmpty() ? tr("not found") : err));
@@ -411,15 +413,19 @@ void YouTubeSession::cleanupStreaming() {
 
   // 3) Kill browser / desktop-app processes (isolated profile + zygotes).
   if (desktopAppMode()) {
+    VRP_TEARDOWN_LOG("Live teardown: stop desktop app…");
     stopDesktopAppProcess();
+    VRP_TEARDOWN_LOG("Live teardown: desktop app stopped");
   } else if (chrome_) {
+    VRP_TEARDOWN_LOG("Live teardown: stop browser…");
     chrome_->stop();
+    VRP_TEARDOWN_LOG("Live teardown: browser stopped");
   }
   if (gnome_meta) {
     // Belt-and-suspenders: even if launcher thought profile was shared / already
     // dead, scrub monasphere chromium-yt / firefox-yt off Meta-*.
     ChromiumYtLauncher::killIsolatedLiveBrowsers(cfg_.browser);
-    VRP_TEARDOWN_LOG("GNOME teardown: isolated Live browsers stopped (Meta clients clear)");
+    VRP_TEARDOWN_LOG("Live teardown: isolated Live browsers scrubbed (Meta clients clear)");
   }
 
   // 4) Seat + portal dialogs off Meta, then settle so Mutter drops surfaces.
@@ -435,46 +441,51 @@ void YouTubeSession::cleanupStreaming() {
                                   static_cast<double>(center.y()));
       }
     }
-    VRP_TEARDOWN_LOG("GNOME teardown: seat off Meta — settle 1500ms before Session.Stop");
+    VRP_TEARDOWN_LOG("Live teardown: seat off Meta — settle 1500ms before Session.Stop");
     QEventLoop loop;
     QTimer::singleShot(1500, &loop, &QEventLoop::quit);
     loop.exec();
   }
 
   // 5) Drop EIS, then PW consumer, then RecordVirtual / portal Session.Stop
-  //    (this is what removes Meta-*).
-  VRP_TEARDOWN_LOG("GNOME teardown: stopEis…");
+  //    (GNOME: this is what removes Meta-*; KDE Virtual stays for Host destroy).
+  VRP_TEARDOWN_LOG("Live teardown: stopEis…");
   stopEis();
+  VRP_TEARDOWN_LOG("Live teardown: stopEis done");
 #if defined(VRP_HAS_PIPEWIRE)
-  VRP_TEARDOWN_LOG("GNOME teardown: PipeWire capture stop…");
+  VRP_TEARDOWN_LOG("Live teardown: PipeWire capture stop…");
   if (capture_) capture_->stop();
-  VRP_TEARDOWN_LOG("GNOME teardown: PipeWire capture stopped");
+  VRP_TEARDOWN_LOG("Live teardown: PipeWire capture stopped");
 #endif
   if (portal_) {
-    VRP_TEARDOWN_LOG("GNOME teardown: portal Session.Stop…");
+    VRP_TEARDOWN_LOG("Live teardown: portal Session.Stop…");
     portal_->stop();
+    VRP_TEARDOWN_LOG("Live teardown: portal Session.Stop done");
   }
   if (vdisp_mgr_ && vdisp_mgr_->gnome_meta_alive()) {
-    VRP_TEARDOWN_LOG("GNOME teardown: Mutter RecordVirtual/RD Session.Stop (Meta dies here)…");
+    VRP_TEARDOWN_LOG("Live teardown: Mutter RecordVirtual/RD Session.Stop (Meta dies here)…");
     vdisp_mgr_->destroy();
-    VRP_TEARDOWN_LOG("GNOME teardown: Mutter Session.Stop returned");
+    VRP_TEARDOWN_LOG("Live teardown: Mutter Session.Stop returned");
   }
   using_mutter_virtual_ = false;
   gnome_live_ready_ = false;
   if (gnome_meta) {
-    VRP_TEARDOWN_LOG("GNOME teardown: Meta gone — post-settle 600ms");
+    VRP_TEARDOWN_LOG("Live teardown: Meta gone — post-settle 600ms");
     QEventLoop loop;
     QTimer::singleShot(600, &loop, &QEventLoop::quit);
     loop.exec();
-    VRP_TEARDOWN_LOG("GNOME teardown END (clients cleared before Meta)");
   }
 #if defined(VRP_HAS_PULSE)
   // Always scrub monaSphereYt — even when Flat live audio was never started
   // (older builds set PULSE_SINK unconditionally and left the null sink around).
   // Synchronous: stopped() unmutes only after this returns, so the leftover
   // buffer is dropped while the output is still muted.
+  VRP_TEARDOWN_LOG("Live teardown: restore browser audio routing…");
   (void)PulseMonitor::restore_browser_routing();
+  VRP_TEARDOWN_LOG("Live teardown: audio routing restored");
 #endif
+  VRP_TEARDOWN_LOG("Live teardown END — desk=%s (clients cleared%s)", desk_tag,
+                   gnome_meta ? "; Meta cleared" : "; Virtual left to Host");
 }
 
 void YouTubeSession::mark_frame_presented() {

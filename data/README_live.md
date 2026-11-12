@@ -284,7 +284,7 @@ on the next launch. Retired keys such as `volume_uncap` are commented out.
 | Conf | File | Default |
 |------|------|---------|
 | `live_display_log=1` | `~/.config/monasphere/live-display.log` (+ `/tmp/monasphere-live-display.log`) | `0` off |
-| `live_teardown_log=1` | `~/.config/monasphere/live-teardown.log` (+ `/tmp/…`) | `0` off |
+| `live_teardown_log=1` | `~/.config/monasphere/live-teardown.log` (+ `/tmp/…`) | `1` on |
 
 These are the only two durable Live breadcrumb files. Ordinary `[vrp]` stdout is unaffected.
 

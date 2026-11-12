@@ -189,10 +189,10 @@ void HostWindow::signalXrStop() {
 }
 
 bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
-  VRP_TEARDOWN_LOG("Host: shutdownXrSession BEGIN timeout=%d stop_monado=%d xr_running=%d in_frame=%d",
-                   timeout_ms, stop_monado ? 1 : 0,
-                   xr_running_.load(std::memory_order_acquire) ? 1 : 0,
-                   xr_in_frame_loop_.load(std::memory_order_acquire) ? 1 : 0);
+  VRP_TEARDOWN_LOG(
+      "Host teardown BEGIN — shutdownXr timeout=%d stop_monado=%d xr_running=%d in_frame=%d",
+      timeout_ms, stop_monado ? 1 : 0, xr_running_.load(std::memory_order_acquire) ? 1 : 0,
+      xr_in_frame_loop_.load(std::memory_order_acquire) ? 1 : 0);
   signalXrStop();
   // Do NOT kill Monado before XR teardown finishes. xrDestroySession / WaitIdle /
   // DestroyDevice need compositor IPC; stopping monado-service mid-teardown yields
@@ -208,7 +208,7 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
     if (!forced_exit && xr_in_frame_loop_.load(std::memory_order_acquire) &&
         std::chrono::steady_clock::now() >= force_exit_at) {
       forced_exit = true;
-      VRP_TEARDOWN_LOG("Host: shutdownXrSession force request_exit (WaitFrame still in loop)");
+      VRP_TEARDOWN_LOG("Host teardown: force request_exit (WaitFrame still in loop)");
       std::lock_guard<std::mutex> lock(xr_app_mu_);
       if (xr_app_) xr_app_->request_exit();
     }
@@ -219,9 +219,9 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
   bool ok = false;
   if (xr_thread_.joinable()) {
     if (!xr_running_.load()) {
-      VRP_TEARDOWN_LOG("Host: shutdownXrSession joining XR thread…");
+      VRP_TEARDOWN_LOG("Host teardown: joining XR thread…");
       xr_thread_.join();
-      VRP_TEARDOWN_LOG("Host: shutdownXrSession XR thread joined");
+      VRP_TEARDOWN_LOG("Host teardown: XR thread joined");
       ok = true;
     }
   } else {
@@ -234,22 +234,22 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
       // Past WaitFrame. Teardown is inside Vulkan/OpenXR destroy. Killing Monado
       // here is what wedges the next xrCreateVulkanInstanceKHR.
       VRP_TEARDOWN_LOG(
-          "Host: shutdownXrSession frame loop left — waiting for teardown, not stopping Monado");
+          "Host teardown: frame loop left — waiting for teardown, not stopping Monado");
       const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(8);
       while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
         QThread::msleep(40);
         QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
       }
       if (!xr_running_.load() && xr_thread_.joinable()) {
-        VRP_TEARDOWN_LOG("Host: shutdownXrSession grace join XR thread…");
+        VRP_TEARDOWN_LOG("Host teardown: grace join XR thread…");
         xr_thread_.join();
-        VRP_TEARDOWN_LOG("Host: shutdownXrSession grace join done");
+        VRP_TEARDOWN_LOG("Host teardown: grace join done");
         ok = true;
       }
     } else {
       // Still inside xrWaitFrame — kill runtime to unblock hung IPC.
       VRP_TEARDOWN_LOG(
-          "Host: shutdownXrSession XR still running after timeout — stopping Monado to unblock");
+          "Host teardown: XR still running after timeout — stopping Monado to unblock");
       stopMonadoProcess();
       const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(2);
       while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
@@ -270,7 +270,7 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
         QGuiApplication::platformName() == QLatin1String("wayland") && desk.contains("GNOME");
     if (gnome_wayland) {
       constexpr int kLeaseSettleMs = 1500;
-      VRP_TEARDOWN_LOG("Host: shutdownXrSession GNOME DRM-lease settle %dms before stopMonado",
+      VRP_TEARDOWN_LOG("Host teardown: GNOME DRM-lease settle %dms before stopMonado",
                        kLeaseSettleMs);
       const auto settle_deadline =
           std::chrono::steady_clock::now() + std::chrono::milliseconds(kLeaseSettleMs);
@@ -278,14 +278,14 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
         QThread::msleep(40);
         QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
       }
-      VRP_TEARDOWN_LOG("Host: shutdownXrSession GNOME DRM-lease settle done");
+      VRP_TEARDOWN_LOG("Host teardown: GNOME DRM-lease settle done");
     }
-    VRP_TEARDOWN_LOG("Host: shutdownXrSession stopMonadoProcess…");
+    VRP_TEARDOWN_LOG("Host teardown: stopMonadoProcess…");
     stopMonadoProcess();
-    VRP_TEARDOWN_LOG("Host: shutdownXrSession stopMonadoProcess done");
+    VRP_TEARDOWN_LOG("Host teardown: stopMonadoProcess done");
   }
 
-  VRP_TEARDOWN_LOG("Host: shutdownXrSession END ok=%d forced_exit=%d", ok ? 1 : 0,
+  VRP_TEARDOWN_LOG("Host teardown END — shutdownXr ok=%d forced_exit=%d", ok ? 1 : 0,
                    forced_exit ? 1 : 0);
   return ok;
 }
@@ -964,17 +964,17 @@ void HostWindow::stopMonadoProcess() {
   const bool gnome_wayland =
       QGuiApplication::platformName() == QLatin1String("wayland") && desk.contains("GNOME");
   monado_intentional_stop_ = true;
-  VRP_TEARDOWN_LOG("Host: stopMonadoProcess terminate (gnome_wayland=%d)", gnome_wayland ? 1 : 0);
+  VRP_TEARDOWN_LOG("Host teardown: stopMonado terminate (gnome_wayland=%d)", gnome_wayland ? 1 : 0);
   monado_->terminate();
   const int term_ms = gnome_wayland ? 4000 : 1500;
   if (!monado_->waitForFinished(term_ms)) {
     if (gnome_wayland) {
       // Leave Monado running rather than kill — next ensureMonadoReady cleans up.
-      VRP_TEARDOWN_LOG("Host: stopMonadoProcess GNOME soft-stop timeout — skip kill");
+      VRP_TEARDOWN_LOG("Host teardown: stopMonado GNOME soft-stop timeout — skip kill");
       monado_intentional_stop_ = false;
       return;
     }
-    VRP_TEARDOWN_LOG("Host: stopMonadoProcess kill after terminate timeout");
+    VRP_TEARDOWN_LOG("Host teardown: stopMonado kill after terminate timeout");
     monado_->kill();
     monado_->waitForFinished(1000);
   }
@@ -982,7 +982,7 @@ void HostWindow::stopMonadoProcess() {
   clearStaleMonadoSocket();
   psvr2_compositor_ready_ms_ = 0;
   psvr2_grab_wait_logged_ = false;
-  VRP_TEARDOWN_LOG("Host: stopMonadoProcess done");
+  VRP_TEARDOWN_LOG("Host teardown: stopMonado done");
 }
 
 void HostWindow::stopSystemdMonadoForOwnedStart() {
@@ -1716,9 +1716,9 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("live_cursor_scale"), QStringLiteral("1")},
       {QStringLiteral("live_chrome_profile"), QStringLiteral("default")},
       // Persist breadcrumbs under ~/.config/monasphere/ (also /tmp/monasphere-*).
-      // 0=off (default). 1=append live-display.log / live-teardown.log.
+      // live_display_log: 0=off (default). live_teardown_log: 1=on (default).
       {QStringLiteral("live_display_log"), QStringLiteral("0")},
-      {QStringLiteral("live_teardown_log"), QStringLiteral("0")},
+      {QStringLiteral("live_teardown_log"), QStringLiteral("1")},
   };
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   migrateYoutubeConfKeysToLive();
@@ -2338,12 +2338,12 @@ vrp::VirtualDisplayManager::Spec HostWindow::virtualSpecForSpan(int span) const 
 
 void HostWindow::destroyVirtualForLeaveLive() {
   if (!vdisp_mgr_) {
-    VRP_TEARDOWN_LOG("Host: destroyVirtualForLeaveLive skip (no mgr)");
+    VRP_TEARDOWN_LOG("Host teardown: destroyVirtual skip (no mgr)");
     return;
   }
-  VRP_TEARDOWN_LOG("Host: destroyVirtualForLeaveLive BEGIN");
+  VRP_TEARDOWN_LOG("Host teardown: destroyVirtual BEGIN");
   vdisp_mgr_->destroy();
-  VRP_TEARDOWN_LOG("Host: destroyVirtualForLeaveLive END");
+  VRP_TEARDOWN_LOG("Host teardown: destroyVirtual END");
 }
 
 void HostWindow::ensureYouTubeSession() {
@@ -2509,8 +2509,8 @@ void HostWindow::ensureYouTubeSession() {
   });
   connect(yt_session_, &vrp::YouTubeSession::stopped, this, [this] {
     // Live window and capture are gone. XR unmutes after the monitor buffers are clear.
-    // Persist past Session.Stop — prior logout freezes happened after teardown END.
-    vrp_persist_log("Host: YouTubeSession::stopped (post-Meta)");
+    // Same breadcrumb form as Live teardown (live_teardown_log=1).
+    VRP_TEARDOWN_LOG("Host teardown: YouTubeSession::stopped");
     yt_live_unmute_req_.store(true, std::memory_order_release);
     pad_hook_.stop();
     pad_hook_active_ = false;
@@ -2522,7 +2522,7 @@ void HostWindow::ensureYouTubeSession() {
         yt_pending_kind_ == YtPendingKind::Video) {
       yt_pending_kind_ = YtPendingKind::None;
       yt_return_apps_menu_.store(false, std::memory_order_release);
-      vrp_persist_log("Host: stopped → remove Virtual before video");
+      VRP_TEARDOWN_LOG("Host teardown: remove Virtual before video…");
       appendLog(tr("Live cleanup done — removing Virtual before video"));
       finishQueuedVideoAfterVirtualGone();
       return;
@@ -2530,15 +2530,15 @@ void HostWindow::ensureYouTubeSession() {
     if (yt_pending_kind_ != YtPendingKind::None) {
       // Next start() → VirtualDisplayManager::ensure (reuse or recreate by resolution).
       yt_return_apps_menu_.store(false, std::memory_order_release);
-      vrp_persist_log("Host: stopped → queued live session");
+      VRP_TEARDOWN_LOG("Host teardown: queued live session (Virtual kept for ensure)");
       appendLog(tr("Live cleanup done — starting queued session (Virtual manager decides)"));
       flushPendingLiveStart();
       return;
     }
     if (yt_return_apps_menu_.exchange(false, std::memory_order_acq_rel)) {
-      vrp_persist_log("Host: stopped → destroyVirtualForLeaveLive…");
+      VRP_TEARDOWN_LOG("Host teardown: destroyVirtualForLeaveLive…");
       destroyVirtualForLeaveLive();
-      vrp_persist_log("Host: destroyVirtualForLeaveLive returned");
+      VRP_TEARDOWN_LOG("Host teardown: destroyVirtualForLeaveLive done → [アプリ]");
       if (yt_session_) yt_session_->clear_busy_status();
       yt_show_apps_after_stop_.store(true, std::memory_order_release);
       appendLog(tr("Live cleanup done — Virtual gone, opening [アプリ]"));
@@ -2574,9 +2574,9 @@ void HostWindow::ensureYouTubeSession() {
     // Plain stop (Tools / no queued switch): drop Virtual.
     // Never reach here after a switch — pending path returns above. A stale fallback
     // stop() used to land here and destroy Virtual under a new x3 session.
-    VRP_TEARDOWN_LOG("Host: stopped → plain destroyVirtualForLeaveLive…");
+    VRP_TEARDOWN_LOG("Host teardown: plain destroyVirtualForLeaveLive…");
     destroyVirtualForLeaveLive();
-    VRP_TEARDOWN_LOG("Host: stopped → plain destroyVirtual done (post-Meta path idle)");
+    VRP_TEARDOWN_LOG("Host teardown: plain destroyVirtual done");
   });
 }
 
@@ -3073,8 +3073,8 @@ void HostWindow::stopYouTubeCapture() {
   }
   // Do not stop pad_hook here while XR still drains DMA — early stop made the XR
   // thread fall into pass-through mid-teardown. Hook/filter end in stopped().
-  vrp_persist_log("Host: stopYouTubeCapture BEGIN xr_running=%d",
-                  xr_running_.load(std::memory_order_acquire) ? 1 : 0);
+  VRP_TEARDOWN_LOG("Host teardown: stopYouTubeCapture BEGIN xr_running=%d",
+                   xr_running_.load(std::memory_order_acquire) ? 1 : 0);
   pad_filter_.stop();
   yt_audio_pending_log_ = false;
   yt_audio_fail_retries_ = 0;
@@ -3094,12 +3094,15 @@ void HostWindow::stopYouTubeCapture() {
       if (yt_stop_gen_.load(std::memory_order_acquire) != stop_gen) return;
       if (!yt_session_) return;
       if (yt_session_->state() != vrp::YouTubeSession::State::Stopping) return;
+      VRP_TEARDOWN_LOG("Host teardown: stopYouTubeCapture UI fallback (still Stopping)");
       appendLog(tr("Live stop fallback (UI) — still Stopping"));
       yt_session_->stop();
     });
+    VRP_TEARDOWN_LOG("Host teardown: stopYouTubeCapture handed to XR thread");
     return;
   }
   if (yt_session_) yt_session_->stop();
+  VRP_TEARDOWN_LOG("Host teardown: stopYouTubeCapture END (UI path)");
 }
 
 void HostWindow::showAboutDialog() {

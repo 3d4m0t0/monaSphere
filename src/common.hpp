@@ -17,14 +17,14 @@
  * Persist log gates (monasphere.conf):
  *   live_display_log=0|1  → ~/.config/monasphere/live-display.log (+ /tmp/…)
  *   live_teardown_log=0|1 → ~/.config/monasphere/live-teardown.log (+ /tmp/…)
- * Defaults: both off (Live dma breadcrumbs were heavy; teardown optional).
+ * Defaults: live_display_log off (dma breadcrumbs heavy); live_teardown_log on.
  */
 inline std::atomic<bool>& vrp_persist_display_enabled_flag() {
   static std::atomic<bool> on{false};
   return on;
 }
 inline std::atomic<bool>& vrp_persist_teardown_enabled_flag() {
-  static std::atomic<bool> on{false};
+  static std::atomic<bool> on{true};
   return on;
 }
 inline void vrp_set_persist_display_log(bool on) {
@@ -145,7 +145,12 @@ inline void vrp_format_log_stamp(char* buf, size_t n) {
     std::fflush(stdout);                     \
   } while (0)
 
-/** stdout + durable files when live_teardown_log=1. Prefer for Meta teardown. */
+/**
+ * stdout + durable files when live_teardown_log=1.
+ * Prefer breadcrumbs of the form:
+ *   Live teardown BEGIN — … / Live teardown: step… / Live teardown END
+ *   Host teardown BEGIN — … / Host teardown: step… / Host teardown END
+ */
 #define VRP_TEARDOWN_LOG(...)                \
   do {                                       \
     if (vrp_persist_teardown_enabled()) {    \

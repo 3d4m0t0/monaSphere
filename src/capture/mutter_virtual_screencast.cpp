@@ -57,7 +57,7 @@ void MutterVirtualScreencast::stop() {
   const bool had =
       !sc_session_.isEmpty() || !rd_session_.isEmpty() || !sc_stream_.isEmpty() || node_id_ != 0;
   if (had) {
-    VRP_TEARDOWN_LOG("mutter-virtual: stop BEGIN sc=%s rd=%s node=%u",
+    VRP_TEARDOWN_LOG("Live teardown: mutter-virtual stop BEGIN sc=%s rd=%s node=%u",
                      sc_session_.toUtf8().constData(), rd_session_.toUtf8().constData(), node_id_);
   }
   if (!sc_stream_.isEmpty()) {
@@ -66,21 +66,21 @@ void MutterVirtualScreencast::stop() {
                    SLOT(onPipeWireStreamAdded(uint)));
   }
   if (!sc_session_.isEmpty()) {
-    VRP_TEARDOWN_LOG("mutter-virtual: ScreenCast.Session.Stop…");
+    VRP_TEARDOWN_LOG("Live teardown: mutter-virtual ScreenCast.Session.Stop…");
     QDBusMessage msg = scCall(sc_session_, QString::fromLatin1(kScSessionIface),
                               QStringLiteral("Stop"));
     const QDBusMessage reply = bus.call(msg, QDBus::Block, 2000);
-    VRP_TEARDOWN_LOG("mutter-virtual: ScreenCast.Session.Stop done err=%s",
+    VRP_TEARDOWN_LOG("Live teardown: mutter-virtual ScreenCast.Session.Stop done err=%s",
                      reply.type() == QDBusMessage::ErrorMessage
                          ? reply.errorMessage().toUtf8().constData()
                          : "(none)");
   }
   if (!rd_session_.isEmpty()) {
-    VRP_TEARDOWN_LOG("mutter-virtual: RemoteDesktop.Session.Stop…");
+    VRP_TEARDOWN_LOG("Live teardown: mutter-virtual RemoteDesktop.Session.Stop…");
     QDBusMessage msg = rdCall(rd_session_, QString::fromLatin1(kRdSessionIface),
                               QStringLiteral("Stop"));
     const QDBusMessage reply = bus.call(msg, QDBus::Block, 2000);
-    VRP_TEARDOWN_LOG("mutter-virtual: RemoteDesktop.Session.Stop done err=%s",
+    VRP_TEARDOWN_LOG("Live teardown: mutter-virtual RemoteDesktop.Session.Stop done err=%s",
                      reply.type() == QDBusMessage::ErrorMessage
                          ? reply.errorMessage().toUtf8().constData()
                          : "(none)");
@@ -98,7 +98,7 @@ void MutterVirtualScreencast::stop() {
     eis_fd_ = -1;
   }
   busy_ = false;
-  if (had) VRP_TEARDOWN_LOG("mutter-virtual: stop END (Meta-* should be gone)");
+  if (had) VRP_TEARDOWN_LOG("Live teardown: mutter-virtual stop END (Meta-* should be gone)");
 }
 
 void MutterVirtualScreencast::start() {
