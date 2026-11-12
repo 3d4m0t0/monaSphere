@@ -53,12 +53,16 @@ inline void vrp_persist_named_logv(const char* name, const char* fmt, va_list ap
 
   char stamp[64];
   {
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
+    using clock = std::chrono::system_clock;
+    const auto now = clock::now();
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    const std::time_t t = clock::to_time_t(now);
     std::tm tm{};
     localtime_r(&t, &tm);
-    std::snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d %02d:%02d:%02d", tm.tm_year + 1900,
-                  tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+    std::snprintf(stamp, sizeof(stamp), "%04d-%02d-%02d %02d:%02d:%02d.%03d", tm.tm_year + 1900,
+                  tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+                  static_cast<int>(ms.count()));
   }
   char line[1200];
   std::snprintf(line, sizeof(line), "%s [vrp] %s\n", stamp, body);
@@ -117,9 +121,25 @@ inline void vrp_persist_display_log(const char* fmt, ...) {
   va_end(ap);
 }
 
+/** Local wall time HH:MM:SS.mmm for stdout / UI log prefixes. */
+inline void vrp_format_log_stamp(char* buf, size_t n) {
+  if (!buf || n == 0) return;
+  using clock = std::chrono::system_clock;
+  const auto now = clock::now();
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) %
+                  1000;
+  const std::time_t t = clock::to_time_t(now);
+  std::tm tm{};
+  localtime_r(&t, &tm);
+  std::snprintf(buf, n, "%02d:%02d:%02d.%03d", tm.tm_hour, tm.tm_min, tm.tm_sec,
+                static_cast<int>(ms.count()));
+}
+
 #define VRP_LOG(...)                         \
   do {                                       \
-    std::fprintf(stdout, "[vrp] ");          \
+    char _vrp_ts[16];                        \
+    vrp_format_log_stamp(_vrp_ts, sizeof(_vrp_ts)); \
+    std::fprintf(stdout, "[vrp %s] ", _vrp_ts); \
     std::fprintf(stdout, __VA_ARGS__);       \
     std::fprintf(stdout, "\n");              \
     std::fflush(stdout);                     \
@@ -145,7 +165,9 @@ inline void vrp_persist_display_log(const char* fmt, ...) {
 
 #define VRP_ERR(...)                         \
   do {                                       \
-    std::fprintf(stderr, "[vrp:error] ");    \
+    char _vrp_ts[16];                        \
+    vrp_format_log_stamp(_vrp_ts, sizeof(_vrp_ts)); \
+    std::fprintf(stderr, "[vrp:error %s] ", _vrp_ts); \
     std::fprintf(stderr, __VA_ARGS__);       \
     std::fprintf(stderr, "\n");              \
     std::fflush(stderr);                     \
@@ -160,7 +182,9 @@ inline bool vrp_debug_enabled() {
 #define VRP_DBG(...)                         \
   do {                                       \
     if (vrp_debug_enabled()) {               \
-      std::fprintf(stdout, "[vrp:debug] ");  \
+      char _vrp_ts[16];                      \
+      vrp_format_log_stamp(_vrp_ts, sizeof(_vrp_ts)); \
+      std::fprintf(stdout, "[vrp:debug %s] ", _vrp_ts); \
       std::fprintf(stdout, __VA_ARGS__);     \
       std::fprintf(stdout, "\n");            \
       std::fflush(stdout);                   \
