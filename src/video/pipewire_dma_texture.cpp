@@ -180,11 +180,12 @@ bool PipewireDmaTexture::init(VkPhysicalDevice phys, VkDevice device, VkQueue qu
   enabled_ = true;
   set_error("ok");
   if (nvidia_) {
-    VRP_LOG("PipewireDmaTexture: dma-buf BGRA import armed (NVIDIA experimental: "
+    VRP_LOG("PipewireDmaTexture: dma-buf BGRA import armed (NVIDIA: "
             "OPAQUE_FD↔DMA_BUF, explicit modifiers, arm %d frames, %zu sampleable mods)",
             kNvidiaArmHits, sampleable_mods_.size());
   } else {
-    VRP_LOG("PipewireDmaTexture: dma-buf BGRA import armed (%zu sampleable mods)",
+    VRP_LOG("PipewireDmaTexture: dma-buf BGRA import armed (AMD/non-NVIDIA: DMA_BUF-first, "
+            "arm 1 frame, %zu sampleable mods)",
             sampleable_mods_.size());
   }
   if (!sampleable_mods_.empty()) {

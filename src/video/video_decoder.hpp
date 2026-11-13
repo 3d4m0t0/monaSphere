@@ -232,6 +232,16 @@ class VideoDecoder {
   /** Prefer FFmpeg Vulkan Video over CUDA/NVDEC. Default false (NVIDIA CUDA path). */
   void set_prefer_vulkan_video(bool prefer) { prefer_vulkan_video_ = prefer; }
   bool prefer_vulkan_video() const { return prefer_vulkan_video_; }
+  /**
+   * When true (conf `vulkan_h264_cb_cuda=1`, default) on NVIDIA, skip Vulkan Video
+   * for H.264 Constrained Baseline with long edge ≥3840 (fall through to CUDA).
+   * Ignored on non-NVIDIA (RADV / VA-API); that fingerprint is an NVIDIA driver class.
+   */
+  void set_vulkan_h264_cb_cuda(bool on) { vulkan_h264_cb_cuda_ = on; }
+  bool vulkan_h264_cb_cuda() const { return vulkan_h264_cb_cuda_; }
+  /** VkPhysicalDeviceProperties::vendorID (e.g. 0x10DE NVIDIA, 0x1002 AMD). */
+  void set_gpu_vendor_id(uint32_t vendor_id) { gpu_vendor_id_ = vendor_id; }
+  uint32_t gpu_vendor_id() const { return gpu_vendor_id_; }
   /** NVDEC → Vulkan NV12 is the active display path. */
   bool gpu_path_active() const;
   /** FFmpeg Vulkan Video → AVVkFrame sampling is active. */
@@ -309,6 +319,8 @@ class VideoDecoder {
   VulkanVideoTexture* vulkan_tex_ = nullptr;
   AVBufferRef* vulkan_hw_device_ = nullptr;  // borrowed, not owned
   bool prefer_vulkan_video_ = false;
+  bool vulkan_h264_cb_cuda_ = true;
+  uint32_t gpu_vendor_id_ = 0;
 
   struct FFmpegState;
   std::unique_ptr<FFmpegState> ff_;

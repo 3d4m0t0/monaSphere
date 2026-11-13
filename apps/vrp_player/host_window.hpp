@@ -345,6 +345,11 @@ class HostWindow : public QMainWindow {
    * 1 = prefer FFmpeg Vulkan Video zero-copy when the XR device supports it.
    */
   bool vulkan_video_ = false;
+  /**
+   * monasphere.conf `vulkan_h264_cb_cuda`. 1 (default) = on NVIDIA, skip Vulkan Video
+   * for H.264 Constrained Baseline with long edge ≥3840 (CUDA). Ignored on AMD/RADV.
+   */
+  bool vulkan_h264_cb_cuda_ = true;
   /** monasphere.conf `thumb_jpeg`. 1 stores seek thumbs as JPEG in main memory. */
   bool thumb_jpeg_ = true;
   /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */

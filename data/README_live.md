@@ -346,9 +346,9 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 
 ## Limits
 
-- NVIDIA DMA-BUF import is **experimental** (OPAQUE_FD fallback, explicit DRM
-  modifiers, armed frames). First hard failure permanently falls back to CPU RGBA
-  for that session (driver import-poisoning). Set nothing special to try it.
+- Live DMA-BUF is shared: **AMD/non-NVIDIA** uses DMA_BUF-first (arm 1 frame);
+  **NVIDIA** adds OPAQUE_FD fallback, explicit DRM modifiers, and multi-frame arm.
+  First hard failure permanently falls back to CPU RGBA for that session.
 - Capture is the **whole monitor** (or whole window). Not a single browser tab.
 - Managed virtual: Plasma = `krfb-virtualmonitor`; GNOME = portal **VIRTUAL** /
   Mutter `RecordVirtual`. Spare MONITOR: `live_virtual=0` + `live_output=`.

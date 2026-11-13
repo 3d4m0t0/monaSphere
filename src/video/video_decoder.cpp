@@ -927,10 +927,16 @@ void VideoDecoder::choose_display_size() {
     VRP_LOG("display path: NVDEC -> Vulkan NV12 zero-copy %dx%d", display_w_, display_h_);
     return;
   }
+  if (info_.hwaccel.find("vaapi") != std::string::npos && vaapi_tex_ && vaapi_tex_->enabled()) {
+    // Same native-resolution contract as CUDA NV12 — do not apply the CPU RGBA pixel cap.
+    info_.display_note = "VA-API → Vulkan NV12 zero-copy";
+    info_.display_width = display_w_;
+    info_.display_height = display_h_;
+    VRP_LOG("display path: VA-API -> Vulkan NV12 zero-copy %dx%d", display_w_, display_h_);
+    return;
+  }
   if (info_.hwaccel.find("vaapi") != std::string::npos) {
-    info_.display_note = (vaapi_tex_ && vaapi_tex_->enabled())
-                             ? "VA-API dma-buf import (CPU RGBA if it fails)"
-                             : "VA-API -> CPU RGBA";
+    info_.display_note = "VA-API -> CPU RGBA";
   }
   constexpr int kMaxPixels = 3840 * 2160;
   const int64_t pixels = static_cast<int64_t>(width_) * height_;
@@ -945,7 +951,7 @@ void VideoDecoder::choose_display_size() {
     else info_.display_note += std::string(" — ") + buf;
     VRP_LOG("%s", info_.display_note.c_str());
   } else if (info_.hwaccel.find("vaapi") != std::string::npos) {
-    VRP_LOG("display path: VA-API -> CPU RGBA %dx%d (dma-buf import not implemented)", display_w_,
+    VRP_LOG("display path: VA-API -> CPU RGBA %dx%d (dma-buf import unavailable)", display_w_,
             display_h_);
   } else if (!info_.hwaccel_active || info_.hwaccel.find("software") != std::string::npos) {
     VRP_LOG("display path: software decode -> CPU RGBA %dx%d", display_w_, display_h_);
@@ -1768,17 +1774,30 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
       continue;
     }
 
-    // Preflight: NVIDIA Vulkan Video H.264 maxCodedExtent is 4096², maxLevel 5.2.
-    // (Confirmed via ffmpeg -v verbose on RTX 5060 Ti.) Skip before open2 so we do not
-    // claim hw=vulkan and then decode software YUV.
-    if (type == AV_HWDEVICE_TYPE_VULKAN && dec->id == AV_CODEC_ID_H264) {
+    // Preflight (NVIDIA only): Vulkan Video H.264 maxCodedExtent 4096², maxLevel 5.2
+    // (ffmpeg -v verbose on RTX 5060 Ti). Plus Constrained Baseline long≥3840 corruption
+    // class (vulkan_h264_cb_cuda=1). On AMD/RADV these NVIDIA caps/fingerprints are not
+    // applied — open2 / VA-API fallthrough decide.
+    constexpr uint32_t kVendorNvidia = 0x10DEu;
+    if (type == AV_HWDEVICE_TYPE_VULKAN && dec->id == AV_CODEC_ID_H264 &&
+        gpu_vendor_id_ == kVendorNvidia) {
       const int w = ff_->codec->width > 0 ? ff_->codec->width : st->codecpar->width;
       const int h = ff_->codec->height > 0 ? ff_->codec->height : st->codecpar->height;
       const int level = ff_->codec->level > 0 ? ff_->codec->level : st->codecpar->level;
+      const int profile = ff_->codec->profile != AV_PROFILE_UNKNOWN ? ff_->codec->profile
+                                                                    : st->codecpar->profile;
+      const int long_edge = std::max(w, h);
       if (w > 4096 || h > 4096 || level > 52) {
-        VRP_LOG("hwaccel skip vulkan: H.264 %dx%d level=%d outside Vulkan Video caps "
-                "(NVIDIA H.264 ≤4096 / level 52; use CUDA) — not an inject bug",
+        VRP_LOG("hwaccel skip vulkan: H.264 %dx%d level=%d outside NVIDIA Vulkan Video caps "
+                "(≤4096 / level 52; fall through to CUDA)",
                 w, h, level);
+        continue;
+      }
+      if (vulkan_h264_cb_cuda_ && profile == AV_PROFILE_H264_CONSTRAINED_BASELINE &&
+          long_edge >= 3840) {
+        VRP_LOG("hwaccel skip vulkan: H.264 Constrained Baseline %dx%d "
+                "(vulkan_h264_cb_cuda=1 NVIDIA fingerprint; fall through to CUDA)",
+                w, h);
         continue;
       }
     }

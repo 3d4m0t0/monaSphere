@@ -6,8 +6,13 @@
 |------|------|---------|
 | **CUDA / NVDEC** | NVIDIA default (`vulkan_video=0`) | CUDA↔Vulkan NV12 textures |
 | **Vulkan Video** | `monasphere.conf` `vulkan_video=1` and XR device probe OK | Zero-copy `AVVkFrame` → R8/R8G8 views (`VulkanVideoTexture`) |
-| **VA-API** | Non-NVIDIA when available | VA-API → Vulkan NV12 |
+| **VA-API** | AMD / non-NVIDIA when available (also CUDA fallback) | VA-API → DRM PRIME → Vulkan NV12 |
 | **Software** | `hwaccel=0` or HW open fails | CPU RGBA upload |
+
+NVIDIA-only H.264 Vulkan preflight (caps ≤4096² / level 5.2, and optional
+`vulkan_h264_cb_cuda` Constrained Baseline ≥3840 → CUDA) is gated on vendor
+`0x10DE`. AMD/RADV does not use those heuristics; decode tries Vulkan (if
+preferred) then VA-API.
 
 Vulkan Video samples decode images in `SHADER_READ_ONLY_OPTIMAL` on the graphics queue (acquire barrier + same-queue FIFO). Eye and FSR both bind those views — no intermediate NV12 copy.
 

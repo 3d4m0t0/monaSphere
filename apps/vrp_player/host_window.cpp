@@ -1204,6 +1204,8 @@ bool monasphereConfAssignmentOk(const QString& code, bool allow_legacy) {
   if (confKeyIs(code, QStringLiteral("hwaccel"), &v)) return v == QLatin1String("0") || v == QLatin1String("1");
   if (confKeyIs(code, QStringLiteral("vulkan_video"), &v))
     return v == QLatin1String("0") || v == QLatin1String("1");
+  if (confKeyIs(code, QStringLiteral("vulkan_h264_cb_cuda"), &v))
+    return v == QLatin1String("0") || v == QLatin1String("1");
   if (confKeyIs(code, QStringLiteral("flat_fov"), &v)) return confFloat(v, 20.f, 140.f);
   if (confKeyIs(code, QStringLiteral("flat_distance"), &v)) return confFloat(v, 2.f, 40.f);
   if (confKeyIs(code, QStringLiteral("milkyway_gain"), &v)) return confFloat(v, 0.2f, 2.5f);
@@ -1699,6 +1701,8 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("hwaccel"), QStringLiteral("1")},
       // 0 = CUDA/NVDEC (NVIDIA default). 1 = prefer Vulkan Video zero-copy.
       {QStringLiteral("vulkan_video"), QStringLiteral("0")},
+      // NVIDIA only: 1 = CUDA for H.264 Constrained Baseline long≥3840 (ignored on AMD).
+      {QStringLiteral("vulkan_h264_cb_cuda"), QStringLiteral("1")},
       {QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2)},
       {QStringLiteral("flat_distance"),
        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
@@ -1811,6 +1815,10 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const int v = line.mid(13).toInt(&ok);
       if (ok && (v == 0 || v == 1)) vulkan_video_ = v != 0;
+    } else if (line.startsWith(QStringLiteral("vulkan_h264_cb_cuda="))) {
+      bool ok = false;
+      const int v = line.mid(QStringLiteral("vulkan_h264_cb_cuda=").size()).toInt(&ok);
+      if (ok && (v == 0 || v == 1)) vulkan_h264_cb_cuda_ = v != 0;
     } else if (line.startsWith(QStringLiteral("thumb_jpeg="))) {
       bool ok = false;
       const int v = line.mid(11).toInt(&ok);
@@ -5271,7 +5279,8 @@ void HostWindow::xrThreadMain() {
           this,
           [this, vk_probe, ff_vk] {
             appendLog(vk_probe);
-            appendLog(ff_vk ? tr("FFmpeg Vulkan hwctx: injected (playback still CUDA)")
+            appendLog(ff_vk ? tr("FFmpeg Vulkan hwctx: injected (file decode still CUDA/VA-API "
+                                 "unless vulkan_video=1)")
                             : tr("FFmpeg Vulkan hwctx: not injected"));
           },
           Qt::QueuedConnection);
@@ -5404,16 +5413,28 @@ void HostWindow::xrThreadMain() {
     decoder.set_vaapi_texture(vaapi_nv12 ? &vaapi_tex : nullptr);
     decoder.set_vulkan_texture(vk_video ? &vulkan_tex : nullptr);
     decoder.set_vulkan_hw_device(vk_video ? xr.ffmpeg_vulkan_device()->ref() : nullptr);
+    decoder.set_gpu_vendor_id(gpu_props.vendorID);
     decoder.set_prefer_vulkan_video(vulkan_video_ && vk_video);
+    decoder.set_vulkan_h264_cb_cuda(vulkan_h264_cb_cuda_);
     if (vk_video) {
       const bool prefer = vulkan_video_;
+      const bool cb_cuda = vulkan_h264_cb_cuda_;
+      const bool is_nvidia = gpu_props.vendorID == 0x10DEu;
       QMetaObject::invokeMethod(
           this,
-          [this, prefer] {
+          [this, prefer, cb_cuda, is_nvidia] {
             if (prefer) {
-              appendLog(tr("Vulkan Video: preferred (conf vulkan_video=1; CUDA fallback)"));
+              appendLog(is_nvidia
+                            ? tr("Vulkan Video: preferred (vulkan_video=1; CUDA fallback)")
+                            : tr("Vulkan Video: preferred (vulkan_video=1; VA-API fallback)"));
             } else {
-              appendLog(tr("Vulkan Video: available (conf vulkan_video=0 -> CUDA/NVDEC)"));
+              appendLog(is_nvidia
+                            ? tr("Vulkan Video: available (vulkan_video=0 → CUDA/NVDEC)")
+                            : tr("Vulkan Video: available (vulkan_video=0 → VA-API)"));
+            }
+            if (prefer && cb_cuda && is_nvidia) {
+              appendLog(tr("Vulkan Video: H.264 Constrained Baseline ≥3840 → CUDA "
+                           "(vulkan_h264_cb_cuda=1, NVIDIA)"));
             }
           },
           Qt::QueuedConnection);
@@ -5421,8 +5442,8 @@ void HostWindow::xrThreadMain() {
     QMetaObject::invokeMethod(
         this,
         [this, gpu_nv12, vaapi_nv12, pw_dma, pw_dma_nvidia] {
-          if (gpu_nv12) appendLog(tr("Video: GPU NV12"));
-          else if (vaapi_nv12) appendLog(tr("Video: VA-API dma-buf"));
+          if (gpu_nv12) appendLog(tr("Video: GPU NV12 (CUDA)"));
+          else if (vaapi_nv12) appendLog(tr("Video: VA-API dma-buf (AMD/non-NVIDIA)"));
           else appendLog(tr("Video: CPU RGBA"));
           if (pw_dma_nvidia)
             appendLog(tr("ScreenCast: DMA-BUF staging→present + sync_file wait (NVIDIA)"));
