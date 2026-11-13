@@ -316,7 +316,12 @@ These are the only two durable Live breadcrumb files. Ordinary `[vrp]` stdout is
   Never `pa_mainloop_iterate(block=1)` — idle block hung Soft start inside
   `drain()` after “routing browsers” (no Soft configure log).
 - Browser move is **pactl** (`list sink-inputs` + `move-sink-input` + unmute on yt).
-- **Do not mute** other HMD sink-inputs during route (Soft/Chrome race → silence).
+- Mute HMD browser streams **only** during Soft startup / early kick
+  (`mute_hmd_until_moved=true`). Once Soft is live, route is move-only and always
+  unmutes — stuck mute after a failed move caused multi-second Live silence.
+- Live Soft feeder uses a **ring-level PLL + linear micro-resample** (rate ≈ 1±0.3%)
+  so Pulse vs Soft clock drift does not accumulate. Soft depth stays at the normal
+  target; a one-buffer safety drop remains only if the ring is nearly full.
 
 ### Code map
 

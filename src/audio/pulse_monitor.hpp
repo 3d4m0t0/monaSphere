@@ -54,11 +54,14 @@ class PulseMonitor {
   /**
    * Move browser sink-inputs onto monaSphereYt (pactl; no Pulse mainloop).
    * Soft start must not await this — call from an async retry worker only.
-   * Streams still on a real/HMD sink are muted until the move succeeds (avoids
-   * a loud unattenuated burst before Soft HRTF owns the path).
+   *
+   * @param mute_hmd_until_moved  true only during Soft startup / early kick:
+   *   mute HMD browser streams until move succeeds (avoids a loud unattenuated
+   *   burst before Soft HRTF owns the path). false once Soft is live — never
+   *   leave a stream muted (Soft/Chrome race → multi-second silence).
    * @return >0 moved count; 0 no browser yet; <0 browsers already on yt (stable).
    */
-  static int route_browser_to_yt_sink();
+  static int route_browser_to_yt_sink(bool mute_hmd_until_moved = false);
   /** Move yt streams back to the default sink, then destroy the null sink. */
   static int restore_browser_routing();
   /** Mute or unmute a Pulse sink by name. Empty or unsafe names are ignored. */

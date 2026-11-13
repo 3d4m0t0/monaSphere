@@ -1618,25 +1618,35 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
   st_->live_thread = std::thread([this] {
     if (!st_) return;
     /*
-     * Live Flat audio path (keep these; verified against rhythmic / startup clicks):
-     *  - Pulse reader thread → PCM ring → Soft feeder (Soft must not block on pa_simple_read)
-     *  - Pulse frag ~20ms (40ms made click period follow fragsize)
-     *  - Coalesce to Soft buffer size (2048f) before queue (short Soft buffers underran)
-     *  - Silence-pad Soft when ring empty (browser→yt route is async for ~10s)
-     *  - Unmute only after live_real_frames (silence pads stay inaudible)
-     * Rejected: Pulse 40ms frag, Soft-internal pending counted as depth, unmute fade,
-     * dual high/low watermarks, Soft 4-deep alone as the fix.
+     * Live Flat audio path:
+     *  - Pulse reader → PCM ring → Soft feeder (Soft must not block on pa_simple_read)
+     *  - Pulse frag ~20ms; coalesce to Soft buffer 2048f before queue
+     *  - Silence-pad Soft when ring empty (browser→yt route async); unmute after real PCM
+     *  - Pulse vs Soft clock drift: ring-level PLL + linear micro-resample (rate≈1±0.3%).
+     *    Soft depth stays at soft_target; no Soft-max absorb / bulk ring drop as primary.
+     * Rejected: Pulse 40ms frag, Soft-internal pending as depth, unmute fade, Soft 4-deep
+     * alone, bulk mid-watermark trim, Soft-max absorb as the drift fix.
      */
     constexpr int kFragFrames = PulseMonitor::kRate / 50;  // ~20ms
     constexpr int kRingFrames = PulseMonitor::kRate / 4;   // ~250ms
     constexpr int kSoftBufFrames = 2048;                  // Soft buffer (~43ms @ 48k)
     constexpr int kSoftTargetMs = 200;
+    constexpr int kRingTargetMs = 100;                    // PLL setpoint
+    constexpr size_t kRingHigh = static_cast<size_t>(kRingFrames * 9 / 10);
     const int soft_target = PulseMonitor::kRate * kSoftTargetMs / 1000;
+    const size_t ring_target = static_cast<size_t>(PulseMonitor::kRate * kRingTargetMs / 1000);
+    // ±0.3% pitch — enough to clear tens of ppm drift; wider would wow.
+    constexpr double kRateMin = 0.997;
+    constexpr double kRateMax = 1.003;
+    constexpr double kPllKp = 0.004;   // err=+0.5 → +0.2% rate
+    constexpr double kPllKi = 0.0008;  // 1/s toward eliminating steady error
+    constexpr double kPllILim = 0.002;
 
     std::vector<int16_t> ring(static_cast<size_t>(kRingFrames * PulseMonitor::kChannels));
     size_t ring_r = 0;
     size_t ring_w = 0;
     size_t ring_n = 0;
+    double ring_phase_frac = 0.0;  // carry across Soft buffers (click-free)
     std::mutex ring_mu;
     std::atomic<bool> reader_stop{false};
 
@@ -1656,23 +1666,45 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
         ++ring_n;
       }
     };
-    auto ring_pop = [&](int16_t* dst, int max_frames) -> int {
-      if (!dst || max_frames <= 0) return 0;
-      std::lock_guard<std::mutex> lock(ring_mu);
-      const int n = std::min(max_frames, static_cast<int>(ring_n));
-      for (int i = 0; i < n; ++i) {
-        const size_t o = static_cast<size_t>(i) * static_cast<size_t>(PulseMonitor::kChannels);
-        const size_t s = ring_r * static_cast<size_t>(PulseMonitor::kChannels);
-        dst[o] = ring[s];
-        dst[o + 1] = ring[s + 1];
-        ring_r = (ring_r + 1) % static_cast<size_t>(kRingFrames);
-        --ring_n;
-      }
-      return n;
-    };
     auto ring_frames = [&]() -> size_t {
       std::lock_guard<std::mutex> lock(ring_mu);
       return ring_n;
+    };
+    auto ring_discard = [&](size_t frames) {
+      std::lock_guard<std::mutex> lock(ring_mu);
+      const size_t n = std::min(frames, ring_n);
+      ring_r = (ring_r + n) % static_cast<size_t>(kRingFrames);
+      ring_n -= n;
+    };
+    // Produce out_frames at Soft rate; consume ~out_frames*rate Pulse frames (lerp).
+    auto ring_resample = [&](int16_t* dst, int out_frames, double rate) -> int {
+      if (!dst || out_frames <= 0 || rate <= 0.0) return 0;
+      std::lock_guard<std::mutex> lock(ring_mu);
+      const double need = ring_phase_frac + static_cast<double>(out_frames) * rate + 1.0;
+      if (static_cast<double>(ring_n) < need) return 0;
+      double phase = ring_phase_frac;
+      for (int i = 0; i < out_frames; ++i) {
+        const size_t i0 = static_cast<size_t>(phase);
+        const double frac = phase - static_cast<double>(i0);
+        const size_t s0 = ((ring_r + i0) % static_cast<size_t>(kRingFrames)) *
+                          static_cast<size_t>(PulseMonitor::kChannels);
+        const size_t s1 = ((ring_r + i0 + 1) % static_cast<size_t>(kRingFrames)) *
+                          static_cast<size_t>(PulseMonitor::kChannels);
+        const size_t o = static_cast<size_t>(i) * static_cast<size_t>(PulseMonitor::kChannels);
+        for (int c = 0; c < PulseMonitor::kChannels; ++c) {
+          const double a = static_cast<double>(ring[s0 + static_cast<size_t>(c)]);
+          const double b = static_cast<double>(ring[s1 + static_cast<size_t>(c)]);
+          const double y = a + (b - a) * frac;
+          dst[o + static_cast<size_t>(c)] =
+              static_cast<int16_t>(std::lround(std::clamp(y, -32768.0, 32767.0)));
+        }
+        phase += rate;
+      }
+      const size_t consumed = static_cast<size_t>(phase);
+      ring_r = (ring_r + consumed) % static_cast<size_t>(kRingFrames);
+      ring_n -= consumed;
+      ring_phase_frac = phase - static_cast<double>(consumed);
+      return out_frames;
     };
 
     std::thread reader([this, &reader_stop, &ring_push] {
@@ -1698,14 +1730,17 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
     st_->live_norm.set_enabled(loudness_normalize_);
     st_->live_norm.reset();
     auto last_dbg = std::chrono::steady_clock::now();
+    auto last_pll = std::chrono::steady_clock::now();
+    auto last_ring_drop = std::chrono::steady_clock::time_point{};
     uint64_t frames_in = 0;
     uint64_t frames_queued = 0;
     double peak = 0.0;
+    double pll_i = 0.0;
+    double pll_rate = 1.0;
+    bool pll_armed = false;
     std::vector<int16_t> soft_acc(
         static_cast<size_t>(kSoftBufFrames * PulseMonitor::kChannels));
     int soft_acc_n = 0;
-    std::vector<int16_t> chunk(
-        static_cast<size_t>(kFragFrames * PulseMonitor::kChannels));
 
     auto flush_soft_acc = [&](bool from_ring) -> bool {
       if (soft_acc_n < kSoftBufFrames) return true;
@@ -1750,6 +1785,34 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
         continue;
       }
 
+      // Arm PLL after ~1s of real PCM so startup silence pads do not yank the rate.
+      if (!pll_armed &&
+          st_->live_real_frames.load(std::memory_order_relaxed) >=
+              static_cast<uint64_t>(PulseMonitor::kRate)) {
+        pll_armed = true;
+        pll_i = 0.0;
+        pll_rate = 1.0;
+        last_pll = now;
+        VRP_LOG("live audio: ring PLL armed (target=%zu frames ~%dms)", ring_target,
+                kRingTargetMs);
+      }
+
+      if (pll_armed) {
+        const double dt =
+            std::chrono::duration<double>(now - last_pll).count();
+        if (dt > 0.0 && dt < 1.0) {
+          const double err =
+              (static_cast<double>(ring_frames()) - static_cast<double>(ring_target)) /
+              static_cast<double>(ring_target);
+          pll_i = std::clamp(pll_i + err * dt * kPllKi, -kPllILim, kPllILim);
+          pll_rate = std::clamp(1.0 + kPllKp * err + pll_i, kRateMin, kRateMax);
+        }
+        last_pll = now;
+      } else {
+        pll_rate = 1.0;
+        last_pll = now;
+      }
+
       while (st_->spatial.min_queued_frames() < soft_target &&
              !st_->live_stop.load(std::memory_order_relaxed) &&
              st_->playing.load(std::memory_order_acquire)) {
@@ -1757,23 +1820,28 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
           if (!flush_soft_acc(true)) break;
           continue;
         }
-        const int want = kSoftBufFrames - soft_acc_n;
-        const int got = ring_pop(chunk.data(), std::min(want, kFragFrames));
-        if (got > 0) {
-          std::memcpy(soft_acc.data() + static_cast<size_t>(soft_acc_n) * PulseMonitor::kChannels,
-                      chunk.data(),
-                      static_cast<size_t>(got) * PulseMonitor::kChannels * sizeof(int16_t));
-          soft_acc_n += got;
+        // Whole Soft buffer via PLL resample (soft_acc_n is 0 or full after flush).
+        const int got = ring_resample(soft_acc.data(), kSoftBufFrames, pll_rate);
+        if (got == kSoftBufFrames) {
+          soft_acc_n = kSoftBufFrames;
           continue;
         }
-        // Ring empty while Soft still needs depth — pad one Soft buffer of silence.
-        const bool had_real = soft_acc_n > 0;
-        std::fill(soft_acc.begin() + static_cast<size_t>(soft_acc_n) * PulseMonitor::kChannels,
+        // Not enough Pulse PCM yet — wait unless Soft is starving and ring is empty.
+        if (ring_frames() > 0 || st_->spatial.min_queued_frames() >= soft_target / 2) break;
+        std::fill(soft_acc.begin(),
                   soft_acc.begin() + static_cast<size_t>(kSoftBufFrames) * PulseMonitor::kChannels,
                   static_cast<int16_t>(0));
         soft_acc_n = kSoftBufFrames;
-        if (!flush_soft_acc(had_real)) break;
+        if (!flush_soft_acc(false)) break;
         break;
+      }
+
+      // Safety only: PLL rate clamp cannot clear a near-full ring instantly.
+      if (ring_frames() > kRingHigh && now - last_ring_drop >= std::chrono::seconds(2)) {
+        ring_discard(static_cast<size_t>(kSoftBufFrames));
+        last_ring_drop = now;
+        VRP_LOG("live audio: ring safety drop %d frames (left=%zu rate=%.5f)", kSoftBufFrames,
+                ring_frames(), pll_rate);
       }
 
       const int queued = st_->spatial.min_queued_frames();
@@ -1782,12 +1850,12 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
 
       if (now - last_dbg >= std::chrono::seconds(30)) {
         VRP_LOG("live audio: Flat surround feed peak=%.3f in=%llu q=%llu real=%llu ring=%zu "
-                "soft=%d acc=%d upmix=%d src=%s",
+                "soft=%d acc=%d rate=%.5f upmix=%d src=%s",
                 peak, static_cast<unsigned long long>(frames_in),
                 static_cast<unsigned long long>(frames_queued),
                 static_cast<unsigned long long>(
                     st_->live_real_frames.load(std::memory_order_relaxed)),
-                ring_frames(), queued, soft_acc_n, st_->use_stereo_upmix ? 1 : 0,
+                ring_frames(), queued, soft_acc_n, pll_rate, st_->use_stereo_upmix ? 1 : 0,
                 st_->live_mon.source().c_str());
         peak = 0.0;
         frames_in = 0;
@@ -1989,7 +2057,7 @@ void AudioPlayer::request_start_live_monitor() {
     VRP_LOG("Audio: live start — Soft (monitor=%s); mute+route HMD browser ASAP", monitor.c_str());
     // Before Soft configure: mute/move any guest already playing on the HMD so the
     // first second is not full-level direct output (hrtf_trim only applies on Soft).
-    (void)PulseMonitor::route_browser_to_yt_sink();
+    (void)PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/true);
 
     VRP_LOG("Audio: live start — configuring Soft HRTF");
     {
@@ -2007,12 +2075,12 @@ void AudioPlayer::request_start_live_monitor() {
         return;
       }
     }
-    // Shared Chrome ignores PULSE_SINK and creates sink-inputs only when media
-    // plays — keep polling; mute-until-yt prevents loud HMD leaks between ticks.
+    // Soft is live: move-only retries (never mute). Stuck mute after a failed move
+    // was the Soft/Chrome race that caused multi-second Live silence.
     const uint64_t route_gen = gen;
     std::thread([this, route_gen] {
       VRP_LOG("Audio: live route worker start");
-      (void)PulseMonitor::route_browser_to_yt_sink();
+      (void)PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/false);
       int stable_on_yt = 0;
       int elapsed_ms = 0;
       for (int i = 0; i < 80; ++i) {
@@ -2024,7 +2092,7 @@ void AudioPlayer::request_start_live_monitor() {
         elapsed_ms += sleep_ms;
         if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
         if (!live_monitor_.load(std::memory_order_acquire)) return;
-        const int n = PulseMonitor::route_browser_to_yt_sink();
+        const int n = PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/false);
         if (n > 0) {
           VRP_LOG("Audio: live route retry moved %d stream(s) (t+%dms)", n, elapsed_ms);
           stable_on_yt = 0;

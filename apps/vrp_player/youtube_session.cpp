@@ -1629,7 +1629,12 @@ void YouTubeSession::kickEarlyYtAudioRoute() {
     for (int i = 0; i < 60; ++i) {
       if (audio_route_gen_.load(std::memory_order_acquire) != gen) return;
       if (state_ == State::Idle || state_ == State::Failed || state_ == State::Stopping) return;
-      (void)PulseMonitor::route_browser_to_yt_sink();
+      // Cold start only: mute HMD for ~1.5s while Soft starts. Live↔Live keeps Soft
+      // live — never mute (stuck mute after failed move → multi-second silence).
+      const bool soft_live =
+          active_.load(std::memory_order_acquire) || switch_hold_content_;
+      const bool mute = !soft_live && (i < 15);
+      (void)PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/mute);
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }).detach();

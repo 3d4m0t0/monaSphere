@@ -567,8 +567,9 @@ void PulseMonitor::destroy_yt_null_sink() {
 #endif
 }
 
-int PulseMonitor::route_browser_to_yt_sink() {
+int PulseMonitor::route_browser_to_yt_sink(bool mute_hmd_until_moved) {
 #if !defined(VRP_HAS_PULSE)
+  (void)mute_hmd_until_moved;
   return 0;
 #else
   // pactl-only: no Pulse mainloop. Soft start must never block on this.
@@ -621,20 +622,27 @@ int PulseMonitor::route_browser_to_yt_sink() {
     const bool on_yt = have_sink && sink_idx == yt_idx;
     char cmd[192];
     if (!on_yt) {
-      // Mute first: shared Chrome often plays on the HMD/default sink at full
-      // level for ~0.5–1s before Soft (hrtf_trim) owns the path via yt.monitor.
-      std::snprintf(cmd, sizeof(cmd), "pactl set-sink-input-mute %d 1 2>/dev/null", cur);
-      (void)std::system(cmd);
+      // Startup only: mute HMD before move so the first second is not full-level
+      // direct output (hrtf_trim applies only on Soft via yt.monitor).
+      if (mute_hmd_until_moved) {
+        std::snprintf(cmd, sizeof(cmd), "pactl set-sink-input-mute %d 1 2>/dev/null", cur);
+        (void)std::system(cmd);
+      }
       std::snprintf(cmd, sizeof(cmd), "pactl move-sink-input %d %s 2>/dev/null", cur, kYtSinkName);
-      if (std::system(cmd) == 0) {
+      const bool moved_ok = (std::system(cmd) == 0);
+      if (moved_ok) {
         ++moved;
         VRP_LOG("PulseMonitor: move sink-input #%d (%s / %s) -> %s", cur,
                 app_name.empty() ? "?" : app_name.c_str(),
                 app_bin.empty() ? "?" : app_bin.c_str(), kYtSinkName);
+      }
+      // Soft live: always unmute (failed move may briefly leak on HMD — better than
+      // multi-second silence from a stuck mute). Startup mute path: unmute only after
+      // a successful move; next poll retries while still muted on HMD.
+      if (moved_ok || !mute_hmd_until_moved) {
         std::snprintf(cmd, sizeof(cmd), "pactl set-sink-input-mute %d 0 2>/dev/null", cur);
         (void)std::system(cmd);
       }
-      // Move failed → stay muted; next poll retries. Do not unmute onto HMD.
     } else {
       // Already on yt — Soft monitor needs the stream unmuted.
       std::snprintf(cmd, sizeof(cmd), "pactl set-sink-input-mute %d 0 2>/dev/null", cur);
