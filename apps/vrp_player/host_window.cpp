@@ -1258,6 +1258,11 @@ bool monasphereConfAssignmentOk(const QString& code, bool allow_legacy) {
   if (confKeyIs(code, QStringLiteral("flat_fov"), &v)) return confFloat(v, 20.f, 140.f);
   if (confKeyIs(code, QStringLiteral("flat_distance"), &v)) return confFloat(v, 2.f, 40.f);
   if (confKeyIs(code, QStringLiteral("milkyway_gain"), &v)) return confFloat(v, 0.2f, 2.5f);
+  if (confKeyIs(code, QStringLiteral("sky_backdrop"), &v))
+    return v.compare(QLatin1String("layers"), Qt::CaseInsensitive) == 0 ||
+           v.compare(QLatin1String("baked"), Qt::CaseInsensitive) == 0;
+  if (confKeyIs(code, QStringLiteral("sky_bake_face"), &v))
+    return v == QLatin1String("1024") || v == QLatin1String("2048") || v == QLatin1String("4096");
   if (confKeyIs(code, QStringLiteral("surround_gain"), &v)) return confFloat(v, 0.f, 2.f);
   if (confKeyIs(code, QStringLiteral("audio_normalize"), &v))
     return confOneOf(v, {QLatin1String("0"), QLatin1String("1"), QLatin1String("on"), QLatin1String("off")},
@@ -1701,6 +1706,9 @@ void HostWindow::saveAppConf() const {
                        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2));
   setMonasphereConfKey(QStringLiteral("milkyway_gain"),
                        QString::number(static_cast<double>(milkyway_gain_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("sky_backdrop"),
+                       sky_backdrop_baked_ ? QStringLiteral("baked") : QStringLiteral("layers"));
+  setMonasphereConfKey(QStringLiteral("sky_bake_face"), QString::number(sky_bake_face_));
   setMonasphereConfKey(QStringLiteral("surround_gain"),
                        QString::number(static_cast<double>(surround_gain_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("audio_normalize"),
@@ -1758,6 +1766,9 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("flat_distance"),
        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
       {QStringLiteral("milkyway_gain"), QStringLiteral("1.00")},
+      // baked = startup cubemap + live sun/moon (default); layers = per-frame MW+stars+nebulae.
+      {QStringLiteral("sky_backdrop"), QStringLiteral("baked")},
+      {QStringLiteral("sky_bake_face"), QStringLiteral("2048")},
       {QStringLiteral("sky_from_timezone"), QStringLiteral("1")},
       {QStringLiteral("sky_lat"), QStringLiteral("35.68")},
       {QStringLiteral("sky_lon"), QStringLiteral("139.65")},
@@ -1888,6 +1899,17 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
       if (ok && v >= 0.2f && v <= 2.5f) milkyway_gain_ = v;
+    } else if (line.startsWith(QStringLiteral("sky_backdrop="))) {
+      const QString v = line.mid(QStringLiteral("sky_backdrop=").size()).trimmed();
+      if (v.compare(QLatin1String("baked"), Qt::CaseInsensitive) == 0) {
+        sky_backdrop_baked_ = true;
+      } else if (v.compare(QLatin1String("layers"), Qt::CaseInsensitive) == 0) {
+        sky_backdrop_baked_ = false;
+      }
+    } else if (line.startsWith(QStringLiteral("sky_bake_face="))) {
+      bool ok = false;
+      const int v = line.mid(QStringLiteral("sky_bake_face=").size()).trimmed().toInt(&ok);
+      if (ok && (v == 1024 || v == 2048 || v == 4096)) sky_bake_face_ = v;
     } else if (line.startsWith(QStringLiteral("surround_gain="))) {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
@@ -5481,6 +5503,8 @@ void HostWindow::xrThreadMain() {
     scene.set_content_aspect(16.f / 9.f);
     scene.set_milkyway_gain(milkyway_gain_);
     scene.set_sky_observer(sky_lat_, sky_lon_);
+    scene.set_sky_backdrop_baked(sky_backdrop_baked_);
+    scene.set_sky_bake_face(static_cast<uint32_t>(sky_bake_face_));
 
     vrp::Fsr1Upscaler fsr;
     fsr.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),

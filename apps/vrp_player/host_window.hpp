@@ -370,6 +370,10 @@ class HostWindow : public QMainWindow {
   bool thumb_jpeg_ = true;
   /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */
   float milkyway_gain_ = 1.f;
+  /** monasphere.conf `sky_backdrop`. true=baked cubemap (default), false=layers. No UI. */
+  bool sky_backdrop_baked_ = true;
+  /** monasphere.conf `sky_bake_face`. Cubemap face size 1024/2048/4096 (default 2048). */
+  int sky_bake_face_ = 2048;
   /** monasphere.conf `surround_gain`. Stereo→4.0 rear for file / Live / [アプリ] (default 0.8; no UI). */
   float surround_gain_ = 0.8f;
   /** monasphere.conf `audio_normalize`. 1 = loudness match on file / Live / [アプリ] (default on; no UI). */

@@ -122,6 +122,8 @@ set(VRP_SHADERS
   ${CMAKE_SOURCE_DIR}/shaders/nebula.frag
   ${CMAKE_SOURCE_DIR}/shaders/milkyway.vert
   ${CMAKE_SOURCE_DIR}/shaders/milkyway.frag
+  ${CMAKE_SOURCE_DIR}/shaders/sky_baked.vert
+  ${CMAKE_SOURCE_DIR}/shaders/sky_baked.frag
   ${CMAKE_SOURCE_DIR}/shaders/moon.vert
   ${CMAKE_SOURCE_DIR}/shaders/moon.frag
   ${CMAKE_SOURCE_DIR}/shaders/sun.vert
@@ -418,6 +420,8 @@ install(FILES
   ${CMAKE_SOURCE_DIR}/shaders/nebula.frag
   ${CMAKE_SOURCE_DIR}/shaders/milkyway.vert
   ${CMAKE_SOURCE_DIR}/shaders/milkyway.frag
+  ${CMAKE_SOURCE_DIR}/shaders/sky_baked.vert
+  ${CMAKE_SOURCE_DIR}/shaders/sky_baked.frag
   ${CMAKE_SOURCE_DIR}/shaders/moon.vert
   ${CMAKE_SOURCE_DIR}/shaders/moon.frag
   ${CMAKE_SOURCE_DIR}/shaders/sun.vert

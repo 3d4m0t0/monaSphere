@@ -38,6 +38,23 @@ Point stars remain `stars_wikidata.bin`; this texture is the soft density backdr
 The Sun and Moon are drawn from a low-precision ephemeris on the host clock (LST +
 body motion).
 
+## Sky backdrop modes (`sky_backdrop`)
+
+| Value | Behaviour |
+|-------|-----------|
+| `baked` (default) | Once at XR start, GPU-bake milky way + nebulae + stars into a **cubemap** (equatorial / catalog space). Each frame draws that cubemap on the sky sphere (still rotated by LST via `earth_sky_matrix`) plus live sun/moon. Sampler is NEAREST (base mip) to keep small-star sparkle. |
+| `layers` | Every frame redraws milky way + nebulae + stars + sun + moon into the mono sky RT. |
+
+Quality of `baked` depends on cubemap face size (`sky_bake_face`):
+
+| `sky_bake_face` | Notes |
+|-----------------|-------|
+| `1024` | Lower VRAM / faster bake |
+| `2048` (default) | Balanced; enough for HMD |
+| `4096` | Highest detail; more VRAM |
+
+`milkyway_gain` still applies at sample time in `baked` mode (no rebake). Observer lat/lon only affect the per-frame LST rotation, not the bake contents. Conf only (no Host UI): set in `~/.config/monasphere/monasphere.conf`, then restart the HMD session.
+
 ## Attribution
 
 When redistributing binaries that include `gaia_sky_edr3_equirect.jpg`, retain

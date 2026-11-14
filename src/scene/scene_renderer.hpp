@@ -81,6 +81,16 @@ class SceneRenderer {
   float sky_lat_deg() const { return sky_lat_deg_; }
   float sky_lon_deg() const { return sky_lon_deg_; }
 
+  /**
+   * sky_backdrop=baked (default): bake MW+nebulae+stars once into a cubemap; each
+   * frame draws that texture + live sun/moon. layers: draw all celestial every frame.
+   */
+  void set_sky_backdrop_baked(bool baked);
+  bool sky_backdrop_baked() const { return sky_backdrop_baked_; }
+  /** Cubemap face size for baked mode (1024 / 2048 / 4096). */
+  void set_sky_bake_face(uint32_t face_px);
+  uint32_t sky_bake_face() const { return sky_bake_face_; }
+
   // Render both eye swapchains for the current frame; fills projection layers.
   // Returns false if the prior eye fence is stuck (no new submit; swapchains not touched).
   // AVVkFrame timelines must NOT be attached here — acquire-once on VulkanVideoTexture.
@@ -102,6 +112,12 @@ class SceneRenderer {
   VkShaderModule load_shader(const std::string& path);
   void destroy_sky_mono();
   bool ensure_sky_mono(VkFormat format, uint32_t w, uint32_t h);
+  void destroy_sky_baked();
+  bool bake_static_sky();
+  /** MW + nebulae + stars. gain_mul overrides milkyway_gain when >= 0 (bake uses 1). */
+  void draw_celestial_static(VkCommandBuffer cmd, const float* sky_mvp16, float gain_mul = -1.f);
+  void draw_celestial_bodies(VkCommandBuffer cmd, const float* sky_mvp16, std::int64_t unix_sec);
+  void draw_sky_baked(VkCommandBuffer cmd, const float* sky_mvp16);
   /** All celestial into mono RT (or per-eye fallback). sky_mvp = proj * view * model. */
   void draw_celestial(VkCommandBuffer cmd, const float* sky_mvp16, std::int64_t unix_sec);
   void draw_sky_mono(VkCommandBuffer cmd, const XrVulkanApp::FrameInfo& frame);
@@ -171,14 +187,29 @@ class SceneRenderer {
   float sky_lat_deg_ = 35.68f;   // Tokyo default
   float sky_lon_deg_ = 139.65f;
   bool milkyway_sky_ok_ = false;
+  bool sky_backdrop_baked_ = true;
+  uint32_t sky_bake_face_ = 2048;
+  bool sky_baked_ok_ = false;
   VkDescriptorSetLayout milkyway_dsl_ = VK_NULL_HANDLE;
   VkDescriptorPool milkyway_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet milkyway_dset_ = VK_NULL_HANDLE;
+  VkDescriptorSet sky_baked_dset_ = VK_NULL_HANDLE;
   VkImage milkyway_img_ = VK_NULL_HANDLE;
   VkDeviceMemory milkyway_img_mem_ = VK_NULL_HANDLE;
   VkImageView milkyway_view_ = VK_NULL_HANDLE;
   VkSampler milkyway_samp_ = VK_NULL_HANDLE;
   void load_milkyway_sky_texture();
+
+  VkPipeline sky_baked_pipeline_ = VK_NULL_HANDLE;
+  VkShaderModule sky_baked_vert_ = VK_NULL_HANDLE;
+  VkShaderModule sky_baked_frag_ = VK_NULL_HANDLE;
+  VkImage sky_baked_img_ = VK_NULL_HANDLE;
+  VkDeviceMemory sky_baked_mem_ = VK_NULL_HANDLE;
+  VkImageView sky_baked_cube_view_ = VK_NULL_HANDLE;
+  VkSampler sky_baked_samp_ = VK_NULL_HANDLE;
+  VkFormat sky_baked_format_ = VK_FORMAT_UNDEFINED;
+  uint32_t sky_baked_face_ = 0;
+  uint32_t sky_baked_mips_ = 1;
 
   /**
    * Shared full-sky RT: milkyway + nebulae + stars + sun/moon once per frame at the
