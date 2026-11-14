@@ -14,6 +14,8 @@
 #if defined(VRP_HAS_FFMPEG)
 extern "C" {
 #include <libavutil/frame.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/pixdesc.h>
 #include <libavutil/pixfmt.h>
 }
 #endif
@@ -31,6 +33,27 @@ bool frame_is_full_range(const AVFrame* f, bool hint) {
   if (f->color_range == AVCOL_RANGE_JPEG) return true;
   if (f->color_range == AVCOL_RANGE_MPEG) return false;
   return hint;
+}
+
+AVPixelFormat cuda_frame_sw_format(const AVFrame* f) {
+  if (f && f->hw_frames_ctx) {
+    auto* fc = reinterpret_cast<AVHWFramesContext*>(f->hw_frames_ctx->data);
+    if (fc && fc->sw_format != AV_PIX_FMT_NONE) return fc->sw_format;
+  }
+  return AV_PIX_FMT_NV12;
+}
+
+/** Bytes per luma sample for 420 semi-planar CUDA surfaces (NV12=1, P010/P016=2). */
+int luma_bytes_per_sample(AVPixelFormat sw) {
+  switch (sw) {
+    case AV_PIX_FMT_P010LE:
+    case AV_PIX_FMT_P010BE:
+    case AV_PIX_FMT_P016LE:
+    case AV_PIX_FMT_P016BE:
+      return 2;
+    default:
+      return 1;
+  }
 }
 #endif
 
@@ -455,6 +478,7 @@ bool CudaNv12Texture::destroy_slots() {
   pending_full_range_ = false;
   width_ = 0;
   height_ = 0;
+  bytes_per_sample_ = 1;
   valid_.store(false);
   layouts_ready_ = false;
   return ok;
@@ -596,11 +620,13 @@ bool CudaNv12Texture::ensure_cuda_imports() {
   return true;
 }
 
-bool CudaNv12Texture::create_slot(Slot& slot, int width, int height) {
+bool CudaNv12Texture::create_slot(Slot& slot, int width, int height, int bytes_per_sample) {
   const int uv_w = std::max(1, width / 2);
   const int uv_h = std::max(1, height / 2);
-  if (!create_plane(slot.y, width, height, VK_FORMAT_R8_UNORM)) return false;
-  if (!create_plane(slot.uv, uv_w, uv_h, VK_FORMAT_R8G8_UNORM)) {
+  const VkFormat y_fmt = bytes_per_sample >= 2 ? VK_FORMAT_R16_UNORM : VK_FORMAT_R8_UNORM;
+  const VkFormat uv_fmt = bytes_per_sample >= 2 ? VK_FORMAT_R16G16_UNORM : VK_FORMAT_R8G8_UNORM;
+  if (!create_plane(slot.y, width, height, y_fmt)) return false;
+  if (!create_plane(slot.uv, uv_w, uv_h, uv_fmt)) {
     destroy_plane(slot.y);
     return false;
   }
@@ -647,15 +673,17 @@ bool CudaNv12Texture::transition_all_to_shader_read() {
   return wait_fence_timeout(kFenceTimeoutNs);
 }
 
-bool CudaNv12Texture::ensure_size(int width, int height) {
+bool CudaNv12Texture::ensure_size(int width, int height, int bytes_per_sample) {
   // Caller must hold slots_mu_ (try_copy) or be the only user (reset already drained).
-  if (width == width_ && height == height_ && slots_[0].y.image && slots_[1].y.image &&
-      layouts_ready_) {
+  const int bps = bytes_per_sample >= 2 ? 2 : 1;
+  if (width == width_ && height == height_ && bps == bytes_per_sample_ && slots_[0].y.image &&
+      slots_[1].y.image && layouts_ready_) {
     return true;
   }
   if (create_failed_) return false;
 
-  VRP_LOG("CudaNv12Texture: ensure_size %dx%d -> %dx%d", width_, height_, width, height);
+  VRP_LOG("CudaNv12Texture: ensure_size %dx%d bps=%d -> %dx%d bps=%d", width_, height_,
+          bytes_per_sample_, width, height, bps);
   (void)retire_pending_copy();
   valid_.store(false, std::memory_order_release);
   layouts_ready_ = false;
@@ -668,7 +696,8 @@ bool CudaNv12Texture::ensure_size(int width, int height) {
   destroy_slots();
   width_ = width;
   height_ = height;
-  if (!create_slot(slots_[0], width, height) || !create_slot(slots_[1], width, height)) {
+  bytes_per_sample_ = bps;
+  if (!create_slot(slots_[0], width, height, bps) || !create_slot(slots_[1], width, height, bps)) {
     VRP_ERR("CudaNv12Texture: create_slot failed — %s", last_error().c_str());
     destroy_slots();
     create_failed_ = true;
@@ -686,7 +715,8 @@ bool CudaNv12Texture::ensure_size(int width, int height) {
   valid_.store(false, std::memory_order_release);
   present_gen_.store(0);
   set_error("ok");
-  VRP_LOG("CudaNv12Texture: LINEAR slots ready %dx%d", width, height);
+  VRP_LOG("CudaNv12Texture: LINEAR slots ready %dx%d bps=%d (%s)", width, height, bps,
+          bps >= 2 ? "P010/R16" : "NV12/R8");
   return true;
 }
 
@@ -738,6 +768,11 @@ bool CudaNv12Texture::try_copy_from_cuda(const AVFrame* cuda_frame, void* cu_con
   const int h = cuda_frame->height;
   if (w <= 0 || h <= 0) return fail("bad size");
 
+  const AVPixelFormat sw = cuda_frame_sw_format(cuda_frame);
+  const int bps = luma_bytes_per_sample(sw);
+  // Y: width * bps. UV (semi-planar): (width/2) * 2 components * bps == width * bps.
+  const int row_bytes = w * bps;
+
   copy_active_.store(true);
   struct ClearFlag {
     std::atomic<bool>& f;
@@ -763,7 +798,7 @@ bool CudaNv12Texture::try_copy_from_cuda(const AVFrame* cuda_frame, void* cu_con
   } pop_guard{this, &scope};
 
   std::lock_guard<std::mutex> slot_lock(slots_mu_);
-  if (!ensure_size(w, h)) {
+  if (!ensure_size(w, h, bps)) {
     // Fence timeout is transient — allow the next frame to retry.
     const std::string why = last_error();
     if (why.find("fence timeout") == std::string::npos) create_failed_ = true;
@@ -834,11 +869,11 @@ bool CudaNv12Texture::try_copy_from_cuda(const AVFrame* cuda_frame, void* cu_con
     return true;
   };
 
-  if (!copy_plane(slot.y, cuda_frame->data[0], cuda_frame->linesize[0], w, h, "Y")) {
+  if (!copy_plane(slot.y, cuda_frame->data[0], cuda_frame->linesize[0], row_bytes, h, "Y")) {
     copy_fail_.fetch_add(1);
     return false;
   }
-  if (!copy_plane(slot.uv, cuda_frame->data[1], cuda_frame->linesize[1], w, h / 2, "UV")) {
+  if (!copy_plane(slot.uv, cuda_frame->data[1], cuda_frame->linesize[1], row_bytes, h / 2, "UV")) {
     copy_fail_.fetch_add(1);
     return false;
   }

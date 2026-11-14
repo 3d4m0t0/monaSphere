@@ -14,7 +14,8 @@ struct AVFrame;
 namespace vrp {
 
 /**
- * NV12 ping-pong: CUDA writes directly into exportable LINEAR VkImages (Y R8 + UV R8G8).
+ * NV12/P010 ping-pong: CUDA writes into exportable LINEAR VkImages.
+ * 8-bit NV12: Y R8 + UV R8G8; 10/16-bit P010/P016: Y R16 + UV R16G16.
  * No vkCmdCopyBufferToImage on the graphics queue — avoids Monado wait_semaphore stalls.
  * Decode thread copies; XR only polls and rebinds descriptors.
  *
@@ -98,6 +99,8 @@ class CudaNv12Texture {
   int write_ = 1;
   int width_ = 0;
   int height_ = 0;
+  /** 1 for NV12, 2 for P010/P016 (luma sample bytes). */
+  int bytes_per_sample_ = 1;
   /** Slot with in-flight async copy; published on next try_copy / flush. -1 = none. */
   int pending_slot_ = -1;
   bool pending_full_range_ = false;
@@ -145,10 +148,11 @@ class CudaNv12Texture {
   bool destroy_plane(Plane& p);
   bool destroy_slots();
   bool create_plane(Plane& p, int width, int height, VkFormat format);
-  bool create_slot(Slot& slot, int width, int height);
+  /** bytes_per_sample: 1=NV12 (R8), 2=P010/P016 (R16). */
+  bool create_slot(Slot& slot, int width, int height, int bytes_per_sample);
   bool import_cuda_plane(Plane& p);
   bool ensure_cuda_imports();
-  bool ensure_size(int width, int height);
+  bool ensure_size(int width, int height, int bytes_per_sample);
   bool transition_all_to_shader_read();
   bool fence_ready() const;
   bool wait_fence_timeout(uint64_t ns);

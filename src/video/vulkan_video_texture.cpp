@@ -741,6 +741,44 @@ bool VulkanVideoTexture::kick_decode_stall() {
 }
 
 #if defined(VRP_HAS_FFMPEG)
+namespace {
+
+AVPixelFormat vulkan_frame_sw_format(const AVFrame* frame) {
+  if (frame && frame->hw_frames_ctx) {
+    auto* fc = reinterpret_cast<AVHWFramesContext*>(frame->hw_frames_ctx->data);
+    if (fc && fc->sw_format != AV_PIX_FMT_NONE) return fc->sw_format;
+  }
+  return AV_PIX_FMT_NV12;
+}
+
+bool sw_is_16bit_semiplanar(AVPixelFormat sw) {
+  switch (sw) {
+    case AV_PIX_FMT_P010LE:
+    case AV_PIX_FMT_P010BE:
+    case AV_PIX_FMT_P016LE:
+    case AV_PIX_FMT_P016BE:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void plane_view_formats(AVPixelFormat sw, bool multiplane, VkFormat* y_fmt, VkFormat* uv_fmt) {
+  *y_fmt = VK_FORMAT_R8_UNORM;
+  *uv_fmt = VK_FORMAT_R8G8_UNORM;
+  const VkFormat* fmts = av_vkfmt_from_pixfmt(sw);
+  if (fmts && fmts[0]) *y_fmt = fmts[0];
+  if (fmts && fmts[1]) *uv_fmt = fmts[1];
+  // Separate images use R16/R16G16 (av_vkfmt). A single multiplane G10X6 image
+  // requires the pack16 plane-compatible views per the Vulkan format features.
+  if (multiplane && sw_is_16bit_semiplanar(sw)) {
+    *y_fmt = VK_FORMAT_R10X6_UNORM_PACK16;
+    *uv_fmt = VK_FORMAT_R10X6G10X6_UNORM_2PACK16;
+  }
+}
+
+}  // namespace
+
 bool VulkanVideoTexture::rebuild_views(Slot& slot, AVFrame* frame) {
   destroy_views(slot);
   if (!frame || frame->format != AV_PIX_FMT_VULKAN || !frame->data[0]) return false;
@@ -752,8 +790,19 @@ bool VulkanVideoTexture::rebuild_views(Slot& slot, AVFrame* frame) {
   if (w < 2 || h < 2) return false;
 
   const bool multiplane = (vkf->img[1] == VK_NULL_HANDLE);
+  // NV12 → R8/R8G8; P010/P016 → R16/R16G16 (or R10X6 pack views when multiplane).
+  // High-bit storage: R16/R10X6 UNORM samples map into the same 0..1 range as 8-bit.
+  const AVPixelFormat sw = vulkan_frame_sw_format(frame);
   VkFormat y_fmt = VK_FORMAT_R8_UNORM;
   VkFormat uv_fmt = VK_FORMAT_R8G8_UNORM;
+  plane_view_formats(sw, multiplane, &y_fmt, &uv_fmt);
+  static thread_local AVPixelFormat logged_sw = AV_PIX_FMT_NONE;
+  if (sw != logged_sw) {
+    logged_sw = sw;
+    VRP_LOG("VulkanVideoTexture: plane views sw=%s y=0x%x uv=0x%x multiplane=%d",
+            av_get_pix_fmt_name(sw) ? av_get_pix_fmt_name(sw) : "?",
+            static_cast<unsigned>(y_fmt), static_cast<unsigned>(uv_fmt), multiplane ? 1 : 0);
+  }
 
   auto make_view = [&](VkImage image, VkFormat fmt, VkImageAspectFlags aspect,
                        VkImageView* out) -> bool {
@@ -766,16 +815,37 @@ bool VulkanVideoTexture::rebuild_views(Slot& slot, AVFrame* frame) {
     vi.subresourceRange.layerCount = 1;
     return vkCreateImageView(device_, &vi, nullptr, out) == VK_SUCCESS;
   };
+  // NVIDIA may accept R16 views on G10X6 multiplane; others require R10X6 pack.
+  const VkFormat y_alt =
+      (y_fmt == VK_FORMAT_R10X6_UNORM_PACK16) ? VK_FORMAT_R16_UNORM
+      : (y_fmt == VK_FORMAT_R16_UNORM)         ? VK_FORMAT_R10X6_UNORM_PACK16
+                                               : y_fmt;
+  const VkFormat uv_alt =
+      (uv_fmt == VK_FORMAT_R10X6G10X6_UNORM_2PACK16) ? VK_FORMAT_R16G16_UNORM
+      : (uv_fmt == VK_FORMAT_R16G16_UNORM)            ? VK_FORMAT_R10X6G10X6_UNORM_2PACK16
+                                                      : uv_fmt;
+  auto make_view_flex = [&](VkImage image, VkFormat prefer, VkFormat alt, VkImageAspectFlags aspect,
+                            VkImageView* out) -> bool {
+    if (make_view(image, prefer, aspect, out)) return true;
+    if (alt != prefer && make_view(image, alt, aspect, out)) {
+      VRP_LOG("VulkanVideoTexture: plane view fallback fmt 0x%x -> 0x%x",
+              static_cast<unsigned>(prefer), static_cast<unsigned>(alt));
+      return true;
+    }
+    return false;
+  };
 
   if (multiplane) {
-    if (!make_view(vkf->img[0], y_fmt, VK_IMAGE_ASPECT_PLANE_0_BIT, &slot.y)) return false;
-    if (!make_view(vkf->img[0], uv_fmt, VK_IMAGE_ASPECT_PLANE_1_BIT, &slot.uv)) {
+    if (!make_view_flex(vkf->img[0], y_fmt, y_alt, VK_IMAGE_ASPECT_PLANE_0_BIT, &slot.y))
+      return false;
+    if (!make_view_flex(vkf->img[0], uv_fmt, uv_alt, VK_IMAGE_ASPECT_PLANE_1_BIT, &slot.uv)) {
       destroy_views(slot);
       return false;
     }
   } else {
-    if (!make_view(vkf->img[0], y_fmt, VK_IMAGE_ASPECT_COLOR_BIT, &slot.y)) return false;
-    if (!make_view(vkf->img[1], uv_fmt, VK_IMAGE_ASPECT_COLOR_BIT, &slot.uv)) {
+    if (!make_view_flex(vkf->img[0], y_fmt, y_alt, VK_IMAGE_ASPECT_COLOR_BIT, &slot.y))
+      return false;
+    if (!make_view_flex(vkf->img[1], uv_fmt, uv_alt, VK_IMAGE_ASPECT_COLOR_BIT, &slot.uv)) {
       destroy_views(slot);
       return false;
     }
