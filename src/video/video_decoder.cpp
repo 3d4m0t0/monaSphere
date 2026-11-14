@@ -201,6 +201,53 @@ enum AVPixelFormat get_hw_format(AVCodecContext* ctx, const enum AVPixelFormat* 
   return AV_PIX_FMT_NONE;
 }
 
+bool codec_has_hw_device_ctx(const AVCodec* c) {
+  if (!c) return false;
+  for (int i = 0;; ++i) {
+    const AVCodecHWConfig* cfg = avcodec_get_hw_config(c, i);
+    if (!cfg) break;
+    if (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) return true;
+  }
+  return false;
+}
+
+bool codec_has_hw_type(const AVCodec* c, AVHWDeviceType type) {
+  if (!c) return false;
+  for (int i = 0;; ++i) {
+    const AVCodecHWConfig* cfg = avcodec_get_hw_config(c, i);
+    if (!cfg) break;
+    if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && cfg->device_type == type)
+      return true;
+  }
+  return false;
+}
+
+// avcodec_find_decoder(AV1) returns libdav1d (no HW_DEVICE_CTX). Prefer the native
+// av1 / av1_cuvid decoders so CUDA NVDEC and Vulkan Video AV1 can attach.
+const AVCodec* find_decoder_for_hw(AVCodecID id, const AVCodec* soft) {
+  if (soft && codec_has_hw_device_ctx(soft)) return soft;
+
+  if (id == AV_CODEC_ID_AV1) {
+    for (const char* name : {"av1", "av1_cuvid"}) {
+      const AVCodec* c = avcodec_find_decoder_by_name(name);
+      if (c && codec_has_hw_device_ctx(c)) {
+        VRP_LOG("decoder: prefer %s over %s for hwaccel", name, soft && soft->name ? soft->name : "?");
+        return c;
+      }
+    }
+  }
+
+  void* opaque = nullptr;
+  while (const AVCodec* c = av_codec_iterate(&opaque)) {
+    if (!av_codec_is_decoder(c) || c->id != id || c == soft) continue;
+    if (codec_has_hw_device_ctx(c)) {
+      VRP_LOG("decoder: prefer %s over %s for hwaccel", c->name, soft && soft->name ? soft->name : "?");
+      return c;
+    }
+  }
+  return soft;
+}
+
 struct JpegStill {
   AVCodecContext* ctx = nullptr;
   AVFrame* yuv = nullptr;
@@ -495,12 +542,14 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
   if (strip.interval_sec < 1.0) strip.interval_sec = 1.0;
   const int count = std::min(max_thumbs, std::max(1, static_cast<int>(duration / strip.interval_sec) + 1));
 
-  const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
-  if (!dec) {
+  const AVCodec* soft_dec = avcodec_find_decoder(st->codecpar->codec_id);
+  if (!soft_dec) {
     avformat_close_input(&fmt);
     strip.status = "デコーダなし";
     return strip;
   }
+  const AVCodec* dec =
+      allow_hwaccel ? find_decoder_for_hw(st->codecpar->codec_id, soft_dec) : soft_dec;
   AVCodecContext* codec = avcodec_alloc_context3(dec);
   avcodec_parameters_to_context(codec, st->codecpar);
   codec->thread_count = 1;
@@ -541,15 +590,30 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
       }
     }
   }
-  if (!nvdec) codec->get_format = avcodec_default_get_format;
-  if (!nvdec && avcodec_open2(codec, dec, nullptr) < 0) {
-    av_buffer_unref(&hw_device);
-    avcodec_free_context(&codec);
-    avformat_close_input(&fmt);
-    strip.status = "デコーダ open 失敗";
-    return strip;
+  if (!nvdec) {
+    if (dec != soft_dec) {
+      avcodec_free_context(&codec);
+      dec = soft_dec;
+      codec = avcodec_alloc_context3(dec);
+      if (!codec) {
+        av_buffer_unref(&hw_device);
+        avformat_close_input(&fmt);
+        strip.status = "デコーダなし";
+        return strip;
+      }
+      avcodec_parameters_to_context(codec, st->codecpar);
+      codec->thread_count = 1;
+    }
+    codec->get_format = avcodec_default_get_format;
+    if (avcodec_open2(codec, dec, nullptr) < 0) {
+      av_buffer_unref(&hw_device);
+      avcodec_free_context(&codec);
+      avformat_close_input(&fmt);
+      strip.status = "デコーダ open 失敗";
+      return strip;
+    }
+    VRP_LOG("Thumbnail hwaccel: software");
   }
-  if (!nvdec) VRP_LOG("Thumbnail hwaccel: software");
 
   AVFrame* frame = av_frame_alloc();
   AVFrame* sw_frame = av_frame_alloc();
@@ -1722,13 +1786,16 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
     return false;
   }
   AVStream* st = ff_->fmt->streams[ff_->video_stream];
-  const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
-  if (!dec) {
+  const AVCodec* soft_dec = avcodec_find_decoder(st->codecpar->codec_id);
+  if (!soft_dec) {
     const char* id_name = avcodec_get_name(st->codecpar->codec_id);
     fail_open(path, std::string("デコーダが見つかりません (codec=") + (id_name ? id_name : "?") + ")");
     close();
     return false;
   }
+  // Prefer HW-capable decoder (e.g. av1 over libdav1d) when hwaccel is allowed.
+  const AVCodec* dec =
+      allow_hwaccel ? find_decoder_for_hw(st->codecpar->codec_id, soft_dec) : soft_dec;
   ff_->codec = avcodec_alloc_context3(dec);
   if (!ff_->codec) {
     fail_open(path, "コーデックコンテキストを確保できません");
@@ -1760,6 +1827,12 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
   try_types_buf[n_try++] = AV_HWDEVICE_TYPE_NONE;
   for (int ti = 0; allow_hwaccel && try_types_buf[ti] != AV_HWDEVICE_TYPE_NONE; ++ti) {
     const AVHWDeviceType type = try_types_buf[ti];
+    // av1_cuvid is CUDA-only; skip non-CUDA tries on that decoder.
+    if (!codec_has_hw_type(dec, type)) {
+      VRP_DBG("hwaccel skip %s: codec %s has no HW_DEVICE_CTX config",
+              av_hwdevice_get_type_name(type), dec->name);
+      continue;
+    }
     AVPixelFormat hw_pix = AV_PIX_FMT_NONE;
     for (int i = 0;; ++i) {
       const AVCodecHWConfig* cfg = avcodec_get_hw_config(dec, i);
@@ -1855,6 +1928,24 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
   if (!hw_ok) {
     // HEVC still offers CUDA/VAAPI formats. A null get_format is called and SIGSEGV.
     // Frame threads decode several pictures at once. Slice-only stays on one core.
+    // If we switched to a HW decoder (av1) but hwaccel failed, reopen with the
+    // software-preferred decoder (libdav1d) for better CPU decode.
+    if (dec != soft_dec) {
+      avcodec_free_context(&ff_->codec);
+      dec = soft_dec;
+      ff_->codec = avcodec_alloc_context3(dec);
+      if (!ff_->codec) {
+        fail_open(path, "コーデックコンテキストを確保できません");
+        close();
+        return false;
+      }
+      err = avcodec_parameters_to_context(ff_->codec, st->codecpar);
+      if (err < 0) {
+        fail_open(path, "コーデックパラメータの適用に失敗: " + av_err(err));
+        close();
+        return false;
+      }
+    }
     ff_->codec->thread_count = 0;
     ff_->codec->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
     ff_->codec->opaque = nullptr;
@@ -2012,8 +2103,10 @@ bool VideoDecoder::reopen_vulkan_codec_keep_hw() {
   if (info_.hwaccel.find("vulkan") == std::string::npos) return false;
 
   AVStream* st = ff_->fmt->streams[ff_->video_stream];
-  const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
-  if (!dec) return false;
+  const AVCodec* soft_dec = avcodec_find_decoder(st->codecpar->codec_id);
+  if (!soft_dec) return false;
+  const AVCodec* dec = find_decoder_for_hw(st->codecpar->codec_id, soft_dec);
+  if (!dec || !codec_has_hw_type(dec, AV_HWDEVICE_TYPE_VULKAN)) return false;
 
   AVPixelFormat hw_pix = ff_->hw_opaque.hw_pix_fmt;
   if (hw_pix == AV_PIX_FMT_NONE) hw_pix = AV_PIX_FMT_VULKAN;
