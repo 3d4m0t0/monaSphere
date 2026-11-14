@@ -5556,6 +5556,8 @@ void HostWindow::xrThreadMain() {
     LiveCpuDiag live_cpu_diag;
     LiveDmaDiag live_dma_diag;
     bool live_dma_path = false;
+    /** Live↔Live: cleared present buffers once while switch_freeze (drop previous Live). */
+    bool live_switch_bufs_cleared = false;
     texture.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
     vrp::VideoTexture seek_tex;
     seek_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex());
@@ -7752,6 +7754,7 @@ void HostWindow::xrThreadMain() {
             (yt_busy.contains(QStringLiteral("切替")) && !yt_session_->switching_live());
         const bool switch_freeze =
             yt_session_->switching_live() && yt_session_->switch_freeze_frames();
+        if (!yt_session_->switching_live()) live_switch_bufs_cleared = false;
         if (yt_live && yt_cap && yt_cap->running() && !yt_busy_teardown) {
           {
             const auto status = yt_cap->drain_status();
@@ -7764,6 +7767,7 @@ void HostWindow::xrThreadMain() {
           live_dma_path = false;
           bool imported_dma = false;
           // Live↔Live gap: drain PW mailbox; busy overlay covers (no last-frame freeze).
+          uint64_t yt_content_key = 0;
           if (switch_freeze) {
             if (pw_dma && !(yt_session_ && yt_session_->dma_disabled())) {
               vrp::PipewireDmaFrame dma;
@@ -7782,9 +7786,24 @@ void HostWindow::xrThreadMain() {
               }
               live_cpu_pending = {};
             }
+            // Drop the previous Live present so reveal cannot re-bind it under the spinner
+            // (DMA view() stayed valid across freeze; first post-settle bind showed old YT).
+            if (!live_switch_bufs_cleared) {
+              live_switch_bufs_cleared = true;
+              if (pw_dma && !(yt_session_ && yt_session_->dma_disabled())) {
+                pw_dma_tex.mark_eye_done();
+                pw_dma_tex.reset();
+              }
+              texture.invalidate_content();
+              last_dma_import_key = 0;
+              last_dma_import_has_spa = false;
+              last_dma_import_spa_pts = 0;
+              last_dma_import_spa_seq = 0;
+              live_cpu_diag = {};
+              live_dma_diag = {};
+            }
             // Do not bind_last_yt — spinner panel owns the Flat view during switch.
-            live_dma_path =
-                pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.has_valid_frame();
+            live_dma_path = false;
           } else if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) &&
               !pw_dma_tex.import_abandoned()) {
             // 1) Keep-latest mailbox. Unread older FD → release held pw_buffer.
@@ -7999,9 +8018,10 @@ void HostWindow::xrThreadMain() {
             }
             if ((flipped || texture.view()) && texture.view()) {
               const int ds = texture.display_slot();
+              yt_content_key = texture.slot_content_fp(ds);
               yt_picture = bind_yt_rgba(texture.view(), texture.sampler(), texture.width(),
                                         texture.height(), flipped, /*rgba_mode=*/0,
-                                        texture.display_seq(), texture.slot_content_fp(ds), ds);
+                                        texture.display_seq(), yt_content_key, ds);
               live_cpu_diag.on_bind_hold(yt_session_->frame_seq(), texture.display_seq(),
                                          texture.upload_in_flight());
             } else if (!yt_loading && bind_last_yt()) {
@@ -8019,17 +8039,19 @@ void HostWindow::xrThreadMain() {
             }
             if ((promoted || pw_dma_tex.view()) && pw_dma_tex.view()) {
               const int ds = pw_dma_tex.display_slot();
+              yt_content_key = pw_dma_tex.slot_content_key(ds);
               yt_picture =
                   bind_yt_rgba(pw_dma_tex.view(), pw_dma_tex.sampler(), pw_dma_tex.width(),
                                pw_dma_tex.height(), promoted, /*rgba_mode=*/3,
-                               pw_dma_tex.display_seq(), pw_dma_tex.slot_content_key(ds), ds);
+                               pw_dma_tex.display_seq(), yt_content_key, ds);
               live_dma_diag.on_bind_hold(yt_session_->dma_seq(), pw_dma_tex.display_seq());
             } else if (!yt_loading && bind_last_yt()) {
               yt_picture = true;
             }
           }
           // Freeze: do not clear hold on the frozen last frame.
-          if (yt_picture && yt_session_ && !switch_freeze) yt_session_->mark_frame_presented();
+          if (yt_picture && yt_session_ && !switch_freeze)
+            yt_session_->mark_frame_presented(yt_content_key);
           // Portal AvailableCursorModes=0 → Hidden stream; draw stick cursor on Flat.
           if (yt_picture && yt_session_ && yt_session_->hmd_content_ready() &&
               !yt_session_->embedded_cursor() && opt_.projection == vrp::ProjectionMode::Flat) {

@@ -174,13 +174,13 @@ class YouTubeSession : public QObject {
   /** Live↔Live Chrome relaunch — hold last HMD frame until reveal. */
   bool switching_live() const { return switch_hold_content_; }
   /**
-   * True while the old browser is gone and the new one is not placed yet.
-   * XR must not import PW frames (Virtual wallpaper) — freeze the last picture.
+   * True while the old browser is gone and the new one is not yet safe to show.
+   * Includes post-place paint settle (still draining wallpaper — do not import).
    */
   bool switch_freeze_frames() const {
     return switch_hold_content_ && !pending_switch_reveal_;
   }
-  /** Chrome placed — resume import; hold clears after a few post-place frames. */
+  /** PW import resumed after paint settle; hold clears on the next presented frames. */
   bool switch_reveal_armed() const {
     return switch_hold_content_ && pending_switch_reveal_;
   }
@@ -218,7 +218,8 @@ class YouTubeSession : public QObject {
    * GNOME Meta: ignored until gnome_live_ready_ (Chrome on Meta + EIS rebound);
    * wallpaper frames must not clear the spinner (KDE parity).
    */
-  void mark_frame_presented();
+  /** Clear busy / switch hold when content is safe to show. content_key unused (API). */
+  void mark_frame_presented(uint64_t content_key = 0);
   /** Chrome on Meta (after place) — reveal PW stream + clear spinner (KDE parity). */
   void mark_gnome_live_ready();
 
@@ -372,10 +373,15 @@ class YouTubeSession : public QObject {
    * the new browser is placed and a frame arrives.
    */
   bool switch_hold_content_ = false;
-  /** After place during switch — mark_frame_presented may start counting reveal frames. */
+  /**
+   * False until post-place paint settle elapses — XR keeps switch_freeze (no wallpaper
+   * import). Then true: import resumes; mark_frame_presented clears hold shortly after.
+   */
   bool pending_switch_reveal_ = false;
-  /** Post-place PW frames seen while still holding (skip wallpaper still in flight). */
+  /** Post-settle PW frames seen while still holding. */
   int switch_reveal_seen_ = 0;
+  /** Bumped on switch / cleanup so paint-settle timers die. */
+  int switch_reveal_gen_ = 0;
   QTimer place_timer_;
   /** Desktop [アプリ]: keep new windows on Virtual after content start. */
   QTimer desk_maintain_timer_;

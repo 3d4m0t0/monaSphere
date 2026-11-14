@@ -345,6 +345,7 @@ void YouTubeSession::cleanupStreaming(bool destroy_meta) {
   switch_hold_content_ = false;
   pending_switch_reveal_ = false;
   switch_reveal_seen_ = 0;
+  ++switch_reveal_gen_;
   KwinWindowPlacer::disarm_place_on_open();
   KwinWindowPlacer::disarm_portal_dialog_on_primary();
 
@@ -507,16 +508,17 @@ void YouTubeSession::cleanupStreaming(bool destroy_meta) {
                                   : "; Meta deferred to Host");
 }
 
-void YouTubeSession::mark_frame_presented() {
+void YouTubeSession::mark_frame_presented(uint64_t /*content_key*/) {
   // GNOME Meta: first PW frames are wallpaper — keep spinner until Chrome + EIS ready.
   if (using_mutter_virtual_ && !gnome_live_ready_) return;
-  // Live↔Live: freeze until place, then skip a few post-place frames (empty Virtual
-  // / first Chrome map still looks like wallpaper if we reveal on frame 1).
+  // Live↔Live: keep freeze until paint settle arms pending_switch_reveal_. DMA buffer
+  // keys churn on static wallpaper too, so they cannot gate reveal. After settle, Chrome
+  // should already be composited — clear hold after a couple of imported frames.
   if (switch_hold_content_) {
     if (!pending_switch_reveal_) return;
     ++switch_reveal_seen_;
-    constexpr int kPostPlaceFrames = 4;
-    if (switch_reveal_seen_ < kPostPlaceFrames) return;
+    constexpr int kRevealFrames = 2;
+    if (switch_reveal_seen_ < kRevealFrames) return;
     switch_hold_content_ = false;
     pending_switch_reveal_ = false;
     switch_reveal_seen_ = 0;
@@ -571,6 +573,7 @@ bool YouTubeSession::switch_live_url(const QString& url, const QString& label) {
   switch_hold_content_ = true;
   pending_switch_reveal_ = false;
   switch_reveal_seen_ = 0;
+  ++switch_reveal_gen_;
   if (using_mutter_virtual_) gnome_live_ready_ = false;
   loading_.store(true, std::memory_order_release);
   // Destination name under spinner (same as first-launch) so the HMD does not
@@ -943,9 +946,12 @@ void YouTubeSession::configureLiveBrowserLaunch() {
                         .arg(QString::number(static_cast<double>(cfg_.virtual_scale), 'f', 2))
                         .arg(QString::number(static_cast<double>(cfg_.chrome_scale), 'f', 2)));
   }
-  chrome_->set_start_fullscreen(cfg_.browser != LiveBrowser::Firefox);
-  chrome_->set_start_minimized(cfg_.virtual_display && desk_ == DesktopEnv::Kde &&
-                               cfg_.browser != LiveBrowser::Firefox);
+  // KDE Virtual: do not --start-fullscreen (warm/--new-window can FS on primary
+  // before KWin place). Minimize on map; placeOnOutput + activate apply FS on Virtual.
+  const bool kde_virt = cfg_.virtual_display && desk_ == DesktopEnv::Kde &&
+                        cfg_.browser != LiveBrowser::Firefox;
+  chrome_->set_start_fullscreen(cfg_.browser != LiveBrowser::Firefox && !kde_virt);
+  chrome_->set_start_minimized(kde_virt);
   if (cfg_.browser == LiveBrowser::Firefox) {
     emit logMessage(tr("Firefox Live: --new-instance + XWayland; maximize (no compositor FS)"));
   }
@@ -1434,6 +1440,16 @@ void YouTubeSession::pollPlace() {
     fail(tr("KWin place failed — browser exited before it reached %1").arg(output_name_));
     return;
   }
+  // Shared/warm Chrome stays "running" forever — abort if place never completes
+  // (otherwise HMD spinner sticks while YouTube may be FS on the host).
+  constexpr int kPlaceGiveUpTries = 40;  // ~6s at 150ms
+  if (place_tries_ >= kPlaceGiveUpTries) {
+    KwinWindowPlacer::disarm_place_on_open();
+    QString cerr;
+    (void)KwinWindowPlacer::close_youtube_window(&cerr);
+    fail(tr("KWin place timed out — browser did not reach %1").arg(output_name_));
+    return;
+  }
   if (place_tries_ == 1 || place_tries_ % 8 == 0) {
     emit logMessage(tr("KWin: waiting for live browser on %1…").arg(output_name_));
   }
@@ -1668,11 +1684,21 @@ void YouTubeSession::onPlaced() {
     activate_kde();
     setState(State::Streaming);
     if (switch_hold_content_) {
-      // Resume PW import; hold clears after a few post-place frames (not wallpaper).
-      pending_switch_reveal_ = true;
+      // Keep switch_freeze (drain wallpaper, spinner covers) until Chrome has time to
+      // paint on Virtual. Warm/--new-window places in ms; paint lags → wallpaper flash
+      // if we import immediately. DMA content keys are useless (pool churn).
+      pending_switch_reveal_ = false;
       switch_reveal_seen_ = 0;
       if (using_mutter_virtual_) gnome_live_ready_ = true;
-      emit logMessage(tr("Live: Chrome placed — waiting for frames to reveal"));
+      const int gen = ++switch_reveal_gen_;
+      constexpr int kPaintSettleMs = 550;
+      emit logMessage(tr("Live: Chrome placed — waiting %1ms for paint").arg(kPaintSettleMs));
+      QTimer::singleShot(kPaintSettleMs, this, [this, gen] {
+        if (gen != switch_reveal_gen_ || !switch_hold_content_) return;
+        pending_switch_reveal_ = true;
+        switch_reveal_seen_ = 0;
+        emit logMessage(tr("Live: revealing stream"));
+      });
       return;
     }
     if (using_mutter_virtual_) {

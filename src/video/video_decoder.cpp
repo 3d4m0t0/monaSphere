@@ -3233,6 +3233,22 @@ void VideoTexture::ensure_size(int width, int height) {
   }
 }
 
+void VideoTexture::invalidate_content() {
+  if (in_flight_ && device_ && fence_) {
+    (void)vkWaitForFences(device_, 1, &fence_, VK_TRUE, 100'000'000ull);
+    in_flight_ = false;
+  }
+  valid_ = false;
+  width_ = 0;
+  height_ = 0;
+  for (int i = 0; i < kSlots; ++i) {
+    slot_seq_[i] = 0;
+    slot_fp_[i] = 0;
+  }
+  upload_seq_ = 0;
+  rebind_ = true;
+}
+
 bool VideoTexture::poll_present() {
   bool changed = false;
   if (in_flight_ && fence_ready()) {

@@ -448,10 +448,12 @@ class VideoTexture {
   static constexpr int kBusyAtlasW = kBusyPanelW;
   static constexpr int kBusyAtlasH = kBusyPanelH;
 
-  VkImageView view() const { return slots_[display_].view; }
+  VkImageView view() const { return valid_ ? slots_[display_].view : VK_NULL_HANDLE; }
   VkSampler sampler() const { return sampler_; }
   int width() const { return width_; }
   int height() const { return height_; }
+  /** Drop presentable content (Live↔Live switch) without destroying the VkDevice objects. */
+  void invalidate_content();
   /** Content generation of the currently displayed slot (0 = never written). */
   uint64_t display_seq() const { return slot_seq_[display_]; }
   int display_slot() const { return display_; }
