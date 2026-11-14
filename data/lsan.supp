@@ -1,0 +1,30 @@
+# LeakSanitizer suppressions for monasphere process-exit noise.
+# Use: LSAN_OPTIONS=suppressions=$PWD/data/lsan.supp ./build-asan/monasphere
+#
+# These are library caches / plugins that intentionally keep memory until process
+# exit. Real monasphere leaks still report (own stacks under src/ or apps/).
+
+# Fontconfig global cache (FcInit / FcConfig)
+leak:libfontconfig.so
+
+# Wayland client display buffers
+leak:libwayland-client.so
+
+# D-Bus connection bookkeeping
+leak:libdbus-1.so
+
+# SDL3 gamepad / subsystem init
+leak:libSDL3.so
+
+# Qt platform / filesystem watcher leftovers on abrupt exit
+leak:libQt6Core.so
+leak:QFileSystemWatcher
+leak:QObjectPrivate::connectImpl
+
+# Input method plugin (fcitx5)
+leak:libfcitx5platforminputcontextplugin.so
+leak:libFcitx5Qt6DBusAddons.so
+
+# NVIDIA / Mesa ICD allocations without symbols (<unknown module> in LSAN).
+# Re-check occasionally with ASAN_OPTIONS=fast_unwind_on_malloc=0 for stacks.
+leak:<unknown module>

@@ -212,6 +212,15 @@ void XrVulkanApp::request_exit() {
   }
 }
 
+void XrVulkanApp::drop_ffmpeg_hwctx() {
+  std::unique_ptr<FfmpegVulkanDevice> victim;
+  {
+    std::lock_guard<std::mutex> lock(ffmpeg_mu_);
+    victim = std::move(ffmpeg_vulkan_);
+  }
+  victim.reset();
+}
+
 namespace {
 
 /** Run a runtime/driver call that can block until Monado dies. Detach on timeout. */
@@ -317,11 +326,7 @@ void XrVulkanApp::shutdown() {
     session_ = XR_NULL_HANDLE;
     session_running_ = false;
     actions_ready_ = false;
-    if (ffmpeg_vulkan_) {
-      static FfmpegVulkanDevice* leaked_hwctx = nullptr;
-      leaked_hwctx = ffmpeg_vulkan_.release();
-      (void)leaked_hwctx;
-    }
+    drop_ffmpeg_hwctx();
     video_decode_ready_ = false;
     video_decode_queue_ = VK_NULL_HANDLE;
     video_decode_queue_family_ = UINT32_MAX;
@@ -428,20 +433,9 @@ void XrVulkanApp::shutdown() {
   }
 
   // Drop FFmpeg hwctx before DestroyDevice (inject does not own the VkDevice).
-  // reset() takes queue_mu_ / waits on a decode CB and used to stall with no log.
-  if (ffmpeg_vulkan_) {
-    VRP_TEARDOWN_LOG("XR: shutdown ffmpeg hwctx reset…");
-    FfmpegVulkanDevice* ff = ffmpeg_vulkan_.get();
-    if (!run_timed("ffmpeg hwctx reset", 1000, [ff] { ff->reset(); })) {
-      static FfmpegVulkanDevice* leaked_hwctx = nullptr;
-      leaked_hwctx = ffmpeg_vulkan_.release();
-      (void)leaked_hwctx;
-      VRP_TEARDOWN_LOG("XR: shutdown ffmpeg hwctx reset TIMEOUT — leaked");
-    } else {
-      ffmpeg_vulkan_.reset();
-    }
-    VRP_TEARDOWN_LOG("XR: shutdown ffmpeg hwctx reset done");
-  }
+  VRP_TEARDOWN_LOG("XR: shutdown ffmpeg hwctx reset…");
+  drop_ffmpeg_hwctx();
+  VRP_TEARDOWN_LOG("XR: shutdown ffmpeg hwctx reset done");
   // Vulkan Video's decode engine is not always finished by vkDeviceWaitIdle.
   // Idling the decode queue while the device still exists lets vkDestroyInstance
   // release the ICD without the ~15s driver timeout. Do not skip the later
@@ -982,19 +976,19 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     ext_ptrs.reserve(enabled_dev_exts_.size());
     for (const auto& s : enabled_dev_exts_) ext_ptrs.push_back(s.c_str());
     const uint32_t gq_count = split_compute ? 2u : 1u;
-    ffmpeg_vulkan_ = std::make_unique<FfmpegVulkanDevice>();
-    if (!ffmpeg_vulkan_->init(vk_instance_, physical_device_, device_, queue_family_index_, gq_count,
-                              video_decode_queue_family_, 1u, &queue_mu_, ext_ptrs)) {
-      VRP_LOG("FFmpeg Vulkan hwctx inject failed: %s — keep CUDA path",
-              ffmpeg_vulkan_->last_error().c_str());
-      ffmpeg_vulkan_.reset();
+    auto ff = std::make_unique<FfmpegVulkanDevice>();
+    if (!ff->init(vk_instance_, physical_device_, device_, queue_family_index_, gq_count,
+                  video_decode_queue_family_, 1u, &queue_mu_, ext_ptrs)) {
+      VRP_LOG("FFmpeg Vulkan hwctx inject failed: %s — keep CUDA path", ff->last_error().c_str());
     } else {
       VRP_LOG("FFmpeg Vulkan hwctx: ready (decode still CUDA until Phase 3 bind)");
+      std::lock_guard<std::mutex> lock(ffmpeg_mu_);
+      ffmpeg_vulkan_ = std::move(ff);
     }
   } else {
     vulkan_video_probe_.enabled_on_device = false;
     video_decode_queue_family_ = UINT32_MAX;
-    ffmpeg_vulkan_.reset();
+    drop_ffmpeg_hwctx();
   }
   if (external_memory_fd_) {
     VRP_LOG("Vulkan external memory FD: yes (NVIDIA CUDA zero-copy)");

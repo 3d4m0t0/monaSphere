@@ -76,7 +76,8 @@ bool VirtualDisplayManager::matches(const Spec& want_in) const {
 }
 
 bool VirtualDisplayManager::reusable() const {
-  // RecordVirtual MONITOR dies with Session.Stop — never reuse across streams.
+  // RecordVirtual MONITOR dies with Session.Stop — never "reuse" after destroy.
+  // While Meta is still up, Host Live↔Live uses gnome_meta_alive() + switch_live_url.
   if (backend_ == Backend::GnomeMutter || gnome_meta_alive_) return false;
   return alive();
 }
@@ -682,7 +683,8 @@ void VirtualDisplayManager::destroy() {
     stopGnomeMetaUnlocked();
     add_progress(50);
     // Mutter removes Meta asynchronously; brief settle for shell/lease.
-    QThread::msleep(600);
+    // (cleanupStreaming also post-settles; keep this short — was 600ms.)
+    QThread::msleep(200);
     add_progress(10);
     emit busyStatus(QString());
     VRP_TEARDOWN_LOG("Live teardown: Virtual destroy END — Meta");

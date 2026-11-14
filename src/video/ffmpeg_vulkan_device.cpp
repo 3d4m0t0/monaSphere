@@ -88,8 +88,27 @@ void FfmpegVulkanDevice::reset() {
     vk->lock_queue = nullptr;
     vk->unlock_queue = nullptr;
 #endif
+    // We allocated enabled_*_extensions with av_malloc/av_strdup. Free them here
+    // before unref and null the fields so FFmpeg's RELEASE_PROPS is a no-op
+    // (avoids double-free). Detached XR threads never reached unref otherwise → LSAN.
+    auto release_props = [](const char* const*& props, int& count) {
+      if (!props) {
+        count = 0;
+        return;
+      }
+      for (int i = 0; i < count; ++i) av_free(const_cast<char*>(props[i]));
+      av_free(const_cast<char**>(props));
+      props = nullptr;
+      count = 0;
+    };
+    release_props(vk->enabled_dev_extensions, vk->nb_enabled_dev_extensions);
+    release_props(vk->enabled_inst_extensions, vk->nb_enabled_inst_extensions);
+    ctx->user_opaque = nullptr;
+    queue_mu_ = nullptr;
+  } else if (ctx) {
+    ctx->user_opaque = nullptr;
+    queue_mu_ = nullptr;
   }
-  ctx->user_opaque = nullptr;
   av_buffer_unref(&ref_);
   ref_ = nullptr;
   queue_mu_ = nullptr;

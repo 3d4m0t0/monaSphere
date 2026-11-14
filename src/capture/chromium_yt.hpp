@@ -92,8 +92,23 @@ class ChromiumYtLauncher : public QObject {
   /**
    * Stop our live window. Shared (default) profile: do not kill system browser.
    * Isolated: terminate the monasphere browser process (+ children).
+   * When Live attached to a warm/isolated process via new-window, stop() does
+   * not kill the profile (same as shared); Meta teardown still scrubs isolated.
    */
   void stop();
+
+  /**
+   * Pre-open Chrome so Live can take the already_running / shared path (same as
+   * the user opening Chrome before monaSphere). No-op for Firefox, or when the
+   * target profile is already running. Ozone / scale follow this launcher's
+   * settings; no PULSE_SINK. WM_CLASS is monaSphereYTWarm (not Live place).
+   */
+  bool ensureWarm();
+  /** Quit warm Chrome only if ensureWarm() started it (never kill a pre-existing browser). */
+  static void shutdownWarm();
+  static bool warmOwned();
+  /** True if warm Chrome for the configured profile is still alive (owned or not). */
+  bool warmAlive() const;
 
   static QString detectBrowser(LiveBrowser kind = LiveBrowser::Chrome);
   /** Isolated profile path (live_chrome_profile=isolated). */
@@ -101,11 +116,27 @@ class ChromiumYtLauncher : public QObject {
   /** Default Chrome/Chromium user-data-dir if present. */
   static QString defaultUserDataDir(const QString& browser_path);
   /**
+   * True when a user system Chrome/Chromium main process is already on Wayland
+   * (GNOME Live cannot attach ozone=x11 / class / place into that singleton).
+   * Ignores monasphere isolated profile and monaSphereYTWarm (our warm).
+   * X11 ozone user Chrome returns false (shared remoting is OK).
+   */
+  static bool userWaylandSharedChromeRunning();
+  /**
    * Kill every process using the monasphere isolated Live profile.
    * GNOME Meta teardown must call this even if our QProcess already exited —
    * zygote children left on Meta-* assert-crash gnome-shell → logout.
+   * Clears warm ownership if the scrubbed profile was the warm profile.
    */
   static void killIsolatedLiveBrowsers(LiveBrowser kind = LiveBrowser::Chrome);
+  /**
+   * True after a shared/default Chrome cold-start for Live (no prior Chrome).
+   * stop() / quitOwnedSharedChrome() then terminates that browser so Wayland
+   * windows are not dumped fullscreen onto the host when Meta dies.
+   */
+  static bool sharedLiveOwned();
+  /** Quit Chrome we cold-started for shared Live; no-op if not owned. */
+  static void quitOwnedSharedChrome();
 
  signals:
   void started();

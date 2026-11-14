@@ -115,7 +115,11 @@ class VirtualDisplayManager : public QObject {
 
   bool alive() const;
   bool matches(const Spec& want) const;
-  /** False while a GNOME Meta RecordVirtual session is open (stream-tied). */
+  /**
+   * False for GNOME Meta (stream dies with Session.Stop — cannot "reuse" after
+   * destroy). Live↔Live while Meta is still alive uses Host `gnome_inplace` +
+   * `YouTubeSession::switch_live_url` instead (keep Session, relaunch Chrome).
+   */
   bool reusable() const;
 
   Backend backend() const { return backend_; }

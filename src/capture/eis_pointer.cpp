@@ -317,6 +317,19 @@ bool EisPointer::key_alt_left() {
   return true;
 }
 
+bool EisPointer::key_escape() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  ei_device_keyboard_key(kbd, KEY_ESC, true);
+  ei_device_frame(kbd, ei_now(ei));
+  ei_device_keyboard_key(kbd, KEY_ESC, false);
+  ei_device_frame(kbd, ei_now(ei));
+  pump();
+  return true;
+}
+
 void EisPointer::warp(double x, double y) {
   double ax = x;
   double ay = y;

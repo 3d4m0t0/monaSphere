@@ -51,6 +51,7 @@
 #include <QWidgetAction>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QMessageBox>
 #include <QIcon>
 #include <QPixmap>
 #include <QPlainTextEdit>
@@ -82,8 +83,11 @@
 #include <QFileInfo>
 #include <QGuiApplication>
 #include <QMap>
+#include <QPointer>
 #include <QProcess>
 #include <QRegularExpression>
+
+#include <memory>
 
 #include <chrono>
 #include <thread>
@@ -127,21 +131,17 @@ HostWindow::HostWindow(vrp::PlayerOptions opt, QString shader_dir, QWidget* pare
   setHealth("Wait", usingWivrn() ? QStringLiteral("Waiting for headset")
                                  : QStringLiteral("Waiting for USB HMD"));
   loadMonadoModeTable();
+  // KDE: warm Chrome for already_running Live. GNOME: resolve/dialog only (no warm).
+  QTimer::singleShot(1200, this, [this] { ensureLiveChromeWarm(); });
   if (!usingWivrn()) {
     QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
   }
 }
 
 HostWindow::~HostWindow() {
-  shutting_down_.store(true);
-  thumb_cancel_.store(true);
-  stopExternalSessions();
-  // Vulkan Video's vkDestroyInstance can take ~15s and must finish.
-  if (!shutdownXrSession(25000, true)) {
-    VRP_ERR("XR thread did not exit in destructor — detaching (last resort)");
-    if (xr_thread_.joinable()) xr_thread_.detach();
-  }
+  finishAppTeardown();
   if (thumb_thread_.joinable()) {
+    thumb_cancel_.store(true);
     thumb_thread_.join();
   }
   QCoreApplication::removePostedEvents(this);
@@ -149,15 +149,7 @@ HostWindow::~HostWindow() {
 
 void HostWindow::closeEvent(QCloseEvent* event) {
   saveWindowGeometry();
-  shutting_down_.store(true);
-  thumb_cancel_.store(true);
-  stopExternalSessions();
-  // Vulkan Video's vkDestroyInstance can take ~15s and must finish.
-  if (!shutdownXrSession(25000, true)) {
-    appendLog(tr("XR thread hung — detach"));
-    VRP_ERR("XR thread join timed out on close — detaching");
-    if (xr_thread_.joinable()) xr_thread_.detach();
-  }
+  finishAppTeardown();
   if (thumb_thread_.joinable()) {
     thumb_cancel_.store(true);
     thumb_thread_.join();
@@ -166,13 +158,45 @@ void HostWindow::closeEvent(QCloseEvent* event) {
   QCoreApplication::quit();
 }
 
-void HostWindow::stopExternalSessions() {
-  // Live / desktop app / virtual display before the XR session is torn down.
-  if (yt_session_) yt_session_->shutdown();
+void HostWindow::finishAppTeardown() {
+  if (app_teardown_done_.exchange(true, std::memory_order_acq_rel)) return;
+  // Freeze XR→UI callbacks before any QObject teardown (create_vulkan watchdog).
+  if (ui_alive_) ui_alive_->store(false, std::memory_order_release);
+  shutting_down_.store(true, std::memory_order_release);
+  thumb_cancel_.store(true, std::memory_order_release);
+  // GNOME: evacuate Live clients first, but Session.Stop Meta only after XR /
+  // Monado drop the HMD DRM lease — otherwise mutter can SEGV (session freeze).
+  stopExternalSessions();
+  if (!shutdownXrSession(25000, true)) {
+    // Detach abandons stack unwind — free FFmpeg hwctx first (LSAN av_malloc).
+    {
+      std::lock_guard<std::mutex> lock(xr_app_mu_);
+      if (xr_app_) xr_app_->drop_ffmpeg_hwctx();
+    }
+    VRP_ERR("XR thread did not exit on app teardown — detaching (last resort)");
+    if (xr_thread_.joinable()) xr_thread_.detach();
+  }
+  VRP_TEARDOWN_LOG("Host teardown: Meta/Virtual after XR/Monado…");
   destroyVirtualForLeaveLive();
+  VRP_TEARDOWN_LOG("Host teardown: Meta/Virtual after XR/Monado done");
+}
+
+void HostWindow::stopExternalSessions() {
+  // Live / desktop app before XR. GNOME Meta stays until finishAppTeardown
+  // (after Monado); leave-Live paths destroy Meta inside YouTubeSession::stop().
+  if (yt_session_) yt_session_->shutdown();
+  const bool gnome_meta = vrp::detect_desktop_env() == vrp::DesktopEnv::Gnome &&
+                          vrp::GnomeVirtualDisplay::managedVirtualAvailable();
+  if (!gnome_meta) {
+    destroyVirtualForLeaveLive();
+  } else {
+    VRP_TEARDOWN_LOG("Host teardown: defer GNOME Meta destroy until after XR/Monado");
+  }
   pad_hook_.stop();
   pad_hook_active_ = false;
   pad_filter_.stop();
+  // Close warm Chrome only if we started it (never a user's pre-existing Chrome).
+  vrp::ChromiumYtLauncher::shutdownWarm();
 }
 
 void HostWindow::signalXrStop() {
@@ -231,14 +255,34 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
 
   if (!ok && xr_thread_.joinable() && stop_monado && !monado_external_) {
     if (!xr_in_frame_loop_.load(std::memory_order_acquire)) {
-      // Past WaitFrame. Teardown is inside Vulkan/OpenXR destroy. Killing Monado
-      // here is what wedges the next xrCreateVulkanInstanceKHR.
-      VRP_TEARDOWN_LOG(
-          "Host teardown: frame loop left — waiting for teardown, not stopping Monado");
-      const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(8);
-      while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
-        QThread::msleep(40);
-        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+      // Not in the frame loop: either still in xrCreateVulkanInstanceKHR (hung
+      // compositor) or inside Vulkan/OpenXR destroy. Stopping Monado mid-create
+      // can SEGV monado-service (teardown_all join) — only do it when create is
+      // known hung or we are quitting and must unblock the XR thread.
+      const bool hung_create = vk_create_hung_.load(std::memory_order_acquire) ||
+                               shutting_down_.load(std::memory_order_acquire);
+      if (hung_create) {
+        VRP_TEARDOWN_LOG(
+            "Host teardown: XR stuck before frame loop (vk_hung=%d) — soft-stop Monado to unblock",
+            vk_create_hung_.load(std::memory_order_acquire) ? 1 : 0);
+        stopMonadoProcess();
+        stopSystemdMonadoForOwnedStart();
+        clearStaleMonadoSocket();
+        const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(6);
+        while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
+          QThread::msleep(40);
+          QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+        }
+      } else {
+        // Past WaitFrame. Teardown is inside Vulkan/OpenXR destroy. Killing Monado
+        // here wedges the next xrCreateVulkanInstanceKHR.
+        VRP_TEARDOWN_LOG(
+            "Host teardown: frame loop left — waiting for teardown, not stopping Monado");
+        const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+        while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
+          QThread::msleep(40);
+          QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+        }
       }
       if (!xr_running_.load() && xr_thread_.joinable()) {
         VRP_TEARDOWN_LOG("Host teardown: grace join XR thread…");
@@ -260,6 +304,11 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
         xr_thread_.join();
         ok = true;
       }
+    }
+    if (!ok && xr_thread_.joinable()) {
+      // About to return failure → caller may detach. Drop FFmpeg hwctx now.
+      std::lock_guard<std::mutex> lock(xr_app_mu_);
+      if (xr_app_) xr_app_->drop_ffmpeg_hwctx();
     }
   } else if (ok && stop_monado && !monado_external_) {
     // GNOME/Mutter: XR/Monado release of the HMD DRM lease races mutter's
@@ -1239,6 +1288,8 @@ bool monasphereConfAssignmentOk(const QString& code, bool allow_legacy) {
   if (confKeyIs(code, QStringLiteral("live_chrome_profile"), &v))
     return v.compare(QLatin1String("default"), Qt::CaseInsensitive) == 0 ||
            v.compare(QLatin1String("isolated"), Qt::CaseInsensitive) == 0;
+  if (confKeyIs(code, QStringLiteral("live_chrome_warm"), &v))
+    return v == QLatin1String("0") || v == QLatin1String("1");
   if (confKeyIs(code, QStringLiteral("live_browser"), &v))
     return confOneOf(v, {QLatin1String("chrome"), QLatin1String("chromium"),
                          QLatin1String("firefox")},
@@ -1719,6 +1770,8 @@ void HostWindow::loadAppConf() {
       {QStringLiteral("live_chrome_scale"), QStringLiteral("1")},
       {QStringLiteral("live_cursor_scale"), QStringLiteral("1")},
       {QStringLiteral("live_chrome_profile"), QStringLiteral("default")},
+      // 1 = pre-open Chrome at host start (same as manual pre-open for faster Live).
+      {QStringLiteral("live_chrome_warm"), QStringLiteral("1")},
       // Persist breadcrumbs under ~/.config/monasphere/ (also /tmp/monasphere-*).
       // live_display_log: 0=off (default). live_teardown_log: 1=on (default).
       {QStringLiteral("live_display_log"), QStringLiteral("0")},
@@ -2014,6 +2067,9 @@ void HostWindow::loadAppConf() {
     } else if (line.startsWith(QStringLiteral("live_chrome_profile="))) {
       const QString v = line.mid(19).trimmed().toLower();
       live_chrome_default_profile_ = (v != QLatin1String("isolated"));
+    } else if (line.startsWith(QStringLiteral("live_chrome_warm="))) {
+      const QString v = line.mid(QStringLiteral("live_chrome_warm=").size()).trimmed();
+      live_chrome_warm_ = (v != QLatin1String("0"));
     } else if (line.startsWith(QStringLiteral("live_browser="))) {
       const QString v = line.mid(13).trimmed().toLower();
       if (v == QLatin1String("firefox"))
@@ -2354,6 +2410,62 @@ void HostWindow::destroyVirtualForLeaveLive() {
   VRP_TEARDOWN_LOG("Host teardown: destroyVirtual END");
 }
 
+void HostWindow::maybeWarnGnomeChromeIsolated(bool forced_isolated) {
+  if (!forced_isolated || gnome_chrome_isolated_warned_) return;
+  if (shutting_down_.load(std::memory_order_acquire)) return;
+  gnome_chrome_isolated_warned_ = true;
+  appendLog(tr("GNOME: system Chrome is Wayland — Live uses isolated profile "
+               "(quit Chrome completely, then restart monaSphere for shared logins)"));
+  QMessageBox::information(
+      this, tr("Live Chrome"),
+      tr("System Chrome is already running on Wayland.\n\n"
+         "Live will use an isolated Chrome profile so the window can be placed "
+         "on the virtual display.\n\n"
+         "To use your normal Chrome logins (shared profile), quit Chrome "
+         "completely, then restart monaSphere."));
+}
+
+void HostWindow::ensureLiveChromeWarm() {
+  if (shutting_down_.load(std::memory_order_acquire)) return;
+  if (!live_chrome_warm_) return;
+  if (live_browser_ == vrp::LiveBrowser::Firefox) return;
+  // GNOME: no warm — Meta Live is fast enough via start/switch settle tuning;
+  // shared Wayland warm fought place/class. Still resolve once for the dialog.
+  if (vrp::detect_desktop_env() == vrp::DesktopEnv::Gnome) {
+    bool forced_iso = false;
+    (void)vrp::YouTubeSession::resolveUseDefaultChromeProfile(
+        live_chrome_default_profile_, live_browser_, live_virtual_, &forced_iso);
+    maybeWarnGnomeChromeIsolated(forced_iso);
+    return;
+  }
+
+  bool forced_iso = false;
+  const bool use_default = vrp::YouTubeSession::resolveUseDefaultChromeProfile(
+      live_chrome_default_profile_, live_browser_, live_virtual_, &forced_iso);
+  maybeWarnGnomeChromeIsolated(forced_iso);
+
+  vrp::ChromiumYtLauncher warm;
+  warm.set_browser(vrp::LiveBrowser::Chrome);
+  warm.set_use_default_profile(use_default);
+  // KDE: Wayland follows output scale (force_x11 only via MONASPHERE_YT_X11).
+  warm.set_force_x11(false);
+  const bool ozone_x11 = !qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11");
+  float chrome_dsf = live_chrome_scale_;
+  if (ozone_x11 && live_virtual_ && live_virtual_scale_ > 1.01f &&
+      std::abs(live_chrome_scale_ - 1.f) < 0.05f) {
+    chrome_dsf = live_virtual_scale_;
+  }
+  warm.set_device_scale_factor(chrome_dsf);
+  warm.set_follow_output_scale(!ozone_x11 && std::abs(live_chrome_scale_ - 1.f) < 0.05f);
+
+  const bool owned_before = vrp::ChromiumYtLauncher::warmOwned();
+  if (!warm.ensureWarm()) return;
+  if (vrp::ChromiumYtLauncher::warmOwned() && !owned_before) {
+    appendLog(tr("Live Chrome warm: pre-opened (%1)")
+                  .arg(use_default ? tr("default profile") : tr("isolated profile")));
+  }
+}
+
 void HostWindow::ensureYouTubeSession() {
   if (!vdisp_mgr_) {
     vdisp_mgr_ = new vrp::VirtualDisplayManager(this);
@@ -2525,6 +2637,15 @@ void HostWindow::ensureYouTubeSession() {
     pad_filter_.stop();
     // No fixed settle — next start waits only if still before this timestamp (usually now).
     yt_restore_ready_ms_ = QDateTime::currentMSecsSinceEpoch();
+    // Meta/isolated teardown may have killed warm Chrome — re-warm before next Live.
+    const auto rewarm = [this](bool sync_before_next_live) {
+      if (shutting_down_.load(std::memory_order_acquire)) return;
+      if (sync_before_next_live) {
+        ensureLiveChromeWarm();
+        return;
+      }
+      QTimer::singleShot(600, this, [this] { ensureLiveChromeWarm(); });
+    };
     // Video queue wins over [アプリ] return (open_video while live).
     if (yt_await_video_after_stop_.load(std::memory_order_acquire) ||
         yt_pending_kind_ == YtPendingKind::Video) {
@@ -2533,6 +2654,7 @@ void HostWindow::ensureYouTubeSession() {
       VRP_TEARDOWN_LOG("Host teardown: remove Virtual before video…");
       appendLog(tr("Live cleanup done — removing Virtual before video"));
       finishQueuedVideoAfterVirtualGone();
+      rewarm(/*sync=*/false);
       return;
     }
     if (yt_pending_kind_ != YtPendingKind::None) {
@@ -2540,6 +2662,7 @@ void HostWindow::ensureYouTubeSession() {
       yt_return_apps_menu_.store(false, std::memory_order_release);
       VRP_TEARDOWN_LOG("Host teardown: queued live session (Virtual kept for ensure)");
       appendLog(tr("Live cleanup done — starting queued session (Virtual manager decides)"));
+      rewarm(/*sync=*/true);
       flushPendingLiveStart();
       return;
     }
@@ -2550,6 +2673,7 @@ void HostWindow::ensureYouTubeSession() {
       if (yt_session_) yt_session_->clear_busy_status();
       yt_show_apps_after_stop_.store(true, std::memory_order_release);
       appendLog(tr("Live cleanup done — Virtual gone, opening [アプリ]"));
+      rewarm(/*sync=*/false);
       return;
     }
     if (yt_setup_phase_ == YtSetupPhase::Capture && !tokenForSpan(live_session_span_).isEmpty()) {
@@ -2561,6 +2685,7 @@ void HostWindow::ensureYouTubeSession() {
         if (yt_setup_phase_ != YtSetupPhase::Refresh) return;
         // Silent restore while still in setup — proves token works before HMD use.
         yt_hmd_suppress_live_.store(true, std::memory_order_release);
+        ensureLiveChromeWarm();
         beginYouTubeCapture(/*host_setup=*/false, /*url_override=*/{}, /*desktop_exec=*/{},
                             /*desktop_args=*/{}, span);
       });
@@ -2570,6 +2695,7 @@ void HostWindow::ensureYouTubeSession() {
       yt_setup_continue_ = false;
       QTimer::singleShot(3500, this, [this] {
         if (yt_setup_queue_.isEmpty()) return;
+        ensureLiveChromeWarm();
         beginNextSetupSpan(/*first=*/false);
       });
       return;
@@ -2585,6 +2711,7 @@ void HostWindow::ensureYouTubeSession() {
     VRP_TEARDOWN_LOG("Host teardown: plain destroyVirtualForLeaveLive…");
     destroyVirtualForLeaveLive();
     VRP_TEARDOWN_LOG("Host teardown: plain destroyVirtual done");
+    rewarm(/*sync=*/false);
   });
 }
 
@@ -2775,21 +2902,36 @@ void HostWindow::startLiveFromHmd(const QString& url) {
   if (yt_session_ &&
       (yt_session_->active() || yt_session_->loading() ||
        yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
-    // Fast path: same Virtual + streaming browser → Chrome relaunch only.
-    const bool reuse = vdisp_mgr_ && vdisp_mgr_->reusable() &&
-                       vdisp_mgr_->matches(virtualSpecForSpan(1));
+    // Fast path: keep capture + Virtual/Meta — relaunch Chrome only.
+    // KDE: reusable() while krfb Virtual stays. GNOME: reusable() is always
+    // false (RecordVirtual dies with Session.Stop) but Meta can stay alive
+    // across Live↔Live URL switches while the PW consumer keeps running.
+    const bool kde_reuse = vdisp_mgr_ && vdisp_mgr_->reusable() &&
+                           vdisp_mgr_->matches(virtualSpecForSpan(1));
+    const auto st = yt_session_->state();
+    const bool gnome_inplace =
+        gnome_meta && vdisp_mgr_ && vdisp_mgr_->gnome_meta_alive() &&
+        yt_session_->meta_live_path() &&
+        (st == vrp::YouTubeSession::State::Streaming ||
+         st == vrp::YouTubeSession::State::Placed);
+    const bool reuse = kde_reuse || gnome_inplace;
     const QString dest_label = liveAppLabelForUrl(open_url);
     if (reuse && yt_session_->active() && !yt_session_->desktop_app_mode() &&
-        yt_session_->state() == vrp::YouTubeSession::State::Streaming &&
+        (st == vrp::YouTubeSession::State::Streaming ||
+         st == vrp::YouTubeSession::State::Placed) &&
         yt_session_->switch_live_url(open_url, dest_label)) {
       appendLog(tr("Live: switch in place (Virtual/ScreenCast kept) → %1").arg(open_url));
       return;
     }
-    appendLog(tr("Live: switch in place skipped (reuse=%1 active=%2 desk=%3 state=%4) — full restart")
+    appendLog(tr("Live: switch in place skipped (reuse=%1 kde=%2 gnome=%3 active=%4 desk=%5 state=%6 meta=%7) — full restart")
                   .arg(reuse ? QStringLiteral("1") : QStringLiteral("0"))
+                  .arg(kde_reuse ? QStringLiteral("1") : QStringLiteral("0"))
+                  .arg(gnome_inplace ? QStringLiteral("1") : QStringLiteral("0"))
                   .arg(yt_session_->active() ? QStringLiteral("1") : QStringLiteral("0"))
                   .arg(yt_session_->desktop_app_mode() ? QStringLiteral("1") : QStringLiteral("0"))
-                  .arg(static_cast<int>(yt_session_->state())));
+                  .arg(static_cast<int>(st))
+                  .arg((vdisp_mgr_ && vdisp_mgr_->gnome_meta_alive()) ? QStringLiteral("1")
+                                                                     : QStringLiteral("0")));
     yt_pending_kind_ = YtPendingKind::Live;
     yt_pending_url_ = open_url;
     yt_pending_exec_.clear();
@@ -2937,6 +3079,9 @@ void HostWindow::reloadLiveCaptureConf() {
     } else if (line.startsWith(QStringLiteral("live_chrome_profile="))) {
       const QString v = line.mid(19).trimmed().toLower();
       live_chrome_default_profile_ = (v != QLatin1String("isolated"));
+    } else if (line.startsWith(QStringLiteral("live_chrome_warm="))) {
+      const QString v = line.mid(QStringLiteral("live_chrome_warm=").size()).trimmed();
+      live_chrome_warm_ = (v != QLatin1String("0"));
     } else if (line.startsWith(QStringLiteral("live_browser="))) {
       const QString v = line.mid(13).trimmed().toLower();
       if (v == QLatin1String("firefox"))
@@ -3037,11 +3182,16 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
                   .arg(live_drm_modifiers_.size()));
   }
   if (cfg.exec.isEmpty()) {
+    // Browser Live: re-resolve before start (race after warm). [アプリ] skips.
+    bool forced_iso = false;
+    const bool use_default_chrome = vrp::YouTubeSession::resolveUseDefaultChromeProfile(
+        live_chrome_default_profile_, live_browser_, live_virtual_, &forced_iso);
+    maybeWarnGnomeChromeIsolated(forced_iso);
     const QString browser_name =
         live_browser_ == vrp::LiveBrowser::Firefox ? tr("Firefox") : tr("Chrome");
     appendLog(tr("Live browser: %1 (%2)")
-                  .arg(browser_name, live_chrome_default_profile_ ? tr("default profile")
-                                                                 : tr("isolated profile")));
+                  .arg(browser_name, use_default_chrome ? tr("default profile")
+                                                       : tr("isolated profile")));
   }
   if (host_setup) {
     appendLog(tr("Live setup — pick %1, enable Remember/allow restore, "
@@ -5214,34 +5364,46 @@ void HostWindow::disconnectHeadsetSession(bool resume_auto_poll) {
 
 void HostWindow::xrThreadMain() {
   xr_running_.store(true);
+  vk_create_hung_.store(false, std::memory_order_release);
   logged_session_refresh_hz_ = false;
-  auto report_progress = [this](const std::string& msg) {
+  // Never QMetaObject::invokeMethod(this, …) from XR/watchdog: Host may be
+  // destroyed after detach while xrCreateVulkanInstanceKHR is still blocked.
+  const std::shared_ptr<std::atomic<bool>> ui_alive = ui_alive_;
+  auto report_progress = [this, ui_alive](const std::string& msg) {
+    VRP_LOG("%s", msg.c_str());
+    if (!ui_alive || !ui_alive->load(std::memory_order_acquire)) return;
+    if (shutting_down_.load(std::memory_order_acquire)) return;
     const QString q = QString::fromStdString(msg);
+    const QPointer<HostWindow> self(this);
     QMetaObject::invokeMethod(
-        this,
-        [this, q] {
-          if (shutting_down_.load()) return;
+        qApp,
+        [self, ui_alive, q] {
+          if (!ui_alive || !ui_alive->load(std::memory_order_acquire)) return;
+          if (!self || self->shutting_down_.load(std::memory_order_acquire)) return;
           QString shown = UiTr(q);
           if (q.startsWith(QLatin1String("HMD found: "))) {
-            shown = tr("HMD found: %1").arg(q.mid(11));
+            shown = self->tr("HMD found: %1").arg(q.mid(11));
           }
-          setHealth("Wait", shown);
-          appendLog(shown);
-          // xrCreateVulkanInstanceKHR can block forever on a wedged Monado compositor.
-          // After ~15s of stall reports, kill owned Monado so the XR call returns.
-          static int vk_inst_stall_n = 0;
-          if (q.contains(QStringLiteral("xrCreateVulkanInstanceKHR blocked"))) {
-            ++vk_inst_stall_n;
-            if (vk_inst_stall_n >= 3 && !monado_external_ && !usingWivrn()) {
-              vk_inst_stall_n = 0;
-              VRP_LOG("startup: xrCreateVulkanInstanceKHR still blocked — stopping Monado");
-              appendLog(tr("Vulkan instance create hung — restarting Monado to unblock"));
-              stopMonadoProcess();
-              stopSystemdMonadoForOwnedStart();
-              clearStaleMonadoSocket();
-            }
-          } else {
-            vk_inst_stall_n = 0;
+          self->setHealth("Wait", shown);
+          self->appendLog(shown);
+          // Wedged compositor: cancel + deferred soft-stop Monado from the UI
+          // thread (never stopMonado synchronously under create — monado
+          // teardown_all can SEGV; monasphere must not invokeMethod on a dead Host).
+          if (q.contains(QStringLiteral("xrCreateVulkanInstanceKHR blocked")) &&
+              !self->vk_create_hung_.exchange(true, std::memory_order_acq_rel)) {
+            self->xr_stop_.store(true, std::memory_order_release);
+            self->appendLog(self->tr(
+                "Vulkan instance create hung — cancelling and restarting Monado…"));
+            QTimer::singleShot(800, self, [self] {
+              if (!self || self->shutting_down_.load(std::memory_order_acquire)) return;
+              if (!self->xr_running_.load(std::memory_order_acquire)) return;
+              if (self->xr_in_frame_loop_.load(std::memory_order_acquire)) return;
+              if (self->monado_external_ || self->usingWivrn()) return;
+              VRP_LOG("startup: deferred soft-stop Monado (unblock xrCreateVulkanInstanceKHR)");
+              self->stopMonadoProcess();
+              self->stopSystemdMonadoForOwnedStart();
+              self->clearStaleMonadoSocket();
+            });
           }
         },
         Qt::QueuedConnection);
@@ -5269,6 +5431,19 @@ void HostWindow::xrThreadMain() {
     }
 
     vrp::XrVulkanApp xr;
+    // Publish before init so Host can drop_ffmpeg_hwctx() if create hangs after
+    // FFmpeg inject and the XR thread is later detached.
+    {
+      std::lock_guard<std::mutex> lock(xr_app_mu_);
+      xr_app_ = &xr;
+    }
+    struct ClearXrApp {
+      HostWindow* self;
+      ~ClearXrApp() {
+        std::lock_guard<std::mutex> lock(self->xr_app_mu_);
+        self->xr_app_ = nullptr;
+      }
+    } clear_xr{this};
     xr.set_controller_prefs(opt_.controller_profile, opt_.controller_hand);
     xr.set_preferred_display_refresh_hz(static_cast<float>(effectivePreferredHz()));
     xr.init(&xr_stop_, report_progress);
@@ -5285,17 +5460,6 @@ void HostWindow::xrThreadMain() {
           },
           Qt::QueuedConnection);
     }
-    {
-      std::lock_guard<std::mutex> lock(xr_app_mu_);
-      xr_app_ = &xr;
-    }
-    struct ClearXrApp {
-      HostWindow* self;
-      ~ClearXrApp() {
-        std::lock_guard<std::mutex> lock(self->xr_app_mu_);
-        self->xr_app_ = nullptr;
-      }
-    } clear_xr{this};
 
     auto st = xr.status();
     QMetaObject::invokeMethod(
@@ -6880,9 +7044,17 @@ void HostWindow::xrThreadMain() {
         if (yt_session_ &&
             (yt_session_->active() || yt_session_->loading() ||
              yt_session_->state() != vrp::YouTubeSession::State::Idle)) {
-          const bool reuse = vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(1));
-          yt_session_->set_busy_status(reuse ? liveLaunchBusyText(liveAppLabelForUrl(live_url))
-                                             : tr("Virtual 削除中"));
+          // GNOME Meta: Live↔Live keeps Meta (switch_live_url) — never flash 削除中.
+          const bool gnome_keep =
+              vrp::detect_desktop_env() == vrp::DesktopEnv::Gnome &&
+              vdisp_mgr_ && vdisp_mgr_->gnome_meta_alive() &&
+              yt_session_->meta_live_path() && !yt_session_->desktop_app_mode();
+          const bool reuse =
+              gnome_keep || (vdisp_mgr_ && vdisp_mgr_->matches(virtualSpecForSpan(1)) &&
+                             vdisp_mgr_->reusable());
+          yt_session_->set_busy_status(reuse || gnome_keep
+                                           ? liveLaunchBusyText(liveAppLabelForUrl(live_url))
+                                           : tr("Virtual 削除中"));
           show_idle_screen = false;
         }
         QMetaObject::invokeMethod(
@@ -7547,8 +7719,8 @@ void HostWindow::xrThreadMain() {
         };
 
         // Skip DMA while tearing down ScreenCast/Virtual. In-place Live↔Live
-        // freezes the last picture until Chrome is placed (do not show Virtual
-        // wallpaper), then imports again so mark_frame_presented can reveal.
+        // drains PW (no wallpaper) and shows spinner+label until Chrome is placed
+        // — freezing the last browser frame looked like a stuck HMD.
         const QString yt_busy = yt_session_->busy_status();
         const bool yt_busy_teardown =
             yt_session_->state() == vrp::YouTubeSession::State::Stopping ||
@@ -7567,7 +7739,7 @@ void HostWindow::xrThreadMain() {
           }
           live_dma_path = false;
           bool imported_dma = false;
-          // Live↔Live gap: drain PW mailbox but do not promote wallpaper frames.
+          // Live↔Live gap: drain PW mailbox; busy overlay covers (no last-frame freeze).
           if (switch_freeze) {
             if (pw_dma && !(yt_session_ && yt_session_->dma_disabled())) {
               vrp::PipewireDmaFrame dma;
@@ -7586,7 +7758,7 @@ void HostWindow::xrThreadMain() {
               }
               live_cpu_pending = {};
             }
-            if (bind_last_yt()) yt_picture = true;
+            // Do not bind_last_yt — spinner panel owns the Flat view during switch.
             live_dma_path =
                 pw_dma && !(yt_session_ && yt_session_->dma_disabled()) && pw_dma_tex.has_valid_frame();
           } else if (pw_dma && !(yt_session_ && yt_session_->dma_disabled()) &&
@@ -7846,14 +8018,12 @@ void HostWindow::xrThreadMain() {
           scene.set_content_cursor(0.5f, 0.5f, false);
         }
 
-        // GNOME Meta: PW frames exist (wallpaper) before Chrome — keep spinner on top
-        // until hmd_content_ready() (Chrome placed). KDE first frame is already browser.
-        // Live↔Live freeze already holds the last browser frame — do not replace it
-        // with the busy panel (that looked like a flash when wallpaper sneaked in).
-        const bool hold_meta_wallpaper =
-            yt_session_->show_busy_overlay() && !yt_session_->hmd_content_ready() &&
-            !yt_session_->switch_freeze_frames();
-        if (yt_session_->show_busy_overlay() && (!yt_picture || hold_meta_wallpaper)) {
+        // Busy panel until hmd_content_ready(): GNOME Meta wallpaper before Chrome,
+        // Live↔Live Chrome relaunch, and first-launch loading. (switch_hold keeps
+        // hmd_content_ready false so spinner+label cover the gap.)
+        const bool cover_with_busy =
+            yt_session_->show_busy_overlay() && !yt_session_->hmd_content_ready();
+        if (yt_session_->show_busy_overlay() && (!yt_picture || cover_with_busy)) {
           yt_spin_phase += static_cast<float>(dt) * 9.5f;
           if (yt_spin_phase > 6.2831853f) yt_spin_phase = std::fmod(yt_spin_phase, 6.2831853f);
           const QString status = yt_session_->busy_status();

@@ -114,8 +114,22 @@ class YouTubeSession : public QObject {
    * Portal / Chrome / KWin cleanup must follow on the Qt thread via stop().
    */
   void stop_capture_from_xr();
-  /** App quit: stop session. Virtual destroy is Host/manager policy. */
+  /**
+   * App quit: stop session without Mutter Session.Stop.
+   * Host destroys Meta after XR/Monado release the HMD DRM lease (avoids
+   * gnome-shell SEGV / session freeze on exit).
+   */
   void shutdown();
+
+  /**
+   * Profile policy for Live and Chrome warm (KDE).
+   * Conf isolated always wins. GNOME + virtual Chrome: shared/default when no
+   * user Wayland Chrome; otherwise force isolated (Host shows dialog).
+   * forced_isolated_out is set for that GNOME Wayland fallback.
+   */
+  static bool resolveUseDefaultChromeProfile(bool conf_default, LiveBrowser browser,
+                                             bool virtual_display,
+                                             bool* forced_isolated_out = nullptr);
 
   /**
    * XR/filter thread: Meta capture stuck in pool-recycle hold — queue stage
@@ -224,7 +238,8 @@ class YouTubeSession : public QObject {
  private:
   void setState(State s);
   void fail(const QString& err);
-  void cleanupStreaming();
+  /** @param destroy_meta GNOME: Session.Stop Meta-*. False on app quit (Host after XR). */
+  void cleanupStreaming(bool destroy_meta = true);
   void stopEis();
   void rememberSeatCursor();
   void restoreSeatCursor();

@@ -120,6 +120,12 @@ class XrVulkanApp {
   const FfmpegVulkanDevice* ffmpeg_vulkan_device() const {
     return ffmpeg_vulkan_ ? ffmpeg_vulkan_.get() : nullptr;
   }
+  /**
+   * Drop FFmpeg hwctx (av_malloc ext list) without destroying the VkDevice.
+   * Host calls this before detaching a stuck XR thread so LSAN does not see the
+   * create_vulkan → av_malloc leak after process exit. Thread-safe vs shutdown().
+   */
+  void drop_ffmpeg_hwctx();
   const std::vector<ViewSwapchain>& swapchains() const { return swapchains_; }
   std::vector<ViewSwapchain>& swapchains() { return swapchains_; }
 
@@ -243,6 +249,8 @@ class XrVulkanApp {
   VkQueue video_decode_queue_ = VK_NULL_HANDLE;
   uint32_t video_decode_queue_family_ = UINT32_MAX;
   std::vector<std::string> enabled_dev_exts_;
+  /** Serializes ffmpeg_vulkan_ reset vs Host drop_ffmpeg_hwctx (detach path). */
+  std::mutex ffmpeg_mu_;
   std::unique_ptr<FfmpegVulkanDevice> ffmpeg_vulkan_;
 
   std::vector<ViewSwapchain> swapchains_;

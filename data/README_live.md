@@ -33,6 +33,7 @@ live_browser=chrome      # chrome|chromium|firefox — Live URL browser (default
 live_chrome_scale=1      # Chromium --force-device-scale-factor (keep 1 when Virtual is scaled; Firefox ignores)
 live_cursor_scale=1      # 1–6 stick cursor gain (exponential curve; lower = slower)
 live_chrome_profile=default  # default = system browser logins; isolated = monasphere profile
+live_chrome_warm=1           # KDE: pre-open Chrome at host start; GNOME ignores. 0=off. Firefox ignored.
 # FSR1 for browser Live only (not [アプリ] / not file UI). 0=Off 1=UQ 2=Q 3=P (default).
 # □ / X (menus closed) cycles Off→UQ→Q→P and writes this key. File FSR stays preferred_fsr / UI.
 live_fsr=3
@@ -83,6 +84,29 @@ start — quit Firefox first to use system logins. Chrome still Force-fullscreen
 
 `live_chrome_profile=default` uses the normal browser profile (subscription logins).
 Stop closes only the Live window — it does not quit the system browser.
+
+`live_chrome_warm=1` (default) pre-opens Chrome/Chromium when monaSphere starts so
+the first Live can use the same fast path as **manually opening Chrome first**
+(`already_running` → `--new-window --app=`). **KDE only** — GNOME skips warm and
+tunes Live start/switch settle instead. Warm uses the same profile resolve as Live,
+ozone/scale flags, class `monaSphereYTWarm`, and no `PULSE_SINK`. If Chrome is
+already running, warm is a no-op. On quit, monaSphere closes warm **only if it
+started it**. Set `live_chrome_warm=0` to disable. Firefox ignores this key.
+
+**GNOME + Virtual + Chrome** (`live_chrome_profile=default`):
+- No system Wayland Chrome → **shared** profile (YouTube logins); Live cold-starts
+  Wayland Chrome onto Meta via seat focus. That browser is **quit on Live stop**
+  (Wayland has no reliable WM_DELETE; otherwise Meta teardown leaves fullscreen
+  windows on the host and the next Live remotes into them).
+- System Chrome already on **Wayland** → **isolated** + one dialog per session
+  (quit Chrome completely, then **restart monaSphere** to use shared logins).
+- `live_chrome_profile=isolated` always wins. No Chrome warm on GNOME.
+- **Live↔Live URL switch** keeps Meta-* / PipeWire / EIS and only relaunches
+  Chrome (`switch in place`). Full Meta destroy + recreate is for leave Live,
+  desktop-app switches, or when Meta is already gone.
+- **App exit** evacuates Live clients first, tears down XR/Monado (HMD DRM
+  lease), then `Session.Stop` Meta — Meta-before-lease caused mutter SEGV /
+  session freeze. `closeEvent` and the destructor share one teardown path.
 
 `live_chrome_scale` (`--force-device-scale-factor`) is ignored when a system Chrome is
 already running (singleton), and is unused for Firefox. Prefer `live_virtual_scale`
@@ -382,7 +406,8 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 | `live_browser` | `chrome` / `chromium` (default) or `firefox` |
 | `live_chrome_scale` | `1.0`–`3.0` Chromium device scale (default `1`; Firefox ignores) |
 | `live_cursor_scale` | `1`–`6` stick/D-pad gain (default `1`; base speed scales with `live_virtual_size`) |
-| `live_chrome_profile` | `default` (system logins) or `isolated` (monaSphere profile) |
+| `live_chrome_profile` | `default` (system logins) or `isolated`. GNOME+Virtual: `default` → isolated if system Chrome is already Wayland |
+| `live_chrome_warm` | `1` (default) KDE pre-open Chrome; ignored on GNOME; `0` off; Firefox ignored |
 | `live_output` | Output name substring for Chromium placement |
 | `live_restore_token` | ScreenCast Remember token for `Virtual-monaSphere` (shared by all spans) |
 | `live_setup_spans` | Kept for compat; setup always authenticates once at x1 size |

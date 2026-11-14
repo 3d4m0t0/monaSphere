@@ -47,6 +47,11 @@ class EisPointer {
    */
   bool key_alt_left();
   /**
+   * Escape — dismiss GNOME Shell Activities/overview on the focused monitor.
+   * Live switch sometimes leaves Meta in a Super-key scaled-desktop state.
+   */
+  bool key_escape();
+  /**
    * When false, motion still works but button/scroll are no-ops.
    * GNOME: keep false until portal grant dialogs are off Meta-* — pad click
    * otherwise activates the remote-control dialog still sitting in the stream.

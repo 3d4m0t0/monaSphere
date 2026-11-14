@@ -95,6 +95,13 @@ class HostWindow : public QMainWindow {
   /** Stop live capture (process exit / new launch; not exposed in Tools). */
   void stopYouTubeCapture();
   void ensureYouTubeSession();
+  /**
+   * Pre-open Chrome (live_chrome_warm) with the same profile/ozone/scale Live
+   * will use. Safe to call repeatedly; no-op if Firefox or already running.
+   */
+  void ensureLiveChromeWarm();
+  /** GNOME: once per session when Wayland system Chrome forces isolated. */
+  void maybeWarnGnomeChromeIsolated(bool forced_isolated);
   void beginYouTubeCapture(bool host_setup, const QString& url_override = {},
                            const QString& desktop_exec = {},
                            const QStringList& desktop_args = {}, int monitor_span = 1,
@@ -218,6 +225,15 @@ class HostWindow : public QMainWindow {
   QString runtime_json_;
   bool monado_external_ = false;
   std::atomic<bool> shutting_down_{false};
+  /** closeEvent + ~HostWindow both run teardown — only the first may proceed. */
+  std::atomic<bool> app_teardown_done_{false};
+  /**
+   * Shared with XR-thread progress lambdas. Cleared before Host QObject teardown so
+   * QMetaObject::invokeMethod is never aimed at a destroyed HostWindow (SEGV).
+   */
+  std::shared_ptr<std::atomic<bool>> ui_alive_{std::make_shared<std::atomic<bool>>(true)};
+  /** xrCreateVulkanInstanceKHR stall — stop Monado only from shutdownXr, not mid-callback. */
+  std::atomic<bool> vk_create_hung_{false};
 
   QProcess* monado_ = nullptr;
   std::thread xr_thread_;
@@ -423,8 +439,13 @@ class HostWindow : public QMainWindow {
   vrp::VirtualDisplayManager::Spec virtualSpecForSpan(int span) const;
   /** Destroy Virtual when leaving live (video / [アプリ] / shutdown). */
   void destroyVirtualForLeaveLive();
-  /** Live capture, desktop app, and virtual display. Before XR teardown. */
+  /**
+   * Live capture / desktop app. Before XR teardown.
+   * GNOME Meta Session.Stop is deferred until after XR/Monado (see finishAppTeardown).
+   */
   void stopExternalSessions();
+  /** Once-only app quit: external → XR → Meta. Safe from closeEvent + destructor. */
+  void finishAppTeardown();
   struct LiveAppEntry {
     QString name;
     QString url;
@@ -464,6 +485,13 @@ class HostWindow : public QMainWindow {
   int live_cursor_scale_ = 1;
   QString live_output_;
   bool live_chrome_default_profile_ = true;
+  /**
+   * Conf `live_chrome_warm` (default on): pre-open Chrome at host start so Live
+   * hits already_running. Ignored for Firefox. Shutdown closes only if owned.
+   */
+  bool live_chrome_warm_ = true;
+  /** Session flag: already showed GNOME Wayland→isolated Chrome dialog. */
+  bool gnome_chrome_isolated_warned_ = false;
   /** Conf `live_browser` — chrome (default) or firefox. */
   vrp::LiveBrowser live_browser_ = vrp::LiveBrowser::Chrome;
   /** Filled on XR thread from PipewireDmaTexture::query_sampleable_modifiers. */

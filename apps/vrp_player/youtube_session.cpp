@@ -338,7 +338,7 @@ void YouTubeSession::kick_meta_paint() {
       Qt::QueuedConnection);
 }
 
-void YouTubeSession::cleanupStreaming() {
+void YouTubeSession::cleanupStreaming(bool destroy_meta) {
   stopDesktopAppMaintain();
   meta_paint_timer_.stop();
   ++gnome_evacuate_gen_;  // cancel pending Chrome launch / Meta paint timers
@@ -351,6 +351,7 @@ void YouTubeSession::cleanupStreaming() {
   // GNOME RecordVirtual: Meta-* must not be torn down while ANY monasphere
   // client still references it (Chrome Wayland/X11, Meta paint window, seat).
   // Order: clients → cursor off Meta → settle → PW consumer → Session.Stop.
+  // App quit: destroy_meta=false — Host Session.Stops after XR/Monado lease drop.
   // VRP_TEARDOWN_LOG (live_teardown_log=1) matches the GNOME breadcrumb form:
   //   Live teardown BEGIN — … / Live teardown: step… / Live teardown END
   const bool gnome_meta = (desk_ == DesktopEnv::Gnome && cfg_.virtual_display);
@@ -417,7 +418,10 @@ void YouTubeSession::cleanupStreaming() {
     stopDesktopAppProcess();
     VRP_TEARDOWN_LOG("Live teardown: desktop app stopped");
   } else if (chrome_) {
-    VRP_TEARDOWN_LOG("Live teardown: stop browser…");
+    const int owned = ChromiumYtLauncher::sharedLiveOwned() ? 1 : 0;
+    VRP_TEARDOWN_LOG("Live teardown: stop browser (shared_owned=%d)…", owned);
+    // Shared cold-start: stop() quits owned Chrome (Wayland has no WM_DELETE) so
+    // Meta teardown cannot dump fullscreen app windows onto the host.
     chrome_->stop();
     VRP_TEARDOWN_LOG("Live teardown: browser stopped");
   }
@@ -441,9 +445,11 @@ void YouTubeSession::cleanupStreaming() {
                                   static_cast<double>(center.y()));
       }
     }
-    VRP_TEARDOWN_LOG("Live teardown: seat off Meta — settle 1500ms before Session.Stop");
+    // Clients already scrubbed; seat warped off Meta. 400ms is enough for Mutter
+    // to drop surfaces before Session.Stop (was 1500ms — dominated Live↔Live).
+    VRP_TEARDOWN_LOG("Live teardown: seat off Meta — settle 400ms before Session.Stop");
     QEventLoop loop;
-    QTimer::singleShot(1500, &loop, &QEventLoop::quit);
+    QTimer::singleShot(400, &loop, &QEventLoop::quit);
     loop.exec();
   }
 
@@ -462,17 +468,28 @@ void YouTubeSession::cleanupStreaming() {
     portal_->stop();
     VRP_TEARDOWN_LOG("Live teardown: portal Session.Stop done");
   }
-  if (vdisp_mgr_ && vdisp_mgr_->gnome_meta_alive()) {
+  if (destroy_meta && vdisp_mgr_ && vdisp_mgr_->gnome_meta_alive()) {
     VRP_TEARDOWN_LOG("Live teardown: Mutter RecordVirtual/RD Session.Stop (Meta dies here)…");
     vdisp_mgr_->destroy();
     VRP_TEARDOWN_LOG("Live teardown: Mutter Session.Stop returned");
+  } else if (!destroy_meta && gnome_meta) {
+    VRP_TEARDOWN_LOG("Live teardown: defer Meta Session.Stop (Host after XR/Monado)");
   }
   using_mutter_virtual_ = false;
   gnome_live_ready_ = false;
-  if (gnome_meta) {
-    VRP_TEARDOWN_LOG("Live teardown: Meta gone — post-settle 600ms");
+  // Pending ConnectToEIS fd (Meta created, portal/EisPointer not yet owning it).
+  if (gnome_eis_fd_ >= 0) {
+    VRP_TEARDOWN_LOG("Live teardown: close unused gnome_eis_fd=%d", gnome_eis_fd_);
+    ::close(gnome_eis_fd_);
+    gnome_eis_fd_ = -1;
+  }
+  gnome_node_id_ = 0;
+  gnome_mapping_id_.clear();
+  if (destroy_meta && gnome_meta) {
+    // destroy() already slept briefly after Session.Stop; keep a short UI settle.
+    VRP_TEARDOWN_LOG("Live teardown: Meta gone — post-settle 200ms");
     QEventLoop loop;
-    QTimer::singleShot(600, &loop, &QEventLoop::quit);
+    QTimer::singleShot(200, &loop, &QEventLoop::quit);
     loop.exec();
   }
 #if defined(VRP_HAS_PULSE)
@@ -485,7 +502,9 @@ void YouTubeSession::cleanupStreaming() {
   VRP_TEARDOWN_LOG("Live teardown: audio routing restored");
 #endif
   VRP_TEARDOWN_LOG("Live teardown END — desk=%s (clients cleared%s)", desk_tag,
-                   gnome_meta ? "; Meta cleared" : "; Virtual left to Host");
+                   !gnome_meta ? "; Virtual left to Host"
+                   : destroy_meta ? "; Meta cleared"
+                                  : "; Meta deferred to Host");
 }
 
 void YouTubeSession::mark_frame_presented() {
@@ -554,7 +573,8 @@ bool YouTubeSession::switch_live_url(const QString& url, const QString& label) {
   switch_reveal_seen_ = 0;
   if (using_mutter_virtual_) gnome_live_ready_ = false;
   loading_.store(true, std::memory_order_release);
-  // Same spinner text as first-launch after Virtual is up (title only, no 「起動中」).
+  // Destination name under spinner (same as first-launch) so the HMD does not
+  // look frozen while Chrome relaunches on the kept Virtual.
   set_busy_status(!cfg_.launch_title.isEmpty() ? cfg_.launch_title : tr("Live"));
 
   closeLiveBrowserWindow();
@@ -628,8 +648,12 @@ void YouTubeSession::start(const Config& cfg) {
       const QPoint c = primary->geometry().center();
       QCursor::setPos(primary, c);
     }
+    // Shared cold-start needs only a short seat settle; isolated scrub may need more.
+    const bool shared = resolveUseDefaultChromeProfile(cfg_.use_default_chrome_profile, cfg_.browser,
+                                                       cfg_.virtual_display);
+    const int settle_ms = shared ? 250 : 450;
     QEventLoop loop;
-    QTimer::singleShot(800, &loop, &QEventLoop::quit);
+    QTimer::singleShot(settle_ms, &loop, &QEventLoop::quit);
     loop.exec();
   }
   stopEis();
@@ -846,6 +870,25 @@ void YouTubeSession::start(const Config& cfg) {
 #endif
 }
 
+bool YouTubeSession::resolveUseDefaultChromeProfile(bool conf_default, LiveBrowser browser,
+                                                    bool virtual_display,
+                                                    bool* forced_isolated_out) {
+  if (forced_isolated_out) *forced_isolated_out = false;
+  if (browser == LiveBrowser::Firefox) return conf_default;
+  if (!conf_default) return false;  // conf live_chrome_profile=isolated
+  // GNOME Virtual: shared/default when no user Wayland Chrome (cold Wayland start
+  // gets class + seat→Meta). Existing Wayland singleton ignores launch flags →
+  // isolated (+ Host dialog). No Chrome warm on GNOME — start/switch timing instead.
+  if (detect_desktop_env() == DesktopEnv::Gnome && virtual_display) {
+    if (ChromiumYtLauncher::userWaylandSharedChromeRunning()) {
+      if (forced_isolated_out) *forced_isolated_out = true;
+      return false;
+    }
+    return true;
+  }
+  return conf_default;
+}
+
 void YouTubeSession::configureLiveBrowserLaunch() {
   chrome_->set_url(cfg_.url);
   // Wayland Chrome follows output scale — do NOT also push virtual_scale into
@@ -863,14 +906,18 @@ void YouTubeSession::configureLiveBrowserLaunch() {
   chrome_->set_device_scale_factor(chrome_dsf);
   const bool follow_out = !ozone_x11 && std::abs(cfg_.chrome_scale - 1.f) < 0.05f;
   chrome_->set_follow_output_scale(follow_out);
-  // GNOME: shared/default Chrome is a Wayland singleton — it ignores ozone=x11,
-  // --window-position, and --class, so the Live window always lands on the host.
-  // Isolated profile = own process we can place on Meta-*.
-  const bool gnome_isolated =
-      desk_ == DesktopEnv::Gnome && cfg_.virtual_display && cfg_.browser != LiveBrowser::Firefox;
-  chrome_->set_use_default_profile(gnome_isolated ? false : cfg_.use_default_chrome_profile);
-  if (gnome_isolated && cfg_.use_default_chrome_profile) {
-    emit logMessage(tr("GNOME Live: isolated Chrome profile (shared Chrome cannot place on Virtual)"));
+  bool forced_iso = false;
+  const bool use_default =
+      resolveUseDefaultChromeProfile(cfg_.use_default_chrome_profile, cfg_.browser,
+                                     cfg_.virtual_display, &forced_iso);
+  chrome_->set_use_default_profile(use_default);
+  if (forced_iso) {
+    emit logMessage(tr("GNOME Live: isolated Chrome (system Chrome is Wayland — quit Chrome + restart monaSphere for shared logins)"));
+  } else if (use_default && desk_ == DesktopEnv::Gnome && cfg_.virtual_display &&
+             cfg_.browser != LiveBrowser::Firefox) {
+    emit logMessage(tr("GNOME Live: shared Chrome profile"));
+  } else if (!use_default && !cfg_.use_default_chrome_profile) {
+    emit logMessage(tr("Live: isolated Chrome profile (live_chrome_profile=isolated)"));
   }
   chrome_->set_route_audio_to_yt_sink(cfg_.enable_audio);
   int chrome_w = place_w_;
@@ -954,9 +1001,37 @@ void YouTubeSession::stop() {
 }
 
 void YouTubeSession::shutdown() {
-  stop();
-  // Virtual lifetime is Host/VirtualDisplayManager — never destroy from here
-  // (child delete order + double shutdown caused QProcess UAF / SEGV).
+  // App quit: evacuate clients + stop PW/EIS, but leave Meta for Host after XR.
+  if (state_ == State::Stopping) {
+    vdisp_mgr_ = nullptr;
+    return;
+  }
+  const bool capture_alive =
+#if defined(VRP_HAS_PIPEWIRE)
+      (capture_ && capture_->running());
+#else
+      false;
+#endif
+  const bool chrome_alive = chrome_ && chrome_->running();
+  const bool desk_alive =
+      desktop_app_ && desktop_app_->state() != QProcess::NotRunning;
+  if (state_ == State::Idle && !loading_.load() && !active_.load() && !capture_alive &&
+      !chrome_alive && !desk_alive && kwin_window_id_.isEmpty()) {
+    vdisp_mgr_ = nullptr;
+    return;
+  }
+  place_timer_.stop();
+  ++portal_gen_;
+  ++audio_route_gen_;
+  setState(State::Stopping);
+  loading_.store(false, std::memory_order_release);
+  active_.store(false, std::memory_order_release);
+  audio_wanted_.store(false, std::memory_order_release);
+  emit logMessage(tr("Live shutdown: capture + app (Meta deferred for Host)"));
+  cleanupStreaming(/*destroy_meta=*/false);
+  clear_busy_status();
+  setState(State::Idle);
+  // Do not emit stopped() — Host is quitting; avoid queued Live / Virtual races.
   vdisp_mgr_ = nullptr;
 }
 
@@ -1475,13 +1550,24 @@ void YouTubeSession::pollPlaceGnome() {
       VRP_LOG("GNOME Shell: Eval unavailable (%s) — relying on EIS Meta focus",
               shell_detail.toUtf8().constData());
     }
-    // Re-focus Meta in case Chrome mapped on host before seat settled.
-    if (portal_eis_ && portal_eis_->ready() && portal_eis_->region_w() > 0) {
-      const double cx =
-          static_cast<double>(portal_eis_->region_x()) + portal_eis_->region_w() * 0.5;
-      const double cy =
-          static_cast<double>(portal_eis_->region_y()) + portal_eis_->region_h() * 0.5;
-      portal_eis_->warp_desktop(cx, cy);
+    // Dismiss Shell overview only (Escape). Do not click — center clicks fire links
+    // inside the Live Chrome page.
+    if (portal_eis_ && portal_eis_->ready()) {
+      (void)portal_eis_->key_escape();
+      if (portal_eis_->region_w() > 0 && portal_eis_->region_h() > 0) {
+        const double cx =
+            static_cast<double>(portal_eis_->region_x()) + portal_eis_->region_w() * 0.5;
+        const double cy =
+            static_cast<double>(portal_eis_->region_y()) + portal_eis_->region_h() * 0.5;
+        portal_eis_->warp_desktop(cx, cy);
+      }
+      const int gen = gnome_evacuate_gen_;
+      QTimer::singleShot(150, this, [this, gen] {
+        if (gen != gnome_evacuate_gen_ || !active_.load(std::memory_order_acquire)) return;
+        if (!portal_eis_ || !portal_eis_->ready()) return;
+        (void)portal_eis_->key_escape();
+        VRP_LOG("GNOME: overview dismiss (Escape, no click)");
+      });
     }
     VRP_LOG("GNOME: Wayland Chrome running without X11 xid — assume Meta place");
     emit logMessage(tr("GNOME: Wayland Chrome on Meta (no X11 window to bind)"));
@@ -1863,7 +1949,7 @@ void YouTubeSession::launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h) 
   QRect geo;
   QString matched;
   bool found = false;
-  for (int attempt = 0; attempt < 50; ++attempt) {
+  for (int attempt = 0; attempt < 40; ++attempt) {
     if (!active_.load(std::memory_order_acquire) && state_ != State::Streaming &&
         state_ != State::Placing) {
       return;
@@ -1872,13 +1958,13 @@ void YouTubeSession::launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h) 
       found = true;
       break;
     }
-    if (attempt == 0 || attempt % 5 == 0) {
+    if (attempt == 0 || attempt % 8 == 0) {
       emit logMessage(tr("GNOME Virtual: waiting for EIS/Meta-* rect (%1×%2)…")
                           .arg(prefer_w)
                           .arg(prefer_h));
     }
     QEventLoop loop;
-    QTimer::singleShot(100, &loop, &QEventLoop::quit);
+    QTimer::singleShot(50, &loop, &QEventLoop::quit);
     loop.exec();
     if (state_ == State::Stopping || state_ == State::Idle || state_ == State::Failed) return;
   }
@@ -1952,9 +2038,13 @@ void YouTubeSession::launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h) 
   }
 
   // Focus Meta before map. Mutter places new Wayland windows on the pointer /
-  // focused monitor — EIS warp to Xrandr physical coords (e.g. 4800) misses the
-  // logical EIS desktop (Meta often 960x540+1920). Click wallpaper so Meta is
-  // current even while monasphere stays focused on the host output.
+  // focused monitor. Dismiss Shell overview (Escape) first — Live switch can
+  // leave Meta in a Super-key scaled-desktop view until the next click.
+  // Warp only (no click on empty wallpaper): a forced click on empty Meta was
+  // associated with that stuck overview-like state.
+  if (portal_eis_ && portal_eis_->ready()) {
+    (void)portal_eis_->key_escape();
+  }
   if (portal_eis_ && portal_eis_->ready() && portal_eis_->region_w() > 0 &&
       portal_eis_->region_h() > 0) {
     const double cx =
@@ -1962,7 +2052,6 @@ void YouTubeSession::launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h) 
     const double cy =
         static_cast<double>(portal_eis_->region_y()) + portal_eis_->region_h() * 0.5;
     portal_eis_->warp_desktop(cx, cy);
-    portal_eis_->click_left_forced();
     VRP_LOG("GNOME: EIS focus Meta @%.0f,%.0f (region %ux%u+%u+%u) before Chrome", cx, cy,
             portal_eis_->region_w(), portal_eis_->region_h(), portal_eis_->region_x(),
             portal_eis_->region_y());
@@ -1970,7 +2059,6 @@ void YouTubeSession::launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h) 
     const int ww = place_win_w_ > 0 ? place_win_w_ : place_w_;
     const int wh = place_win_h_ > 0 ? place_win_h_ : place_h_;
     portal_eis_->warp_desktop(place_x_ + ww * 0.5, place_y_ + wh * 0.5);
-    portal_eis_->click_left_forced();
     VRP_LOG("GNOME: EIS warped (no region) @%d,%d before Chrome", place_x_ + ww / 2,
             place_y_ + wh / 2);
   }
@@ -1983,7 +2071,7 @@ void YouTubeSession::launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h) 
   }
   {
     QEventLoop loop;
-    QTimer::singleShot(120, &loop, &QEventLoop::quit);
+    QTimer::singleShot(50, &loop, &QEventLoop::quit);
     loop.exec();
   }
 
@@ -2243,13 +2331,13 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
                          "browser deferred until portal dialogs stay off Meta-*"));
       mark_gnome_live_ready();
     } else {
-      // RecordVirtual creates Meta-* during/after PW. Wait until portal buttons
-      // are enabled (grant UI evacuated) so Chrome does not map under the dialog.
+      // RecordVirtual creates Meta-* during/after PW. Launch as soon as EIS is
+      // ready (Mutter path) — first tick ~150ms (was 600ms); poll every 250ms.
       const int bw = prefer_w;
       const int bh = prefer_h;
       const int gen = gnome_evacuate_gen_;
-      for (int attempt = 0; attempt < 24; ++attempt) {
-        QTimer::singleShot(600 + attempt * 400, this, [this, bw, bh, gen, attempt] {
+      for (int attempt = 0; attempt < 28; ++attempt) {
+        QTimer::singleShot(150 + attempt * 250, this, [this, bw, bh, gen, attempt] {
           if (gen != gnome_evacuate_gen_ || !active_.load(std::memory_order_acquire)) return;
           if (chrome_ && chrome_->running()) return;  // already launched by an earlier tick
           (void)evacuateGnomePortalDialogsOnce();
@@ -2258,8 +2346,8 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
           const bool eis_ready = portal_eis_ && portal_eis_->ready();
           const bool buttons_ok = !portal_eis_ || portal_eis_->buttons_enabled();
           if (using_mutter_virtual_) {
-            if (!eis_ready && attempt < 22) return;
-          } else if (!buttons_ok && attempt < 20) {
+            if (!eis_ready && attempt < 26) return;
+          } else if (!buttons_ok && attempt < 24) {
             return;
           }
           VRP_LOG("GNOME: launching Chrome after settle (attempt %d eis=%d buttons=%d)",

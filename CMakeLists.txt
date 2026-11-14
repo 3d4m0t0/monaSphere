@@ -5,6 +5,17 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Optional Address/LeakSanitizer (Debug-style). Example:
+#   cmake -B build-asan -DVRP_SANITIZE=ON && cmake --build build-asan -j
+#   LSAN_OPTIONS=suppressions=$PWD/data/lsan.supp \
+#     ASAN_OPTIONS=detect_leaks=1:halt_on_error=0 ./build-asan/monasphere
+option(VRP_SANITIZE "Build with AddressSanitizer + LeakSanitizer" OFF)
+if(VRP_SANITIZE)
+  add_compile_options(-fsanitize=address,leak -fno-omit-frame-pointer -g)
+  add_link_options(-fsanitize=address,leak)
+  message(STATUS "VRP_SANITIZE=ON — AddressSanitizer + LeakSanitizer")
+endif()
+
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
