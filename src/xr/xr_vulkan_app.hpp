@@ -60,7 +60,20 @@ class XrVulkanApp {
    * (e.g. between xrGetSystem retries). Throws std::runtime_error on failure.
    */
   void init(std::atomic<bool>* cancel, const std::function<void(const std::string&)>& progress = {});
+  /**
+   * Tear down OpenXR + Vulkan on the creating thread.
+   * Order: XR objects → VkDevice → VkInstance while the runtime is still alive,
+   * so the compositor can release the NVIDIA client. Host stops Monado after join.
+   * Equivalent to shutdown_device() + destroy_vk_instance().
+   */
   void shutdown();
+  /**
+   * Destroy XR objects and VkDevice. Leaves VkInstance for destroy_vk_instance()
+   * so the Host can overlap independent teardown with the slow ICD release.
+   */
+  void shutdown_device();
+  /** vkDestroyInstance while the runtime is still alive. Call after shutdown_device(). */
+  void destroy_vk_instance();
 
   /** Must be set before init(). Defaults: Oculus Touch + right hand. */
   void set_controller_prefs(ControllerProfile profile, ControllerHand hand);
@@ -222,8 +235,12 @@ class XrVulkanApp {
 
   bool session_running_ = false;
   std::atomic<bool> exit_requested_{false};
-  /** shutdown() is also called from the destructor. */
+  /** destroy_vk_instance() / full shutdown completed (also from destructor). */
   std::atomic<bool> shutdown_done_{false};
+  /** shutdown_device() completed (may still have pending_vk_instance_). */
+  std::atomic<bool> device_shutdown_done_{false};
+  /** Set by shutdown_device(); consumed by destroy_vk_instance(). */
+  VkInstance pending_vk_instance_ = VK_NULL_HANDLE;
   bool session_focused_ = false;
   bool tracking_valid_ = false;
   bool tracking_origin_inited_ = false;

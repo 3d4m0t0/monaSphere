@@ -168,6 +168,12 @@ XrVulkanApp::~XrVulkanApp() { shutdown(); }
 void XrVulkanApp::init() { init(nullptr, {}); }
 
 void XrVulkanApp::init(std::atomic<bool>* cancel, const std::function<void(const std::string&)>& progress) {
+  // Allow one re-init after shutdown() from a stalled create retry.
+  shutdown_done_.store(false, std::memory_order_release);
+  device_shutdown_done_.store(false, std::memory_order_release);
+  pending_vk_instance_ = VK_NULL_HANDLE;
+  exit_requested_.store(false, std::memory_order_release);
+
   auto note = [&](const char* msg) {
     VRP_LOG("%s", msg);
     if (progress) progress(msg);
@@ -312,7 +318,13 @@ void XrVulkanApp::report_if_device_lost(VkResult result) const {
 }
 
 void XrVulkanApp::shutdown() {
-  if (shutdown_done_.exchange(true, std::memory_order_acq_rel)) return;
+  shutdown_device();
+  destroy_vk_instance();
+}
+
+void XrVulkanApp::shutdown_device() {
+  if (device_shutdown_done_.exchange(true, std::memory_order_acq_rel)) return;
+  if (shutdown_done_.load(std::memory_order_acquire)) return;
 
   // Drop every handle without another runtime call. Used when a call is still
   // running on a detached thread, or the decode queue never went idle.
@@ -336,15 +348,18 @@ void XrVulkanApp::shutdown() {
     queue_ = VK_NULL_HANDLE;
     physical_device_ = VK_NULL_HANDLE;
     vk_instance_ = VK_NULL_HANDLE;
+    pending_vk_instance_ = VK_NULL_HANDLE;
     instance_ = XR_NULL_HANDLE;
     session_focused_ = false;
     tracking_valid_ = false;
     crash_guard::clear_session_cookie();
+    shutdown_done_.store(true, std::memory_order_release);
     VRP_TEARDOWN_LOG("XR: shutdown ABANDON done");
   };
 
-  VRP_TEARDOWN_LOG("XR: shutdown begin running=%d session=%d device=%d", session_running_ ? 1 : 0,
-                   session_ ? 1 : 0, device_ != VK_NULL_HANDLE ? 1 : 0);
+  VRP_TEARDOWN_LOG("XR: shutdown_device begin running=%d session=%d device=%d",
+                   session_running_ ? 1 : 0, session_ ? 1 : 0,
+                   device_ != VK_NULL_HANDLE ? 1 : 0);
   // OpenXR session must be torn down before the Vulkan device it uses.
   if (session_ && session_running_) {
     VRP_TEARDOWN_LOG("XR: shutdown session still running -> request_exit");
@@ -437,19 +452,17 @@ void XrVulkanApp::shutdown() {
   drop_ffmpeg_hwctx();
   VRP_TEARDOWN_LOG("XR: shutdown ffmpeg hwctx reset done");
   // Vulkan Video's decode engine is not always finished by vkDeviceWaitIdle.
-  // Idling the decode queue while the device still exists lets vkDestroyInstance
-  // release the ICD without the ~15s driver timeout. Do not skip the later
-  // vkDestroyInstance dlclose — that is what frees the compositor's client device.
+  // Idling the decode queue while the device still exists speeds vkDestroyInstance.
   if (video_decode_queue_ != VK_NULL_HANDLE) {
+    const VkQueue dq = video_decode_queue_;
     const auto t0 = std::chrono::steady_clock::now();
-    vkQueueWaitIdle(video_decode_queue_);
+    const bool idle_ok =
+        run_timed("vkQueueWaitIdle(decode)", 1000, [dq] { (void)vkQueueWaitIdle(dq); });
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
-    if (ms >= 50) {
-      VRP_TEARDOWN_LOG("XR: shutdown video decode queue idle %lld ms",
-                       static_cast<long long>(ms));
-    }
+    VRP_TEARDOWN_LOG("XR: shutdown video decode queue idle %lld ms ok=%d",
+                     static_cast<long long>(ms), idle_ok ? 1 : 0);
   }
   video_decode_ready_ = false;
   video_decode_queue_ = VK_NULL_HANDLE;
@@ -458,14 +471,14 @@ void XrVulkanApp::shutdown() {
   pfn_get_device_fault_ = nullptr;
   enabled_dev_exts_.clear();
 
-  // vkDestroyDevice before xrDestroyInstance does not return: the compositor still
-  // holds the device. Leaking it and exiting wedges the next
-  // xrCreateVulkanInstanceKHR until Monado is restarted. Drop the XR instance
-  // first, then destroy the device.
+  // Keep Monado/runtime alive through VkInstance destroy. Stopping the compositor
+  // before vkDestroyInstance makes DestroyInstance fast but leaves an NVIDIA
+  // client that blocks the next xrCreateVulkanInstanceKHR for ~15s+.
+  // Order: xrDestroyInstance → VkDevice → (Host overlap) → VkInstance → stopMonado.
   const VkDevice dev = device_;
   const VkCommandPool pool = command_pool_;
   const VkRenderPass pass = color_pass_;
-  const VkInstance vk_inst = vk_instance_;
+  pending_vk_instance_ = vk_instance_;
   command_pool_ = VK_NULL_HANDLE;
   color_pass_ = VK_NULL_HANDLE;
   device_ = VK_NULL_HANDLE;
@@ -479,20 +492,20 @@ void XrVulkanApp::shutdown() {
     instance_ = XR_NULL_HANDLE;
     if (!run_timed("xrDestroyInstance", 2000, [instance] { xrDestroyInstance(instance); })) {
       crash_guard::clear_session_cookie();
+      pending_vk_instance_ = VK_NULL_HANDLE;
       VRP_TEARDOWN_LOG(
           "XR: shutdown xrDestroyInstance TIMEOUT — leaking VkDevice; next "
           "xrCreateVulkanInstanceKHR may block");
       VRP_ERR("shutdown: xrDestroyInstance timed out — leaking VkDevice; next "
               "xrCreateVulkanInstanceKHR may block");
+      shutdown_done_.store(true, std::memory_order_release);
       return;
     }
     VRP_TEARDOWN_LOG("XR: shutdown xrDestroyInstance done");
   }
-  if (dev != VK_NULL_HANDLE || vk_inst != VK_NULL_HANDLE) {
-    // On the thread that created the device. A side thread deadlocks NVIDIA
-    // inside vkDestroyDevice. vkDestroyInstance must run to completion: its
-    // dlclose is what drops the compositor's client device. After Vulkan Video
-    // that call can take around 15s and still succeed; do not log it as a failure.
+  if (dev != VK_NULL_HANDLE) {
+    // Destroy* must stay on the creating thread — a worker thread deadlocks NVIDIA
+    // inside vkDestroyDevice (cannot use run_timed here).
     auto timed = [&](const char* name, auto&& fn) {
       const auto t0 = std::chrono::steady_clock::now();
       VRP_TEARDOWN_LOG("XR: shutdown %s enter", name);
@@ -502,15 +515,37 @@ void XrVulkanApp::shutdown() {
                           .count();
       VRP_TEARDOWN_LOG("XR: shutdown %s leave %lld ms", name, static_cast<long long>(ms));
     };
-    if (dev && pool) timed("vkDestroyCommandPool", [&] { vkDestroyCommandPool(dev, pool, nullptr); });
-    if (dev && pass) timed("vkDestroyRenderPass", [&] { vkDestroyRenderPass(dev, pass, nullptr); });
-    if (dev) timed("vkDestroyDevice", [&] { vkDestroyDevice(dev, nullptr); });
-    if (vk_inst) timed("vkDestroyInstance", [&] { vkDestroyInstance(vk_inst, nullptr); });
+    if (pool) timed("vkDestroyCommandPool", [&] { vkDestroyCommandPool(dev, pool, nullptr); });
+    if (pass) timed("vkDestroyRenderPass", [&] { vkDestroyRenderPass(dev, pass, nullptr); });
+    timed("vkDestroyDevice", [&] { vkDestroyDevice(dev, nullptr); });
   }
   session_focused_ = false;
   tracking_valid_ = false;
   last_display_time_ = 0;
+  VRP_TEARDOWN_LOG("XR: shutdown_device end pending_instance=%d",
+                   pending_vk_instance_ != VK_NULL_HANDLE ? 1 : 0);
+}
+
+void XrVulkanApp::destroy_vk_instance() {
+  if (shutdown_done_.exchange(true, std::memory_order_acq_rel)) return;
+
+  const VkInstance vk_inst = pending_vk_instance_ != VK_NULL_HANDLE ? pending_vk_instance_
+                                                                   : vk_instance_;
+  pending_vk_instance_ = VK_NULL_HANDLE;
+  vk_instance_ = VK_NULL_HANDLE;
+  if (vk_inst != VK_NULL_HANDLE) {
+    // Runtime still alive: ICD/compositor can drop the client cleanly.
+    const auto t0 = std::chrono::steady_clock::now();
+    VRP_TEARDOWN_LOG("XR: shutdown vkDestroyInstance enter");
+    vkDestroyInstance(vk_inst, nullptr);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    VRP_TEARDOWN_LOG("XR: shutdown vkDestroyInstance leave %lld ms", static_cast<long long>(ms));
+  }
   crash_guard::clear_session_cookie();
+  // Safety net for a following process if anything still races the GPU.
+  crash_guard::mark_vulkan_client_released();
   VRP_TEARDOWN_LOG("XR: shutdown end");
 }
 
@@ -654,7 +689,8 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
       for (int sec = 0; creating.load(std::memory_order_acquire); ++sec) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (!creating.load(std::memory_order_acquire)) return;
-        if (sec > 0 && (sec % 5) == 0) {
+        // 5/10s: log only. 15s: Host may soft-stop Monado and retry once.
+        if (sec == 5 || sec == 10 || sec == 15 || (sec > 15 && (sec % 5) == 0)) {
           const std::string stall = std::string("startup: xrCreateVulkanInstanceKHR blocked ") +
                                     std::to_string(sec) + "s (" + label +
                                     ") — compositor still holds the previous VkDevice";
