@@ -147,18 +147,18 @@
     },
     {
       "context": "HostWindow",
-      "source": "UQ (~1.3x)",
-      "translation": "UQ (~1.3x)"
+      "source": "1.3×",
+      "translation": "1.3×"
     },
     {
       "context": "HostWindow",
-      "source": "Q (~1.5x)",
-      "translation": "Q (~1.5x)"
+      "source": "1.5×",
+      "translation": "1.5×"
     },
     {
       "context": "HostWindow",
-      "source": "P (~2.0x)",
-      "translation": "P (~2.0x)"
+      "source": "2.0×",
+      "translation": "2.0×"
     },
     {
       "context": "HostWindow",
@@ -1324,6 +1324,497 @@
       "context": "HostWindow",
       "source": "Vulkan compute queue: sharing the frame queue",
       "translation": "Vulkan コンピュートキュー: フレームキューと共用"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Preferences…",
+      "translation": "設定…"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Preferences applied",
+      "translation": "設定を適用しました"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Preferences: ignored invalid %1=%2",
+      "translation": "設定: 無効な値を無視 %1=%2"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "Preferences",
+      "translation": "設定"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "Advanced",
+      "translation": "詳細"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "Reset",
+      "translation": "元に戻す"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "Defaults",
+      "translation": "標準設定"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "Restore values from when this dialog was opened.",
+      "translation": "このダイアログを開いたときの値に戻します。"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "Restore shipped standard settings for all preferences.",
+      "translation": "出荷時の標準設定に戻します。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Video",
+      "translation": "映像"
+    },
+    {
+      "context": "Preferences",
+      "source": "Audio",
+      "translation": "音声"
+    },
+    {
+      "context": "Preferences",
+      "source": "Sky",
+      "translation": "空"
+    },
+    {
+      "context": "Preferences",
+      "source": "Live",
+      "translation": "Live"
+    },
+    {
+      "context": "Preferences",
+      "source": "Decode",
+      "translation": "デコード"
+    },
+    {
+      "context": "Preferences",
+      "source": "Other",
+      "translation": "その他"
+    },
+    {
+      "context": "Preferences",
+      "source": "Preview distance (m)",
+      "translation": "プレビュー距離 (m)"
+    },
+    {
+      "context": "Preferences",
+      "source": "How far the file-dialog preview sits in front of the viewer.",
+      "translation": "ファイルダイアログのプレビューを視点からどれだけ手前に置くか。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Preview X (m)",
+      "translation": "プレビュー X (m)"
+    },
+    {
+      "context": "Preferences",
+      "source": "Horizontal offset (positive = right).",
+      "translation": "左右オフセット（正で右）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Preview height (m)",
+      "translation": "プレビュー高さ (m)"
+    },
+    {
+      "context": "Preferences",
+      "source": "Vertical offset (negative = lower).",
+      "translation": "上下オフセット（負で下）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Preview tilt (°)",
+      "translation": "プレビュー傾き (°)"
+    },
+    {
+      "context": "Preferences",
+      "source": "Recline into depth (0 = upright facing you, 90 = flat away).",
+      "translation": "奥への倒れ角（0 = 正対、90 = ほぼ水平）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Preview half-width (m)",
+      "translation": "プレビュー半幅 (m)"
+    },
+    {
+      "context": "Preferences",
+      "source": "Half-width of the preview card in meters. 180/360 previews use a slightly smaller size.",
+      "translation": "プレビューカードの半幅（メートル）。180/360 は少し小さく表示します。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Off",
+      "translation": "オフ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Upscale decoded video before the HMD panel. Larger × = sharper but heavier (1.3× / 1.5× / 2.0×). Off leaves the source resolution.",
+      "translation": "デコード後の映像を HMD 表示前に拡大します。倍率が大きいほどシャープですが負荷も増えます（1.3× / 1.5× / 2.0×）。Off は元解像度のままです。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Same upscale for browser Live (not desktop apps). Larger × costs more GPU.",
+      "translation": "ブラウザ Live 用の同様の拡大です（デスクトップアプリには使いません）。倍率が大きいほど GPU 負荷が増えます。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Vertical field of view of the flat screen in degrees.",
+      "translation": "平面スクリーンの垂直視野角（度）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Distance to the flat screen in meters (seat preset).",
+      "translation": "平面スクリーンまでの距離（メートル、座席プリセット）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "HMD refresh preference. Auto uses 90 Hz.",
+      "translation": "HMD のリフレッシュ設定。自動は 90 Hz です。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Level of the soft stereo→surround upmix for 2-channel sources (file / Live / apps). Does not apply to true multi-channel tracks.",
+      "translation": "2ch ソース向けの疑似サラウンド（ステレオ→サラウンド）の強さです（ファイル / Live / アプリ）。本物の多ch トラックには効きません。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Match loudness across file / Live / app playback.",
+      "translation": "ファイル / Live / アプリ間で音量感を揃えます。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Allow changing HRTF attenuation below. Lower trim makes audio louder — change with care.",
+      "translation": "下の HRTF 減衰の変更を許可します。減衰を下げると音が大きくなります。変更には注意してください。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Attenuation before upmix/HRTF. Reducing it makes sound louder and can clip. Fixed at 10 dB while locked.",
+      "translation": "アップミックス / HRTF 前の減衰です。下げると音が大きくなりクリップしやすくなります。制限時は 10 dB 固定です。"
+    },
+
+    {
+      "context": "Preferences",
+      "source": "Use GPU decode when available. Off forces software.",
+      "translation": "可能なとき GPU デコードを使います。Off はソフトウェア固定です。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Prefer FFmpeg Vulkan Video zero-copy. Off uses CUDA/NVDEC on NVIDIA.",
+      "translation": "FFmpeg Vulkan Video（ゼロコピー）を優先します。Off 時は NVIDIA では CUDA/NVDEC です。"
+    },
+    {
+      "context": "Preferences",
+      "source": "On NVIDIA, use CUDA for H.264 Constrained Baseline 4K+ instead of Vulkan Video. Ignored on AMD.",
+      "translation": "NVIDIA では H.264 Constrained Baseline の 4K 以上を Vulkan Video ではなく CUDA にします。AMD では無視されます。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Brightness of the Gaia sky backdrop.",
+      "translation": "Gaia 空背景の明るさ。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Baked: cubemap + live sun/moon. Layers: per-frame stars/nebulae (heavier).",
+      "translation": "ベイク済み: キューブマップ＋動的な太陽/月。レイヤー: 毎フレーム星雲など（重い）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Cubemap face resolution when backdrop is baked.",
+      "translation": "ベイク時のキューブマップ面解像度。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Set observer lat/lon from the host timezone. Off uses manual coordinates.",
+      "translation": "ホストのタイムゾーンから観測緯度経度を決めます。Off は手動座標です。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Used when “Sky from timezone” is off.",
+      "translation": "「タイムゾーンから空を決める」が Off のときに使います。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Create a virtual output for Live (recommended on).",
+      "translation": "Live 用の仮想ディスプレイを作ります（推奨: On）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Base (x1) virtual resolution as WIDTHxHEIGHT.",
+      "translation": "仮想ディスプレイの基本解像度（x1）を WIDTHxHEIGHT で指定。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Compositor scale for the virtual display (e.g. 2 = 200%).",
+      "translation": "仮想ディスプレイのコンポジタ倍率（例: 2 = 200%）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Chrome --force-device-scale-factor. Keep 1 when Virtual scale is already >1.",
+      "translation": "Chrome の --force-device-scale-factor。仮想スケールが既に 1 超なら 1 のまま推奨。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Host cursor size multiplier on the virtual display.",
+      "translation": "仮想ディスプレイ上のホストカーソル倍率。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Default shares logins (Chrome and Firefox). Isolated is a separate profile (needed on some GNOME/Wayland setups).",
+      "translation": "標準はログイン共有（Chrome / Firefox）。隔離は別プロファイル（一部 GNOME/Wayland で必要）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Pre-create a Chrome process when monaSphere starts so Live connects faster. Effective on KDE only (ignored on GNOME).",
+      "translation": "monaSphere 起動時に Chrome プロセスを用意し、Live 接続を速くします。KDE のみ有効（GNOME では無視されます）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Browser used for Live URLs.",
+      "translation": "Live URL に使うブラウザ。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Optional connector/output name override. Leave empty for auto.",
+      "translation": "出力コネクタ名の上書き（空なら自動）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Write Live display breadcrumbs under ~/.config/monasphere/.",
+      "translation": "Live 表示のデバッグログを ~/.config/monasphere/ に書きます。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Write Live teardown breadcrumbs for debugging.",
+      "translation": "Live 終了処理のデバッグログを書きます。"
+    },
+    {
+      "context": "Preferences",
+      "source": "How many seek-bar thumbnails to build.",
+      "translation": "シークバー用サムネイルの枚数。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Max long-edge pixels when building seek thumbnails.",
+      "translation": "シークサムネ作成時の長辺ピクセル上限。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Store seek thumbs as JPEG in memory (saves RAM).",
+      "translation": "シークサムネを JPEG でメモリ保持（RAM 節約）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Auto (90 Hz)",
+      "translation": "自動 (90 Hz)"
+    },
+    {
+      "context": "Preferences",
+      "source": "Baked cubemap",
+      "translation": "ベイク済み"
+    },
+    {
+      "context": "Preferences",
+      "source": "Live layers",
+      "translation": "レイヤー"
+    },
+    {
+      "context": "Preferences",
+      "source": "Monitor",
+      "translation": "モニタ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Window",
+      "translation": "ウィンドウ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Default profile",
+      "translation": "標準プロファイル"
+    },
+    {
+      "context": "Preferences",
+      "source": "Isolated profile",
+      "translation": "隔離プロファイル"
+    },
+    {
+      "context": "Preferences",
+      "source": "FSR (file)",
+      "translation": "FSR（ファイル）"
+    },
+    {
+      "context": "Preferences",
+      "source": "FSR (Live browser)",
+      "translation": "FSR（Live ブラウザ）"
+    },
+    {
+      "context": "Preferences",
+      "source": "Flat FOV",
+      "translation": "平面 FOV"
+    },
+    {
+      "context": "Preferences",
+      "source": "Flat distance",
+      "translation": "平面距離"
+    },
+    {
+      "context": "Preferences",
+      "source": "Display Hz",
+      "translation": "表示 Hz"
+    },
+    {
+      "context": "Preferences",
+      "source": "Volume",
+      "translation": "音量"
+    },
+    {
+      "context": "Preferences",
+      "source": "Surround gain",
+      "translation": "サラウンドゲイン"
+    },
+    {
+      "context": "Preferences",
+      "source": "Normalize audio",
+      "translation": "音量正規化"
+    },
+    {
+      "context": "Preferences",
+      "source": "Unlock HRTF trim",
+      "translation": "HRTF 減衰の制限を解除"
+    },
+    {
+      "context": "Preferences",
+      "source": "HRTF trim (dB)",
+      "translation": "HRTF 減衰 (dB)"
+    },
+    {
+      "context": "Preferences",
+      "source": "Milky Way gain",
+      "translation": "天の川ゲイン"
+    },
+    {
+      "context": "Preferences",
+      "source": "Sky backdrop",
+      "translation": "空の背景"
+    },
+    {
+      "context": "Preferences",
+      "source": "Sky bake face size",
+      "translation": "空ベイク解像度"
+    },
+    {
+      "context": "Preferences",
+      "source": "Sky from timezone",
+      "translation": "タイムゾーンから空を決める"
+    },
+    {
+      "context": "Preferences",
+      "source": "Observer latitude",
+      "translation": "観測緯度"
+    },
+    {
+      "context": "Preferences",
+      "source": "Observer longitude",
+      "translation": "観測経度"
+    },
+    {
+      "context": "Preferences",
+      "source": "Live capture",
+      "translation": "Live キャプチャ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Virtual display",
+      "translation": "仮想ディスプレイ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Virtual size",
+      "translation": "仮想解像度"
+    },
+    {
+      "context": "Preferences",
+      "source": "Virtual scale",
+      "translation": "仮想スケール"
+    },
+    {
+      "context": "Preferences",
+      "source": "Chrome scale",
+      "translation": "Chrome スケール"
+    },
+    {
+      "context": "Preferences",
+      "source": "Cursor scale",
+      "translation": "カーソル倍率"
+    },
+    {
+      "context": "Preferences",
+      "source": "Browser profile",
+      "translation": "ブラウザ プロファイル"
+    },
+    {
+      "context": "Preferences",
+      "source": "Create Chrome instance",
+      "translation": "Chrome インスタンス作成"
+    },
+    {
+      "context": "Preferences",
+      "source": "Browser",
+      "translation": "ブラウザ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Live output name",
+      "translation": "Live 出力名"
+    },
+    {
+      "context": "Preferences",
+      "source": "Live display log",
+      "translation": "Live 表示ログ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Live teardown log",
+      "translation": "Live 終了ログ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Hardware decode",
+      "translation": "ハードウェアデコード"
+    },
+    {
+      "context": "Preferences",
+      "source": "Vulkan Video",
+      "translation": "Vulkan Video"
+    },
+    {
+      "context": "Preferences",
+      "source": "H.264 CB → CUDA (NVIDIA)",
+      "translation": "H.264 CB → CUDA (NVIDIA)"
+    },
+    {
+      "context": "Preferences",
+      "source": "Seek thumbnail count",
+      "translation": "シークサムネ枚数"
+    },
+    {
+      "context": "Preferences",
+      "source": "Seek thumbnail max edge",
+      "translation": "シークサムネ最大辺"
+    },
+    {
+      "context": "Preferences",
+      "source": "Seek thumbnails as JPEG",
+      "translation": "シークサムネを JPEG で保持"
     }
   ]
 }
