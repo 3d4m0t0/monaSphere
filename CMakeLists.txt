@@ -323,6 +323,10 @@ add_executable(vrp_player
   apps/vrp_player/i18n.qrc
   apps/vrp_player/host_window.cpp
   apps/vrp_player/host_window.hpp
+  apps/vrp_player/settings_catalog.cpp
+  apps/vrp_player/settings_catalog.hpp
+  apps/vrp_player/preferences_dialog.cpp
+  apps/vrp_player/preferences_dialog.hpp
   apps/vrp_player/youtube_session.cpp
   apps/vrp_player/youtube_session.hpp
   apps/vrp_player/drm_lease_probe.cpp
