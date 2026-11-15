@@ -62,11 +62,12 @@ class SceneRenderer {
   void set_hud_layout(float half_width_m, float distance_m, float aspect_h_over_w = 0.f,
                       float y_offset_m = 0.f);
   /**
-   * Thumbnail card in front of the file dialog.
-   * world_half_w is meters. pixel_h_over_w is the card's height/width.
+   * File-dialog preview card in app space.
+   * world_half_w / x / y / distance in meters; pitch_deg reclines into depth (0..90).
    */
   void set_thumb_texture(VkImageView view, VkSampler sampler, bool visible);
-  void set_thumb_pose(float world_half_w, float pixel_h_over_w, float x_m, float y_m, float distance_m);
+  void set_thumb_pose(float world_half_w, float pixel_h_over_w, float x_m, float y_m, float distance_m,
+                      float pitch_deg = 60.f);
   /** File-dialog preview. Flat stays a frame card. 180/360 projects a square window. */
   void set_thumb_format(ProjectionMode mode, StereoLayout stereo);
   /** Wait for previous eye submit. Returns false on timeout (do not rewrite descriptors). */
@@ -290,8 +291,9 @@ class SceneRenderer {
   float thumb_scale_x_ = 0.16f;
   float thumb_scale_y_ = 0.16f;
   float thumb_x_ = 0.f;
-  float thumb_y_ = 0.f;
-  float thumb_distance_ = 1.32f;
+  float thumb_y_ = -0.35f;
+  float thumb_distance_ = 0.60f;
+  float thumb_pitch_deg_ = 60.f;
   VkFence submit_fence_ = VK_NULL_HANDLE;
   /** Prior eye submit never completed — poll instead of multi-second waits. */
   bool eye_fence_wedged_ = false;

@@ -1429,7 +1429,7 @@ void SceneRenderer::set_thumb_format(ProjectionMode mode, StereoLayout stereo) {
 }
 
 void SceneRenderer::set_thumb_pose(float world_half_w, float pixel_h_over_w, float x_m, float y_m,
-                                   float distance_m) {
+                                   float distance_m, float pitch_deg) {
   constexpr float kMeshHalfW = 16.f / 9.f;
   if (world_half_w > 0.02f) {
     thumb_scale_x_ = world_half_w / kMeshHalfW;
@@ -1438,6 +1438,7 @@ void SceneRenderer::set_thumb_pose(float world_half_w, float pixel_h_over_w, flo
   thumb_x_ = x_m;
   thumb_y_ = y_m;
   if (distance_m > 0.3f) thumb_distance_ = distance_m;
+  thumb_pitch_deg_ = std::clamp(pitch_deg, 0.f, 90.f);
 }
 
 void SceneRenderer::set_hud_mesh(const HudVertex* vertices, uint32_t count) {
@@ -2636,56 +2637,17 @@ void SceneRenderer::draw_view(uint32_t view_index, const XrView& view, ViewSwapc
 
   if (thumb_visible_ && thumb_dset_) {
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout_, 0, 1, &thumb_dset_, 0, nullptr);
-    // Quad normal is +Z. Turn that face toward this eye.
-    const float px = thumb_x_;
-    const float py = thumb_y_;
-    const float pz = -thumb_distance_;
-    float fx = view.pose.position.x - px;
-    float fy = view.pose.position.y - py;
-    float fz = view.pose.position.z - pz;
-    const float flen = std::sqrt(fx * fx + fy * fy + fz * fz);
-    if (flen > 1e-4f) {
-      fx /= flen;
-      fy /= flen;
-      fz /= flen;
-    } else {
-      fx = 0.f;
-      fy = 0.f;
-      fz = 1.f;
-    }
-    float rx = fz;
-    float ry = 0.f;
-    float rz = -fx;
-    float rlen = std::sqrt(rx * rx + rz * rz);
-    if (rlen < 1e-4f) {
-      rx = 1.f;
-      ry = 0.f;
-      rz = 0.f;
-    } else {
-      rx /= rlen;
-      rz /= rlen;
-    }
-    const float ux = fy * rz - fz * ry;
-    const float uy = fz * rx - fx * rz;
-    const float uz = fx * ry - fy * rx;
+    // App-space card facing +Z (toward origin). Negative pitch tips the top into −Z (奥へ).
+    const float recline_rad =
+        -thumb_pitch_deg_ * static_cast<float>(M_PI) / 180.f;
     Mat4 scale = Mat4::identity();
     scale.m[0] = thumb_scale_x_;
     scale.m[5] = thumb_scale_y_;
-    Mat4 rot = Mat4::identity();
-    rot.m[0] = rx;
-    rot.m[1] = ry;
-    rot.m[2] = rz;
-    rot.m[4] = ux;
-    rot.m[5] = uy;
-    rot.m[6] = uz;
-    rot.m[8] = fx;
-    rot.m[9] = fy;
-    rot.m[10] = fz;
     Mat4 trans = Mat4::identity();
-    trans.m[12] = px;
-    trans.m[13] = py;
-    trans.m[14] = pz;
-    const Mat4 thumb_model = Mat4::mul(trans, Mat4::mul(rot, scale));
+    trans.m[12] = thumb_x_;
+    trans.m[13] = thumb_y_;
+    trans.m[14] = -thumb_distance_;
+    const Mat4 thumb_model = Mat4::mul(trans, Mat4::mul(rot_x(recline_rad), scale));
     PushConstants tpc{};
     tpc.mvp = Mat4::mul(proj, Mat4::mul(view_mat, thumb_model));
     const bool thumb_stereo = thumb_stereo_ != StereoLayout::Mono;

@@ -12,6 +12,7 @@
 #include "capture/pipewire_capture.hpp"
 #endif
 
+#include <QHash>
 #include <QMainWindow>
 #include <QProcess>
 #include <QMap>
@@ -83,6 +84,10 @@ class HostWindow : public QMainWindow {
   void onFsrAction(QAction* action);
   void onHzAction(QAction* action);
   void showAboutDialog();
+  /** Settings → Preferences… (KDE-style category dialog). */
+  void showPreferencesDialog();
+  /** Apply Preferences values to members + monasphere.conf. */
+  void applyPreferences(const QHash<QString, QString>& values);
   /** Host Tools → Set up live capture… (one Remember for Virtual-monaSphere). */
   void setupYouTubeCapture();
   /** Start next span in yt_setup_queue_ (interactive Capture). */
@@ -232,7 +237,7 @@ class HostWindow : public QMainWindow {
    * QMetaObject::invokeMethod is never aimed at a destroyed HostWindow (SEGV).
    */
   std::shared_ptr<std::atomic<bool>> ui_alive_{std::make_shared<std::atomic<bool>>(true)};
-  /** xrCreateVulkanInstanceKHR stall — stop Monado only from shutdownXr, not mid-callback. */
+  /** xrCreateVulkanInstanceKHR stalled ≥15s — Host may soft-stop Monado only on quit. */
   std::atomic<bool> vk_create_hung_{false};
 
   QProcess* monado_ = nullptr;
@@ -281,6 +286,18 @@ class HostWindow : public QMainWindow {
   std::atomic<bool> xr_running_{false};
   /** True only inside the XR frame loop. request_exit is for a stuck WaitFrame. */
   std::atomic<bool> xr_in_frame_loop_{false};
+  /**
+   * True after leaving the frame loop, while Vulkan/OpenXR Destroy* runs.
+   * Soft-stop during Destroy* leaves an NVIDIA client that blocks the next create.
+   * Keep Monado alive until destroy_vk_instance() finishes; Host stops it after join.
+   */
+  std::atomic<bool> xr_tearing_down_{false};
+  /** XR set just before vkDestroyInstance — Host may overlap independent teardown. */
+  std::atomic<bool> xr_vk_instance_destroying_{false};
+  /** Host already ran chrome-warm + lease-settle start during DestroyInstance. */
+  std::atomic<bool> destroy_instance_overlap_done_{false};
+  /** Steady clock ms when GNOME DRM-lease settle started (0 = not started). */
+  std::atomic<int64_t> gnome_lease_settle_start_ms_{0};
   std::atomic<int> cmd_{0};  // 1 play, 2 seek-, 3 seek+, 4 recenter
   std::atomic<int> proj_req_{-1};
   std::atomic<int> stereo_req_{-1};
@@ -370,6 +387,12 @@ class HostWindow : public QMainWindow {
   bool thumb_jpeg_ = true;
   /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */
   float milkyway_gain_ = 1.f;
+  /** File-dialog preview pose (monasphere.conf `file_thumb_*`). */
+  float file_thumb_distance_ = 0.60f;
+  float file_thumb_x_ = 0.f;
+  float file_thumb_y_ = -0.35f;
+  float file_thumb_pitch_deg_ = 60.f;
+  float file_thumb_half_w_ = 0.46f;
   /** monasphere.conf `sky_backdrop`. true=baked cubemap (default), false=layers. No UI. */
   bool sky_backdrop_baked_ = true;
   /** monasphere.conf `sky_bake_face`. Cubemap face size 1024/2048/4096 (default 2048). */
@@ -378,8 +401,10 @@ class HostWindow : public QMainWindow {
   float surround_gain_ = 0.8f;
   /** monasphere.conf `audio_normalize`. 1 = loudness match on file / Live / [アプリ] (default on; no UI). */
   bool audio_normalize_ = true;
-  /** monasphere.conf `hrtf_trim_db`. Cut before upmix/HRTF, 0..24 dB, default 12. No UI. */
-  float hrtf_trim_db_ = 12.f;
+  /** monasphere.conf `hrtf_trim_unlock`. 0 = HRTF trim locked at 10 dB. */
+  bool hrtf_trim_unlock_ = false;
+  /** monasphere.conf `hrtf_trim_db`. Cut before upmix/HRTF, 0..24 dB; locked default 10. */
+  float hrtf_trim_db_ = 10.f;
   /**
    * Earth-horizon sky observer. When `sky_from_timezone=1` (default), filled from the
    * host IANA zone (zone.tab). Manual `sky_lat` / `sky_lon` apply only if that flag is 0.
@@ -389,7 +414,7 @@ class HostWindow : public QMainWindow {
   float sky_lon_ = 139.65f;
   vrp::FsrMode preferred_fsr_ = vrp::FsrMode::Quality;
   /** Browser Live only (not [アプリ]); conf `live_fsr`, default Performance.
-   *  Provisional: □ / X cycles Off→UQ→Q→P while Live (menus closed). */
+   *  Provisional: □ / X cycles Off→1.3×→1.5×→2.0× while Live (menus closed). */
   vrp::FsrMode live_fsr_ = vrp::FsrMode::Performance;
   std::atomic<int> fsr_req_{-1};       // -1 none; else FsrMode
   /** 8K+ source: runtime FSR forced Off; preferred_fsr_ kept for restore. */
@@ -446,8 +471,14 @@ class HostWindow : public QMainWindow {
   /**
    * Live capture / desktop app. Before XR teardown.
    * GNOME Meta Session.Stop is deferred until after XR/Monado (see finishAppTeardown).
+   * Warm Chrome shutdown is deferred to overlap DestroyInstance when XR is running.
    */
   void stopExternalSessions();
+  /**
+   * Work with no dependency on DestroyInstance having started: warm Chrome + GNOME
+   * lease-settle clock. Call once when xr_vk_instance_destroying_ is set (or as fallback).
+   */
+  void runTeardownOverlappingDestroyInstance();
   /** Once-only app quit: external → XR → Meta. Safe from closeEvent + destructor. */
   void finishAppTeardown();
   struct LiveAppEntry {
@@ -480,8 +511,8 @@ class HostWindow : public QMainWindow {
    * Base Virtual size (x1). x2/x3 keep this width and reduce height
    * (e.g. 3840×2160 → 3840×1440 → 3840×960).
    */
-  int live_virtual_w_ = 1280;
-  int live_virtual_h_ = 720;
+  int live_virtual_w_ = 1920;
+  int live_virtual_h_ = 1080;
   /** krfb-virtualmonitor --scale (2 = 200%). */
   float live_virtual_scale_ = 2.f;
   /** Chromium --force-device-scale-factor (keep 1 when Virtual is already scaled). */
@@ -491,7 +522,8 @@ class HostWindow : public QMainWindow {
   bool live_chrome_default_profile_ = true;
   /**
    * Conf `live_chrome_warm` (default on): pre-open Chrome at host start so Live
-   * hits already_running. Ignored for Firefox. Shutdown closes only if owned.
+   * hits already_running. KDE only (GNOME ignores). Ignored for Firefox.
+   * Shutdown closes only if owned.
    */
   bool live_chrome_warm_ = true;
   /** Session flag: already showed GNOME Wayland→isolated Chrome dialog. */

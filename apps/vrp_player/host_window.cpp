@@ -2,6 +2,8 @@
 #include "desktop_ui.hpp"
 #include "hud_paint.hpp"
 #include "i18n.hpp"
+#include "preferences_dialog.hpp"
+#include "settings_catalog.hpp"
 #include "x11_direct_probe.hpp"
 
 #include "audio/audio_player.hpp"
@@ -167,7 +169,7 @@ void HostWindow::finishAppTeardown() {
   // GNOME: evacuate Live clients first, but Session.Stop Meta only after XR /
   // Monado drop the HMD DRM lease — otherwise mutter can SEGV (session freeze).
   stopExternalSessions();
-  if (!shutdownXrSession(25000, true)) {
+  if (!shutdownXrSession(45000, true)) {
     // Detach abandons stack unwind — free FFmpeg hwctx first (LSAN av_malloc).
     {
       std::lock_guard<std::mutex> lock(xr_app_mu_);
@@ -175,6 +177,16 @@ void HostWindow::finishAppTeardown() {
     }
     VRP_ERR("XR thread did not exit on app teardown — detaching (last resort)");
     if (xr_thread_.joinable()) xr_thread_.detach();
+    // Detach left Monado running → ~QProcess would waitForFinished and SEGV into
+    // onMonadoFinished while widgets die. Stop + disconnect before QObject teardown.
+    runTeardownOverlappingDestroyInstance();
+    if (!monado_external_) {
+      VRP_TEARDOWN_LOG("Host teardown: stopMonado after XR detach…");
+      stopMonadoProcess();
+    }
+  }
+  if (monado_) {
+    disconnect(monado_, nullptr, this, nullptr);
   }
   VRP_TEARDOWN_LOG("Host teardown: Meta/Virtual after XR/Monado…");
   destroyVirtualForLeaveLive();
@@ -195,8 +207,29 @@ void HostWindow::stopExternalSessions() {
   pad_hook_.stop();
   pad_hook_active_ = false;
   pad_filter_.stop();
-  // Close warm Chrome only if we started it (never a user's pre-existing Chrome).
+  // Warm Chrome: deferred to runTeardownOverlappingDestroyInstance when XR runs,
+  // so its cost hides under vkDestroyInstance. If XR is idle, close it here.
+  if (!xr_running_.load(std::memory_order_acquire)) {
+    vrp::ChromiumYtLauncher::shutdownWarm();
+  } else {
+    VRP_TEARDOWN_LOG("Host teardown: defer warm Chrome until DestroyInstance starts");
+  }
+}
+
+void HostWindow::runTeardownOverlappingDestroyInstance() {
+  if (destroy_instance_overlap_done_.exchange(true, std::memory_order_acq_rel)) return;
+  VRP_TEARDOWN_LOG("Host teardown: overlap DestroyInstance — warm Chrome + lease settle start");
   vrp::ChromiumYtLauncher::shutdownWarm();
+  const QByteArray desk = qgetenv("XDG_CURRENT_DESKTOP").toUpper();
+  const bool gnome_wayland =
+      QGuiApplication::platformName() == QLatin1String("wayland") && desk.contains("GNOME");
+  if (gnome_wayland) {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    gnome_lease_settle_start_ms_.store(ms, std::memory_order_release);
+    VRP_TEARDOWN_LOG("Host teardown: GNOME DRM-lease settle started (overlap)");
+  }
 }
 
 void HostWindow::signalXrStop() {
@@ -218,11 +251,10 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
       timeout_ms, stop_monado ? 1 : 0, xr_running_.load(std::memory_order_acquire) ? 1 : 0,
       xr_in_frame_loop_.load(std::memory_order_acquire) ? 1 : 0);
   signalXrStop();
-  // Do NOT kill Monado before XR teardown finishes. xrDestroySession / WaitIdle /
-  // DestroyDevice need compositor IPC; stopping monado-service mid-teardown yields
-  // Broken pipe and can wedge NVIDIA so the next xrCreateVulkanInstanceKHR fails.
-  // request_exit is delayed so the XR thread can leave the frame loop and stop
-  // video/audio/live first. It is only forced if WaitFrame is stuck.
+  // Keep Monado alive until XR finishes vkDestroyInstance. Killing the runtime
+  // earlier leaves an NVIDIA client that blocks the next create (~15s+).
+  destroy_instance_overlap_done_.store(false, std::memory_order_release);
+  gnome_lease_settle_start_ms_.store(0, std::memory_order_release);
 
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms > 0 ? timeout_ms : 0);
@@ -235,6 +267,11 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
       VRP_TEARDOWN_LOG("Host teardown: force request_exit (WaitFrame still in loop)");
       std::lock_guard<std::mutex> lock(xr_app_mu_);
       if (xr_app_) xr_app_->request_exit();
+    }
+    // Independent of DestroyInstance completion — hide warm Chrome / lease settle
+    // under the ICD release wait.
+    if (xr_vk_instance_destroying_.load(std::memory_order_acquire)) {
+      runTeardownOverlappingDestroyInstance();
     }
     QThread::msleep(40);
     QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
@@ -255,16 +292,17 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
 
   if (!ok && xr_thread_.joinable() && stop_monado && !monado_external_) {
     if (!xr_in_frame_loop_.load(std::memory_order_acquire)) {
-      // Not in the frame loop: either still in xrCreateVulkanInstanceKHR (hung
-      // compositor) or inside Vulkan/OpenXR destroy. Stopping Monado mid-create
-      // can SEGV monado-service (teardown_all join) — only do it when create is
-      // known hung or we are quitting and must unblock the XR thread.
-      const bool hung_create = vk_create_hung_.load(std::memory_order_acquire) ||
-                               shutting_down_.load(std::memory_order_acquire);
-      if (hung_create) {
+      const bool tearing = xr_tearing_down_.load(std::memory_order_acquire);
+      // During Destroy*: never soft-stop Monado (breaks vkDestroyInstance release).
+      // During create hang / quit before frame: soft-stop to unblock the XR thread.
+      const bool stuck_in_create =
+          !tearing && (vk_create_hung_.load(std::memory_order_acquire) ||
+                       shutting_down_.load(std::memory_order_acquire));
+      if (stuck_in_create) {
         VRP_TEARDOWN_LOG(
-            "Host teardown: XR stuck before frame loop (vk_hung=%d) — soft-stop Monado to unblock",
-            vk_create_hung_.load(std::memory_order_acquire) ? 1 : 0);
+            "Host teardown: XR stuck in create (vk_hung=%d shutting_down=%d) — soft-stop Monado",
+            vk_create_hung_.load(std::memory_order_acquire) ? 1 : 0,
+            shutting_down_.load(std::memory_order_acquire) ? 1 : 0);
         stopMonadoProcess();
         stopSystemdMonadoForOwnedStart();
         clearStaleMonadoSocket();
@@ -274,11 +312,9 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
           QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
         }
       } else {
-        // Past WaitFrame. Teardown is inside Vulkan/OpenXR destroy. Killing Monado
-        // here wedges the next xrCreateVulkanInstanceKHR.
         VRP_TEARDOWN_LOG(
-            "Host teardown: frame loop left — waiting for teardown, not stopping Monado");
-        const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+            "Host teardown: waiting for XR Destroy* (tearing=%d) — keep Monado", tearing ? 1 : 0);
+        const auto grace = std::chrono::steady_clock::now() + std::chrono::seconds(30);
         while (xr_running_.load() && std::chrono::steady_clock::now() < grace) {
           QThread::msleep(40);
           QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
@@ -291,7 +327,6 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
         ok = true;
       }
     } else {
-      // Still inside xrWaitFrame — kill runtime to unblock hung IPC.
       VRP_TEARDOWN_LOG(
           "Host teardown: XR still running after timeout — stopping Monado to unblock");
       stopMonadoProcess();
@@ -306,28 +341,40 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
       }
     }
     if (!ok && xr_thread_.joinable()) {
-      // About to return failure → caller may detach. Drop FFmpeg hwctx now.
       std::lock_guard<std::mutex> lock(xr_app_mu_);
       if (xr_app_) xr_app_->drop_ffmpeg_hwctx();
     }
   } else if (ok && stop_monado && !monado_external_) {
-    // GNOME/Mutter: XR/Monado release of the HMD DRM lease races mutter's
-    // revoke path (ENOENT → SEGV in meta_device_file_get_fd → session logout).
-    // Settle after XR destroy so KMS can drop the lease before we SIGTERM Monado.
+    // Fallback if DestroyInstance was skipped/abandoned before the flag flipped.
+    runTeardownOverlappingDestroyInstance();
+    // XR finished DestroyInstance with Monado still up — now stop the runtime.
     const QByteArray desk = qgetenv("XDG_CURRENT_DESKTOP").toUpper();
     const bool gnome_wayland =
         QGuiApplication::platformName() == QLatin1String("wayland") && desk.contains("GNOME");
     if (gnome_wayland) {
       constexpr int kLeaseSettleMs = 1500;
-      VRP_TEARDOWN_LOG("Host teardown: GNOME DRM-lease settle %dms before stopMonado",
-                       kLeaseSettleMs);
-      const auto settle_deadline =
-          std::chrono::steady_clock::now() + std::chrono::milliseconds(kLeaseSettleMs);
-      while (std::chrono::steady_clock::now() < settle_deadline) {
-        QThread::msleep(40);
-        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+      const int64_t started = gnome_lease_settle_start_ms_.load(std::memory_order_acquire);
+      const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+      const int64_t elapsed = started > 0 ? (now_ms - started) : 0;
+      const int remain_ms =
+          started > 0 ? std::max(0, kLeaseSettleMs - static_cast<int>(elapsed)) : kLeaseSettleMs;
+      if (remain_ms > 0) {
+        VRP_TEARDOWN_LOG(
+            "Host teardown: GNOME DRM-lease settle remain %dms (elapsed %lld during DestroyInstance)",
+            remain_ms, static_cast<long long>(elapsed));
+        const auto settle_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(remain_ms);
+        while (std::chrono::steady_clock::now() < settle_deadline) {
+          QThread::msleep(40);
+          QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents, 40);
+        }
+      } else {
+        VRP_TEARDOWN_LOG(
+            "Host teardown: GNOME DRM-lease settle already done during DestroyInstance (%lld ms)",
+            static_cast<long long>(elapsed));
       }
-      VRP_TEARDOWN_LOG("Host teardown: GNOME DRM-lease settle done");
     }
     VRP_TEARDOWN_LOG("Host teardown: stopMonadoProcess…");
     stopMonadoProcess();
@@ -344,6 +391,8 @@ bool HostWindow::usingWivrn() const { return runtime_kind_.load() == 1; }
 bool HostWindow::ensureMonadoReady() {
   // Previous monasphere SEGV leaves Monado up with a dead IPC client → Broken pipe
   // on the next xrCreateInstance. Restart owned Monado when the crash cookie remains.
+  // Do not restart on a clean vk-release stamp: DestroyInstance with Monado alive
+  // already dropped the client; settle+restart races a new compositor against residual.
   const bool unclean = vrp::crash_guard::consume_unclean_session();
   if (unclean && !usingWivrn() && !monado_external_) {
     appendLog(tr("Previous session crashed — restarting Monado"));
@@ -1184,9 +1233,7 @@ void HostWindow::buildUi() {
 
 namespace {
 
-QString monasphereConfPath() {
-  return QDir::homePath() + QStringLiteral("/.config/monasphere/monasphere.conf");
-}
+QString monasphereConfPath() { return vrp::settings::confPath(); }
 
 /** Text to the right of '#' is a comment and is not part of the assignment. */
 QString confCode(QString line) {
@@ -1196,173 +1243,14 @@ QString confCode(QString line) {
   return line.trimmed();
 }
 
-bool confKeyIs(const QString& code, const QString& key, QString* value) {
-  const QString prefix = key + QLatin1Char('=');
-  if (!code.startsWith(prefix)) return false;
-  if (value) *value = code.mid(prefix.size()).trimmed();
-  return true;
-}
-
-bool confInt(const QString& v, int lo, int hi) {
-  bool ok = false;
-  const int n = v.toInt(&ok);
-  return ok && n >= lo && n <= hi;
-}
-
-bool confFloat(const QString& v, float lo, float hi) {
-  bool ok = false;
-  const float n = v.toFloat(&ok);
-  return ok && n >= lo && n <= hi;
-}
-
-bool confOneOf(const QString& v, std::initializer_list<QLatin1String> opts, bool ignore_case = false) {
-  for (const QLatin1String o : opts) {
-    if (ignore_case ? v.compare(o, Qt::CaseInsensitive) == 0 : v == o) return true;
-  }
-  return false;
-}
-
 /**
  * Assignments the running app still reads. Unknown keys and values the
  * parser would ignore are not ok — those lines are commented out.
  * allow_legacy keeps youtube_url= for the one migration pass.
+ * Scalar / list rules live in settings_catalog (single source of truth).
  */
 bool monasphereConfAssignmentOk(const QString& code, bool allow_legacy) {
-  QString v;
-  if (confKeyIs(code, QStringLiteral("volume"), &v)) return confFloat(v, 0.f, 1.f);
-  if (confKeyIs(code, QStringLiteral("fsr"), &v)) return confInt(v, 0, 3);
-  if (confKeyIs(code, QStringLiteral("live_fsr"), &v)) return confInt(v, 0, 3);
-  if (confKeyIs(code, QStringLiteral("live_display_log"), &v))
-    return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("live_teardown_log"), &v))
-    return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("hz"), &v)) {
-    bool ok = false;
-    const int n = v.toInt(&ok);
-    return ok && (n == 0 || n == 90 || n == 120);
-  }
-  if (confKeyIs(code, QStringLiteral("runtime"), &v))
-    return confOneOf(v, {QLatin1String("monado"), QLatin1String("wivrn")});
-  if (confKeyIs(code, QStringLiteral("pad"), &v))
-    return confOneOf(v, {QLatin1String("auto"), QLatin1String("simple"), QLatin1String("oculus_touch"),
-                         QLatin1String("ms_motion"), QLatin1String("vive"), QLatin1String("index"),
-                         QLatin1String("gamepad")});
-  if (confKeyIs(code, QStringLiteral("hand"), &v))
-    return confOneOf(v, {QLatin1String("left"), QLatin1String("right")});
-  if (confKeyIs(code, QStringLiteral("gamepad"), &v)) return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("hwaccel"), &v)) return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("vulkan_video"), &v))
-    return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("vulkan_h264_cb_cuda"), &v))
-    return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("flat_fov"), &v)) return confFloat(v, 20.f, 140.f);
-  if (confKeyIs(code, QStringLiteral("flat_distance"), &v)) return confFloat(v, 2.f, 40.f);
-  if (confKeyIs(code, QStringLiteral("milkyway_gain"), &v)) return confFloat(v, 0.2f, 2.5f);
-  if (confKeyIs(code, QStringLiteral("sky_backdrop"), &v))
-    return v.compare(QLatin1String("layers"), Qt::CaseInsensitive) == 0 ||
-           v.compare(QLatin1String("baked"), Qt::CaseInsensitive) == 0;
-  if (confKeyIs(code, QStringLiteral("sky_bake_face"), &v))
-    return v == QLatin1String("1024") || v == QLatin1String("2048") || v == QLatin1String("4096");
-  if (confKeyIs(code, QStringLiteral("surround_gain"), &v)) return confFloat(v, 0.f, 2.f);
-  if (confKeyIs(code, QStringLiteral("audio_normalize"), &v))
-    return confOneOf(v, {QLatin1String("0"), QLatin1String("1"), QLatin1String("on"), QLatin1String("off")},
-                     true);
-  if (confKeyIs(code, QStringLiteral("hrtf_trim_db"), &v)) return confFloat(v, 0.f, 24.f);
-  if (confKeyIs(code, QStringLiteral("sky_from_timezone"), &v))
-    return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("sky_lat"), &v)) return confFloat(v, -90.f, 90.f);
-  if (confKeyIs(code, QStringLiteral("sky_lon"), &v)) return confFloat(v, -180.f, 180.f);
-  if (confKeyIs(code, QStringLiteral("live_restore_token"), &v)) return true;
-  if (confKeyIs(code, QStringLiteral("live_output"), &v)) return true;
-  if (confKeyIs(code, QStringLiteral("live_capture"), &v))
-    return v.compare(QLatin1String("monitor"), Qt::CaseInsensitive) == 0 ||
-           v.compare(QLatin1String("window"), Qt::CaseInsensitive) == 0;
-  if (confKeyIs(code, QStringLiteral("live_virtual"), &v))
-    return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("live_virtual_size"), &v)) {
-    const QRegularExpression re(QStringLiteral("^(\\d+)x(\\d+)$"));
-    const QRegularExpressionMatch m = re.match(v.toLower());
-    if (!m.hasMatch()) return false;
-    const int w = m.captured(1).toInt();
-    const int h = m.captured(2).toInt();
-    return w >= 640 && w <= 7680 && h >= 360 && h <= 4320;
-  }
-  if (confKeyIs(code, QStringLiteral("live_virtual_scale"), &v)) return confFloat(v, 1.f, 3.f);
-  if (confKeyIs(code, QStringLiteral("live_chrome_scale"), &v)) return confFloat(v, 1.f, 3.f);
-  if (confKeyIs(code, QStringLiteral("live_cursor_scale"), &v)) return confInt(v, 1, 6);
-  if (confKeyIs(code, QStringLiteral("live_chrome_profile"), &v))
-    return v.compare(QLatin1String("default"), Qt::CaseInsensitive) == 0 ||
-           v.compare(QLatin1String("isolated"), Qt::CaseInsensitive) == 0;
-  if (confKeyIs(code, QStringLiteral("live_chrome_warm"), &v))
-    return v == QLatin1String("0") || v == QLatin1String("1");
-  if (confKeyIs(code, QStringLiteral("live_browser"), &v))
-    return confOneOf(v, {QLatin1String("chrome"), QLatin1String("chromium"),
-                         QLatin1String("firefox")},
-                     /*ignore_case=*/true);
-  if (confKeyIs(code, QStringLiteral("last_dir"), &v)) return !v.isEmpty();
-  if (confKeyIs(code, QStringLiteral("geometry"), &v)) return !v.isEmpty();
-  if (confKeyIs(code, QStringLiteral("modes"), &v)) {
-    const QStringList parts = v.split(QLatin1Char(';'), Qt::SkipEmptyParts);
-    if (parts.isEmpty()) return false;
-    for (const QString& part : parts) {
-      const QStringList f = part.split(QLatin1Char(':'));
-      if (f.size() < 2) return false;
-      bool ok1 = false;
-      bool ok2 = false;
-      const int idx = f[0].toInt(&ok1);
-      const double hz = f[1].toDouble(&ok2);
-      if (!ok1 || !ok2 || idx < 0 || hz <= 0.0) return false;
-      if (f.size() >= 3) {
-        bool ok3 = false;
-        f[2].toLongLong(&ok3);
-        if (!ok3) return false;
-      }
-    }
-    return true;
-  }
-  if (allow_legacy && confKeyIs(code, QStringLiteral("youtube_url"), &v)) return !v.isEmpty();
-  if (allow_legacy) {
-    // One pass so a span token can be copied into live_restore_token, then commented out.
-    const QRegularExpression re(QStringLiteral("^live_restore_token\\[x([1-3])\\]=(.*)$"));
-    if (re.match(code).hasMatch()) return true;
-  }
-
-  {
-    const QRegularExpression re(QStringLiteral("^live_app(?:\\[(\\d+)\\])?=(.*)$"));
-    const QRegularExpressionMatch m = re.match(code);
-    if (m.hasMatch()) {
-      const QString rest = m.captured(2).trimmed();
-      if (rest.isEmpty()) return true;
-      const int bar = rest.indexOf(QLatin1Char('|'));
-      if (bar <= 0) return false;
-      const QString name = rest.left(bar).trimmed();
-      const QString url = rest.mid(bar + 1).trimmed();
-      return !name.isEmpty() &&
-             (url.startsWith(QLatin1String("http://")) || url.startsWith(QLatin1String("https://")));
-    }
-  }
-  {
-    const QRegularExpression re(
-        QStringLiteral("^live_desktop_app\\[(\\d+)\\]\\.title\\[(\\d+)\\]=(.*)$"));
-    const QRegularExpressionMatch m = re.match(code);
-    if (m.hasMatch()) {
-      const QString rest = m.captured(3).trimmed();
-      if (rest.isEmpty()) return true;
-      const QString name = rest.section(QLatin1Char('|'), 0, 0).trimmed();
-      return !name.isEmpty();
-    }
-  }
-  {
-    const QRegularExpression re(QStringLiteral("^live_desktop_app(?:\\[(\\d+)\\])?=(.*)$"));
-    const QRegularExpressionMatch m = re.match(code);
-    if (m.hasMatch()) {
-      const QString rest = m.captured(2).trimmed();
-      if (rest.isEmpty()) return true;
-      const QStringList parts = rest.split(QLatin1Char('|'));
-      return parts.size() >= 2 && !parts[0].trimmed().isEmpty() && !parts[1].trimmed().isEmpty();
-    }
-  }
-  return false;
+  return vrp::settings::assignmentOk(code, allow_legacy);
 }
 
 /** Comment lines that are not a current option or whose value would be ignored. */
@@ -1566,35 +1454,7 @@ void migrateYoutubeConfKeysToLive() {
 }
 
 void ensureMonasphereConfKeys(const QHash<QString, QString>& defaults) {
-  const QString path = monasphereConfPath();
-  QDir().mkpath(QDir::homePath() + QStringLiteral("/.config/monasphere"));
-  QStringList lines;
-  QSet<QString> seen;
-  QFile in(path);
-  if (in.open(QIODevice::ReadOnly | QIODevice::Text)) {
-    while (!in.atEnd()) {
-      QString line = QString::fromUtf8(in.readLine());
-      if (line.endsWith(QLatin1Char('\n'))) line.chop(1);
-      if (line.endsWith(QLatin1Char('\r'))) line.chop(1);
-      const QString trimmed = line.trimmed();
-      lines << trimmed;
-      const QString code = confCode(trimmed);
-      const int eq = code.indexOf(QLatin1Char('='));
-      if (eq > 0) seen.insert(code.left(eq));
-    }
-    in.close();
-  }
-  bool added = lines.isEmpty() && !QFile::exists(path);
-  for (auto it = defaults.cbegin(); it != defaults.cend(); ++it) {
-    if (seen.contains(it.key())) continue;
-    lines << it.key() + QLatin1Char('=') + it.value();
-    added = true;
-  }
-  if (!added) return;
-  QFile out(path);
-  if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) return;
-  QTextStream ts(&out);
-  for (const QString& line : lines) ts << line << '\n';
+  vrp::settings::ensureConfKeys(defaults);
 }
 
 void setMonasphereConfKey(const QString& key, const QString& value) {
@@ -1706,6 +1566,16 @@ void HostWindow::saveAppConf() const {
                        QString::number(static_cast<double>(opt_.screen_distance), 'f', 2));
   setMonasphereConfKey(QStringLiteral("milkyway_gain"),
                        QString::number(static_cast<double>(milkyway_gain_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("file_thumb_distance"),
+                       QString::number(static_cast<double>(file_thumb_distance_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("file_thumb_x"),
+                       QString::number(static_cast<double>(file_thumb_x_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("file_thumb_y"),
+                       QString::number(static_cast<double>(file_thumb_y_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("file_thumb_pitch_deg"),
+                       QString::number(static_cast<double>(file_thumb_pitch_deg_), 'f', 1));
+  setMonasphereConfKey(QStringLiteral("file_thumb_half_w"),
+                       QString::number(static_cast<double>(file_thumb_half_w_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("sky_backdrop"),
                        sky_backdrop_baked_ ? QStringLiteral("baked") : QStringLiteral("layers"));
   setMonasphereConfKey(QStringLiteral("sky_bake_face"), QString::number(sky_bake_face_));
@@ -1713,6 +1583,8 @@ void HostWindow::saveAppConf() const {
                        QString::number(static_cast<double>(surround_gain_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("audio_normalize"),
                        audio_normalize_ ? QStringLiteral("1") : QStringLiteral("0"));
+  setMonasphereConfKey(QStringLiteral("hrtf_trim_unlock"),
+                       hrtf_trim_unlock_ ? QStringLiteral("1") : QStringLiteral("0"));
   setMonasphereConfKey(QStringLiteral("hrtf_trim_db"),
                        QString::number(static_cast<double>(hrtf_trim_db_), 'f', 1));
   setMonasphereConfKey(QStringLiteral("sky_from_timezone"), sky_from_timezone_ ? QStringLiteral("1") : QStringLiteral("0"));
@@ -1742,52 +1614,21 @@ void HostWindow::loadAppConf() {
     f.close();
   }
 
-  QHash<QString, QString> defaults{
-      {QStringLiteral("volume"), QStringLiteral("0.2")},
-      {QStringLiteral("fsr"),
-       QString::number(fsr_migrated >= 0 ? fsr_migrated : static_cast<int>(vrp::FsrMode::Quality))},
-      // Browser Live only (not [アプリ]). 0=Off 1=UQ 2=Q 3=P — default Performance.
-      {QStringLiteral("live_fsr"), QString::number(static_cast<int>(vrp::FsrMode::Performance))},
-      {QStringLiteral("hz"), QStringLiteral("0")},
-      {QStringLiteral("runtime"),
-       runtime_migrated == QLatin1String("wivrn") ? QStringLiteral("wivrn") : QStringLiteral("monado")},
-      {QStringLiteral("pad"), QStringLiteral("auto")},
-      {QStringLiteral("hand"), QStringLiteral("right")},
-      {QStringLiteral("gamepad"), QStringLiteral("1")},
-      {QStringLiteral("surround_gain"), QStringLiteral("0.80")},
-      {QStringLiteral("audio_normalize"), QStringLiteral("1")},
-      {QStringLiteral("hrtf_trim_db"), QStringLiteral("12")},
-      {QStringLiteral("hwaccel"), QStringLiteral("1")},
-      // 0 = CUDA/NVDEC (NVIDIA default). 1 = prefer Vulkan Video zero-copy.
-      {QStringLiteral("vulkan_video"), QStringLiteral("0")},
-      // NVIDIA only: 1 = CUDA for H.264 Constrained Baseline long≥3840 (ignored on AMD).
-      {QStringLiteral("vulkan_h264_cb_cuda"), QStringLiteral("1")},
-      {QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2)},
-      {QStringLiteral("flat_distance"),
-       QString::number(static_cast<double>(opt_.screen_distance), 'f', 2)},
-      {QStringLiteral("milkyway_gain"), QStringLiteral("1.00")},
-      // baked = startup cubemap + live sun/moon (default); layers = per-frame MW+stars+nebulae.
-      {QStringLiteral("sky_backdrop"), QStringLiteral("baked")},
-      {QStringLiteral("sky_bake_face"), QStringLiteral("2048")},
-      {QStringLiteral("sky_from_timezone"), QStringLiteral("1")},
-      {QStringLiteral("sky_lat"), QStringLiteral("35.68")},
-      {QStringLiteral("sky_lon"), QStringLiteral("139.65")},
-      {QStringLiteral("live_restore_token"), QString()},
-      {QStringLiteral("live_capture"), QStringLiteral("monitor")},
-      {QStringLiteral("live_output"), QString()},
-      {QStringLiteral("live_virtual"), QStringLiteral("1")},
-      {QStringLiteral("live_virtual_size"), QStringLiteral("1280x720")},
-      {QStringLiteral("live_virtual_scale"), QStringLiteral("2")},
-      {QStringLiteral("live_chrome_scale"), QStringLiteral("1")},
-      {QStringLiteral("live_cursor_scale"), QStringLiteral("1")},
-      {QStringLiteral("live_chrome_profile"), QStringLiteral("default")},
-      // 1 = pre-open Chrome at host start (same as manual pre-open for faster Live).
-      {QStringLiteral("live_chrome_warm"), QStringLiteral("1")},
-      // Persist breadcrumbs under ~/.config/monasphere/ (also /tmp/monasphere-*).
-      // live_display_log: 0=off (default). live_teardown_log: 1=on (default).
-      {QStringLiteral("live_display_log"), QStringLiteral("0")},
-      {QStringLiteral("live_teardown_log"), QStringLiteral("1")},
-  };
+  // Catalog defaults (categories / ranges / visibility). Override only migration
+  // and runtime-known values so existing user conf is not silently rewritten.
+  QHash<QString, QString> defaults = vrp::settings::defaultHash();
+  defaults.insert(
+      QStringLiteral("fsr"),
+      QString::number(fsr_migrated >= 0 ? fsr_migrated : static_cast<int>(vrp::FsrMode::Quality)));
+  defaults.insert(QStringLiteral("live_fsr"),
+                  QString::number(static_cast<int>(vrp::FsrMode::Performance)));
+  defaults.insert(QStringLiteral("runtime"), runtime_migrated == QLatin1String("wivrn")
+                                                 ? QStringLiteral("wivrn")
+                                                 : QStringLiteral("monado"));
+  defaults.insert(QStringLiteral("flat_fov"),
+                  QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2));
+  defaults.insert(QStringLiteral("flat_distance"),
+                  QString::number(static_cast<double>(opt_.screen_distance), 'f', 2));
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   migrateYoutubeConfKeysToLive();
   commentOutStaleConf(/*allow_legacy=*/true);
@@ -1899,6 +1740,26 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
       if (ok && v >= 0.2f && v <= 2.5f) milkyway_gain_ = v;
+    } else if (line.startsWith(QStringLiteral("file_thumb_distance="))) {
+      bool ok = false;
+      const float v = line.mid(QStringLiteral("file_thumb_distance=").size()).trimmed().toFloat(&ok);
+      if (ok && v >= 0.3f && v <= 3.f) file_thumb_distance_ = v;
+    } else if (line.startsWith(QStringLiteral("file_thumb_x="))) {
+      bool ok = false;
+      const float v = line.mid(QStringLiteral("file_thumb_x=").size()).trimmed().toFloat(&ok);
+      if (ok && v >= -2.f && v <= 2.f) file_thumb_x_ = v;
+    } else if (line.startsWith(QStringLiteral("file_thumb_y="))) {
+      bool ok = false;
+      const float v = line.mid(QStringLiteral("file_thumb_y=").size()).trimmed().toFloat(&ok);
+      if (ok && v >= -2.f && v <= 2.f) file_thumb_y_ = v;
+    } else if (line.startsWith(QStringLiteral("file_thumb_pitch_deg="))) {
+      bool ok = false;
+      const float v = line.mid(QStringLiteral("file_thumb_pitch_deg=").size()).trimmed().toFloat(&ok);
+      if (ok && v >= 0.f && v <= 90.f) file_thumb_pitch_deg_ = v;
+    } else if (line.startsWith(QStringLiteral("file_thumb_half_w="))) {
+      bool ok = false;
+      const float v = line.mid(QStringLiteral("file_thumb_half_w=").size()).trimmed().toFloat(&ok);
+      if (ok && v >= 0.1f && v <= 1.5f) file_thumb_half_w_ = v;
     } else if (line.startsWith(QStringLiteral("sky_backdrop="))) {
       const QString v = line.mid(QStringLiteral("sky_backdrop=").size()).trimmed();
       if (v.compare(QLatin1String("baked"), Qt::CaseInsensitive) == 0) {
@@ -1921,6 +1782,12 @@ void HostWindow::loadAppConf() {
       } else if (v == QLatin1String("1") || v.compare(QLatin1String("on"), Qt::CaseInsensitive) == 0) {
         audio_normalize_ = true;
       }
+    } else if (line.startsWith(QStringLiteral("hrtf_trim_unlock="))) {
+      const QString v = line.mid(QStringLiteral("hrtf_trim_unlock=").size()).trimmed();
+      if (v == QLatin1String("0") || v.compare(QLatin1String("off"), Qt::CaseInsensitive) == 0)
+        hrtf_trim_unlock_ = false;
+      else if (v == QLatin1String("1") || v.compare(QLatin1String("on"), Qt::CaseInsensitive) == 0)
+        hrtf_trim_unlock_ = true;
     } else if (line.startsWith(QStringLiteral("hrtf_trim_db="))) {
       bool ok = false;
       const float v = line.mid(QStringLiteral("hrtf_trim_db=").size()).trimmed().toFloat(&ok);
@@ -2101,10 +1968,12 @@ void HostWindow::loadAppConf() {
     }
   }
   user.close();
-  // Shipped defaults moved. A different saved value is left as edited.
-  if (hrtf_trim_db_ > 8.95f && hrtf_trim_db_ < 9.05f) {
-    hrtf_trim_db_ = 12.f;
-    setMonasphereConfKey(QStringLiteral("hrtf_trim_db"), QStringLiteral("12.0"));
+  // Locked HRTF trim is fixed at 10 dB (unlock via Preferences Advanced).
+  if (!hrtf_trim_unlock_) {
+    if (hrtf_trim_db_ < 9.95f || hrtf_trim_db_ > 10.05f) {
+      hrtf_trim_db_ = 10.f;
+      setMonasphereConfKey(QStringLiteral("hrtf_trim_db"), QStringLiteral("10.0"));
+    }
   }
   if (surround_gain_ > 0.549f && surround_gain_ < 0.551f) {
     surround_gain_ = 0.8f;
@@ -2262,25 +2131,15 @@ void HostWindow::buildMenus() {
   ops->addAction(tr("Quit"), this, &QWidget::close);
 
   auto* settings = menuBar()->addMenu(tr("Settings"));
+  settings->addAction(tr("Preferences…"), this, &HostWindow::showPreferencesDialog);
+  settings->addSeparator();
   audio_menu_ = settings->addMenu(tr("Audio"));
   audio_group_ = new QActionGroup(this);
   audio_group_->setExclusive(true);
   connect(audio_menu_, &QMenu::aboutToShow, this, &HostWindow::rebuildAudioMenu);
   connect(audio_group_, &QActionGroup::triggered, this, &HostWindow::onAudioDeviceAction);
 
-  fsr_menu_ = settings->addMenu(tr("FSR"));
-  fsr_group_ = new QActionGroup(this);
-  fsr_group_->setExclusive(true);
-  connect(fsr_menu_, &QMenu::aboutToShow, this, &HostWindow::rebuildFsrMenu);
-  connect(fsr_group_, &QActionGroup::triggered, this, &HostWindow::onFsrAction);
-  rebuildFsrMenu();
-
-  hz_menu_ = settings->addMenu(tr("Hz"));
-  hz_group_ = new QActionGroup(this);
-  hz_group_->setExclusive(true);
-  connect(hz_menu_, &QMenu::aboutToShow, this, &HostWindow::rebuildHzMenu);
-  connect(hz_group_, &QActionGroup::triggered, this, &HostWindow::onHzAction);
-  rebuildHzMenu();
+  // FSR / Hz: Preferences (映像) only — not duplicated in the menu bar.
 
   controller_menu_ = settings->addMenu(tr("Pad"));
   controller_group_ = new QActionGroup(this);
@@ -2384,8 +2243,8 @@ void HostWindow::syncTokensIntoManager() {
 
 void HostWindow::virtualSizeForSpan(int span, int* out_w, int* out_h) const {
   const int s = std::clamp(span, 1, 3);
-  const int w = live_virtual_w_ > 0 ? live_virtual_w_ : 1280;
-  const int h1 = live_virtual_h_ > 0 ? live_virtual_h_ : 720;
+  const int w = live_virtual_w_ > 0 ? live_virtual_w_ : 1920;
+  const int h1 = live_virtual_h_ > 0 ? live_virtual_h_ : 1080;
   int h = h1;
   if (s == 2) {
     // 8:3 into fixed width (3840×1440 when w=3840).
@@ -3285,6 +3144,297 @@ void HostWindow::stopYouTubeCapture() {
   VRP_TEARDOWN_LOG("Host teardown: stopYouTubeCapture END (UI path)");
 }
 
+void HostWindow::showPreferencesDialog() {
+  QHash<QString, QString> cur;
+  for (const vrp::settings::Entry& e : vrp::settings::prefsEntries()) {
+    const QString key = QString::fromLatin1(e.key);
+    QString v = monasphereConfValue(key);
+    if (v.isEmpty() && e.default_value) v = QString::fromUtf8(e.default_value);
+    // Prefer live members when they diverge from a stale conf read.
+    if (key == QLatin1String("fsr")) v = QString::number(static_cast<int>(preferred_fsr_));
+    else if (key == QLatin1String("live_fsr")) v = QString::number(static_cast<int>(live_fsr_));
+    else if (key == QLatin1String("hz")) v = QString::number(preferred_hz_);
+    else if (key == QLatin1String("flat_fov"))
+      v = QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2);
+    else if (key == QLatin1String("flat_distance"))
+      v = QString::number(static_cast<double>(opt_.screen_distance), 'f', 2);
+    else if (key == QLatin1String("hwaccel")) v = hwaccel_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("vulkan_video"))
+      v = vulkan_video_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("vulkan_h264_cb_cuda"))
+      v = vulkan_h264_cb_cuda_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("surround_gain"))
+      v = QString::number(static_cast<double>(surround_gain_), 'f', 2);
+    else if (key == QLatin1String("audio_normalize"))
+      v = audio_normalize_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("hrtf_trim_unlock"))
+      v = hrtf_trim_unlock_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("hrtf_trim_db"))
+      v = QString::number(static_cast<double>(hrtf_trim_db_), 'f', 1);
+    else if (key == QLatin1String("milkyway_gain"))
+      v = QString::number(static_cast<double>(milkyway_gain_), 'f', 2);
+    else if (key == QLatin1String("file_thumb_distance"))
+      v = QString::number(static_cast<double>(file_thumb_distance_), 'f', 2);
+    else if (key == QLatin1String("file_thumb_x"))
+      v = QString::number(static_cast<double>(file_thumb_x_), 'f', 2);
+    else if (key == QLatin1String("file_thumb_y"))
+      v = QString::number(static_cast<double>(file_thumb_y_), 'f', 2);
+    else if (key == QLatin1String("file_thumb_pitch_deg"))
+      v = QString::number(static_cast<double>(file_thumb_pitch_deg_), 'f', 1);
+    else if (key == QLatin1String("file_thumb_half_w"))
+      v = QString::number(static_cast<double>(file_thumb_half_w_), 'f', 2);
+    else if (key == QLatin1String("sky_backdrop"))
+      v = sky_backdrop_baked_ ? QStringLiteral("baked") : QStringLiteral("layers");
+    else if (key == QLatin1String("sky_bake_face")) v = QString::number(sky_bake_face_);
+    else if (key == QLatin1String("sky_from_timezone"))
+      v = sky_from_timezone_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("sky_lat"))
+      v = QString::number(static_cast<double>(sky_lat_), 'f', 2);
+    else if (key == QLatin1String("sky_lon"))
+      v = QString::number(static_cast<double>(sky_lon_), 'f', 2);
+    else if (key == QLatin1String("live_capture"))
+      v = live_capture_monitor_ ? QStringLiteral("monitor") : QStringLiteral("window");
+    else if (key == QLatin1String("live_virtual"))
+      v = live_virtual_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("live_virtual_size"))
+      v = QStringLiteral("%1x%2").arg(live_virtual_w_).arg(live_virtual_h_);
+    else if (key == QLatin1String("live_virtual_scale"))
+      v = QString::number(static_cast<double>(live_virtual_scale_), 'f', 2);
+    else if (key == QLatin1String("live_chrome_scale"))
+      v = QString::number(static_cast<double>(live_chrome_scale_), 'f', 2);
+    else if (key == QLatin1String("live_cursor_scale")) v = QString::number(live_cursor_scale_);
+    else if (key == QLatin1String("live_chrome_profile"))
+      v = live_chrome_default_profile_ ? QStringLiteral("default") : QStringLiteral("isolated");
+    else if (key == QLatin1String("live_chrome_warm"))
+      v = live_chrome_warm_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("live_browser")) {
+      if (live_browser_ == vrp::LiveBrowser::Firefox) v = QStringLiteral("firefox");
+      else v = QStringLiteral("chrome");
+    } else if (key == QLatin1String("live_output"))
+      v = live_output_;
+    else if (key == QLatin1String("thumb_count")) v = QString::number(seek_thumb_count_);
+    else if (key == QLatin1String("thumb_edge")) v = QString::number(seek_thumb_edge_);
+    else if (key == QLatin1String("thumb_jpeg"))
+      v = thumb_jpeg_ ? QStringLiteral("1") : QStringLiteral("0");
+    cur.insert(key, v);
+  }
+
+  PreferencesDialog dlg(cur, this);
+  connect(&dlg, &PreferencesDialog::applyRequested, this, &HostWindow::applyPreferences);
+  dlg.exec();
+}
+
+void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
+  bool hz_changed = false;
+  bool fsr_changed = false;
+  int new_hz = preferred_hz_;
+
+  for (auto it = values.cbegin(); it != values.cend(); ++it) {
+    const QString& key = it.key();
+    const QString& value = it.value();
+    const QString code = key + QLatin1Char('=') + value;
+    if (!vrp::settings::assignmentOk(code, /*allow_legacy=*/false)) {
+      appendLog(tr("Preferences: ignored invalid %1=%2").arg(key, value));
+      continue;
+    }
+    setMonasphereConfKey(key, value);
+
+    if (key == QLatin1String("fsr")) {
+      bool ok = false;
+      const int n = value.toInt(&ok);
+      if (ok && n >= 0 && n <= 3) {
+        preferred_fsr_ = static_cast<vrp::FsrMode>(n);
+        fsr_changed = true;
+      }
+    } else if (key == QLatin1String("live_fsr")) {
+      bool ok = false;
+      const int n = value.toInt(&ok);
+      if (ok && n >= 0 && n <= 3) live_fsr_ = static_cast<vrp::FsrMode>(n);
+    } else if (key == QLatin1String("hz")) {
+      bool ok = false;
+      const int n = value.toInt(&ok);
+      if (ok && (n == 0 || n == 90 || n == 120) && n != preferred_hz_) {
+        new_hz = n;
+        hz_changed = true;
+      }
+    } else if (key == QLatin1String("flat_fov")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) opt_.flat_fov_deg = v;
+    } else if (key == QLatin1String("flat_distance")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) opt_.screen_distance = v;
+    } else if (key == QLatin1String("hwaccel")) {
+      hwaccel_ = value != QLatin1String("0");
+    } else if (key == QLatin1String("vulkan_video")) {
+      vulkan_video_ = value != QLatin1String("0");
+    } else if (key == QLatin1String("vulkan_h264_cb_cuda")) {
+      vulkan_h264_cb_cuda_ = value != QLatin1String("0");
+    } else if (key == QLatin1String("volume")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) {
+        std::lock_guard<std::mutex> lock(menu_mu_);
+        if (vr_menu_) vr_menu_->set_volume(v);
+      }
+    } else if (key == QLatin1String("surround_gain")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) surround_gain_ = v;
+    } else if (key == QLatin1String("audio_normalize")) {
+      audio_normalize_ = !(value == QLatin1String("0") ||
+                           value.compare(QLatin1String("off"), Qt::CaseInsensitive) == 0);
+    } else if (key == QLatin1String("hrtf_trim_unlock")) {
+      hrtf_trim_unlock_ = !(value == QLatin1String("0") ||
+                            value.compare(QLatin1String("off"), Qt::CaseInsensitive) == 0);
+      if (!hrtf_trim_unlock_) {
+        hrtf_trim_db_ = 10.f;
+        setMonasphereConfKey(QStringLiteral("hrtf_trim_db"), QStringLiteral("10.0"));
+      }
+    } else if (key == QLatin1String("hrtf_trim_db")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) hrtf_trim_db_ = hrtf_trim_unlock_ ? v : 10.f;
+    } else if (key == QLatin1String("milkyway_gain")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) milkyway_gain_ = v;
+    } else if (key == QLatin1String("file_thumb_distance")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok && v >= 0.3f && v <= 3.f) file_thumb_distance_ = v;
+    } else if (key == QLatin1String("file_thumb_x")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok && v >= -2.f && v <= 2.f) file_thumb_x_ = v;
+    } else if (key == QLatin1String("file_thumb_y")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok && v >= -2.f && v <= 2.f) file_thumb_y_ = v;
+    } else if (key == QLatin1String("file_thumb_pitch_deg")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok && v >= 0.f && v <= 90.f) file_thumb_pitch_deg_ = v;
+    } else if (key == QLatin1String("file_thumb_half_w")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok && v >= 0.1f && v <= 1.5f) file_thumb_half_w_ = v;
+    } else if (key == QLatin1String("sky_backdrop")) {
+      sky_backdrop_baked_ = value.compare(QLatin1String("baked"), Qt::CaseInsensitive) == 0;
+    } else if (key == QLatin1String("sky_bake_face")) {
+      bool ok = false;
+      const int v = value.toInt(&ok);
+      if (ok) sky_bake_face_ = v;
+    } else if (key == QLatin1String("sky_from_timezone")) {
+      sky_from_timezone_ = value != QLatin1String("0");
+    } else if (key == QLatin1String("sky_lat")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) sky_lat_ = v;
+    } else if (key == QLatin1String("sky_lon")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) sky_lon_ = v;
+    } else if (key == QLatin1String("live_capture")) {
+      live_capture_monitor_ = value.compare(QLatin1String("window"), Qt::CaseInsensitive) != 0;
+    } else if (key == QLatin1String("live_virtual")) {
+      live_virtual_ = value != QLatin1String("0");
+    } else if (key == QLatin1String("live_virtual_size")) {
+      const QRegularExpression re(QStringLiteral("^(\\d+)x(\\d+)$"));
+      const QRegularExpressionMatch m = re.match(value.toLower());
+      if (m.hasMatch()) {
+        live_virtual_w_ = m.captured(1).toInt();
+        live_virtual_h_ = m.captured(2).toInt();
+      }
+    } else if (key == QLatin1String("live_virtual_scale")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) live_virtual_scale_ = v;
+    } else if (key == QLatin1String("live_chrome_scale")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) live_chrome_scale_ = v;
+    } else if (key == QLatin1String("live_cursor_scale")) {
+      bool ok = false;
+      const int v = value.toInt(&ok);
+      if (ok) live_cursor_scale_ = v;
+    } else if (key == QLatin1String("live_chrome_profile")) {
+      live_chrome_default_profile_ =
+          value.compare(QLatin1String("isolated"), Qt::CaseInsensitive) != 0;
+    } else if (key == QLatin1String("live_chrome_warm")) {
+      live_chrome_warm_ = value != QLatin1String("0");
+    } else if (key == QLatin1String("live_browser")) {
+      live_browser_ = value.compare(QLatin1String("firefox"), Qt::CaseInsensitive) == 0
+                          ? vrp::LiveBrowser::Firefox
+                          : vrp::LiveBrowser::Chrome;
+    } else if (key == QLatin1String("live_output")) {
+      live_output_ = value;
+    } else if (key == QLatin1String("live_display_log")) {
+      vrp_set_persist_display_log(value == QLatin1String("1"));
+    } else if (key == QLatin1String("live_teardown_log")) {
+      vrp_set_persist_teardown_log(value == QLatin1String("1"));
+    } else if (key == QLatin1String("thumb_count")) {
+      bool ok = false;
+      const int v = value.toInt(&ok);
+      if (ok) seek_thumb_count_ = v;
+    } else if (key == QLatin1String("thumb_edge")) {
+      bool ok = false;
+      int v = value.toInt(&ok);
+      if (ok) {
+        v &= ~1;
+        if (v >= vrp::kSeekThumbEdgeMin) seek_thumb_edge_ = v;
+      }
+    } else if (key == QLatin1String("thumb_jpeg")) {
+      thumb_jpeg_ = value != QLatin1String("0");
+    }
+  }
+
+  // Unlock may arrive after trim in the hash; resolve locked=10 last.
+  if (values.contains(QStringLiteral("hrtf_trim_unlock")) ||
+      values.contains(QStringLiteral("hrtf_trim_db"))) {
+    if (values.contains(QStringLiteral("hrtf_trim_unlock"))) {
+      const QString& uv = values.value(QStringLiteral("hrtf_trim_unlock"));
+      hrtf_trim_unlock_ = !(uv == QLatin1String("0") ||
+                            uv.compare(QLatin1String("off"), Qt::CaseInsensitive) == 0);
+      setMonasphereConfKey(QStringLiteral("hrtf_trim_unlock"),
+                           hrtf_trim_unlock_ ? QStringLiteral("1") : QStringLiteral("0"));
+    }
+    if (!hrtf_trim_unlock_) {
+      hrtf_trim_db_ = 10.f;
+      setMonasphereConfKey(QStringLiteral("hrtf_trim_db"), QStringLiteral("10.0"));
+    } else if (values.contains(QStringLiteral("hrtf_trim_db"))) {
+      bool ok = false;
+      const float v = values.value(QStringLiteral("hrtf_trim_db")).toFloat(&ok);
+      if (ok && v >= 0.f && v <= 24.f) {
+        hrtf_trim_db_ = v;
+        setMonasphereConfKey(QStringLiteral("hrtf_trim_db"),
+                             QString::number(static_cast<double>(hrtf_trim_db_), 'f', 1));
+      }
+    }
+  }
+
+  if (fsr_changed && !fsr_locked_8k_.load()) {
+    fsr_req_.store(static_cast<int>(preferred_fsr_));
+    rebuildFsrMenu();
+    std::lock_guard<std::mutex> lock(menu_mu_);
+    if (vr_menu_) vr_menu_->set_fsr(preferred_fsr_);
+  }
+  if (hz_changed) {
+    preferred_hz_ = new_hz;
+    rebuildHzMenu();
+    {
+      std::lock_guard<std::mutex> lock(menu_mu_);
+      if (vr_menu_) vr_menu_->set_preferred_hz(new_hz);
+    }
+    monado_hz_restarted_ = false;
+    monado_hz_mismatch_retried_ = false;
+    applyPreferredRefreshRate(/*from_ui=*/true, /*force_monado_restart=*/true);
+  }
+  requestHudPaint();
+  appendLog(tr("Preferences applied"));
+}
+
 void HostWindow::showAboutDialog() {
   const QString text = tr(
       "<h3>monaSphere v%1</h3>"
@@ -3416,11 +3566,12 @@ void HostWindow::rebuildFsrMenu() {
     vrp::FsrMode mode;
     const char* label;
   };
+  // Upscale from decoded source (larger × = heavier). Not game-FSR “render cheaper”.
   const Item items[] = {
       {vrp::FsrMode::Off, QT_TR_NOOP("Off")},
-      {vrp::FsrMode::UltraQuality, QT_TR_NOOP("UQ (~1.3x)")},
-      {vrp::FsrMode::Quality, QT_TR_NOOP("Q (~1.5x)")},
-      {vrp::FsrMode::Performance, QT_TR_NOOP("P (~2.0x)")},
+      {vrp::FsrMode::UltraQuality, QT_TR_NOOP("1.3×")},
+      {vrp::FsrMode::Quality, QT_TR_NOOP("1.5×")},
+      {vrp::FsrMode::Performance, QT_TR_NOOP("2.0×")},
   };
   for (const auto& it : items) {
     auto* a = fsr_menu_->addAction(tr(it.label));
@@ -4477,7 +4628,7 @@ void HostWindow::refreshRuntimeActions() {
 void HostWindow::releaseRuntimeForSwitch() {
   if (xr_running_.load() || xr_thread_.joinable()) {
     appendLog(tr("Disconnecting HMD before runtime switch"));
-    if (!shutdownXrSession(8000, /*stop_monado=*/false)) {
+    if (!shutdownXrSession(30000, /*stop_monado=*/false)) {
       if (xr_thread_.joinable()) xr_thread_.detach();
       xr_running_.store(false);
     }
@@ -4983,7 +5134,7 @@ void HostWindow::applyPreferredRefreshRate(bool from_ui, bool force_monado_resta
   if (xr_running_.load() || xr_thread_.joinable()) {
     resume_media_after_hz_.store(true);
     user_suppressed_auto_connect_ = false;  // reconnect after Monado comes back
-    if (!shutdownXrSession(8000, /*stop_monado=*/false)) {
+    if (!shutdownXrSession(30000, /*stop_monado=*/false)) {
       appendLog(tr("XR detach timeout — restart continues"));
       if (xr_thread_.joinable()) xr_thread_.detach();
       xr_running_.store(false);
@@ -5033,7 +5184,7 @@ void HostWindow::maybeRestartMonadoForHz() {
         if (xr_running_.load() || xr_thread_.joinable()) {
           resume_media_after_hz_.store(true);
           user_suppressed_auto_connect_ = false;
-          if (!shutdownXrSession(8000, /*stop_monado=*/false)) {
+          if (!shutdownXrSession(30000, /*stop_monado=*/false)) {
             if (xr_thread_.joinable()) xr_thread_.detach();
             xr_running_.store(false);
           }
@@ -5168,7 +5319,7 @@ void HostWindow::stopMonado() {
       appendLog(tr("External Monado left running"));
       appendLog(tr("Or: systemctl --user stop monado.socket monado.service"));
     }
-    if (!shutdownXrSession(8000, false)) {
+    if (!shutdownXrSession(30000, false)) {
       appendLog(tr("XR disconnect timeout"));
       if (xr_thread_.joinable()) xr_thread_.detach();
       xr_running_.store(false);
@@ -5184,7 +5335,7 @@ void HostWindow::stopMonado() {
   if (monado_ && monado_->state() != QProcess::NotRunning) {
     appendLog(usingWivrn() ? tr("Stopping WiVRn") : tr("Stopping Monado"));
   }
-  if (!shutdownXrSession(8000, true)) {
+  if (!shutdownXrSession(30000, true)) {
     appendLog(tr("XR disconnect timeout"));
     if (xr_thread_.joinable()) xr_thread_.detach();
     xr_running_.store(false);
@@ -5250,14 +5401,17 @@ void HostWindow::onMonadoOutput() {
 }
 
 void HostWindow::onMonadoFinished(int code, QProcess::ExitStatus status) {
-  monado_label_->setText(tr("Exit %1").arg(code));
+  // QProcess::finished can fire from ~QProcess during HostWindow deleteChildren —
+  // never touch widgets once teardown started (SEGV in QLabel::setText / QPicture).
+  if (monado_intentional_stop_ || shutting_down_.load(std::memory_order_acquire) ||
+      app_teardown_done_.load(std::memory_order_acquire)) {
+    return;
+  }
+  if (monado_label_) monado_label_->setText(tr("Exit %1").arg(code));
   appendLog(QString("%1 exited code=%2 status=%3")
                 .arg(usingWivrn() ? QStringLiteral("wivrn-server") : QStringLiteral("monado-service"))
                 .arg(code)
                 .arg(status == QProcess::CrashExit ? "crash" : "normal"));
-  if (monado_intentional_stop_ || shutting_down_.load()) {
-    return;
-  }
   if (code != 0) {
     if (usingWivrn()) {
       setHealth("Error", "WiVRn exited. See log");
@@ -5308,7 +5462,7 @@ void HostWindow::connectHeadset() {
   // Finished threads stay joinable; assigning again would std::terminate().
   if (xr_thread_.joinable() || xr_running_.load()) {
     appendLog(tr("Waiting for previous session…"));
-    if (!shutdownXrSession(8000, false)) {
+    if (!shutdownXrSession(30000, false)) {
       appendLog(tr("Previous XR thread hung — detach"));
       if (xr_thread_.joinable()) xr_thread_.detach();
       xr_running_.store(false);
@@ -5366,7 +5520,7 @@ void HostWindow::disconnectHeadsetSession(bool resume_auto_poll) {
     return;
   }
   // Stop owned Monado with the XR session so the compositor releases GPU/DRM.
-  if (!shutdownXrSession(8000, !monado_external_)) {
+  if (!shutdownXrSession(30000, !monado_external_)) {
     appendLog(tr("Disconnect timeout — detach XR"));
     VRP_ERR("disconnect: XR join timed out — detaching");
     if (xr_thread_.joinable()) xr_thread_.detach();
@@ -5386,6 +5540,8 @@ void HostWindow::disconnectHeadsetSession(bool resume_auto_poll) {
 
 void HostWindow::xrThreadMain() {
   xr_running_.store(true);
+  xr_tearing_down_.store(false, std::memory_order_release);
+  xr_vk_instance_destroying_.store(false, std::memory_order_release);
   vk_create_hung_.store(false, std::memory_order_release);
   logged_session_refresh_hz_ = false;
   // Never QMetaObject::invokeMethod(this, …) from XR/watchdog: Host may be
@@ -5408,24 +5564,10 @@ void HostWindow::xrThreadMain() {
           }
           self->setHealth("Wait", shown);
           self->appendLog(shown);
-          // Wedged compositor: cancel + deferred soft-stop Monado from the UI
-          // thread (never stopMonado synchronously under create — monado
-          // teardown_all can SEGV; monasphere must not invokeMethod on a dead Host).
-          if (q.contains(QStringLiteral("xrCreateVulkanInstanceKHR blocked")) &&
-              !self->vk_create_hung_.exchange(true, std::memory_order_acq_rel)) {
-            self->xr_stop_.store(true, std::memory_order_release);
-            self->appendLog(self->tr(
-                "Vulkan instance create hung — cancelling and restarting Monado…"));
-            QTimer::singleShot(800, self, [self] {
-              if (!self || self->shutting_down_.load(std::memory_order_acquire)) return;
-              if (!self->xr_running_.load(std::memory_order_acquire)) return;
-              if (self->xr_in_frame_loop_.load(std::memory_order_acquire)) return;
-              if (self->monado_external_ || self->usingWivrn()) return;
-              VRP_LOG("startup: deferred soft-stop Monado (unblock xrCreateVulkanInstanceKHR)");
-              self->stopMonadoProcess();
-              self->stopSystemdMonadoForOwnedStart();
-              self->clearStaleMonadoSocket();
-            });
+          // Log stalls only. Soft-stopping Monado while xrCreateVulkanInstanceKHR
+          // is blocked cancels the call (Broken pipe) and leaves a worse residual.
+          if (q.contains(QStringLiteral("xrCreateVulkanInstanceKHR blocked 15s"))) {
+            (void)self->vk_create_hung_.exchange(true, std::memory_order_acq_rel);
           }
         },
         Qt::QueuedConnection);
@@ -5469,6 +5611,7 @@ void HostWindow::xrThreadMain() {
     xr.set_controller_prefs(opt_.controller_profile, opt_.controller_hand);
     xr.set_preferred_display_refresh_hz(static_cast<float>(effectivePreferredHz()));
     xr.init(&xr_stop_, report_progress);
+    vk_create_hung_.store(false, std::memory_order_release);
     {
       const QString vk_probe = QString::fromStdString(xr.vulkan_video_probe().summary());
       const bool ff_vk = xr.ffmpeg_vulkan_device() && xr.ffmpeg_vulkan_device()->ok();
@@ -6571,7 +6714,7 @@ void HostWindow::xrThreadMain() {
       }
 
       // Provisional Live FSR cycle: □ / X while browser Live, menus closed.
-      // Off → UQ → Q → P → Off; writes conf live_fsr. Skips [アプリ] only.
+      // Off → 1.3× → 1.5× → 2.0× → Off; writes conf live_fsr. Skips [アプリ] only.
       const bool can_live_fsr_cycle =
           yt_live && yt_session_ && !yt_session_->desktop_app_mode() && menus_closed;
       if (can_live_fsr_cycle && pad_face_x) {
@@ -6597,9 +6740,9 @@ void HostWindow::xrThreadMain() {
         QString toast;
         switch (mode) {
           case vrp::FsrMode::Off: toast = QStringLiteral("Live FSR Off"); break;
-          case vrp::FsrMode::UltraQuality: toast = QStringLiteral("Live FSR UQ"); break;
-          case vrp::FsrMode::Quality: toast = QStringLiteral("Live FSR Q"); break;
-          case vrp::FsrMode::Performance: toast = QStringLiteral("Live FSR P"); break;
+          case vrp::FsrMode::UltraQuality: toast = QStringLiteral("Live FSR 1.3×"); break;
+          case vrp::FsrMode::Quality: toast = QStringLiteral("Live FSR 1.5×"); break;
+          case vrp::FsrMode::Performance: toast = QStringLiteral("Live FSR 2.0×"); break;
         }
         showHudToast(toast);
         QMetaObject::invokeMethod(
@@ -8605,14 +8748,11 @@ void HostWindow::xrThreadMain() {
           std::lock_guard<std::mutex> lock(hud_pixels_mu_);
           thumb_pixels = thumb_w_ > 0 && thumb_h_ > 0 && !thumb_pixels_.empty();
           if (thumb_pixels) {
-            if (thumb_proj != vrp::ProjectionMode::Flat) {
-              thumb_aspect = 1.f;
-            } else {
-              const float disp = vrp::frame_display_aspect(static_cast<float>(thumb_w_),
-                                                           static_cast<float>(thumb_h_), thumb_stereo,
-                                                           thumb_full);
-              thumb_aspect = 1.f / disp;
-            }
+            // Match card aspect to the preview frame (incl. 180/360 equirect).
+            const float disp = vrp::frame_display_aspect(static_cast<float>(thumb_w_),
+                                                         static_cast<float>(thumb_h_), thumb_stereo,
+                                                         thumb_full);
+            thumb_aspect = 1.f / disp;
           }
           if (thumb_pixels && thumb_gen_ != uploaded_thumb) {
             thumb_frame.width = thumb_w_;
@@ -8628,7 +8768,12 @@ void HostWindow::xrThreadMain() {
         }
         if (want_kind == 2 && thumb_pixels && thumb_shown && thumb_tex.view()) {
           scene.set_thumb_format(thumb_proj, thumb_stereo);
-          scene.set_thumb_pose(0.46f, thumb_aspect, 0.66f, 0.12f, kHudDistanceM - 0.18f);
+          // 180/360: slightly smaller card than flat.
+          const float half_w = (thumb_proj != vrp::ProjectionMode::Flat)
+                                   ? file_thumb_half_w_ * 0.75f
+                                   : file_thumb_half_w_;
+          scene.set_thumb_pose(half_w, thumb_aspect, file_thumb_x_, file_thumb_y_,
+                               file_thumb_distance_, file_thumb_pitch_deg_);
           scene.set_thumb_texture(thumb_tex.view(), thumb_tex.sampler(), true);
         } else {
           scene.set_thumb_texture(thumb_tex.view(), thumb_tex.sampler(), false);
@@ -8870,12 +9015,14 @@ void HostWindow::xrThreadMain() {
     }
 
     xr_in_frame_loop_.store(false, std::memory_order_release);
-    VRP_TEARDOWN_LOG("XR teardown: left frame loop — stopping video/audio");
+    xr_tearing_down_.store(true, std::memory_order_release);
+    VRP_TEARDOWN_LOG("XR teardown: left frame loop — stopping video (audio deferred)");
     decoder.stop_thumbnail_build();
     join_preview_worker();
     decoder.halt_decode();
-    audio.close();
-    VRP_TEARDOWN_LOG("XR teardown: video, audio, live stopped");
+    // audio.close() has no Vulkan/OpenXR dependency — run after DestroyInstance
+    // so Host can start overlapping work sooner.
+    VRP_TEARDOWN_LOG("XR teardown: video halted (audio after DestroyInstance)");
     cuda_tex.prepare_shutdown();
     cuda_tex.drain_copies();
     // Timed fence only — vkQueueWaitIdle hangs forever on a wedged graphics queue
@@ -8939,9 +9086,17 @@ void HostWindow::xrThreadMain() {
     VRP_TEARDOWN_LOG("XR teardown: finish_exit…");
     xr.finish_exit();
     VRP_TEARDOWN_LOG("XR teardown: finish_exit done");
-    VRP_TEARDOWN_LOG("XR teardown: xr.shutdown…");
-    xr.shutdown();
-    VRP_TEARDOWN_LOG("XR teardown: xr.shutdown done");
+    // Device path first; signal Host before the slow vkDestroyInstance so warm
+    // Chrome / GNOME lease settle can run in parallel on the UI thread.
+    VRP_TEARDOWN_LOG("XR teardown: xr.shutdown_device…");
+    xr.shutdown_device();
+    VRP_TEARDOWN_LOG("XR teardown: xr.shutdown_device done");
+    xr_vk_instance_destroying_.store(true, std::memory_order_release);
+    VRP_TEARDOWN_LOG("XR teardown: xr.destroy_vk_instance…");
+    xr.destroy_vk_instance();
+    VRP_TEARDOWN_LOG("XR teardown: xr.destroy_vk_instance done");
+    audio.close();
+    VRP_TEARDOWN_LOG("XR teardown: audio closed (after DestroyInstance)");
     // App exit joins once this drops. A normal session end keeps the flag set
     // until the thread returns, so reconnect does not overlap the unwind.
     if (shutting_down_.load()) xr_running_.store(false);
@@ -8967,6 +9122,7 @@ void HostWindow::xrThreadMain() {
     }
   }
   xr_running_.store(false);
+  xr_tearing_down_.store(false, std::memory_order_release);
   VRP_TEARDOWN_LOG("XR teardown: xr_running cleared (thread exit)");
   if (!shutting_down_.load()) {
     QMetaObject::invokeMethod(

@@ -179,12 +179,12 @@ class AudioPlayer {
   std::mutex live_ops_mu_;
   bool start_live_monitor_with_gen(uint64_t gen);
   float volume_ = 0.2f;
-  /** Decibels cut before upmix / HRTF. Default −9 dB. */
-  static constexpr float kDefaultHrtfTrimDb = 12.f;
+  /** Decibels cut before upmix / HRTF. Default −10 dB. */
+  static constexpr float kDefaultHrtfTrimDb = 10.f;
   static constexpr float kMaxHrtfTrimDb = 24.f;
   float hrtf_trim_db_ = kDefaultHrtfTrimDb;
-  /** Linear form of hrtf_trim_db_. 10^(-12/20) until set_hrtf_trim_db. */
-  std::atomic<float> headroom_gain_{0.2511886f};
+  /** Linear form of hrtf_trim_db_. 10^(-10/20) until set_hrtf_trim_db. */
+  std::atomic<float> headroom_gain_{0.316227766f};
   /** Live / [アプリ] listener gain. Unity; the level cut is headroom_gain_. */
   float live_base_gain_ = 1.f;
   /** File switch: listener stays at 0 until the new stream is prefilled. */
