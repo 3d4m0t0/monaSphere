@@ -464,6 +464,8 @@ class VrMenu {
   /** Keep the bar on the commanded time. A decoded keyframe is earlier and must not pull it back. */
   bool seek_bar_hold_ = false;
   AxisRepeat stick_seek_repeat_{};
+  /** Host seconds held in stick band 6 (max tilt). Reset when leaving that band. */
+  float seek_max_band_hold_sec_ = 0.f;
   /** After L2+R2, ignore both triggers until each has been released. */
   bool rate_trigger_lock_ = false;
   AxisRepeat rate_trigger_repeat_{};

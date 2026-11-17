@@ -142,6 +142,7 @@ void VrMenu::set_media(const std::string& path, double duration_sec) {
   seek_glide_paint_ = false;
   seek_bar_hold_ = false;
   stick_seek_repeat_ = {};
+  seek_max_band_hold_sec_ = 0.f;
   thumb_cover_sec_ = 0;
   thumb_bar_force_ = false;
   bump();
@@ -1554,6 +1555,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     const bool was_gliding = seek_gliding_;
     if (media_path_.empty()) {
       stick_seek_repeat_ = {};
+      seek_max_band_hold_sec_ = 0.f;
       if (seek_gliding_) {
         seek_bar_sec_ = seek_target_sec_;
         seek_gliding_ = false;
@@ -1566,13 +1568,26 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     constexpr double kRates[] = {15, 30, 60, 120, 240, 480};
     constexpr double kButtonRate = 30;
     int dir = 0;
+    int band = -1;
     const float mag = std::fabs(in.stick_x);
     if (mag > kDead) {
       const float t = std::clamp((mag - kDead) / (1.f - kDead), 0.f, 1.f);
-      const int band = std::min(5, static_cast<int>(t * 6.f));
+      band = std::min(5, static_cast<int>(t * 6.f));
       seek_step_sec_ = kRates[band];
       dir = in.stick_x > 0.f ? 1 : -1;
+      // Band 6 (index 5): hold 1s→×2, 2s→×3, 3s→×4. Leave band → reset timer.
+      if (band == 5) {
+        seek_max_band_hold_sec_ += dt > 0.f ? dt : 0.f;
+        const double mul = seek_max_band_hold_sec_ >= 3.f   ? 4.0
+                           : seek_max_band_hold_sec_ >= 2.f ? 3.0
+                           : seek_max_band_hold_sec_ >= 1.f ? 2.0
+                                                           : 1.0;
+        seek_step_sec_ = kRates[5] * mul;
+      } else {
+        seek_max_band_hold_sec_ = 0.f;
+      }
     } else {
+      seek_max_band_hold_sec_ = 0.f;
       bool back = in.seek_back_held;
       bool fwd = in.seek_forward_held;
       if (controls_visible_ && controls_edit_ == ControlsEdit::None) {
@@ -1591,6 +1606,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     const bool was_held = stick_seek_repeat_.dir != 0;
     if (dir == 0) {
       stick_seek_repeat_.dir = 0;
+      seek_max_band_hold_sec_ = 0.f;
       if (was_held) {
         seek_gliding_ = false;
         seek_target_sec_ = seek_bar_sec_;
