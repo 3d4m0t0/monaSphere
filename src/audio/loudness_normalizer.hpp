@@ -7,11 +7,11 @@ namespace vrp {
 
 /**
  * Realtime loudness match for file and Live PCM.
- * One gain for every channel: block RMS eases toward -16 dBFS (boost 400 ms,
- * cut 50 ms, ±12 dB), then a -6 dBFS peak ceiling (±16384). Headphones and
- * HMD DACs distort at 0 dBFS. Silence below -48 dBFS holds the current gain.
- * In-place S16. Run before upmix and OpenAL HRTF so head turns do not move
- * the limiter. Reset on seek, loop, and live start.
+ * Block RMS eases toward -16 dBFS (boost 500 ms, cut 220 ms, max +8 dB).
+ * Within each chunk, gain ramps down to a peak-safe value by the loudest frame
+ * (lookahead) so quiet→bass does not click or soft-clip into grit. Output is
+ * hard-capped at -6 dBFS only as a safety net. Silence below -48 dBFS holds
+ * gain. In-place S16; run before upmix/HRTF. Reset on seek, loop, live start.
  */
 class LoudnessNormalizer {
  public:
