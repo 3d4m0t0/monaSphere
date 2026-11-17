@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -8,6 +9,8 @@
 #include <vector>
 
 namespace vrp {
+
+class VideoDecoder;
 
 enum class AudioRouteKind {
   Unknown = 0,
@@ -64,8 +67,15 @@ class AudioPlayer {
   /**
    * Switch the demuxed file while keeping the miniaudio device running (silence).
    * Calls ensure_output() if the device is not up yet.
+   * Prefer attach_file_demux() for playback — shared video demux avoids a second seek.
    */
   bool switch_file(const std::string& path);
+  /**
+   * File playback via VideoDecoder's shared demux (no second avformat_open / av_seek).
+   * Sets up codec/swr from the video demuxer; decode thread pulls AVPackets from it.
+   */
+  bool attach_file_demux(class VideoDecoder* vd);
+  void detach_file_demux();
   /** Drop demux only; keep silent output device (e.g. video-only file). */
   void clear_file();
   /** Tear down device + demux (HMD disconnect / app exit). */
@@ -82,10 +92,27 @@ class AudioPlayer {
   void mute_output();
   /** Gain 0, then drop queued PCM. Volume returns on the next prefill. */
   void mute_for_switch();
-  /** Seek to sec and stay silent. Video is held on the matching still. */
+  /** Seek to sec and stay silent (non-blocking demux post). Video holds the still. */
   void park_at(double sec);
-  /** Seek to sec, prefill, then unmute. Call start_presentation() immediately after. */
-  void arm_at(double sec);
+  /**
+   * Blocking arm (tests / rare paths). Prefer begin_arm_at + poll_arm_at on the UI thread —
+   * slow storage demux can take seconds and must not freeze the host loop.
+   */
+  bool arm_at(double sec);
+  /** Mute, post demux seek, return immediately. Drive with poll_arm_at each tick. */
+  void begin_arm_at(double sec);
+  /**
+   * Pending = seeking/prefilling; Ready = land done (Soft may still be empty);
+   * Failed = retry begin_arm_at. Call commit_arm() then start_presentation.
+   */
+  enum class ArmPoll { Pending, Ready, Failed };
+  ArmPoll poll_arm_at();
+  /** Unmute after Ready — pair with start_presentation so A/V start together. */
+  bool commit_arm();
+  /** Drop an in-flight arm (new seek / scrub). Leaves output muted. */
+  void cancel_arm();
+  /** True while Seeking/Prefilling/Buffered (not yet committed). */
+  bool arm_pending() const { return arm_phase_ != ArmPhase::Idle || arm_instant_ready_; }
   /** Seek to 0 + mute; device stays up (silence) until the next play(). */
   void stop();
   void toggle();
@@ -208,17 +235,40 @@ class AudioPlayer {
   void stop_live_thread();
   /** Free FFmpeg demux/codec/swr (device/ring untouched). */
   void free_demux();
-  /** Open path into existing State demux slots. */
+  /** Open path into existing State demux slots (legacy dual-open; prefer attach_file_demux). */
   bool setup_demux(const std::string& path);
+  /** Codec+swr from shared video demux codecpar (no AVFormatContext). */
+  bool setup_codec_from_params(const void* codecpar, int tb_num, int tb_den,
+                               double pts_origin_sec = 0.0);
   bool init_device(const std::string& sink_label);
   void shutdown_device();
   std::string resolve_sink_label(const std::string& device_name) const;
   /** Stop output+decode, wait writer/callback idle, reset ring (SPSC-safe). */
   void quiesce_and_flush();
-  /** Post demux seek and wait; ring must already be muted. */
-  void seek_demux_wait(double sec);
-  /** Start decode, optionally wait for a small prefill, then enable output. */
+  /** Post demux seek and wait until done (or timeout). Ring must already be muted. */
+  bool seek_demux_wait(double sec, int timeout_ms = 5000);
+  /** Post demux seek without waiting (ring must already be muted). */
+  uint64_t post_demux_seek(double sec);
+  /**
+   * Start decode, wait for prefill when requested, then enable output.
+   * Returns false if wait_for_prefill and PCM never arrived — output stays muted.
+   */
   bool prefill_and_enable_output(bool wait_for_prefill);
+  /** Unmute after prefill depth is met (no wait). */
+  bool enable_output_after_prefill();
+  bool prefill_depth_ready() const;
+  /** Shared demux: flush codec/ring, set discard_until, start muted decode fill. */
+  void enter_shared_prefill(double sec);
+
+  enum class ArmPhase { Idle, Seeking, Prefilling, Buffered };
+  ArmPhase arm_phase_ = ArmPhase::Idle;
+  uint64_t arm_epoch_ = 0;
+  double arm_sec_ = 0.0;
+  std::chrono::steady_clock::time_point arm_phase_from_{};
+  /** begin_arm_at with no demux (live / no audio) — poll returns Ready until commit. */
+  bool arm_instant_ready_ = false;
+  /** Shared file demux (owned by VideoDecoder). nullptr = legacy own-fmt mode. */
+  VideoDecoder* file_demux_ = nullptr;
 };
 
 }  // namespace vrp

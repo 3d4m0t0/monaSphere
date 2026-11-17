@@ -5,6 +5,7 @@
 #include "audio/pulse_monitor.hpp"
 #include "audio/stereo_surround.hpp"
 #include "common.hpp"
+#include "video/video_decoder.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -339,6 +340,8 @@ struct AudioPlayer::State {
   AVPacket* packet = nullptr;
   int stream_index = -1;
   AVRational time_base{};
+  /** stream->start_time in seconds (0 if unknown). PTS media time = pts*tb - origin. */
+  double pts_origin_sec = 0.0;
   int out_rate = 48000;
   int out_channels = 2;
 #endif
@@ -438,6 +441,7 @@ struct AudioPlayer::State {
   std::atomic<double> seek_sec{0.0};
   /** Drop decoded audio that ends before this timeline (backward seek preroll). -1 = off. */
   double discard_until_sec = -1.0;
+  int nopts_discard_streak = 0;
   std::atomic<uint64_t> seek_epoch{0};
   std::atomic<uint64_t> seek_done_epoch{0};
   std::atomic<uint64_t> underrun_frames{0};
@@ -886,12 +890,14 @@ void AudioPlayer::clear_file() {
   if (live_monitor_) {
     // Live capture owns the spatial path — don't tear it down via clear_file.
     stop_thread();
+    detach_file_demux();
     free_demux();
     return;
   }
   // Mute before any stop/flush so OpenAL source stop is inaudible.
   mute_for_switch();
   stop_thread();
+  detach_file_demux();
   free_demux();
   has_audio_ = false;
   playing_ = false;
@@ -926,6 +932,151 @@ void AudioPlayer::free_demux() {
   st_->use_stereo_upmix = false;
 #endif
   spatial_active_ = false;
+}
+
+void AudioPlayer::detach_file_demux() { file_demux_ = nullptr; }
+
+bool AudioPlayer::setup_codec_from_params(const void* codecpar_void, int tb_num, int tb_den,
+                                          double pts_origin_sec) {
+#if !defined(VRP_HAS_FFMPEG)
+  (void)codecpar_void;
+  (void)tb_num;
+  (void)tb_den;
+  (void)pts_origin_sec;
+  fail("音声再生には FFmpeg が必要です");
+  return false;
+#else
+  if (!st_ || !codecpar_void) {
+    fail("内部状態がありません");
+    return false;
+  }
+  free_demux();
+  const auto* codecpar = static_cast<const AVCodecParameters*>(codecpar_void);
+  st_->time_base = AVRational{tb_num, tb_den};
+  st_->pts_origin_sec = std::max(0.0, pts_origin_sec);
+  st_->stream_index = 0;  // logical; packets come from shared demux
+  st_->fmt = nullptr;     // shared demux — no owned format context
+  const AVCodec* dec = avcodec_find_decoder(codecpar->codec_id);
+  if (!dec) {
+    fail("音声デコーダが見つかりません");
+    free_demux();
+    return false;
+  }
+  st_->codec = avcodec_alloc_context3(dec);
+  if (!st_->codec || avcodec_parameters_to_context(st_->codec, codecpar) < 0 ||
+      avcodec_open2(st_->codec, dec, nullptr) < 0) {
+    fail("音声デコーダを開けません");
+    free_demux();
+    return false;
+  }
+
+  st_->out_rate = 48000;
+  st_->out_channels = 2;
+  st_->use_spatial = false;
+  st_->use_stereo_upmix = false;
+  spatial_active_ = false;
+  st_->spatial.flush();
+  st_->stereo_upmix.clear();
+
+  const int src_ch = st_->codec->ch_layout.nb_channels;
+  uint64_t ch_mask = 0;
+  if (st_->codec->ch_layout.order == AV_CHANNEL_ORDER_NATIVE) ch_mask = st_->codec->ch_layout.u.mask;
+
+#if defined(VRP_HAS_OPENAL)
+  constexpr uint64_t kMaskQuad = 0x00000033ull;
+  if (src_ch == 2 && OpenAlSpatial::runtime_available() &&
+      st_->spatial.configure(kMaskQuad, StereoSurround::kOutChannels, st_->out_rate)) {
+    st_->use_spatial = true;
+    st_->use_stereo_upmix = true;
+    spatial_active_ = true;
+    st_->out_channels = 2;
+    st_->stereo_upmix.reset(st_->out_rate);
+    st_->stereo_upmix.set_rear_gain(surround_gain_);
+    VRP_LOG("Audio: OpenAL Soft HRTF 4.0 (shared demux, gain=%.2f)",
+            static_cast<double>(surround_gain_));
+  } else if (src_ch > 2 && OpenAlSpatial::runtime_available() &&
+             st_->spatial.configure(ch_mask, src_ch, st_->out_rate)) {
+    st_->use_spatial = true;
+    spatial_active_ = true;
+    st_->out_channels = src_ch;
+    VRP_LOG("Audio: OpenAL Soft HRTF (%d ch, shared demux)", src_ch);
+  } else if (src_ch >= 2) {
+    VRP_LOG("Audio: OpenAL HRTF unavailable — miniaudio stereo (%d ch, shared demux)", src_ch);
+  }
+#else
+  (void)ch_mask;
+#endif
+
+  AVChannelLayout out_ch{};
+  if (st_->use_spatial && !st_->use_stereo_upmix) {
+    if (av_channel_layout_copy(&out_ch, &st_->codec->ch_layout) < 0)
+      av_channel_layout_default(&out_ch, st_->out_channels);
+  } else {
+    av_channel_layout_default(&out_ch, st_->out_channels);
+  }
+  if (swr_alloc_set_opts2(&st_->swr, &out_ch, AV_SAMPLE_FMT_S16, st_->out_rate, &st_->codec->ch_layout,
+                          st_->codec->sample_fmt, st_->codec->sample_rate, 0, nullptr) < 0 ||
+      swr_init(st_->swr) < 0) {
+    av_channel_layout_uninit(&out_ch);
+    fail("swresample を初期化できません");
+    free_demux();
+    return false;
+  }
+  av_channel_layout_uninit(&out_ch);
+
+  st_->frame = av_frame_alloc();
+  st_->packet = av_packet_alloc();
+  if (!st_->frame || !st_->packet) {
+    fail("音声フレームを確保できません");
+    free_demux();
+    return false;
+  }
+  return true;
+#endif
+}
+
+bool AudioPlayer::attach_file_demux(VideoDecoder* vd) {
+#if !defined(VRP_HAS_FFMPEG) || !defined(VRP_HAS_MINIAUDIO)
+  (void)vd;
+  fail("FFmpeg + miniaudio が必要です");
+  return false;
+#else
+  if (!is_output_ready() && !ensure_output(device_name_)) return false;
+  if (!vd || !vd->has_file_audio() || !vd->file_audio_codecpar()) {
+    fail("共有 demux に音声がありません");
+    return false;
+  }
+  int tb_num = 0, tb_den = 1;
+  if (!vd->file_audio_time_base(tb_num, tb_den)) {
+    fail("音声 time_base を取得できません");
+    return false;
+  }
+  const double audio_origin = vd->file_audio_start_sec();
+  mute_output();
+  stop_thread();
+  detach_file_demux();
+  if (!setup_codec_from_params(vd->file_audio_codecpar(), tb_num, tb_den, audio_origin)) {
+    has_audio_ = false;
+    if (st_) {
+      st_->stop.store(false);
+      start_thread();
+    }
+    return false;
+  }
+  file_demux_ = vd;
+  flush_output();
+  playing_ = false;
+  st_->playing.store(false, std::memory_order_release);
+  st_->stop.store(false);
+  st_->seek_req.store(false);
+  st_->volume.store(volume_);
+  st_->rate.store(rate_);
+  has_audio_ = true;
+  open_ = true;
+  start_thread();
+  VRP_LOG("Audio attached to shared video demux (pts_origin=%.3fs)", audio_origin);
+  return true;
+#endif
 }
 
 bool AudioPlayer::setup_demux(const std::string& path) {
@@ -1137,34 +1288,40 @@ void AudioPlayer::start_thread() {
     uint64_t last_underrun_events = 0;
 
     while (!st_->stop.load()) {
-      // No demux yet (session silence-only) — keep thread alive, emit nothing into the ring.
-      if (!st_->fmt || st_->stream_index < 0) {
+      const bool shared = file_demux_ != nullptr;
+      // No codec yet (session silence-only) — keep thread alive.
+      if (!st_->codec || st_->stream_index < 0) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         continue;
       }
-      if (st_->seek_req.exchange(false)) {
+      // Legacy own-fmt seeks. Shared demux: video seeks once; we only trim via discard_until.
+      while (st_->seek_req.exchange(false, std::memory_order_acq_rel)) {
+        const uint64_t done_ep = st_->seek_epoch.load(std::memory_order_acquire);
         std::lock_guard<std::mutex> lock(st_->mu);
-        double sec = st_->seek_sec.load();
+        double sec = st_->seek_sec.load(std::memory_order_relaxed);
         sec = std::max(0.0, sec);
-        const double tb = av_q2d(st_->time_base);
-        int64_t ts = (tb > 0.0) ? static_cast<int64_t>(sec / tb) : 0;
-        int sr = av_seek_frame(st_->fmt, st_->stream_index, ts, AVSEEK_FLAG_BACKWARD);
-        if (sr < 0) {
-          sr = avformat_seek_file(st_->fmt, st_->stream_index, INT64_MIN, ts, ts, 0);
+        if (!shared && st_->fmt) {
+          const double tb = av_q2d(st_->time_base);
+          int64_t ts = (tb > 0.0) ? static_cast<int64_t>(sec / tb) : 0;
+          int sr = av_seek_frame(st_->fmt, st_->stream_index, ts, AVSEEK_FLAG_BACKWARD);
+          if (sr < 0) {
+            sr = avformat_seek_file(st_->fmt, st_->stream_index, INT64_MIN, ts, ts, 0);
+          }
+          if (sr < 0) {
+            VRP_LOG("audio demux seek failed sec=%.3f err=%d — still marking epoch done", sec, sr);
+          }
         }
-        avcodec_flush_buffers(st_->codec);
+        if (st_->codec) avcodec_flush_buffers(st_->codec);
         flush_swr();
         st_->file_norm.reset();
         st_->discard_until_sec = sec;
-        // Host already muted output before posting seek_req; reset is exclusive here.
         if (st_->use_spatial) {
           if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
           st_->spatial.flush();
         } else if (st_->rb_ok) {
           st_->clear_ring_exclusive();
         }
-        st_->seek_done_epoch.store(st_->seek_epoch.load(std::memory_order_relaxed),
-                                   std::memory_order_release);
+        st_->seek_done_epoch.store(done_ep, std::memory_order_release);
       }
       if (!st_->playing.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1186,31 +1343,41 @@ void AudioPlayer::start_thread() {
         }
       }
 
-      // Keep the ring reasonably full so USB/decode stalls are absorbed; leave ~100ms headroom.
-      // Volume is applied in data_callback (instant); rate changes seek (host) instead of flush.
       if (st_->rb_ok) {
         const ma_uint32 avail = ma_pcm_rb_available_write(&st_->rb);
-        if (avail < 4800) {  // <100ms free → almost full
+        if (avail < 4800) {
           std::this_thread::sleep_for(std::chrono::milliseconds(2));
           continue;
         }
       }
 
       std::unique_lock<std::mutex> lock(st_->mu);
-      if (av_read_frame(st_->fmt, st_->packet) < 0) {
-        // End of stream — loop. If seek fails, pause rather than spin silent.
-        if (!restart_at_start()) {
-          lock.unlock();
-          playing_ = false;
-          st_->output_live.store(false, std::memory_order_release);
-          st_->playing.store(false, std::memory_order_release);
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      if (shared) {
+        lock.unlock();
+        AVPacket* ext = static_cast<AVPacket*>(file_demux_->take_audio_packet());
+        if (!ext) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          continue;
         }
-        continue;
-      }
-      if (st_->packet->stream_index != st_->stream_index) {
+        lock.lock();
         av_packet_unref(st_->packet);
-        continue;
+        av_packet_move_ref(st_->packet, ext);
+        av_packet_free(&ext);
+      } else {
+        if (!st_->fmt || av_read_frame(st_->fmt, st_->packet) < 0) {
+          if (!restart_at_start()) {
+            lock.unlock();
+            playing_ = false;
+            st_->output_live.store(false, std::memory_order_release);
+            st_->playing.store(false, std::memory_order_release);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          }
+          continue;
+        }
+        if (st_->packet->stream_index != st_->stream_index) {
+          av_packet_unref(st_->packet);
+          continue;
+        }
       }
       if (avcodec_send_packet(st_->codec, st_->packet) < 0) {
         av_packet_unref(st_->packet);
@@ -1220,23 +1387,41 @@ void AudioPlayer::start_thread() {
 
       while (avcodec_receive_frame(st_->codec, st_->frame) == 0) {
         int skip_in = 0;
-        if (st_->discard_until_sec >= 0.0) {
-          double pts = -1.0;
+        bool drop_all = false;
+        double frame_pts = -1.0;
+        {
           const int64_t stamp = st_->frame->best_effort_timestamp != AV_NOPTS_VALUE
                                     ? st_->frame->best_effort_timestamp
                                     : st_->frame->pts;
-          if (stamp != AV_NOPTS_VALUE) pts = static_cast<double>(stamp) * av_q2d(st_->time_base);
+          if (stamp != AV_NOPTS_VALUE) {
+            frame_pts = static_cast<double>(stamp) * av_q2d(st_->time_base) - st_->pts_origin_sec;
+          }
+        }
+        if (st_->discard_until_sec >= 0.0) {
           const double dur = st_->frame->sample_rate > 0
                                  ? st_->frame->nb_samples / static_cast<double>(st_->frame->sample_rate)
                                  : 0.0;
-          if (pts >= 0.0 && pts + dur < st_->discard_until_sec - 0.005) continue;
-          // Keep the overlapping frame, but drop the samples that sit before the
-          // video PTS. Playing them makes audio lead by one packet after a keyframe seek.
-          if (pts >= 0.0 && pts < st_->discard_until_sec && st_->frame->sample_rate > 0) {
-            skip_in = static_cast<int>(std::lround((st_->discard_until_sec - pts) * st_->frame->sample_rate));
-            if (skip_in >= st_->frame->nb_samples) skip_in = st_->frame->nb_samples;
+          if (frame_pts < 0.0) {
+            // NOPTS after flush: drop PCM but do not eternally consume the stream
+            // as "before target" (that drained ~10s of packets during empty Soft arm).
+            drop_all = true;
+            st_->nopts_discard_streak++;
+            if (st_->nopts_discard_streak >= 64) {
+              st_->discard_until_sec = -1.0;
+              st_->nopts_discard_streak = 0;
+            }
+          } else if (frame_pts + dur < st_->discard_until_sec - 0.005) {
+            drop_all = true;  // entirely before target — feed swr, do not play
+            st_->nopts_discard_streak = 0;
+          } else {
+            if (frame_pts < st_->discard_until_sec && st_->frame->sample_rate > 0) {
+              skip_in = static_cast<int>(
+                  std::lround((st_->discard_until_sec - frame_pts) * st_->frame->sample_rate));
+              if (skip_in >= st_->frame->nb_samples) skip_in = st_->frame->nb_samples;
+            }
+            st_->discard_until_sec = -1.0;
+            st_->nopts_discard_streak = 0;
           }
-          st_->discard_until_sec = -1.0;
         }
         const int out_samples = swr_get_out_samples(st_->swr, st_->frame->nb_samples) + 256;
         buf.resize(static_cast<size_t>(std::max(out_samples, 0) * st_->out_channels));
@@ -1245,6 +1430,7 @@ void AudioPlayer::start_thread() {
             swr_convert(st_->swr, outs, out_samples,
                         const_cast<const uint8_t**>(st_->frame->extended_data), st_->frame->nb_samples);
         if (converted <= 0) continue;
+        if (drop_all) continue;  // swr fed; PCM discarded (preroll to seek target)
         if (!st_->use_spatial && !st_->rb_ok) continue;
 
         int skip_out = 0;
@@ -1383,21 +1569,40 @@ void AudioPlayer::quiesce_and_flush() {
 #endif
 }
 
-void AudioPlayer::seek_demux_wait(double sec) {
-  if (!st_ || !has_audio_) return;
+uint64_t AudioPlayer::post_demux_seek(double sec) {
+  if (!st_ || !has_audio_) return 0;
   const uint64_t ep = st_->seek_epoch.fetch_add(1, std::memory_order_acq_rel) + 1;
-  st_->seek_sec.store(sec);
+  st_->seek_sec.store(sec, std::memory_order_relaxed);
   st_->seek_req.store(true, std::memory_order_release);
-  for (int i = 0; i < 100; ++i) {
-    if (st_->seek_done_epoch.load(std::memory_order_acquire) >= ep) break;
+  return ep;
+}
+
+bool AudioPlayer::seek_demux_wait(double sec, int timeout_ms) {
+  if (!st_ || !has_audio_) return true;
+  const uint64_t ep = post_demux_seek(sec);
+  const int spins = std::max(1, timeout_ms / 2);
+  bool ok = false;
+  for (int i = 0; i < spins; ++i) {
+    if (st_->seek_done_epoch.load(std::memory_order_acquire) >= ep) {
+      ok = true;
+      break;
+    }
+    if (st_->stop.load(std::memory_order_relaxed)) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
+  if (!ok) {
+    VRP_LOG("audio seek_demux_wait TIMEOUT sec=%.3f ep=%llu after %dms", sec,
+            static_cast<unsigned long long>(ep), timeout_ms);
+  }
+  // Demux thread already flushes on seek apply; host-side flush is for the wait path
+  // when ack raced ahead of the exclusive reset.
   if (st_->use_spatial) {
     if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
     st_->spatial.flush();
   } else if (st_->rb_ok) {
     st_->clear_ring_exclusive();
   }
+  return ok;
 }
 
 bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
@@ -1412,13 +1617,24 @@ bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
     const bool restore = switch_muted_;
     if (restore) st_->spatial.set_gain(0.f);
     else st_->spatial.set_gain(volume_);
+    const int want = std::max(1, st_->out_rate / 10);  // ~100ms
+    bool ready = !wait_for_prefill;
     if (wait_for_prefill) {
-      const int want = st_->out_rate / 10;
-      for (int i = 0; i < 50; ++i) {
-        if (st_->spatial.min_queued_frames() >= want) break;
+      // Up to ~2s — slow USB demux after seek needs headroom beyond 100ms.
+      for (int i = 0; i < 1000; ++i) {
+        if (st_->spatial.min_queued_frames() >= want) {
+          ready = true;
+          break;
+        }
         if (st_->stop.load(std::memory_order_relaxed)) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
       }
+    }
+    if (!ready) {
+      st_->playing.store(false, std::memory_order_release);
+      playing_ = false;
+      VRP_LOG("audio prefill TIMEOUT (OpenAL) — output stays muted");
+      return false;
     }
     switch_muted_ = false;
     st_->spatial.set_hold_silence(false);
@@ -1437,13 +1653,23 @@ bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
   }
   if (!st_->rb_ok) return false;
   st_->playing.store(true, std::memory_order_release);  // decode fills ring; callback still muted
+  const ma_uint32 want = static_cast<ma_uint32>(std::max(1, st_->out_rate / 10));  // ~100ms
+  bool ready = !wait_for_prefill;
   if (wait_for_prefill) {
-    constexpr ma_uint32 kPrefillFrames = 48000 / 10;  // ~100ms
-    for (int i = 0; i < 50; ++i) {                   // up to ~100ms
-      if (ma_pcm_rb_available_read(&st_->rb) >= kPrefillFrames) break;
+    for (int i = 0; i < 1000; ++i) {  // up to ~2s
+      if (ma_pcm_rb_available_read(&st_->rb) >= want) {
+        ready = true;
+        break;
+      }
       if (st_->stop.load(std::memory_order_relaxed)) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+  }
+  if (!ready) {
+    st_->playing.store(false, std::memory_order_release);
+    playing_ = false;
+    VRP_LOG("audio prefill TIMEOUT (ring) — output stays muted");
+    return false;
   }
   const int fade = std::max(1, st_->out_rate * (switch_muted_ ? 40 : 15) / 1000);
   switch_muted_ = false;
@@ -1452,7 +1678,7 @@ bool AudioPlayer::prefill_and_enable_output(bool wait_for_prefill) {
   st_->fade_in_left.store(fade, std::memory_order_relaxed);
   st_->output_live.store(true, std::memory_order_release);
   playing_ = true;
-  return ma_pcm_rb_available_read(&st_->rb) > 0;
+  return true;
 #endif
 }
 
@@ -1473,26 +1699,272 @@ void AudioPlayer::play() {
 void AudioPlayer::mute_output() {
   // Live capture owns OpenAL — file mute/pause must not stop HRTF playback.
   if (live_monitor_.load(std::memory_order_acquire)) return;
+  // Do not cancel_arm here — settle hold_play pauses every tick and must not
+  // abort an overlapping demux/prefill. New seek/scrub calls cancel_arm explicitly.
   playing_ = false;
   if (!st_) return;
+  if (arm_phase_ == ArmPhase::Seeking || arm_phase_ == ArmPhase::Prefilling ||
+      arm_phase_ == ArmPhase::Buffered) {
+    // Keep demux/prefill alive; only silence the device callback / Soft sources.
+    // hold_silence is required — queue→play() would otherwise restart Soft every chunk.
+    st_->output_live.store(false, std::memory_order_release);
+    if (st_->use_spatial) {
+      st_->spatial.set_hold_silence(true);
+      st_->spatial.pause();
+    }
+    return;
+  }
   quiesce_and_flush();
 }
 
 void AudioPlayer::park_at(double sec) {
   if (live_monitor_.load(std::memory_order_acquire)) return;
   if (!st_ || !has_audio_) return;
+  cancel_arm();
   playing_ = false;
   quiesce_and_flush();
-  seek_demux_wait(sec);
+  if (file_demux_) {
+    // Shared demux: video owns seek; only remember trim PTS.
+    std::lock_guard<std::mutex> lock(st_->mu);
+    st_->discard_until_sec = std::max(0.0, sec);
+    if (st_->codec) avcodec_flush_buffers(st_->codec);
+  } else {
+    (void)post_demux_seek(sec);
+  }
 }
 
-void AudioPlayer::arm_at(double sec) {
-  if (live_monitor_.load(std::memory_order_acquire)) return;
-  if (!st_ || !has_audio_) return;
+void AudioPlayer::enter_shared_prefill(double sec) {
+  if (!st_) return;
+  {
+    std::lock_guard<std::mutex> lock(st_->mu);
+    st_->discard_until_sec = std::max(0.0, sec);
+    st_->nopts_discard_streak = 0;
+    if (st_->codec) avcodec_flush_buffers(st_->codec);
+    if (st_->swr) {
+      // Drain swr so preroll discard does not leave pitched residue.
+      std::vector<int16_t> drain(static_cast<size_t>(2048 * std::max(1, st_->out_channels)));
+      for (;;) {
+        uint8_t* outs[1] = {reinterpret_cast<uint8_t*>(drain.data())};
+        const int n = swr_convert(st_->swr, outs, 2048, nullptr, 0);
+        if (n <= 0) break;
+      }
+    }
+    st_->file_norm.reset();
+    if (st_->use_spatial) {
+      if (st_->use_stereo_upmix) st_->stereo_upmix.clear();
+      st_->spatial.flush();
+    } else if (st_->rb_ok) {
+      st_->clear_ring_exclusive();
+    }
+  }
+  st_->output_live.store(false, std::memory_order_release);
+  if (st_->use_spatial) {
+    // queue_interleaved_s16() calls play() after every chunk — hold_silence keeps
+    // Soft muted until commit_arm/enable_output (settle still / video lag).
+    st_->spatial.set_hold_silence(true);
+    st_->spatial.set_gain(0.f);
+    st_->spatial.pause();
+  }
+  st_->playing.store(true, std::memory_order_release);
+}
+
+bool AudioPlayer::prefill_depth_ready() const {
+  if (!st_ || !has_audio_) return true;
+  // Seek resume: ~40ms is enough to avoid startup underrun; 100ms added latency
+  // on slow demux after land. Steady-state play() still uses the longer fill.
+  const int want = std::max(1, st_->out_rate / 25);  // ~40ms
+  if (st_->use_spatial) {
+    return st_->spatial.min_queued_frames() >= want;
+  }
+#if defined(VRP_HAS_MINIAUDIO)
+  if (!st_->rb_ok) return false;
+  return ma_pcm_rb_available_read(&st_->rb) >= static_cast<ma_uint32>(want);
+#else
+  return false;
+#endif
+}
+
+bool AudioPlayer::enable_output_after_prefill() {
+#if !defined(VRP_HAS_MINIAUDIO)
+  return false;
+#else
+  if (!st_ || !has_audio_) return false;
+  if (st_->use_spatial) {
+    const bool restore = switch_muted_;
+    switch_muted_ = false;
+    st_->spatial.set_hold_silence(false);
+    st_->spatial.play();
+    if (restore) {
+      const float target = volume_;
+      for (int i = 1; i <= 8; ++i) {
+        st_->spatial.set_gain(target * (static_cast<float>(i) / 8.f));
+        std::this_thread::sleep_for(std::chrono::milliseconds(4));
+      }
+    } else {
+      st_->spatial.set_gain(volume_);
+    }
+    playing_ = true;
+    return true;
+  }
+  if (!st_->rb_ok) return false;
+  const int fade = std::max(1, st_->out_rate * (switch_muted_ ? 40 : 15) / 1000);
+  switch_muted_ = false;
+  st_->spatial.set_hold_silence(false);
+  st_->volume.store(volume_, std::memory_order_relaxed);
+  st_->fade_in_left.store(fade, std::memory_order_relaxed);
+  st_->output_live.store(true, std::memory_order_release);
+  playing_ = true;
+  return true;
+#endif
+}
+
+void AudioPlayer::begin_arm_at(double sec) {
+  cancel_arm();
+  if (live_monitor_.load(std::memory_order_acquire) || !st_ || !has_audio_) {
+    arm_instant_ready_ = true;
+    return;
+  }
   playing_ = false;
   quiesce_and_flush();
-  seek_demux_wait(sec);
-  (void)prefill_and_enable_output(true);
+  arm_sec_ = sec;
+  arm_instant_ready_ = false;
+  {
+    std::lock_guard<std::mutex> lock(st_->mu);
+    st_->discard_until_sec = std::max(0.0, sec);
+    if (st_->codec) avcodec_flush_buffers(st_->codec);
+  }
+  if (file_demux_) {
+    // Wait for land (seek_in_flight), not applied_gen — that bumps at av_seek
+    // before land and would deadlock arm through settle.
+    const bool wait_land = file_demux_->seek_in_flight();
+    arm_phase_from_ = std::chrono::steady_clock::now();
+    if (wait_land) {
+      arm_phase_ = ArmPhase::Seeking;
+    } else {
+      arm_phase_ = ArmPhase::Prefilling;
+      enter_shared_prefill(sec);
+    }
+    VRP_LOG("audio begin_arm_at sec=%.3f shared wait_land=%d", sec, wait_land ? 1 : 0);
+    return;
+  }
+  // Legacy dual-open path.
+  arm_epoch_ = post_demux_seek(sec);
+  arm_phase_ = ArmPhase::Seeking;
+  arm_phase_from_ = std::chrono::steady_clock::now();
+  VRP_LOG("audio begin_arm_at sec=%.3f ep=%llu (legacy)", sec,
+          static_cast<unsigned long long>(arm_epoch_));
+}
+
+AudioPlayer::ArmPoll AudioPlayer::poll_arm_at() {
+  if (arm_instant_ready_) return ArmPoll::Ready;
+  if (!st_ || !has_audio_) {
+    arm_phase_ = ArmPhase::Idle;
+    arm_instant_ready_ = true;  // commit_arm clears
+    return ArmPoll::Ready;
+  }
+  if (arm_phase_ == ArmPhase::Idle) return ArmPoll::Failed;
+
+  const auto now = std::chrono::steady_clock::now();
+  const double phase_s = std::chrono::duration<double>(now - arm_phase_from_).count();
+
+  if (arm_phase_ == ArmPhase::Seeking) {
+    bool seek_ready = false;
+    if (file_demux_) {
+      // Land (or clear) finished — demux has post-seek packets (or will shortly).
+      seek_ready = !file_demux_->seek_in_flight();
+    } else {
+      seek_ready = st_->seek_done_epoch.load(std::memory_order_acquire) >= arm_epoch_;
+    }
+    if (seek_ready) {
+      if (file_demux_) enter_shared_prefill(arm_sec_);
+      else {
+        st_->output_live.store(false, std::memory_order_release);
+        if (st_->use_spatial) {
+          st_->spatial.set_hold_silence(true);
+          st_->spatial.set_gain(0.f);
+          st_->spatial.pause();
+        }
+        st_->playing.store(true, std::memory_order_release);
+      }
+      arm_phase_ = ArmPhase::Prefilling;
+      arm_phase_from_ = now;
+      return ArmPoll::Pending;
+    }
+    if (phase_s >= 30.0) {
+      VRP_LOG("audio poll_arm_at SEEK TIMEOUT sec=%.3f after %.1fs", arm_sec_, phase_s);
+      st_->playing.store(false, std::memory_order_release);
+      arm_phase_ = ArmPhase::Idle;
+      return ArmPoll::Failed;
+    }
+    return ArmPoll::Pending;
+  }
+
+  if (arm_phase_ == ArmPhase::Prefilling) {
+    // Soft may stay empty through settle (demux idle while paused). Ready lets
+    // host commit_arm + start_presentation together from the land cursor.
+    const bool soft_ready = prefill_depth_ready();
+    const bool land_ready =
+        file_demux_ && !file_demux_->seek_in_flight() && phase_s >= 0.05;
+    if (soft_ready || land_ready) {
+      arm_phase_ = ArmPhase::Buffered;
+      VRP_LOG("audio poll_arm_at BUFFERED sec=%.3f soft=%d", arm_sec_, soft_ready ? 1 : 0);
+      return ArmPoll::Ready;
+    }
+    if (phase_s >= 5.0) {
+      VRP_LOG("audio poll_arm_at PREFILL TIMEOUT sec=%.3f", arm_sec_);
+      st_->playing.store(false, std::memory_order_release);
+      playing_ = false;
+      arm_phase_ = ArmPhase::Idle;
+      return ArmPoll::Failed;
+    }
+    return ArmPoll::Pending;
+  }
+
+  if (arm_phase_ == ArmPhase::Buffered) return ArmPoll::Ready;
+
+  arm_phase_ = ArmPhase::Idle;
+  return ArmPoll::Failed;
+}
+
+bool AudioPlayer::commit_arm() {
+  if (arm_instant_ready_) {
+    arm_instant_ready_ = false;
+    return true;
+  }
+  if (arm_phase_ != ArmPhase::Buffered) return false;
+  // Unmute only — do NOT touch video demux queues (that froze the picture while
+  // audio ran alone). discard_until was set in enter_shared_prefill(arm_sec_).
+  if (!enable_output_after_prefill()) {
+    st_->playing.store(false, std::memory_order_release);
+    playing_ = false;
+    arm_phase_ = ArmPhase::Idle;
+    return false;
+  }
+  arm_phase_ = ArmPhase::Idle;
+  VRP_LOG("audio commit_arm sec=%.3f", arm_sec_);
+  return true;
+}
+
+void AudioPlayer::cancel_arm() {
+  arm_instant_ready_ = false;
+  if (arm_phase_ == ArmPhase::Idle) return;
+  arm_phase_ = ArmPhase::Idle;
+  playing_ = false;
+  if (st_) {
+    st_->playing.store(false, std::memory_order_release);
+    st_->output_live.store(false, std::memory_order_release);
+  }
+}
+
+bool AudioPlayer::arm_at(double sec) {
+  begin_arm_at(sec);
+  // Blocking helper for non-UI callers — same timeouts as poll_arm_at.
+  for (;;) {
+    const ArmPoll p = poll_arm_at();
+    if (p == ArmPoll::Ready) return commit_arm();
+    if (p == ArmPoll::Failed) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
 }
 
 void AudioPlayer::pause() {
@@ -1521,7 +1993,7 @@ void AudioPlayer::seek_to(double sec) {
   const bool was_playing = playing_;
   playing_ = false;
   quiesce_and_flush();
-  seek_demux_wait(sec);
+  if (!seek_demux_wait(sec)) return;
   if (was_playing) (void)prefill_and_enable_output(true);
 }
 
