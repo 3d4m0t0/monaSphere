@@ -6062,6 +6062,10 @@ void HostWindow::xrThreadMain() {
     std::chrono::steady_clock::time_point seek_land_from{};
     std::chrono::steady_clock::time_point seek_scrub_kick_at{};
     bool seek_resume_force = false;
+    /** Non-blocking audio arm in flight — poll until Ready before start_presentation. */
+    bool seek_audio_arm_pending = false;
+    double seek_audio_arm_sec = -1.0;
+    std::chrono::steady_clock::time_point seek_audio_arm_retry_at{};
     std::chrono::steady_clock::time_point stop_decoded_from{};
     double last_scrub_seek_sec = -1.0;
     std::chrono::steady_clock::time_point last_scrub_seek_at{};
@@ -6090,6 +6094,10 @@ void HostWindow::xrThreadMain() {
       stop_seek_pending = false;
       seek_land_from = {};
       seek_resume_force = false;
+      seek_audio_arm_pending = false;
+      seek_audio_arm_sec = -1.0;
+      seek_audio_arm_retry_at = {};
+      audio.cancel_arm();
       stop_decoded_from = {};
       last_scrub_seek_sec = -1.0;
       last_scrub_seek_at = {};
@@ -6255,18 +6263,22 @@ void HostWindow::xrThreadMain() {
             adev = audio_device_;
           }
           (void)audio.ensure_output(adev);
-          // Demux swap only — device keeps pumping silence into the HMD.
-          if (audio.switch_file(path)) {
+          // Shared video demux — no second avformat_open / audio av_seek_frame.
+          if (decoder.has_file_audio() && audio.attach_file_demux(&decoder)) {
             audio.set_volume(menu.volume());
             audio.set_rate(1.f);
             const QString dev = QString::fromStdString(audio.device_name());
             QMetaObject::invokeMethod(
-                this, [this, dev] { appendLog(tr("Audio -> %1").arg(dev)); }, Qt::QueuedConnection);
+                this, [this, dev] { appendLog(tr("Audio -> %1").arg(dev)); },
+                Qt::QueuedConnection);
           } else {
             audio.clear_file();  // video-only / demux fail — keep silent device
-            const QString err = QString::fromStdString(audio.last_error());
-            QMetaObject::invokeMethod(
-                this, [this, err] { appendLog(tr("No audio: %1").arg(err)); }, Qt::QueuedConnection);
+            if (decoder.has_file_audio()) {
+              const QString err = QString::fromStdString(audio.last_error());
+              QMetaObject::invokeMethod(
+                  this, [this, err] { appendLog(tr("No audio: %1").arg(err)); },
+                  Qt::QueuedConnection);
+            }
           }
         } else {
           audio.clear_file();
@@ -6382,6 +6394,19 @@ void HostWindow::xrThreadMain() {
       }
       menu.set_seek_frame_dt(seek_dt);
 
+      // Shared demux reads ~2s ahead into the video packet queue while presenting.
+      // Pause freezes the still but leaves the file cursor at that ahead point; a
+      // plain play() then arms audio from the cursor while video drains older
+      // packets → audio leads until the next seek. Rewind demux to the still on
+      // user pause so unpause arms A/V from the same place.
+      auto pause_av_rewind = [&]() {
+        play_wanted = false;
+        decoder.pause();
+        audio.pause();
+        if (decoder.is_open() && decoder.has_file_audio() && audio.is_open() &&
+            audio.has_audio())
+          decoder.seek_to(decoder.position());
+      };
       const int cmd = cmd_.exchange(0);
       if (cmd == 1) {
         // Keep A/V in lockstep — independent toggles desync after audio reopen.
@@ -6391,9 +6416,7 @@ void HostWindow::xrThreadMain() {
           show_idle_screen = false;
           decoder.play();
         } else {
-          play_wanted = false;
-          decoder.pause();
-          audio.pause();
+          pause_av_rewind();
         }
       }
       if (cmd == 2 || cmd == 3) {
@@ -7312,9 +7335,7 @@ void HostWindow::xrThreadMain() {
         // Do not also handle raw input.confirm this frame — open_video closes the menu while
         // confirm is still true and would immediately pause.
         if (decoder.is_playing() || decoder.is_priming()) {
-          play_wanted = false;
-          decoder.pause();
-          audio.pause();
+          pause_av_rewind();
         } else {
           play_wanted = true;
           show_idle_screen = false;
@@ -7343,9 +7364,7 @@ void HostWindow::xrThreadMain() {
         decoder.play();
       }
       if (menu_out.pause) {
-        play_wanted = false;
-        decoder.pause();
-        audio.pause();
+        pause_av_rewind();
       }
       if (menu_out.stop) {
         play_wanted = false;
@@ -7385,10 +7404,13 @@ void HostWindow::xrThreadMain() {
         audio.set_rate(menu_out.rate);
         menu.set_rate(menu_out.rate);
         // Rate change is a pause plus the normal play start, so audio is armed
-        // with the picture instead of catching up afterwards.
+        // with the picture instead of catching up afterwards. Rewind demux so
+        // the arm cursor matches the still (same gap as user pause).
         if (play_wanted && (decoder.is_playing() || decoder.is_priming())) {
           decoder.pause();
           audio.pause();
+          if (decoder.has_file_audio() && audio.is_open() && audio.has_audio())
+            decoder.seek_to(decoder.position());
           decoder.play();
         }
         hud_paint();
@@ -7484,6 +7506,20 @@ void HostWindow::xrThreadMain() {
         stop_upload_sent = false;
         seek_land_from = now;
         seek_settle = false;
+        seek_resume_force = false;
+        seek_audio_arm_retry_at = {};
+        // Arm at target PTS (shared demux — no second av_seek). Prefill waits
+        // for land via seek_in_flight, then host commit + start_presentation.
+        if (play_wanted && audio.is_open() && audio.has_audio()) {
+          seek_audio_arm_sec = sec;
+          audio.begin_arm_at(sec);
+          seek_audio_arm_pending = true;
+          VRP_LOG("seek: begin_arm_at arm=%.3f (stop-seek)", sec);
+        } else {
+          audio.cancel_arm();
+          seek_audio_arm_pending = false;
+          seek_audio_arm_sec = -1.0;
+        }
         hud_paint();
       };
       if (scrubbing) {
@@ -7508,11 +7544,14 @@ void HostWindow::xrThreadMain() {
         // 1e9 = first seek of this scrub gesture (last_scrub_seek_sec < 0).
         const double moved =
             last_scrub_seek_sec < 0.0 ? 1.0e9 : std::fabs(bar - last_scrub_seek_sec);
+        // One seek = one still: never re-issue while the previous scrub seek is
+        // in flight (that replayed the same GOP as 10↔11). Coalesce to the
+        // latest bar once the prior land completes.
         const bool cooled =
             last_scrub_seek_at.time_since_epoch().count() == 0 ||
-            (now - last_scrub_seek_at) >= std::chrono::milliseconds(32);
-        // One still per seek (no neighbor flicker). 0.05s keeps the bar tracking.
-        if (cooled && (moved >= 0.05 || last_scrub_seek_sec < 0.0)) {
+            (now - last_scrub_seek_at) >= std::chrono::milliseconds(120);
+        if (!decoder.seek_in_flight() && cooled &&
+            (moved >= 0.75 || last_scrub_seek_sec < 0.0)) {
           VRP_LOG("seek: scrub seek_to sec=%.3f (moved=%.3f)", bar, moved);
           begin_decoder_seek(bar, /*stop_seek=*/false);
           last_scrub_seek_sec = bar;
@@ -7538,38 +7577,110 @@ void HostWindow::xrThreadMain() {
       const bool seek_settling =
           seek_settle && std::chrono::duration<double>(now - seek_settle_from).count() < 0.5;
       const bool hold_play = scrubbing || seek_settling || wait_stop_frame || stop_seek_pending;
-      // Never pause/park while live monitor owns OpenAL (Flat HRTF path).
-      if (hold_play && !yt_live && !audio.live_monitor_active()) audio.pause();
-
-      if (decoder.consume_av_resync()) {
-        const bool resume = play_wanted && !hold_play;
-        if (resume) decoder.play();
-        else if ((!play_wanted || hold_play) && !yt_live && !audio.live_monitor_active())
-          audio.park_at(decoder.position());
+      // Scrub / new stop-seek aborts audio arm; settle hold must not (overlaps demux).
+      if (seek_audio_arm_pending && (scrubbing || stop_seek_pending)) {
+        audio.cancel_arm();
+        seek_audio_arm_pending = false;
+        seek_audio_arm_sec = -1.0;
       }
+      // Never pause/park while live monitor owns OpenAL (Flat HRTF path).
+      // Skip pause/park while arm demux/prefill overlaps settle — mute_output would
+      // stall Soft queue progress if called every tick.
+      if (hold_play && !seek_audio_arm_pending && !yt_live && !audio.live_monitor_active())
+        audio.pause();
 
-      // Sole start: audible audio, then the first new frame. Seek-in-flight waits
-      // so we arm at the landed PTS rather than the requested time.
-      // seek_resume_force: land timed out / zombie slots — do not stay muted forever.
-      if (decoder.consume_playback_started() && play_wanted && !hold_play && !decoder.is_playing() &&
-          (!decoder.seek_in_flight() || seek_resume_force)) {
-        const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
-        if (audio.is_open()) audio.arm_at(arm);
+      // Advance async arm every tick (including settle). Commit+start only when
+      // hold_play is clear so the still/settle UX stays intact.
+      auto arm_target_sec = [&]() {
+        if (seek_audio_arm_sec >= 0.0) return seek_audio_arm_sec;
+        if (stop_pts >= 0.0) return stop_pts;
+        return decoder.position();
+      };
+      auto kick_audio_arm = [&](double arm, const char* why) {
+        seek_audio_arm_sec = arm;
+        if (!audio.is_open() || !audio.has_audio()) {
+          seek_audio_arm_pending = false;
+          return false;
+        }
+        audio.begin_arm_at(arm);
+        seek_audio_arm_pending = true;
+        seek_audio_arm_retry_at = {};
+        VRP_LOG("seek: begin_arm_at arm=%.3f (%s)", arm, why);
+        return true;
+      };
+      auto retry_arm_if_failed = [&](vrp::AudioPlayer::ArmPoll& poll, const char* why) {
+        if (poll != vrp::AudioPlayer::ArmPoll::Failed) return;
+        const bool retry_due =
+            seek_audio_arm_retry_at.time_since_epoch().count() == 0 ||
+            (now - seek_audio_arm_retry_at) >= std::chrono::milliseconds(200);
+        if (!retry_due) return;
+        kick_audio_arm(arm_target_sec(), why);
+        seek_audio_arm_retry_at = now;
+        poll = audio.poll_arm_at();
+      };
+      auto try_start_with_arm = [&](const char* why, bool ignore_hold = false) -> bool {
+        if (!play_wanted || decoder.is_playing() || decoder.seek_in_flight()) return false;
+        if (!audio.is_open() || !audio.has_audio()) {
+          decoder.start_presentation();
+          VRP_LOG("seek: start_presentation (no audio) (%s)", why);
+          stop_pts = -1.0;
+          seek_resume_force = false;
+          seek_audio_arm_pending = false;
+          seek_audio_arm_sec = -1.0;
+          return true;
+        }
+        if (!seek_audio_arm_pending) kick_audio_arm(arm_target_sec(), why);
+        using ArmPoll = vrp::AudioPlayer::ArmPoll;
+        ArmPoll poll = audio.poll_arm_at();
+        retry_arm_if_failed(poll, "retry");
+        if (poll != ArmPoll::Ready) return false;
+        // hold_play is sampled at frame start — settle-end paths pass ignore_hold.
+        if (hold_play && !ignore_hold) return false;
+        // Unmute then start demux together (commit before start_presentation).
+        if (!audio.commit_arm()) {
+          seek_audio_arm_pending = true;
+          seek_audio_arm_retry_at = now;
+          VRP_LOG("seek: commit_arm failed (%s) — retry", why);
+          return false;
+        }
         decoder.start_presentation();
-        VRP_LOG("seek: start_presentation (playback_started) arm=%.3f force=%d hold=%d",
-                arm, seek_resume_force ? 1 : 0, hold_play ? 1 : 0);
+        VRP_LOG("seek: start_presentation arm=%.3f (%s)", arm_target_sec(), why);
         stop_pts = -1.0;
         seek_resume_force = false;
-      } else if (play_wanted && hold_play) {
-        static std::chrono::steady_clock::time_point hold_log{};
-        if (hold_log.time_since_epoch().count() == 0 ||
-            (now - hold_log) >= std::chrono::milliseconds(1000)) {
-          VRP_LOG("seek: hold_play scrub=%d settle=%d wait_stop=%d pending=%d busy=%d shown=%d",
-                  scrubbing ? 1 : 0, seek_settling ? 1 : 0, wait_stop_frame ? 1 : 0,
-                  stop_seek_pending ? 1 : 0, decoder.seek_in_flight() ? 1 : 0,
-                  stop_frame_shown ? 1 : 0);
-          hold_log = now;
+        seek_audio_arm_pending = false;
+        seek_audio_arm_sec = -1.0;
+        seek_audio_arm_retry_at = {};
+        return true;
+      };
+
+      if (decoder.consume_av_resync()) {
+        // Never decoder.play() here — that re-arms mid-playback. Pause-rewind and
+        // scrub land park while stopped; play_wanted starts arm+presentation.
+        if ((!play_wanted || hold_play) && !seek_audio_arm_pending && !yt_live &&
+            !audio.live_monitor_active()) {
+          audio.park_at(decoder.position());
+        } else if (play_wanted && !hold_play && !decoder.is_playing() &&
+                   !decoder.is_priming() && !decoder.seek_in_flight()) {
+          (void)try_start_with_arm("av_resync");
         }
+      }
+
+      // Poll arm during settle so demux/prefill overlap the 0.5s still.
+      if (seek_audio_arm_pending && play_wanted) {
+        using ArmPoll = vrp::AudioPlayer::ArmPoll;
+        ArmPoll poll = audio.poll_arm_at();
+        retry_arm_if_failed(poll, "settle-poll-retry");
+      }
+
+      // Commit armed audio + start_presentation together after settle.
+      const bool playback_start =
+          decoder.consume_playback_started() && play_wanted && !hold_play && !decoder.is_playing() &&
+          (!decoder.seek_in_flight() || seek_resume_force);
+      if (playback_start) {
+        (void)try_start_with_arm(seek_resume_force ? "playback_started+force" : "playback_started");
+      } else if (play_wanted && !hold_play && !decoder.is_playing() && !decoder.seek_in_flight() &&
+                 (seek_audio_arm_pending || seek_resume_force) && !decoder.is_priming()) {
+        (void)try_start_with_arm(seek_resume_force ? "resume_force" : "arm_ready");
       }
 
       // EOF auto-loop: treat as playback end → face forward again for 180/360.
@@ -7657,10 +7768,12 @@ void HostWindow::xrThreadMain() {
           const QString err = QString::fromStdString(audio.last_error());
           QMetaObject::invokeMethod(
               this, [this, err] { appendLog(tr("Audio switch failed: %1").arg(err)); }, Qt::QueuedConnection);
-        } else if (!path.empty() && audio.switch_file(path)) {
+        } else if (!path.empty() && decoder.has_file_audio() &&
+                   audio.attach_file_demux(&decoder)) {
           if (play_wanted && !decoder.seek_in_flight()) {
             decoder.pause();
             audio.pause();
+            decoder.seek_to(decoder.position());
             decoder.play();
           } else {
             audio.park_at(decoder.position());
@@ -8464,12 +8577,23 @@ void HostWindow::xrThreadMain() {
         // promoted that frame onto the sampling front, then binds it. Other paths
         // may settle after 150ms so A/V is not stuck on upload.
         if (reveal_stop && !stop_frame_shown) {
+          auto on_stop_frame_shown = [&] {
+            // Re-arm only if land PTS drifted from the parallel stop-seek target.
+            // Same region stays on the in-flight arm (cache already warm).
+            if (!play_wanted || stop_pts < 0.0) return;
+            if (seek_audio_arm_pending &&
+                std::fabs(stop_pts - seek_audio_arm_sec) <= 0.25) {
+              return;
+            }
+            (void)kick_audio_arm(stop_pts, "frame_shown");
+          };
           if (decoder.vulkan_path_active()) {
             if (vulkan_front_promoted && src_y) {
               bound_file_video = queue_file_raw() || bound_file_video;
               stop_frame_shown = true;
               seek_settle = true;
               seek_settle_from = now;
+              on_stop_frame_shown();
               VRP_LOG("seek: frame shown pts=%.3f pic=1 grace=0 bound=%d settle=0.5s",
                       stop_pts, bound_file_video ? 1 : 0);
             }
@@ -8485,6 +8609,7 @@ void HostWindow::xrThreadMain() {
               stop_frame_shown = true;
               seek_settle = true;
               seek_settle_from = now;
+              on_stop_frame_shown();
               VRP_LOG("seek: frame shown pts=%.3f pic=%d grace=%d bound=%d settle=0.5s",
                       stop_pts, pic_ready ? 1 : 0, grace ? 1 : 0, bound_file_video ? 1 : 0);
             }
@@ -8512,20 +8637,21 @@ void HostWindow::xrThreadMain() {
         seek_land_from = {};
         stop_decoded_from = {};
         if (play_wanted) {
-          decoder.play();
-          if (decoder.consume_playback_started()) {
+          // Still on screen at land PTS. Start A/V together — no priming, no
+          // demux-queue wipe on commit. Shared demux feeds both from the land cursor.
+          stop_frame_shown = false;
+          seek_resume_force = true;
+          if (!seek_audio_arm_pending && audio.is_open() && audio.has_audio()) {
             const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
-            if (audio.is_open()) audio.arm_at(arm);
-            decoder.start_presentation();
-            VRP_LOG("seek: presentation started arm=%.3f", arm);
-            stop_pts = -1.0;
-          } else {
-            // Priming fills asynchronously; general playback_started path resumes A/V.
-            seek_resume_force = true;
-            VRP_LOG("seek: play() — waiting playback_started (priming)");
+            (void)kick_audio_arm(arm, "after_settle");
           }
+          if (!try_start_with_arm("after_settle", /*ignore_hold=*/true)) {
+            VRP_LOG("seek: after settle — waiting arm Ready pts=%.3f pending=%d", stop_pts,
+                    seek_audio_arm_pending ? 1 : 0);
+          }
+        } else {
+          stop_frame_shown = false;
         }
-        stop_frame_shown = false;
       } else if (wait_stop_frame && !scrubbing &&
                  seek_land_from.time_since_epoch().count() != 0) {
         const double land_wait =
@@ -8578,12 +8704,12 @@ void HostWindow::xrThreadMain() {
           thumb_latched = false;
           seek_resume_force = true;
           if (play_wanted) {
-            const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
-            if (audio.is_open()) audio.arm_at(arm);
-            decoder.start_presentation();
-            seek_resume_force = false;
-            stop_pts = -1.0;
-            VRP_LOG("seek: TIMEOUT forced presentation arm=%.3f", arm);
+            if (!seek_audio_arm_pending && stop_pts >= 0.0)
+              (void)kick_audio_arm(stop_pts, "land_timeout");
+            // playback_started from force_resume; start when arm Ready (may be next ticks).
+            if (!try_start_with_arm("land_timeout", /*ignore_hold=*/true)) {
+              VRP_LOG("seek: TIMEOUT — waiting arm Ready pts=%.3f", stop_pts);
+            }
           } else {
             stop_pts = -1.0;
           }
