@@ -934,6 +934,7 @@ struct VideoDecoder::FFmpegState {
   AVBufferRef* hw_device_ctx = nullptr;
   HwOpaque hw_opaque{};
   int video_stream = -1;
+  int audio_stream = -1;
 #endif
 };
 
@@ -1024,6 +1025,17 @@ void VideoDecoder::choose_display_size() {
   info_.display_height = display_h_;
 }
 
+void VideoDecoder::clear_audio_packet_queue_locked() {
+#if defined(VRP_HAS_FFMPEG)
+  for (void* p : audio_pkt_q_) {
+    auto* pkt = static_cast<AVPacket*>(p);
+    av_packet_free(&pkt);
+  }
+#endif
+  audio_pkt_q_.clear();
+  audio_pkt_bytes_ = 0;
+}
+
 void VideoDecoder::clear_packet_queue() {
 #if defined(VRP_HAS_FFMPEG)
   std::lock_guard<std::mutex> lk(pkt_mu_);
@@ -1033,11 +1045,13 @@ void VideoDecoder::clear_packet_queue() {
   }
   pkt_q_.clear();
   pkt_bytes_ = 0;
+  clear_audio_packet_queue_locked();
   pkt_cv_.notify_all();
 #else
   std::lock_guard<std::mutex> lk(pkt_mu_);
   pkt_q_.clear();
   pkt_bytes_ = 0;
+  clear_audio_packet_queue_locked();
 #endif
 }
 
@@ -1074,19 +1088,10 @@ void VideoDecoder::begin_priming(size_t need_bytes) {
 
 void VideoDecoder::set_seek_scrubbing(bool active) {
   const bool was = seek_scrubbing_.exchange(active);
-  if (!was && active) {
-    // Entering key-repeat: pause output; stay priming until scrub ends + 1s fill.
-    if (playing_.load() || priming_.load()) {
-      begin_priming(prefetch_resume_bytes_);
-    }
-  } else if (was && !active) {
-    // Key-repeat ended — fill ~1s then resume playback.
-    if (playing_.load() || priming_.load()) {
-      begin_priming(prefetch_resume_bytes_);
-    } else {
-      pkt_cv_.notify_all();
-    }
-  }
+  if (was == active) return;
+  // Host owns pause + stop-seek arm + start_presentation. Do not begin_priming
+  // here — that set playing=false mid-stream and later re-armed audio alone.
+  pkt_cv_.notify_all();
 }
 
 void VideoDecoder::start_decode_thread() {
@@ -1143,37 +1148,83 @@ void VideoDecoder::demux_loop() {
   constexpr size_t kMaxPackets = 400;
   constexpr size_t kHoldMaxBytes = 512u * 1024u;  // tiny queue while key-repeat scrubbing
   constexpr size_t kHoldMaxPackets = 3;
-  while (!demux_stop_.load()) {
-    if (!open_.load() || demux_pause_.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(3));
-      continue;
-    }
-    if (demux_eof_.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      continue;
-    }
-
-    // Cap prefetch while scrubbing or any seek is in flight (avoid q=400 during
-    // wait_avframe stalls that block apply).
-    const bool hold = seek_scrubbing_.load() || seek_busy_.load() || seek_req_.load();
-    const size_t target_bytes = hold ? kHoldMaxBytes : prefetch_target_bytes_;
-    const size_t max_pkts = hold ? kHoldMaxPackets : kMaxPackets;
-
-    if (priming_.load() && !hold) {
-      const size_t need = priming_need_bytes_.load();
-      if (prefetch_enough(need > 0 ? need : prefetch_resume_bytes_)) {
-        priming_.store(false);
-        playback_started_.store(true);
-      }
-    }
-
-    {
-      std::unique_lock<std::mutex> lk(pkt_mu_);
-      if (pkt_bytes_ >= target_bytes || pkt_q_.size() >= max_pkts) {
-        pkt_cv_.wait_for(lk, std::chrono::milliseconds(8));
+    // Soft targets per stream; wait only when *both* are full so interleaved
+    // demux never starves audio while video is buffered (or vice versa).
+    // During settle still, video decode is paused — video soft/hard fills fast.
+    // Never hard-stall demux while audio is still below soft target (arm prefill).
+    constexpr size_t kVideoHardPackets = 800;
+    constexpr size_t kVideoAbsPackets = 1600;
+    constexpr size_t kAudioHardPackets = kAudioMaxPackets * 2;
+    constexpr size_t kAudioHardBytes = kAudioMaxBytes * 2;
+    while (!demux_stop_.load()) {
+      if (!open_.load() || demux_pause_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
         continue;
       }
-    }
+      if (demux_eof_.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+
+      // Scrub / seek-busy (approach to land): tiny queue so the file cursor cannot
+      // run ~10s past the still — that made audio (from cursor) lead video (from
+      // buffered packets) after start_presentation.
+      const bool scrub = seek_scrubbing_.load();
+      const bool hold = scrub || seek_req_.load() || seek_busy_.load();
+      const size_t target_bytes = hold ? kHoldMaxBytes : prefetch_target_bytes_;
+      const size_t max_pkts = hold ? kHoldMaxPackets : kMaxPackets;
+      const int astream = ff_->audio_stream;
+      const bool playing_now = playing_.load();
+      const bool priming_now = priming_.load();
+      // Audio only while presenting. Land keeps the tiny video hold-queue so the
+      // open GOP stays intact; audio queue is cleared on land / start_presentation.
+      const bool want_audio = astream >= 0 && !scrub && playing_now;
+      // Settle still: do not demux ahead (was filling q=1600 / ~20MiB and starving arm).
+      // Priming / playing / scrub / seek-await still demux normally.
+      if (!playing_now && !priming_now && !hold && !scrub && !awaiting_frame_after_seek_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+
+      if (priming_now && !hold) {
+        const size_t need = priming_need_bytes_.load();
+        if (prefetch_enough(need > 0 ? need : prefetch_resume_bytes_)) {
+          priming_.store(false);
+          playback_started_.store(true);
+        }
+      }
+
+      {
+        std::unique_lock<std::mutex> lk(pkt_mu_);
+        const bool video_full = pkt_bytes_ >= target_bytes || pkt_q_.size() >= max_pkts;
+        const bool audio_full =
+            want_audio && (audio_pkt_q_.size() >= kAudioMaxPackets ||
+                           audio_pkt_bytes_ >= kAudioMaxBytes);
+        const bool audio_needs =
+            want_audio && !audio_full &&
+            (audio_pkt_q_.size() < (kAudioMaxPackets / 4) ||
+             audio_pkt_bytes_ < (kAudioMaxBytes / 4));
+        const bool video_needs =
+            !video_full &&
+            (pkt_q_.size() < (max_pkts / 4) || pkt_bytes_ < (target_bytes / 4));
+        const bool video_hard =
+            pkt_q_.size() >= kVideoHardPackets ||
+            pkt_bytes_ >= (prefetch_target_bytes_ + (2u << 20));
+        const bool video_abs = pkt_q_.size() >= kVideoAbsPackets;
+        const bool audio_hard =
+            want_audio && (audio_pkt_q_.size() >= kAudioHardPackets ||
+                           audio_pkt_bytes_ >= kAudioHardBytes);
+        // Stall when every active stream is soft-full, or one side hit a hard cap
+        // *and* the other does not need data. Never let a full Soft/audio queue
+        // alone freeze demux while video is starving.
+        const bool both_soft_full = video_full && (!want_audio || audio_full);
+        const bool video_block = video_abs || (video_hard && !audio_needs);
+        const bool audio_block = audio_hard && !video_needs;
+        if (both_soft_full || video_block || audio_block) {
+          pkt_cv_.wait_for(lk, std::chrono::milliseconds(8));
+          continue;
+        }
+      }
 
     const uint64_t serial = seek_serial_.load();
     AVPacket* pkt = av_packet_alloc();
@@ -1210,7 +1261,7 @@ void VideoDecoder::demux_loop() {
           VRP_LOG("demux: slow av_read_frame %lld ms (#%d) q=%zu bytes=%.2fMiB play=%d scrub=%d",
                   static_cast<long long>(read_ms), n, qn,
                   static_cast<double>(qb) / (1024.0 * 1024.0), playing_.load() ? 1 : 0,
-                  seek_scrubbing_.load() ? 1 : 0);
+                  scrub ? 1 : 0);
         }
       }
     }
@@ -1222,13 +1273,15 @@ void VideoDecoder::demux_loop() {
       continue;
     }
 
-    if (pkt->stream_index != ff_->video_stream) {
-      av_packet_unref(pkt);
+    if (serial != seek_serial_.load() || demux_pause_.load()) {
       av_packet_free(&pkt);
       continue;
     }
 
-    if (serial != seek_serial_.load() || demux_pause_.load()) {
+    const bool is_video = pkt->stream_index == ff_->video_stream;
+    const bool is_audio = want_audio && pkt->stream_index == astream;
+    if (!is_video && !is_audio) {
+      av_packet_unref(pkt);
       av_packet_free(&pkt);
       continue;
     }
@@ -1237,10 +1290,23 @@ void VideoDecoder::demux_loop() {
       std::lock_guard<std::mutex> lk(pkt_mu_);
       if (serial != seek_serial_.load() || demux_pause_.load()) {
         av_packet_free(&pkt);
-      } else {
+      } else if (is_video) {
+        // Never drop video (would skip frames / desync the shared cursor).
         pkt_bytes_ += static_cast<size_t>(std::max(0, pkt->size));
         pkt_q_.push_back(pkt);
         pkt = nullptr;
+      } else {
+        // Soft backed up: keep the queued timeline intact and drop this *new*
+        // packet so demux can keep feeding video. Dropping the oldest head tore
+        // holes in PCM → rare mid-play silence with no A/V offset.
+        if (audio_pkt_q_.size() >= kAudioHardPackets ||
+            audio_pkt_bytes_ >= kAudioHardBytes) {
+          av_packet_free(&pkt);
+        } else {
+          audio_pkt_bytes_ += static_cast<size_t>(std::max(0, pkt->size));
+          audio_pkt_q_.push_back(pkt);
+          pkt = nullptr;
+        }
       }
     }
     if (pkt) av_packet_free(&pkt);
@@ -1271,6 +1337,71 @@ bool VideoDecoder::pop_video_packet() {
   pkt_cv_.notify_all();
   return true;
 #endif
+}
+
+void* VideoDecoder::take_audio_packet() {
+#if !defined(VRP_HAS_FFMPEG)
+  return nullptr;
+#else
+  std::lock_guard<std::mutex> lk(pkt_mu_);
+  if (audio_pkt_q_.empty()) return nullptr;
+  auto* pkt = static_cast<AVPacket*>(audio_pkt_q_.front());
+  audio_pkt_q_.pop_front();
+  audio_pkt_bytes_ -= static_cast<size_t>(std::max(0, pkt->size));
+  pkt_cv_.notify_all();
+  return pkt;
+#endif
+}
+
+const void* VideoDecoder::file_audio_codecpar() const {
+#if !defined(VRP_HAS_FFMPEG)
+  return nullptr;
+#else
+  if (!ff_ || !ff_->fmt || audio_stream_ < 0) return nullptr;
+  if (audio_stream_ >= static_cast<int>(ff_->fmt->nb_streams)) return nullptr;
+  return ff_->fmt->streams[audio_stream_]->codecpar;
+#endif
+}
+
+bool VideoDecoder::file_audio_time_base(int& num, int& den) const {
+#if !defined(VRP_HAS_FFMPEG)
+  (void)num;
+  (void)den;
+  return false;
+#else
+  if (!ff_ || !ff_->fmt || audio_stream_ < 0) return false;
+  if (audio_stream_ >= static_cast<int>(ff_->fmt->nb_streams)) return false;
+  const AVRational tb = ff_->fmt->streams[audio_stream_]->time_base;
+  num = tb.num;
+  den = tb.den;
+  return den != 0;
+#endif
+}
+
+double VideoDecoder::file_audio_start_sec() const {
+#if !defined(VRP_HAS_FFMPEG)
+  return 0.0;
+#else
+  if (!ff_ || !ff_->fmt || audio_stream_ < 0) return 0.0;
+  if (audio_stream_ >= static_cast<int>(ff_->fmt->nb_streams)) return 0.0;
+  const AVStream* ast = ff_->fmt->streams[audio_stream_];
+  if (!ast || ast->start_time == AV_NOPTS_VALUE) return 0.0;
+  return static_cast<double>(ast->start_time) * av_q2d(ast->time_base);
+#endif
+}
+
+void VideoDecoder::discard_packets_after_land() {
+  // Audio only. Dropping video packets after the still opens a hole in the open
+  // GOP (codec DPB still at the land frame, file cursor already past the dropped
+  // NALs) → no pictures until the next IDR while audio plays normally, then a
+  // sudden catch-up. seek_busy keeps the demux hold-queue tiny so the cursor
+  // cannot race far ahead of those few kept video packets.
+  {
+    std::lock_guard<std::mutex> lk(pkt_mu_);
+    clear_audio_packet_queue_locked();
+    pkt_cv_.notify_all();
+  }
+  VRP_LOG("seek: discard audio queue after land (keep video GOP)");
 }
 
 void VideoDecoder::decode_loop() {
@@ -1384,6 +1515,7 @@ void VideoDecoder::decode_loop() {
           const double sec =
               std::clamp(t_apply, 0.0, duration_sec_ > 0 ? duration_sec_ : t_apply);
           int64_t ts = static_cast<int64_t>(sec / av_q2d(st->time_base));
+          if (st->start_time != AV_NOPTS_VALUE) ts += st->start_time;
           const auto seek_t0 = clock::now();
           set_decode_phase("seek_av_seek");
           av_seek_frame(ff_->fmt, ff_->video_stream, ts, AVSEEK_FLAG_BACKWARD);
@@ -1430,15 +1562,19 @@ void VideoDecoder::decode_loop() {
         }
 #endif
       }
+      // Drop any audio that snuck in during seek; then publish applied gen so
+      // AudioPlayer may prefill from post-seek packets only.
+      clear_packet_queue();
       demux_pause_.store(false);
       pkt_cv_.notify_all();
       next_deadline = clock::now();
-      // Forward scrub keeps the newest PTS already shown, so the re-decode from
-      // the keyframe does not replay earlier pictures (the 9↔10 flicker).
-      // A backward seek clears it and may show earlier frames again.
+      // Scrub: always clear shown-PTS so each preview is one fresh keyframe still.
+      // Keeping it across scrub seeks forced KF+1/+2 after regress skips (10↔11).
+      // Stop-seek / play: keep newest on forward seeks to avoid replaying earlier pictures.
       {
         const double applied = position_sec_.load();
-        if (!(seek_shown_pts_ >= 0.0 && applied + frame_duration_ >= seek_shown_pts_))
+        if (seek_scrubbing_.load() ||
+            !(seek_shown_pts_ >= 0.0 && applied + frame_duration_ >= seek_shown_pts_))
           seek_shown_pts_ = -1.0;
       }
       awaiting_frame_after_seek_ = true;
@@ -1485,13 +1621,10 @@ void VideoDecoder::decode_loop() {
       continue;
     }
     if (open_.load() && (playing_.load() || awaiting_frame_after_seek_)) {
-      // Scrub shows each newer approach frame (the responsive path). Stop-seek
-      // discards until the bar. Frames older than the newest shown PTS are
-      // dropped in decode_next so the picture never steps backward.
+      // Stop-seek: discard until the bar. Scrub: also discard until target so
+      // keyframe→approach is not flashed (10→11); one still per seek.
       const double present_after =
-          (awaiting_frame_after_seek_ && seek_skips < 300 && !scrub_preview)
-              ? seek_target_.load()
-              : -1.0;
+          (awaiting_frame_after_seek_ && seek_skips < 300) ? seek_target_.load() : -1.0;
       // Discard (present_after / seek bail) uses recycle_frame (wait + consumer +1).
       got = decode_next(scratch, /*convert_rgba=*/true, present_after);
     }
@@ -1505,34 +1638,35 @@ void VideoDecoder::decode_loop() {
         next_deadline = clock::now();
         continue;
       }
-      {
-        std::lock_guard<std::mutex> fl(frame_mu_);
-        latest_ = std::move(scratch);
-        ++latest_seq_;
-      }
       if (awaiting_frame_after_seek_) {
         const double target = seek_target_.load();
         // Rewind used to use (pts >= target) which instantly "lands" on the old
         // forward frame (e.g. pts=315 target=307) and clears seek_busy early.
         const bool near =
-            std::fabs(latest_.pts_sec - target) <= 0.08 || seek_skips >= 300;
-        // Vulkan scrub must land a gpu frame — gpu=0 must not clear seek_busy.
-        const bool scrub_needs_picture =
-            scrub_preview && vulkan_tex_ && vulkan_tex_->enabled();
-        if (scrub_preview && (!near || (scrub_needs_picture && !latest_.gpu && seek_skips < 300))) {
+            std::fabs(scratch.pts_sec - target) <= 0.08 || seek_skips >= 300;
+        // Vulkan scrub/stop must land a gpu frame — gpu=0 must not clear seek_busy.
+        const bool needs_gpu = vulkan_tex_ && vulkan_tex_->enabled();
+        if (needs_gpu && !scratch.gpu && seek_skips < 300) {
           ++seek_skips;
-          if ((seek_skips % 30) == 1 || (near && !latest_.gpu)) {
-            VRP_LOG("seek: scrub approach pts=%.3f target=%.3f skips=%d gpu=%d near=%d",
-                    latest_.pts_sec, target, seek_skips, latest_.gpu ? 1 : 0, near ? 1 : 0);
+          if ((seek_skips % 30) == 1) {
+            VRP_LOG("seek: wait gpu pts=%.3f target=%.3f scrub=%d skips=%d", scratch.pts_sec,
+                    target, scrub_preview ? 1 : 0, seek_skips);
           }
           next_deadline = clock::now();
           continue;
         }
-        // Stop-seek: also require proximity (same fabs rule).
-        if (!scrub_preview && !near && seek_skips < 300) {
+        if (!near && seek_skips < 300) {
+          // present_after should already have skipped; tolerate rare early frames
+          // without publishing them to the mailbox / latest_.
           ++seek_skips;
           next_deadline = clock::now();
           continue;
+        }
+        // Publish only the landed still — never intermediate approach frames.
+        {
+          std::lock_guard<std::mutex> fl(frame_mu_);
+          latest_ = std::move(scratch);
+          ++latest_seq_;
         }
         VRP_LOG("seek: decode landed pts=%.3f target=%.3f scrub=%d gpu=%d skips=%d",
                 latest_.pts_sec, target, scrub_preview ? 1 : 0, latest_.gpu ? 1 : 0,
@@ -1541,10 +1675,17 @@ void VideoDecoder::decode_loop() {
         awaiting_frame_after_seek_ = false;
         seek_busy_.store(false);
         av_resync_.store(true);
+        // Drop packets demuxed past the still so audio cannot start ~60s ahead.
+        discard_packets_after_land();
         // Start pacing from this frame's presentation time.
         next_deadline = clock::now() + std::chrono::duration_cast<clock::duration>(
                                            std::chrono::duration<double>(step));
       } else {
+        {
+          std::lock_guard<std::mutex> fl(frame_mu_);
+          latest_ = std::move(scratch);
+          ++latest_seq_;
+        }
         seek_skips = 0;
         next_deadline += std::chrono::duration_cast<clock::duration>(
             std::chrono::duration<double>(step));
@@ -1974,6 +2115,10 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
   } else if (ff_->fmt->duration > 0) {
     duration_sec_ = static_cast<double>(ff_->fmt->duration) / AV_TIME_BASE;
   }
+  video_pts_origin_sec_ = 0.0;
+  if (st->start_time != AV_NOPTS_VALUE) {
+    video_pts_origin_sec_ = static_cast<double>(st->start_time) * av_q2d(st->time_base);
+  }
   double fps = 0.0;
   if (st->avg_frame_rate.num > 0 && st->avg_frame_rate.den > 0) {
     fps = av_q2d(st->avg_frame_rate);
@@ -2060,11 +2205,19 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
   }
   {
     const int astream = av_find_best_stream(ff_->fmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+    ff_->audio_stream = astream;
+    audio_stream_ = astream;
     if (astream >= 0) {
       AVCodecParameters* ap = ff_->fmt->streams[astream]->codecpar;
       if (const char* an = avcodec_get_name(ap->codec_id)) info_.audio_codec = an;
       info_.audio_sample_rate = ap->sample_rate;
       info_.audio_channels = ap->ch_layout.nb_channels;
+      VRP_LOG("decoder: shared demux audio stream=%d (%s %dHz %dch)", astream,
+              info_.audio_codec.c_str(), info_.audio_sample_rate, info_.audio_channels);
+    }
+    const double a0 = file_audio_start_sec();
+    if (video_pts_origin_sec_ > 0.01 || a0 > 0.01) {
+      VRP_LOG("AV start_time video=%.3fs audio=%.3fs", video_pts_origin_sec_, a0);
     }
   }
   info_.thumb_status = "未生成";
@@ -2235,8 +2388,10 @@ void VideoDecoder::close() {
     ff_->sws_src_w = 0;
     ff_->sws_src_h = 0;
     ff_->video_stream = -1;
+    ff_->audio_stream = -1;
   }
 #endif
+  audio_stream_ = -1;
   width_ = height_ = display_w_ = display_h_ = 0;
   duration_sec_ = 0;
   position_sec_.store(0);
@@ -2260,6 +2415,14 @@ void VideoDecoder::play() {
   // Resume must bring demux and decode back; otherwise play() only sets a flag.
   if (!decode_thread_.joinable()) start_decode_thread();
   seek_scrubbing_.store(false);
+  // Shared demux + file audio: skip video-only prime (would advance the cursor
+  // without audio). Host arms audio then start_presentation; A/V demux together.
+  if (audio_stream_ >= 0) {
+    priming_.store(false);
+    playback_started_.store(true);
+    pkt_cv_.notify_all();
+    return;
+  }
   begin_priming(prefetch_target_bytes_);  // fill full ~2s before start
   if (prefetch_enough(prefetch_target_bytes_)) {
     priming_.store(false);
@@ -2270,7 +2433,16 @@ void VideoDecoder::play() {
 void VideoDecoder::start_presentation() {
   if (!open_.load() || playing_.load()) return;
   priming_.store(false);
+  // Never clear video here — that punches the same post-land GOP hole as a full
+  // land discard (frozen/2-frame stutter until the next keyframe). Audio queue
+  // must start empty so Soft cannot play pre-land PCM; demux refills A/V together.
+  {
+    std::lock_guard<std::mutex> lk(pkt_mu_);
+    clear_audio_packet_queue_locked();
+    pkt_cv_.notify_all();
+  }
   playing_.store(true);
+  pkt_cv_.notify_all();
 }
 
 void VideoDecoder::pause() {
@@ -2524,7 +2696,9 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
         set_decode_phase("got_frame");
         AVStream* st = ff_->fmt->streams[ff_->video_stream];
         if (ff_->frame->best_effort_timestamp != AV_NOPTS_VALUE) {
-          position_sec_.store(ff_->frame->best_effort_timestamp * av_q2d(st->time_base));
+          const double pts = ff_->frame->best_effort_timestamp * av_q2d(st->time_base) -
+                             video_pts_origin_sec_;
+          position_sec_.store(std::max(0.0, pts));
         } else {
           position_sec_.store(position_sec_.load() + frame_duration_);
         }

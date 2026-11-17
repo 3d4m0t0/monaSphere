@@ -300,6 +300,26 @@ class VideoDecoder {
   /** Packet read-ahead depth (slow-storage / stall diagnostics). */
   void packet_queue_stats(size_t& packets, size_t& bytes) const;
 
+  /** File has an audio stream demuxed alongside video (shared AVFormatContext). */
+  bool has_file_audio() const { return audio_stream_ >= 0; }
+  /**
+   * Pop next demuxed audio packet (ownership transferred as AVPacket*).
+   * Returns nullptr when empty. Caller must av_packet_free.
+   */
+  void* take_audio_packet();
+  /** Borrowed AVCodecParameters* for file audio; valid while open. nullptr if none. */
+  const void* file_audio_codecpar() const;
+  /** Audio stream time_base; false if no file audio. */
+  bool file_audio_time_base(int& num, int& den) const;
+  /** Audio stream start_time in seconds (0 if unknown). */
+  double file_audio_start_sec() const;
+  /**
+   * After a seek land still is published: drop demuxed audio only. Video packets
+   * past the still must stay — discarding them gaps the open GOP and freezes the
+   * picture until the next IDR while audio runs ahead.
+   */
+  void discard_packets_after_land();
+
  private:
   std::atomic<bool> open_{false};
   std::atomic<bool> playing_{false};
@@ -312,6 +332,8 @@ class VideoDecoder {
   int display_h_ = 0;
   double duration_sec_ = 0.0;
   std::atomic<double> position_sec_{0.0};
+  /** video stream start_time in seconds — subtracted from frame PTS for media time. */
+  double video_pts_origin_sec_ = 0.0;
   double frame_duration_ = 1.0 / 30.0;
   VideoInfo info_;
   CudaNv12Texture* cuda_tex_ = nullptr;
@@ -366,6 +388,12 @@ class VideoDecoder {
   size_t pkt_bytes_ = 0;
   size_t prefetch_target_bytes_ = 4u << 20;   // ~2s
   size_t prefetch_resume_bytes_ = 2u << 20;   // ~1s
+  /** Shared-demux audio fan-out (file playback). Separate from video hold caps. */
+  int audio_stream_ = -1;
+  std::deque<void*> audio_pkt_q_;  // AVPacket*
+  size_t audio_pkt_bytes_ = 0;
+  static constexpr size_t kAudioMaxPackets = 256;
+  static constexpr size_t kAudioMaxBytes = 2u << 20;  // ~2 MiB soft target
 
   mutable std::mutex thumbs_mu_;
   ThumbnailStrip thumbs_;
@@ -387,6 +415,7 @@ class VideoDecoder {
   void decode_loop();
   void demux_loop();
   void clear_packet_queue();
+  void clear_audio_packet_queue_locked();  // caller holds pkt_mu_
   bool pop_video_packet();  // fills ff_->packet
   void choose_display_size();
   bool prefetch_enough(size_t need_bytes) const;
