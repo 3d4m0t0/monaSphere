@@ -14,9 +14,9 @@ namespace vrp {
 /**
  * Exclusive DualSense (etc.) grab + uinput mirror for [アプリ].
  * Forwards the pad to a virtual device the guest app opens, while:
- *   - PS (BTN_MODE) long-press → menu (not forwarded)
- *   - short PS → press on release, release next pump (guest must see a real pulse)
- *   - L3+R3 → recenter (clicks still forwarded)
+ *   - PS short → menu (not forwarded)
+ *   - PS long → short PS pulse to the guest app
+ *   - Options long → recenter (short Options still forwarded)
  */
 class PadFilter {
  public:
@@ -42,8 +42,7 @@ class PadFilter {
   /**
    * Read physical → filter → optional uinput. Call once per XR frame while desktop app is live.
    * @param guest_forward when false (VR menu open), update snapshot only — no uinput
-   *   (menu owns the pad). PS long never reaches the guest; short PS is injected on release
-   *   only when guest_forward is true.
+   *   (menu owns the pad). PS short → menu; PS long → app short-PS when guest_forward.
    */
   Edges pump(bool guest_forward = true);
 
@@ -70,22 +69,23 @@ class PadFilter {
   struct input_absinfo absinfo_[ABS_CNT]{};
 
   bool ps_down_ = false;
-  bool ps_long_fired_ = false;       // this hold crossed long threshold
-  /**
-   * Set when long fires; cleared after PS up + cooldown. While set, never write uinput
-   * (blocks release-inject and stick leak in the frame before menu.visible flips).
-   */
-  bool ps_menu_gesture_ = false;
-  bool ps_release_pending_ = false;  // inject BTN_MODE=0 on next pump (short only)
-  /** After a long gesture, ignore BTN_MODE until this time (release bounce → false short). */
+  bool ps_long_fired_ = false;  // this hold crossed long threshold (→ app short PS)
+  /** After PS short→menu, block guest briefly until menu owns the pad. */
+  bool ps_host_gesture_ = false;
+  bool ps_app_pulse_up_pending_ = false;  // inject BTN_MODE=0 after long→app pulse
+  /** Ignore BTN_MODE until this time (release bounce). */
   std::chrono::steady_clock::time_point ps_ignore_until_{};
   std::chrono::steady_clock::time_point ps_down_at_{};
   bool last_guest_forward_ = true;
   int dbg_forward_count_ = 0;
 
+  bool options_down_ = false;
+  bool options_long_fired_ = false;
+  bool options_swallow_ = false;  // long used for recenter — do not forward
+  std::chrono::steady_clock::time_point options_down_at_{};
+
   bool l3_down_ = false;
   bool r3_down_ = false;
-  bool recenter_chord_fired_ = false;
 
   GamepadInput::State snap_{};
   bool prev_a_ = false;

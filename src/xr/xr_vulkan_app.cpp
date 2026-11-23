@@ -1306,8 +1306,8 @@ void XrVulkanApp::create_actions() {
   }
 
   // Oculus Touch / PSVR2 Sense (typical under Monado)
-  // Options long = menu; HMD system = recenter (pad: PS long=menu, L3+R3=recenter).
-  // △ = Flat seats. R3 = reset look. ○ = back. Recenter also on HMD function.
+  // Options long = recenter; PS short = menu (pad path). HMD system = recenter.
+  // △ = Flat seats. R3 = reset look. ○ = back.
   if (want(ControllerProfile::OculusTouch)) {
     suggest("/interaction_profiles/oculus/touch_controller",
             add_look({{navigate_action_, hand_path(primary, "thumbstick")},
@@ -1333,8 +1333,7 @@ void XrVulkanApp::create_actions() {
                       {menu_toggle_action_, hand_path(secondary, "menu/click")},
                       {play_action_, hand_path(primary, "trackpad/click")},
                       {l2_action_, hand_path("left", "trigger/click")},
-                      {r2_action_, hand_path("right", "trigger/click")},
-                      {recenter_action_, hand_path(secondary, "thumbstick/click")}},
+                      {r2_action_, hand_path("right", "trigger/click")}},
                      "thumbstick"));
   }
 
@@ -1347,8 +1346,7 @@ void XrVulkanApp::create_actions() {
                       {menu_toggle_action_, hand_path(secondary, "menu/click")},
                       {play_action_, hand_path(primary, "squeeze/click")},
                       {l2_action_, hand_path("left", "trigger/click")},
-                      {r2_action_, hand_path("right", "trigger/click")},
-                      {recenter_action_, hand_path(secondary, "trackpad/click")}},
+                      {r2_action_, hand_path("right", "trigger/click")}},
                      "trackpad"));
   }
 
@@ -1363,8 +1361,7 @@ void XrVulkanApp::create_actions() {
                       {l2_action_, hand_path("left", "trigger/click")},
                       {r2_action_, hand_path("right", "trigger/click")},
                       {seek_back_action_, hand_path(secondary, "a/click")},
-                      {seek_fwd_action_, hand_path(primary, "thumbstick/click")},
-                      {recenter_action_, hand_path(secondary, "thumbstick/click")}},
+                      {seek_fwd_action_, hand_path(primary, "thumbstick/click")}},
                      "thumbstick"));
   }
 
@@ -1774,21 +1771,22 @@ XrVulkanApp::InputState XrVulkanApp::poll_actions() {
   st.flat_scale = edge(flat_scale_action_);
   st.view_reset = edge(view_reset_action_);
 
-  // Options / menu button: long press toggles the VR menu (same as video). Short is unused
-  // so DualSense Options can pass through to desktop apps. Pad recenter is L3+R3; HMD system stays.
+  // Options / menu button: long → recenter; short release → menu (Sense / non-PS pads).
+  // DualSense PS short → menu and Options long → recenter come from the pad path.
   {
-    constexpr auto kMenuLongPress = std::chrono::milliseconds(700);
+    constexpr auto kOptLongPress = std::chrono::milliseconds(700);
     const bool menu_down = action_down(menu_toggle_action_);
     if (menu_down) {
       if (!menu_btn_down_) {
         menu_btn_down_ = true;
         menu_long_fired_ = false;
         menu_down_at_ = now;
-      } else if (!menu_long_fired_ && now - menu_down_at_ >= kMenuLongPress) {
-        st.menu_toggle = true;
+      } else if (!menu_long_fired_ && now - menu_down_at_ >= kOptLongPress) {
+        st.recenter = true;
         menu_long_fired_ = true;
       }
     } else if (menu_btn_down_) {
+      if (!menu_long_fired_) st.menu_toggle = true;
       menu_btn_down_ = false;
       menu_long_fired_ = false;
     }

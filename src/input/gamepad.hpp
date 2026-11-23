@@ -29,12 +29,12 @@ class GamepadInput {
     bool confirm_held = false;  // A level
     bool back = false;     // B edge
     bool back_held = false;  // B level (for long-press)
-    bool menu_toggle = false;  // PS / Guide long press (Options long also)
+    bool menu_toggle = false;  // PS / Guide short press
     /** X / □ edge. Browser Live FSR cycle (provisional test). */
     bool face_x = false;
     /** Y / △ edge. Flat scale cycle when menus are closed. */
     bool face_y = false;
-    bool recenter = false;     // L3+R3 chord
+    bool recenter = false;     // Options / Start long press
     /** Right stick click (R3) alone. Clears stick look offset. */
     bool view_reset = false;
     bool seek_back = false;    // LB edge (repeat)
@@ -51,8 +51,8 @@ class GamepadInput {
   };
 
   struct PassThroughEdges {
-    bool menu_toggle = false;  // Options long
-    bool recenter = false;     // PS / Guide long
+    bool menu_toggle = false;  // PS short
+    bool recenter = false;     // Options long
   };
 
   GamepadInput();
@@ -67,14 +67,13 @@ class GamepadInput {
   State poll();
 
   /**
-   * Release SDL so the desktop app owns the pad. Watch chords only (do not steal
-   * single Options/PS — those stay with RetroArch etc.):
-   *   PS+R1 hold → menu,  PS+L1 hold → recenter.
+   * Release SDL so the desktop app owns the pad. Watch:
+   *   PS short → menu,  Options long → recenter.
    */
   void begin_pass_through_watch();
   void end_pass_through_watch();
   bool pass_through_watching() const { return pass_active_; }
-  /** Edges for PS+R1 menu and PS+L1 recenter. */
+  /** Edges for PS short menu and Options long recenter. */
   PassThroughEdges poll_pass_through();
 
   static std::vector<std::string> list_names();
@@ -94,12 +93,11 @@ class GamepadInput {
   /** /dev/input/jsN for DualSense — survives EVIOCGRAB on event*. */
   int pass_js_fd_ = -1;
   bool pass_ps_down_ = false;
-  bool pass_l1_down_ = false;
-  bool pass_r1_down_ = false;
-  bool pass_menu_chord_fired_ = false;
-  bool pass_recenter_chord_fired_ = false;
-  std::chrono::steady_clock::time_point pass_menu_chord_at_{};
-  std::chrono::steady_clock::time_point pass_recenter_chord_at_{};
+  bool pass_options_down_ = false;
+  bool pass_ps_long_fired_ = false;
+  bool pass_options_long_fired_ = false;
+  std::chrono::steady_clock::time_point pass_ps_down_at_{};
+  std::chrono::steady_clock::time_point pass_options_down_at_{};
   bool prev_a_ = false;
   bool prev_b_ = false;
   bool prev_x_ = false;
@@ -119,7 +117,6 @@ class GamepadInput {
   std::chrono::steady_clock::time_point ps_down_at_{};
   bool l3_down_ = false;
   bool r3_down_ = false;
-  bool l3r3_recenter_fired_ = false;
 };
 
 }  // namespace vrp

@@ -1,9 +1,9 @@
 /**
  * LD_PRELOAD library for [アプリ] guests (RetroArch etc.).
  * Interposes SDL2 GameController / Joystick getters to:
- *   - PS (GUIDE) long → notify monaSphere MENU, never expose GUIDE to the app
- *   - PS short → pulse GUIDE to the app on release
- *   - L3+R3 → notify RECENTER (buttons still visible to the app)
+ *   - PS (GUIDE) short → notify monaSphere MENU, never expose GUIDE to the app
+ *   - PS long → pulse GUIDE to the app (short press)
+ *   - Options (START) long → notify RECENTER; short Options still visible to the app
  *   - BLOCK 1 from host → all buttons/axes zero (VR menu owns the pad)
  *
  * No /dev/uinput required. Socket path: env MONASPHERE_PAD_SOCK.
@@ -31,9 +31,8 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-constexpr int kBtnGuide = 5;       // SDL_CONTROLLER_BUTTON_GUIDE
-constexpr int kBtnLeftStick = 7;   // SDL_CONTROLLER_BUTTON_LEFTSTICK
-constexpr int kBtnRightStick = 8;  // SDL_CONTROLLER_BUTTON_RIGHTSTICK
+constexpr int kBtnGuide = 5;  // SDL_CONTROLLER_BUTTON_GUIDE (PS)
+constexpr int kBtnStart = 6;  // SDL_CONTROLLER_BUTTON_START (Options)
 constexpr int kPsLongMs = 700;
 constexpr int kCooldownMs = 400;
 constexpr int kShortPulsePolls = 4;
@@ -55,14 +54,17 @@ std::atomic<int> g_sock_fd{-1};
 std::mutex g_ps_mu;
 bool g_ps_down = false;
 bool g_ps_long = false;
-bool g_ps_menu_gesture = false;
-int g_short_pulse = 0;
+bool g_ps_host_gesture = false;  // short PS → menu; block GUIDE until cooldown
+int g_short_pulse = 0;           // app sees GUIDE=1 for N polls (PS long → short)
 Clock::time_point g_ps_down_at{};
 Clock::time_point g_ps_ignore_until{};
 
-bool g_l3 = false;
-bool g_r3 = false;
-bool g_l3r3_fired = false;
+std::mutex g_opt_mu;
+bool g_opt_down = false;
+bool g_opt_long = false;
+bool g_opt_swallow = false;
+int g_opt_short_pulse = 0;
+Clock::time_point g_opt_down_at{};
 
 void log_msg(const char* s) {
   std::fprintf(stderr, "[monasphere_padhook] %s\n", s);
@@ -108,7 +110,7 @@ std::uint8_t filter_guide(std::uint8_t raw) {
   }
 
   if (raw != 0) {
-    if (g_ps_menu_gesture) return 0;
+    if (g_ps_host_gesture) return 0;
     if (!g_ps_down) {
       g_ps_down = true;
       g_ps_long = false;
@@ -119,52 +121,77 @@ std::uint8_t filter_guide(std::uint8_t raw) {
           std::chrono::duration_cast<std::chrono::milliseconds>(now - g_ps_down_at).count();
       if (ms >= kPsLongMs) {
         g_ps_long = true;
-        g_ps_menu_gesture = true;
-        log_msg("PS LONG → MENU");
-        send_line(vrp::pad_hook::kMsgMenu);
+        g_short_pulse = kShortPulsePolls;
+        log_msg("PS LONG → app short PS");
       }
     }
-    return 0;  // never expose held GUIDE while deciding / after long
+    return 0;  // never expose held GUIDE while deciding
   }
 
   // raw == 0
   if (!g_ps_down) return 0;
-  const bool was_long = g_ps_long || g_ps_menu_gesture;
+  const bool was_long = g_ps_long;
   g_ps_down = false;
   if (was_long) {
-    g_ps_long = true;
-    g_ps_menu_gesture = true;
     g_ps_ignore_until = now + std::chrono::milliseconds(kCooldownMs);
-    log_msg("PS up after LONG — suppress");
+    log_msg("PS up after LONG — app pulse already started");
     return 0;
   }
-  log_msg("PS up SHORT → pulse to app");
-  g_short_pulse = kShortPulsePolls;
+  g_ps_host_gesture = true;
+  g_ps_ignore_until = now + std::chrono::milliseconds(kCooldownMs);
+  log_msg("PS up SHORT → MENU");
+  send_line(vrp::pad_hook::kMsgMenu);
+  return 0;
+}
+
+/** Options short → app pulse; Options long → recenter (hidden from app during hold). */
+std::uint8_t filter_start(std::uint8_t raw) {
+  const auto now = Clock::now();
+  std::lock_guard<std::mutex> lock(g_opt_mu);
+  if (g_opt_short_pulse > 0) {
+    --g_opt_short_pulse;
+    return 1;
+  }
+  if (raw != 0) {
+    if (!g_opt_down) {
+      g_opt_down = true;
+      g_opt_long = false;
+      g_opt_swallow = false;
+      g_opt_down_at = now;
+      log_msg("Options down (arm)");
+    } else if (!g_opt_long) {
+      const auto ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - g_opt_down_at).count();
+      if (ms >= kPsLongMs) {
+        g_opt_long = true;
+        g_opt_swallow = true;
+        log_msg("Options LONG → RECENTER");
+        send_line(vrp::pad_hook::kMsgRecenter);
+      }
+    }
+    return 0;  // delay short until release
+  }
+  if (!g_opt_down) return 0;
+  const bool was_long = g_opt_long || g_opt_swallow;
+  g_opt_down = false;
+  g_opt_long = false;
+  g_opt_swallow = false;
+  if (was_long) {
+    log_msg("Options up after LONG — suppress");
+    return 0;
+  }
+  log_msg("Options SHORT → app");
+  g_opt_short_pulse = kShortPulsePolls;
   return 1;
 }
 
-void track_sticks(int button, std::uint8_t v) {
-  if (button == kBtnLeftStick) {
-    g_l3 = v != 0;
-    if (!g_l3) g_l3r3_fired = false;
-  } else if (button == kBtnRightStick) {
-    g_r3 = v != 0;
-    if (!g_r3) g_l3r3_fired = false;
-  }
-  if (g_l3 && g_r3 && !g_l3r3_fired) {
-    g_l3r3_fired = true;
-    log_msg("L3+R3 → RECENTER");
-    send_line(vrp::pad_hook::kMsgRecenter);
-  }
-}
-
-void end_menu_gesture_if_idle() {
+void end_host_gesture_if_idle() {
   const auto now = Clock::now();
   std::lock_guard<std::mutex> lock(g_ps_mu);
-  if (g_ps_menu_gesture && !g_ps_down && now >= g_ps_ignore_until) {
-    g_ps_menu_gesture = false;
+  if (g_ps_host_gesture && !g_ps_down && now >= g_ps_ignore_until) {
+    g_ps_host_gesture = false;
     g_ps_long = false;
-    log_msg("menu-gesture end");
+    log_msg("host-menu gesture end");
   }
 }
 
@@ -251,14 +278,12 @@ __attribute__((constructor)) void monasphere_padhook_init() {
 std::uint8_t SDL_GameControllerGetButton(void* gc, int button) {
   resolve_sdl();
   ensure_sock_thread();
-  end_menu_gesture_if_idle();
+  end_host_gesture_if_idle();
   if (!real_gc_get_button) return 0;
   const std::uint8_t raw = real_gc_get_button(gc, button);
   if (g_block.load(std::memory_order_acquire)) return 0;
   if (button == kBtnGuide) return filter_guide(raw);
-  if (button == kBtnLeftStick || button == kBtnRightStick) {
-    track_sticks(button, raw);
-  }
+  if (button == kBtnStart) return filter_start(raw);
   return raw;
 }
 
@@ -273,12 +298,13 @@ std::int16_t SDL_GameControllerGetAxis(void* gc, int axis) {
 std::uint8_t SDL_JoystickGetButton(void* joy, int button) {
   resolve_sdl();
   ensure_sock_thread();
-  end_menu_gesture_if_idle();
+  end_host_gesture_if_idle();
   if (!real_joy_get_button) return 0;
   const std::uint8_t raw = real_joy_get_button(joy, button);
   if (g_block.load(std::memory_order_acquire)) return 0;
-  // DualSense via joystick API: Guide is often button 5 (same as GC) on many mappings.
+  // DualSense via joystick API: Guide/Start often match GC indices.
   if (button == kBtnGuide) return filter_guide(raw);
+  if (button == kBtnStart) return filter_start(raw);
   return raw;
 }
 

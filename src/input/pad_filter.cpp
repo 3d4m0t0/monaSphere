@@ -108,7 +108,7 @@ bool PadFilter::start() {
   running_.store(true, std::memory_order_release);
   std::cerr << "[monaSphere] PadFilter: grab " << phys_path_ << " → "
             << (uinput_event_path_.empty() ? "uinput" : uinput_event_path_)
-            << " (PS long=menu, L3+R3=recenter)\n";
+            << " (PS short=menu, PS long=app PS, Options long=recenter)\n";
   return true;
 }
 
@@ -232,14 +232,17 @@ void PadFilter::close_all() {
   uinput_event_path_.clear();
   ps_down_ = false;
   ps_long_fired_ = false;
-  ps_menu_gesture_ = false;
-  ps_release_pending_ = false;
+  ps_host_gesture_ = false;
+  ps_app_pulse_up_pending_ = false;
   ps_ignore_until_ = {};
   last_guest_forward_ = true;
   dbg_forward_count_ = 0;
+  options_down_ = false;
+  options_long_fired_ = false;
+  options_swallow_ = false;
+  options_down_at_ = {};
   l3_down_ = false;
   r3_down_ = false;
-  recenter_chord_fired_ = false;
   snap_ = {};
   prev_a_ = prev_b_ = prev_y_ = false;
 }
@@ -339,46 +342,61 @@ PadFilter::Edges PadFilter::pump(bool guest_forward) {
 
   const auto now = std::chrono::steady_clock::now();
 
-  // End menu-gesture block after PS is up and cooldown elapsed.
-  if (ps_menu_gesture_ && !ps_down_ && now >= ps_ignore_until_) {
-    VRP_LOG("PadFilter: menu-gesture end (guest may receive again)");
-    ps_menu_gesture_ = false;
+  // End host-menu block after PS is up and cooldown elapsed.
+  if (ps_host_gesture_ && !ps_down_ && now >= ps_ignore_until_) {
+    VRP_LOG("PadFilter: host-menu gesture end (guest may receive again)");
+    ps_host_gesture_ = false;
     ps_long_fired_ = false;
   }
 
-  // Guest sees pad only when menu says so AND we are not inside a PS-long gesture.
-  // Re-evaluate after long-fire in this pump (do not capture once).
-  auto allow_guest = [&]() { return guest_forward && !ps_menu_gesture_; };
+  auto allow_guest = [&]() { return guest_forward && !ps_host_gesture_; };
   if (guest_forward != last_guest_forward_) {
-    VRP_LOG("PadFilter: guest_forward %d -> %d (menu_gesture=%d allow_guest=%d)",
-            last_guest_forward_ ? 1 : 0, guest_forward ? 1 : 0, ps_menu_gesture_ ? 1 : 0,
+    VRP_LOG("PadFilter: guest_forward %d -> %d (host_gesture=%d allow_guest=%d)",
+            last_guest_forward_ ? 1 : 0, guest_forward ? 1 : 0, ps_host_gesture_ ? 1 : 0,
             allow_guest() ? 1 : 0);
     last_guest_forward_ = guest_forward;
   }
 
-  // Short-PS up half: only when guest is allowed.
-  if (ps_release_pending_) {
-    ps_release_pending_ = false;
+  // Complete app short-PS pulse (UP half).
+  if (ps_app_pulse_up_pending_) {
+    ps_app_pulse_up_pending_ = false;
     if (allow_guest()) {
-      VRP_LOG("PadFilter: short-PS pending UP -> guest");
+      VRP_LOG("PadFilter: app-PS pulse UP -> guest");
       inject_key(BTN_MODE, 0);
       flush_uinput_sync();
     } else {
-      VRP_LOG("PadFilter: short-PS pending UP DROPPED (allow_guest=0)");
+      VRP_LOG("PadFilter: app-PS pulse UP DROPPED (allow_guest=0)");
     }
   }
 
+  // PS long while held → short PS to the app (not menu).
   if (ps_down_ && !ps_long_fired_ && now >= ps_ignore_until_) {
     const auto ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(now - ps_down_at_).count();
     if (ms >= kPsLongMs) {
       ps_long_fired_ = true;
-      ps_menu_gesture_ = true;      // block all uinput until up+cooldown
-      ps_release_pending_ = false;
-      edges.menu_toggle = true;
-      snap_.menu_toggle = true;
-      VRP_LOG("PadFilter: PS LONG fired (hold %lldms) — menu_toggle, block guest",
-              static_cast<long long>(ms));
+      if (allow_guest()) {
+        VRP_LOG("PadFilter: PS LONG (hold %lldms) — app short PS", static_cast<long long>(ms));
+        inject_key(BTN_MODE, 1);
+        flush_uinput_sync();
+        ps_app_pulse_up_pending_ = true;
+      } else {
+        VRP_LOG("PadFilter: PS LONG (hold %lldms) — skip app pulse (allow_guest=0)",
+                static_cast<long long>(ms));
+      }
+    }
+  }
+
+  // Options long while held → recenter.
+  if (options_down_ && !options_long_fired_) {
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(now - options_down_at_).count();
+    if (ms >= kPsLongMs) {
+      options_long_fired_ = true;
+      options_swallow_ = true;
+      edges.recenter = true;
+      snap_.recenter = true;
+      VRP_LOG("PadFilter: Options LONG — recenter");
     }
   }
 
@@ -396,46 +414,38 @@ PadFilter::Edges PadFilter::pump(bool guest_forward) {
       const int value = ev.value;
 
       if (code == BTN_MODE) {
-        VRP_LOG("PadFilter: phys PS value=%d down=%d long=%d gesture=%d ignore=%d allow=%d",
-                value, ps_down_ ? 1 : 0, ps_long_fired_ ? 1 : 0, ps_menu_gesture_ ? 1 : 0,
+        VRP_LOG("PadFilter: phys PS value=%d down=%d long=%d host=%d ignore=%d allow=%d",
+                value, ps_down_ ? 1 : 0, ps_long_fired_ ? 1 : 0, ps_host_gesture_ ? 1 : 0,
                 (now < ps_ignore_until_) ? 1 : 0, allow_guest() ? 1 : 0);
-        // Post-long cooldown: drop bounce / re-press so it cannot become a false short inject.
         if (now < ps_ignore_until_) {
           if (value == 0) ps_down_ = false;
           VRP_LOG("PadFilter: PS swallowed (cooldown)");
           continue;
         }
         if (value == 1) {
-          // Do not start a new short gesture while a long menu-gesture is still active.
-          if (ps_menu_gesture_) {
-            VRP_LOG("PadFilter: PS down ignored (menu-gesture active)");
+          if (ps_host_gesture_) {
+            VRP_LOG("PadFilter: PS down ignored (host-menu gesture active)");
             continue;
           }
           ps_down_ = true;
           ps_long_fired_ = false;
-          ps_release_pending_ = false;
+          ps_app_pulse_up_pending_ = false;
           ps_down_at_ = now;
-          VRP_LOG("PadFilter: PS down (arm short/long)");
-          continue;  // never forward PS down
+          VRP_LOG("PadFilter: PS down (arm short=menu / long=app)");
+          continue;  // never forward raw PS
         }
         if (value == 0 && ps_down_) {
-          const bool was_long = ps_long_fired_ || ps_menu_gesture_;
+          const bool was_long = ps_long_fired_;
           ps_down_ = false;
-          // Short → guest pulse on release (only if guest owns the pad).
-          // Long → never inject; keep menu-gesture until cooldown ends.
           if (was_long) {
-            ps_release_pending_ = false;
-            ps_long_fired_ = true;
-            ps_menu_gesture_ = true;
             ps_ignore_until_ = now + std::chrono::milliseconds(400);
-            VRP_LOG("PadFilter: PS up after LONG — no inject, cooldown 400ms");
-          } else if (allow_guest()) {
-            VRP_LOG("PadFilter: PS up SHORT -> inject pulse to guest");
-            inject_key(BTN_MODE, 1);
-            flush_uinput_sync();
-            ps_release_pending_ = true;
+            VRP_LOG("PadFilter: PS up after LONG — app pulse already sent");
           } else {
-            VRP_LOG("PadFilter: PS up SHORT but allow_guest=0 — no inject");
+            edges.menu_toggle = true;
+            snap_.menu_toggle = true;
+            ps_host_gesture_ = true;
+            ps_ignore_until_ = now + std::chrono::milliseconds(400);
+            VRP_LOG("PadFilter: PS up SHORT — menu_toggle");
           }
           continue;
         }
@@ -445,27 +455,44 @@ PadFilter::Edges PadFilter::pump(bool guest_forward) {
         continue;
       }
 
+      if (code == BTN_START) {
+        // Options: short → guest; long → recenter (swallowed).
+        if (value == 1) {
+          options_down_ = true;
+          options_long_fired_ = false;
+          options_swallow_ = false;
+          options_down_at_ = now;
+          continue;  // delay forward until short release
+        }
+        if (value == 0 && options_down_) {
+          const bool was_long = options_long_fired_ || options_swallow_;
+          options_down_ = false;
+          if (was_long) {
+            VRP_LOG("PadFilter: Options up after LONG — no forward");
+          } else if (allow_guest()) {
+            VRP_LOG("PadFilter: Options SHORT → guest");
+            inject_key(BTN_START, 1);
+            flush_uinput_sync();
+            inject_key(BTN_START, 0);
+            flush_uinput_sync();
+          }
+          options_long_fired_ = false;
+          options_swallow_ = false;
+          continue;
+        }
+        continue;
+      }
+
       if (code == BTN_THUMBL) {
         if (value == 1) l3_down_ = true;
-        if (value == 0) {
-          l3_down_ = false;
-          recenter_chord_fired_ = false;
-        }
+        if (value == 0) l3_down_ = false;
       }
       if (code == BTN_THUMBR) {
         if (value == 1) r3_down_ = true;
-        if (value == 0) {
-          r3_down_ = false;
-          recenter_chord_fired_ = false;
-        }
+        if (value == 0) r3_down_ = false;
         if (value == 1 && !l3_down_) {
           snap_.view_reset = true;
         }
-      }
-      if (l3_down_ && r3_down_ && !recenter_chord_fired_) {
-        recenter_chord_fired_ = true;
-        edges.recenter = true;
-        snap_.recenter = true;
       }
 
       apply_key_to_snap(code, value);

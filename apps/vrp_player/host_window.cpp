@@ -3089,7 +3089,7 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
       pad_hook_active_ = true;
       cfg.pad_hook_lib = hook_lib;
       cfg.pad_hook_sock = QString::fromStdString(pad_hook_.socket_path());
-      appendLog(tr("Pad hook: LD_PRELOAD %1 (PS long=menu, L3+R3=recenter; no uinput)")
+      appendLog(tr("Pad hook: LD_PRELOAD %1 (PS short=menu, PS long=app PS, Options long=recenter)")
                     .arg(hook_lib));
     } else if (pad_filter_.start()) {
       const QString node = QString::fromStdString(pad_filter_.uinput_event_path());
@@ -6518,8 +6518,9 @@ void HostWindow::xrThreadMain() {
       }
 
       auto input = xr.poll_actions();
-      bool pad_sony = false;
       bool pad_present = false;
+      // Seed from last known pad — do not reset to Xbox while SDL is closed.
+      bool pad_sony = last_pad_sony;
       bool pad_nav_up = false;
       bool pad_nav_down = false;
       bool pad_nav_left = false;
@@ -6667,7 +6668,7 @@ void HostWindow::xrThreadMain() {
         gamepad_seen_name_.clear();
       }
       gamepad_was = want_gamepad;
-      // L3+R3 recenter before live handlers (works during Live busy/spinner).
+      // Options long / HMD system recenter before live handlers (works during Live busy/spinner).
       if (input.recenter && xr.recenter()) {
         look_yaw = 0.f;
         look_pitch = 0.f;
@@ -7011,11 +7012,11 @@ void HostWindow::xrThreadMain() {
                   this,
                   [this, hook, filt] {
                     if (hook) {
-                      appendLog(tr("Desktop app: LD_PRELOAD pad hook — PS long=menu, L3+R3=recenter"));
+                      appendLog(tr("Desktop app: LD_PRELOAD pad hook — PS short=menu, PS long=app PS, Options long=recenter"));
                     } else if (filt) {
-                      appendLog(tr("Desktop app: legacy uinput filter — PS long=menu, L3+R3=recenter"));
+                      appendLog(tr("Desktop app: legacy uinput filter — PS short=menu, PS long=app PS, Options long=recenter"));
                     } else {
-                      appendLog(tr("Desktop app: pad chords — PS+R1 menu, PS+L1 recenter"));
+                      appendLog(tr("Desktop app: pad watch — PS short=menu, Options long=recenter"));
                     }
                   },
                   Qt::QueuedConnection);
@@ -7280,6 +7281,40 @@ void HostWindow::xrThreadMain() {
             Qt::QueuedConnection);
         prepare_live_flat();
         if (yt_session_ && !yt_session_->busy_status().isEmpty()) show_idle_screen = false;
+      }
+
+      if (menu_out.cycle_flat_seat) {
+        apply_flat_seat(menu_out.flat_seat_index);
+      }
+
+      if (menu_out.leave_desktop_app) {
+        // Same teardown as desktopAppExited: stop → destroy Virtual → show_app_return_place.
+        yt_return_apps_menu_.store(true, std::memory_order_release);
+        pad_hook_.set_block_guest(false);
+        pad_filter_.stop();
+        showHudToast(tr("終了中…"));
+        const bool session_up =
+            yt_session_ &&
+            (yt_session_->active() || yt_session_->loading() ||
+             yt_session_->state() != vrp::YouTubeSession::State::Idle);
+        if (session_up) {
+          yt_stop_requested_.store(true, std::memory_order_release);
+        } else {
+          // Already idle — still remove Virtual and restore the launch place.
+          QMetaObject::invokeMethod(
+              this,
+              [this] {
+                if (yt_return_apps_menu_.exchange(false, std::memory_order_acq_rel)) {
+                  destroyVirtualForLeaveLive();
+                  yt_show_apps_after_stop_.store(true, std::memory_order_release);
+                }
+              },
+              Qt::QueuedConnection);
+        }
+        QMetaObject::invokeMethod(
+            this,
+            [this] { appendLog(tr("Desktop app: Exit from AppMenu — Virtual 削除後に復帰")); },
+            Qt::QueuedConnection);
       }
 
       if (menu_out.open_video) {

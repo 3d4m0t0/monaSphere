@@ -411,17 +411,17 @@ int paint_ab_footer(HudCanvas& c, int right, int y, int h, const QString& a_labe
   return x;
 }
 
-/** Right-aligned Options/Menu chip + Close. Returns the left edge of the cluster. */
+/** Right-aligned PS/Guide chip + Close. Returns the left edge of the cluster. */
 int paint_option_close_footer(HudCanvas& c, int right, int y, int h, const QFont& font) {
   const QString close = VRP_TR("Close");
   const int tw = QFontMetrics(font).horizontalAdvance(close);
-  const int start_h = start_icon_height();
-  const int start_w = menu_button_width();
+  const int gh = guide_icon_height();
+  const int gw = guide_button_width();
   int x = right - tw;
   paint_footer_label(c, x, y, h, close, font);
-  x -= 6 + start_w;
-  const int by = y + (h - start_h) / 2;
-  paint_start_button(c, QRect(x, by, start_w, start_h));
+  x -= 6 + gw;
+  const int by = y + (h - gh) / 2;
+  paint_guide_button(c, QRect(x, by, gw, gh));
   return x;
 }
 
@@ -994,6 +994,54 @@ HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width, int height
     return canvas.take();
   }
 
+  // Compact centered [アプリ] menu: same fonts / row metrics as browser; fewer rows + narrower width.
+  if (snap.screen == VrMenu::Screen::AppMenu) {
+    constexpr int kTitleH = 48;  // same as browser title bar
+    constexpr int kRowH = 34;    // same as browser list rows
+    constexpr int kFootH = 44;
+    constexpr int kPad = 16;
+    constexpr int kDpad = 26;
+    constexpr int kStick = 26;
+    const QString decide = VRP_TR("Decide");
+    const QString back = VRP_TR("Back");
+    const QString close = VRP_TR("Close");
+    const QString select = VRP_TR("Select");
+    const QString title = VRP_TR(snap.title.c_str());
+    const QFontMetrics title_fm(title_font);
+    const QFontMetrics body_fm(body_font);
+    const int count = static_cast<int>(snap.entries.size());
+    int text_w = title_fm.horizontalAdvance(title);
+    for (int i = 0; i < count; ++i) {
+      text_w = std::max(
+          text_w, body_fm.horizontalAdvance(QString::fromStdString(snap.entries[static_cast<size_t>(i)].name)));
+    }
+    // Footer: [↑↓ L Select] … [A Decide][B Back][PS Close] — width must fit all icons.
+    const int select_w = kDpad * 2 + 2 + 8 + kStick + 4 + body_fm.horizontalAdvance(select);
+    const int ab_w = kFootFace + 6 + body_fm.horizontalAdvance(decide) + 14 + kFootFace + 6 +
+                     body_fm.horizontalAdvance(back);
+    const int ps_w = guide_button_width() + 6 + body_fm.horizontalAdvance(close);
+    const int foot_w = select_w + 14 + ab_w + 10 + ps_w;
+    const int panel_w = std::max(text_w + kPad * 2, foot_w + kPad * 2);
+    const int panel_h = kTitleH + std::max(1, count) * kRowH + kFootH;
+    const int panel_x = (width - panel_w) / 2;
+    const int panel_y = (height - panel_h) / 2;
+    canvas.fill(QRect(panel_x, panel_y, panel_w, panel_h), QColor(12, 16, 24, 230));
+    canvas.fill(QRect(panel_x, panel_y, panel_w, kTitleH), QColor(20, 28, 40, 255));
+    canvas.text(QRect(panel_x + kPad, panel_y + 4, panel_w - kPad * 2, 40), title, title_font,
+                QColor(230, 240, 255), Qt::AlignVCenter | Qt::AlignLeft);
+    for (int i = 0; i < count; ++i) {
+      const QRect row(panel_x + 8, panel_y + kTitleH + i * kRowH, panel_w - 16, kRowH);
+      if (i == snap.cursor) canvas.fill(row.adjusted(4, 2, -4, -2), QColor(40, 120, 200, 220));
+      draw_row(canvas, row, QString::fromStdString(snap.entries[static_cast<size_t>(i)].name), body_font);
+    }
+    const QRect foot(panel_x + kPad, panel_y + panel_h - kFootH, panel_w - kPad * 2, kFootH - 4);
+    const int option_left =
+        paint_option_close_footer(canvas, foot.right(), foot.y(), foot.height(), body_font);
+    paint_ab_footer(canvas, option_left - 14, foot.y(), foot.height(), decide, back, body_font);
+    paint_dpad_ud_stick_cluster(canvas, foot.x(), foot.y(), foot.height(), select, body_font);
+    return canvas.take();
+  }
+
   const int side = width / 7;
   const int content_w = width - side * 2;
   canvas.fill(QRect(side, 0, content_w, height), QColor(12, 16, 24, 230));
@@ -1235,16 +1283,15 @@ HudPaintResult paint_controls_help(int width, int height, bool sony_face, bool m
   };
   // HelpIcon::Y paints △ when sony_face_buttons, otherwise the letter Y.
   const Row rows[] = {
-      {HelpIcon::Guide, "long-press", "Menu"},
-      {HelpIcon::Start, "long-press", "Menu"},
-      {HelpIcon::Stick, "L3+R3", "Recenter"},
+      {HelpIcon::Guide, nullptr, "Menu (open / close)"},
+      {HelpIcon::Start, "long-press", "Recenter"},
       {HelpIcon::B, nullptr, "Playback controls"},
       {HelpIcon::A, nullptr, "Play or pause"},
       {HelpIcon::StickR, nullptr, "Look (180° / 360°)"},
       {HelpIcon::StickR3, nullptr, "Reset view"},
       {HelpIcon::Speed, nullptr, "Playback speed"},
       {HelpIcon::SpeedReset, nullptr, "Speed ×1"},
-      {HelpIcon::Y, nullptr, "Flat seat (Near/Cinema/Far)"},
+      {HelpIcon::Y, nullptr, "Screen distance (Near/Cinema/Far)"},
   };
 
   const QFont title_font = deUiFont(22, QFont::DemiBold);

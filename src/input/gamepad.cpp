@@ -130,14 +130,15 @@ int open_sony_hidraw(bool* out_dualsense) {
 
 struct SonyPadLevels {
   bool ps = false;
+  bool options = false;
   bool l1 = false;
   bool r1 = false;
 };
 
 /**
- * Parse DualSense / DS4 hidraw → PS / L1 / R1 (hid-playstation.c layout).
+ * Parse DualSense / DS4 hidraw → PS / Options / L1 / R1 (hid-playstation.c layout).
  * DualSense USB 0x01: payload @ buf[1]; BT 0x31: payload @ buf[2].
- * buttons[1] BIT(0)=L1 BIT(1)=R1; buttons[2] BIT(0)=PS.
+ * buttons[1] BIT(0)=L1 BIT(1)=R1 BIT(5)=Options; buttons[2] BIT(0)=PS.
  */
 bool parse_sony_hid_levels(const uint8_t* buf, size_t n, bool dualsense, SonyPadLevels* out) {
   if (!buf || !out || n < 7) return false;
@@ -155,18 +156,21 @@ bool parse_sony_hid_levels(const uint8_t* buf, size_t n, bool dualsense, SonyPad
     const uint8_t b2 = buf[base + 9];
     out->l1 = (b1 & 0x01) != 0;
     out->r1 = (b1 & 0x02) != 0;
+    out->options = (b1 & 0x20) != 0;
     out->ps = (b2 & 0x01) != 0;
     return true;
   }
   if (id == 0x01 && n >= 9) {
     out->l1 = (buf[6] & 0x01) != 0;
     out->r1 = (buf[6] & 0x02) != 0;
+    out->options = (buf[6] & 0x20) != 0;
     out->ps = (buf[7] & 0x01) != 0;
     return true;
   }
   if (id == 0x11 && n >= 11) {
     out->l1 = (buf[8] & 0x01) != 0;
     out->r1 = (buf[8] & 0x02) != 0;
+    out->options = (buf[8] & 0x20) != 0;
     out->ps = (buf[9] & 0x01) != 0;
     return true;
   }
@@ -174,10 +178,8 @@ bool parse_sony_hid_levels(const uint8_t* buf, size_t n, bool dualsense, SonyPad
 }
 
 /** DualSense joydev order (BTN_GAMEPAD sequence → js0). */
-constexpr int kJsL1Btn = 4;   // BTN_TL
-constexpr int kJsR1Btn = 5;   // BTN_TR
-constexpr int kJsPsBtn = 10;  // BTN_MODE
-constexpr auto kChordHold = std::chrono::milliseconds(500);
+constexpr int kJsOptionsBtn = 9;  // BTN_START
+constexpr int kJsPsBtn = 10;      // BTN_MODE
 
 int open_joystick_js_for_dualsense() {
   // Prefer js node paired with DualSense gamepad (Handlers=event10 js0).
@@ -306,10 +308,11 @@ void GamepadInput::end_pass_through_watch() {
 #endif
   pass_active_ = false;
   pass_ps_down_ = false;
-  pass_l1_down_ = false;
-  pass_r1_down_ = false;
-  pass_menu_chord_fired_ = false;
-  pass_recenter_chord_fired_ = false;
+  pass_options_down_ = false;
+  pass_ps_long_fired_ = false;
+  pass_options_long_fired_ = false;
+  pass_ps_down_at_ = {};
+  pass_options_down_at_ = {};
 }
 
 void GamepadInput::begin_pass_through_watch() {
@@ -341,11 +344,11 @@ void GamepadInput::begin_pass_through_watch() {
   pass_js_fd_ = open_joystick_js_for_dualsense();
   pass_active_ = true;
   if (!pass_fds_.empty() || pass_hidraw_fd_ >= 0 || pass_js_fd_ >= 0) {
-    VRP_LOG("Gamepad pass-through watch: %zu evdev + hidraw=%s js=%s (PS+R1=menu, PS+L1=recenter)",
+    VRP_LOG("Gamepad pass-through watch: %zu evdev + hidraw=%s js=%s (PS short=menu, Options long=recenter)",
             pass_fds_.size(), pass_hidraw_fd_ >= 0 ? "yes" : "no",
             pass_js_fd_ >= 0 ? "yes" : "no");
   } else {
-    VRP_LOG("Gamepad pass-through watch: no evdev/hidraw/js (XR Options long=menu; HMD system=recenter)");
+    VRP_LOG("Gamepad pass-through watch: no evdev/hidraw/js (XR Options long=recenter; HMD system=recenter)");
   }
 #else
   close();
@@ -361,7 +364,7 @@ GamepadInput::PassThroughEdges GamepadInput::poll_pass_through() {
   if (!pass_active_) return out;
   const auto now = std::chrono::steady_clock::now();
 
-  // Evdev (silent if the app EVIOCGRAB'd the node). Track PS / L1 / R1 only.
+  // Evdev (silent if the app EVIOCGRAB'd the node). Track PS / Options.
   for (int fd : pass_fds_) {
     if (fd < 0) continue;
     input_event ev{};
@@ -373,10 +376,8 @@ GamepadInput::PassThroughEdges GamepadInput::poll_pass_through() {
       const bool down = ev.value != 0;
       if (is_ps_code(code))
         pass_ps_down_ = down;
-      else if (code == BTN_TL)
-        pass_l1_down_ = down;
-      else if (code == BTN_TR)
-        pass_r1_down_ = down;
+      else if (code == BTN_START)
+        pass_options_down_ = down;
     }
   }
 
@@ -389,8 +390,7 @@ GamepadInput::PassThroughEdges GamepadInput::poll_pass_through() {
       SonyPadLevels lv;
       if (!parse_sony_hid_levels(buf, static_cast<size_t>(n), pass_hidraw_dualsense_, &lv)) continue;
       pass_ps_down_ = lv.ps;
-      pass_l1_down_ = lv.l1;
-      pass_r1_down_ = lv.r1;
+      pass_options_down_ = lv.options;
     }
   }
 
@@ -407,40 +407,36 @@ GamepadInput::PassThroughEdges GamepadInput::poll_pass_through() {
       const bool down = value != 0;
       if (number == kJsPsBtn)
         pass_ps_down_ = down;
-      else if (number == kJsL1Btn)
-        pass_l1_down_ = down;
-      else if (number == kJsR1Btn)
-        pass_r1_down_ = down;
+      else if (number == kJsOptionsBtn)
+        pass_options_down_ = down;
     }
   }
 
-  // Chords: do not bind single Options/PS (those stay with the app — no 暴発).
-  // R1 is easier with PS for menu; L1 → recenter.
-  const bool menu_chord = pass_ps_down_ && pass_r1_down_;
-  const bool recenter_chord = pass_ps_down_ && pass_l1_down_;
-  if (menu_chord) {
-    if (!pass_menu_chord_fired_) {
-      if (pass_menu_chord_at_.time_since_epoch().count() == 0) pass_menu_chord_at_ = now;
-      if (now - pass_menu_chord_at_ >= kChordHold) {
-        pass_menu_chord_fired_ = true;
-        out.menu_toggle = true;
-      }
+  // PS short → menu; Options long → recenter.
+  if (pass_ps_down_) {
+    if (pass_ps_down_at_.time_since_epoch().count() == 0) {
+      pass_ps_down_at_ = now;
+      pass_ps_long_fired_ = false;
+    } else if (!pass_ps_long_fired_ && now - pass_ps_down_at_ >= kStartLongPress) {
+      pass_ps_long_fired_ = true;
     }
-  } else {
-    pass_menu_chord_fired_ = false;
-    pass_menu_chord_at_ = {};
+  } else if (pass_ps_down_at_.time_since_epoch().count() != 0) {
+    if (!pass_ps_long_fired_) out.menu_toggle = true;
+    pass_ps_down_at_ = {};
+    pass_ps_long_fired_ = false;
   }
-  if (recenter_chord) {
-    if (!pass_recenter_chord_fired_) {
-      if (pass_recenter_chord_at_.time_since_epoch().count() == 0) pass_recenter_chord_at_ = now;
-      if (now - pass_recenter_chord_at_ >= kChordHold) {
-        pass_recenter_chord_fired_ = true;
-        out.recenter = true;
-      }
+
+  if (pass_options_down_) {
+    if (pass_options_down_at_.time_since_epoch().count() == 0) {
+      pass_options_down_at_ = now;
+      pass_options_long_fired_ = false;
+    } else if (!pass_options_long_fired_ && now - pass_options_down_at_ >= kStartLongPress) {
+      pass_options_long_fired_ = true;
+      out.recenter = true;
     }
   } else {
-    pass_recenter_chord_fired_ = false;
-    pass_recenter_chord_at_ = {};
+    pass_options_down_at_ = {};
+    pass_options_long_fired_ = false;
   }
   return out;
 #endif
@@ -573,7 +569,7 @@ GamepadInput::State GamepadInput::poll() {
   const bool y = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_Y) != 0;
   const bool l3 = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSTICK) != 0;
   const bool r3 = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_RIGHTSTICK) != 0;
-  // Global: PS long → menu, L3+R3 → recenter. Options long also opens menu.
+  // PS short → menu; Options long → recenter. (App: PS long → short PS via pad filter/hook.)
   const bool options = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_START) != 0;
   const bool ps = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_GUIDE) != 0;
   const bool lb = SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_LEFTSHOULDER) != 0;
@@ -585,7 +581,7 @@ GamepadInput::State GamepadInput::poll() {
   st.back_held = b;
   st.face_x = edge(x, prev_x_);
   st.face_y = edge(y, prev_y_);
-  // R3 alone resets view look; L3+R3 is recenter (handled below).
+  // R3 alone resets view look.
   st.view_reset = edge(r3 && !l3, prev_r3_);
   const auto now = std::chrono::steady_clock::now();
   st.seek_back_held = lb;
@@ -602,7 +598,7 @@ GamepadInput::State GamepadInput::poll() {
       options_long_fired_ = false;
       options_down_at_ = now;
     } else if (!options_long_fired_ && now - options_down_at_ >= kStartLongPress) {
-      st.menu_toggle = true;
+      st.recenter = true;
       options_long_fired_ = true;
     }
   } else if (options_down_) {
@@ -616,24 +612,16 @@ GamepadInput::State GamepadInput::poll() {
       ps_long_fired_ = false;
       ps_down_at_ = now;
     } else if (!ps_long_fired_ && now - ps_down_at_ >= kStartLongPress) {
-      st.menu_toggle = true;
-      ps_long_fired_ = true;
+      ps_long_fired_ = true;  // long: app short-PS via filter/hook; no menu here
     }
   } else if (ps_down_) {
+    if (!ps_long_fired_) st.menu_toggle = true;  // short release → menu
     ps_down_ = false;
     ps_long_fired_ = false;
   }
 
   l3_down_ = l3;
   r3_down_ = r3;
-  if (l3 && r3) {
-    if (!l3r3_recenter_fired_) {
-      l3r3_recenter_fired_ = true;
-      st.recenter = true;
-    }
-  } else {
-    l3r3_recenter_fired_ = false;
-  }
 
   return st;
 #endif
