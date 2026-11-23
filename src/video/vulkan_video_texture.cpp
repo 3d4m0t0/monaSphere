@@ -267,7 +267,16 @@ bool VulkanVideoTexture::wait_avframe_decode(const AVFrame* frame, uint64_t time
   const bool infinite = (timeout_ns == 0);
   const auto t0 = std::chrono::steady_clock::now();
   const auto deadline = t0 + std::chrono::nanoseconds(infinite ? 0 : timeout_ns);
-  auto next_stall_log = t0 + std::chrono::milliseconds(1000);
+  // Kick only after a real stall. Immediate/frequent kicks race acquire_gpu on the
+  // shared cmd_/fence_ (prepare_display unlocks mu_ before acquire) → DEVICE_LOST.
+  // Short discard budgets (approach skip ≤64ms) kick after ~6ms so PowerMizer ramps.
+  const bool discard_budget =
+      !infinite && timeout_ns > 0 && timeout_ns <= 64'000'000ull;
+  const double kick_after_ms = discard_budget ? 6.0 : 200.0;
+  const auto kick_period =
+      discard_budget ? std::chrono::milliseconds(40) : std::chrono::milliseconds(500);
+  auto next_stall_log =
+      t0 + std::chrono::milliseconds(static_cast<int64_t>(kick_after_ms));
   VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
   wi.semaphoreCount = n;
   wi.pSemaphores = sems;

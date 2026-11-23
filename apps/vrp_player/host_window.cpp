@@ -9373,6 +9373,17 @@ void HostWindow::xrThreadMain() {
       VRP_TEARDOWN_LOG("XR teardown: vulkan decode idle %lld ms ok=%d",
                        static_cast<long long>(ms), submit == VK_SUCCESS ? 1 : 0);
     }
+    // PowerMizer AUTO: keep clocks up while VkVideoSession still exists. NVIDIA's
+    // video thread otherwise sleeps and only wakes inside vkDestroyInstance (~100s),
+    // poisoning the next xrCreateVulkanInstanceKHR.
+    VRP_TEARDOWN_LOG("XR teardown: PowerMizer kick before video session destroy…");
+    for (int i = 0; i < 20; ++i) {
+      vulkan_tex.kick_gpu_activity();
+      if ((i % 5) == 0) xr.kick_queues_for_teardown(1, 0);
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    xr.kick_queues_for_teardown(10, 50);
+    VRP_TEARDOWN_LOG("XR teardown: PowerMizer kick done");
     // AVVkFrames before avcodec_free_context, so the VkVideoSession is destroyed
     // with no outstanding images. CUDA imports before decoder.close(), while the
     // NVDEC CUcontext that imported them is still alive.

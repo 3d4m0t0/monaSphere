@@ -2744,17 +2744,38 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
             out.width = 0;
             out.height = 0;
           };
+          auto note_recycle_wait = [&](double wms, const char* kind) {
+            ++seek_timing_recycle_n_;
+            seek_timing_recycle_ms_ += wms;
+            if (wms >= 2.0 || vrp_seek_detail_enabled()) {
+              VRP_SEEK_LOG("seekdbg: recycle %s %.1fms why=%s discard=%d pts=%.3f | %s", kind,
+                      wms, wait_why ? wait_why : "?", approach_discard ? 1 : 0, out.pts_sec,
+                      vulkan_tex_->debug_state().c_str());
+            }
+          };
           if (!want_mailbox) {
             // Seek armed: do not block apply behind recycle wait — seek_req handler
             // waits for the real GPU timeline in pre_flush, then +1 / flush.
             if (drop_for_seek) {
+              ++seek_timing_bail_req_n_;
               lock.lock();
               set_decode_phase("receive_bail_req");
               out.width = 0;
               out.height = 0;
               return true;
             }
-            const bool recycled = vulkan_tex_->recycle_frame(ff_->frame, wait_ns, &wait_why);
+            const auto rt0 = std::chrono::steady_clock::now();
+            bool recycled = vulkan_tex_->recycle_frame(ff_->frame, wait_ns, &wait_why);
+            // Cold GPU / PowerMizer: one kick + short extend, then reopen if still stuck.
+            if (!recycled && approach_discard && wait_why &&
+                std::strcmp(wait_why, "timeout") == 0) {
+              vulkan_tex_->kick_gpu_activity();
+              recycled = vulkan_tex_->recycle_frame(ff_->frame, 80'000'000ull, &wait_why);
+            }
+            note_recycle_wait(std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - rt0)
+                                  .count(),
+                              skip_frame ? (skip_past ? "past" : "skip") : "bail");
             if (!recycled && wait_why && std::strcmp(wait_why, "timeout") == 0) {
               recover_land_timeout();
               return true;

@@ -451,6 +451,9 @@ void XrVulkanApp::shutdown_device() {
   VRP_TEARDOWN_LOG("XR: shutdown ffmpeg hwctx reset…");
   drop_ffmpeg_hwctx();
   VRP_TEARDOWN_LOG("XR: shutdown ffmpeg hwctx reset done");
+  // PowerMizer AUTO: wake clocks while graphics + decode queues still exist so
+  // NVIDIA's video thread can finish before DestroyDevice / DestroyInstance.
+  kick_queues_for_teardown(15, 40);
   // Vulkan Video's decode engine is not always finished by vkDeviceWaitIdle.
   // Idling the decode queue while the device still exists speeds vkDestroyInstance.
   if (video_decode_queue_ != VK_NULL_HANDLE) {
@@ -526,6 +529,179 @@ void XrVulkanApp::shutdown_device() {
                    pending_vk_instance_ != VK_NULL_HANDLE ? 1 : 0);
 }
 
+namespace {
+
+/** Side-channel PowerMizer poke: XR device is already gone during DestroyInstance. */
+struct PowermizerKickHelper {
+  VkInstance inst = VK_NULL_HANDLE;
+  VkDevice dev = VK_NULL_HANDLE;
+  VkQueue queue = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  bool ready = false;
+
+  bool init() {
+    VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    ai.pApplicationName = "monasphere-teardown-kick";
+    ai.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    ici.pApplicationInfo = &ai;
+    if (vkCreateInstance(&ici, nullptr, &inst) != VK_SUCCESS || !inst) return false;
+    uint32_t n = 0;
+    vkEnumeratePhysicalDevices(inst, &n, nullptr);
+    if (n == 0) return false;
+    std::vector<VkPhysicalDevice> phys(n);
+    vkEnumeratePhysicalDevices(inst, &n, phys.data());
+    VkPhysicalDevice pick = VK_NULL_HANDLE;
+    uint32_t qfam = UINT32_MAX;
+    for (VkPhysicalDevice pd : phys) {
+      VkPhysicalDeviceProperties props{};
+      vkGetPhysicalDeviceProperties(pd, &props);
+      uint32_t qn = 0;
+      vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, nullptr);
+      std::vector<VkQueueFamilyProperties> qf(qn);
+      vkGetPhysicalDeviceQueueFamilyProperties(pd, &qn, qf.data());
+      for (uint32_t i = 0; i < qn; ++i) {
+        if (!(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) continue;
+        // Prefer NVIDIA discrete — PowerMizer hang is ICD-side.
+        if (props.vendorID == 0x10de) {
+          pick = pd;
+          qfam = i;
+          break;
+        }
+        if (!pick) {
+          pick = pd;
+          qfam = i;
+        }
+      }
+      if (pick && props.vendorID == 0x10de) break;
+    }
+    if (!pick || qfam == UINT32_MAX) return false;
+    float prio = 0.f;
+    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    qci.queueFamilyIndex = qfam;
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    if (vkCreateDevice(pick, &dci, nullptr, &dev) != VK_SUCCESS || !dev) return false;
+    vkGetDeviceQueue(dev, qfam, 0, &queue);
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = qfam;
+    if (vkCreateCommandPool(dev, &pci, nullptr, &pool) != VK_SUCCESS) return false;
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(dev, &cai, &cmd) != VK_SUCCESS) return false;
+    VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vkCreateFence(dev, &fi, nullptr, &fence) != VK_SUCCESS) return false;
+    ready = true;
+    return true;
+  }
+
+  void kick() {
+    if (!ready) return;
+    vkResetFences(dev, 1, &fence);
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return;
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) return;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) return;
+    (void)vkWaitForFences(dev, 1, &fence, VK_TRUE, 50'000'000ull);
+  }
+
+  /**
+   * Bounded release — never vkDeviceWaitIdle. After a fast XR DestroyInstance that
+   * call can sit ~10s on NVIDIA while holding the teardown path on join().
+   */
+  void shutdown() {
+    ready = false;
+    if (dev) {
+      if (fence) {
+        (void)vkWaitForFences(dev, 1, &fence, VK_TRUE, 50'000'000ull);
+        vkDestroyFence(dev, fence, nullptr);
+        fence = VK_NULL_HANDLE;
+      }
+      if (pool) {
+        vkDestroyCommandPool(dev, pool, nullptr);
+        pool = VK_NULL_HANDLE;
+      }
+      cmd = VK_NULL_HANDLE;
+      queue = VK_NULL_HANDLE;
+      vkDestroyDevice(dev, nullptr);
+      dev = VK_NULL_HANDLE;
+    }
+    if (inst) {
+      vkDestroyInstance(inst, nullptr);
+      inst = VK_NULL_HANDLE;
+    }
+  }
+};
+
+}  // namespace
+
+void XrVulkanApp::kick_queues_for_teardown(int rounds, int interval_ms) {
+  if (!device_ || !queue_ || !command_pool_ || rounds <= 0) return;
+  VRP_TEARDOWN_LOG("XR: teardown PowerMizer kick %d×%dms (device+decode still live)", rounds,
+                   interval_ms);
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cai.commandPool = command_pool_;
+  cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cai.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(device_, &cai, &cmd) != VK_SUCCESS || !cmd) return;
+  VkFence fence = VK_NULL_HANDLE;
+  VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(device_, &fi, nullptr, &fence) != VK_SUCCESS) {
+    vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+    return;
+  }
+  for (int i = 0; i < rounds; ++i) {
+    vkResetFences(device_, 1, &fence);
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) == VK_SUCCESS && vkEndCommandBuffer(cmd) == VK_SUCCESS) {
+      VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+      si.commandBufferCount = 1;
+      si.pCommandBuffers = &cmd;
+      {
+        std::lock_guard<std::mutex> lock(queue_mu_);
+        (void)vkQueueSubmit(queue_, 1, &si, fence);
+      }
+      (void)vkWaitForFences(device_, 1, &fence, VK_TRUE, 50'000'000ull);
+    }
+    if (video_decode_queue_ != VK_NULL_HANDLE) {
+      VkFence df = VK_NULL_HANDLE;
+      if (vkCreateFence(device_, &fi, nullptr, &df) == VK_SUCCESS) {
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        VkResult r = VK_ERROR_DEVICE_LOST;
+        {
+          std::lock_guard<std::mutex> lock(queue_mu_);
+          r = vkQueueSubmit(video_decode_queue_, 1, &si, df);
+        }
+        if (r == VK_SUCCESS) (void)vkWaitForFences(device_, 1, &df, VK_TRUE, 50'000'000ull);
+        vkDestroyFence(device_, df, nullptr);
+      }
+    }
+    if ((i + 1) == 1 || (i + 1) == rounds || ((i + 1) % 10) == 0) {
+      VRP_TEARDOWN_LOG("XR: teardown PowerMizer kick %d/%d", i + 1, rounds);
+    }
+    if (interval_ms > 0 && i + 1 < rounds)
+      std::this_thread::sleep_for(std::chrono::milliseconds(interval_ms));
+  }
+  vkDestroyFence(device_, fence, nullptr);
+  vkFreeCommandBuffers(device_, command_pool_, 1, &cmd);
+}
+
 void XrVulkanApp::destroy_vk_instance() {
   if (shutdown_done_.exchange(true, std::memory_order_acq_rel)) return;
 
@@ -534,17 +710,73 @@ void XrVulkanApp::destroy_vk_instance() {
   pending_vk_instance_ = VK_NULL_HANDLE;
   vk_instance_ = VK_NULL_HANDLE;
   if (vk_inst != VK_NULL_HANDLE) {
-    // Runtime still alive: ICD/compositor can drop the client cleanly.
+    // Device is gone — side-channel kicks keep PowerMizer up while ICD drains
+    // residual Vulkan Video / compositor client state (else DestroyInstance can
+    // sit for ~100s and the next xrCreateVulkanInstanceKHR wedges).
+    std::atomic<bool> kick_done{false};
+    auto kick_finished = std::make_shared<std::atomic<bool>>(false);
+    std::thread kicker([&, kick_finished] {
+      PowermizerKickHelper helper;
+      if (!helper.init()) {
+        VRP_TEARDOWN_LOG("XR: PowerMizer kick helper unavailable during DestroyInstance");
+        while (!kick_done.load(std::memory_order_acquire))
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        kick_finished->store(true, std::memory_order_release);
+        return;
+      }
+      VRP_TEARDOWN_LOG("XR: PowerMizer kick helper live during DestroyInstance");
+      int n = 0;
+      while (!kick_done.load(std::memory_order_acquire)) {
+        helper.kick();
+        ++n;
+        if (n == 1 || n == 10 || (n % 50) == 0)
+          VRP_TEARDOWN_LOG("XR: DestroyInstance PowerMizer kick #%d", n);
+        // Short slices so a finished DestroyInstance is noticed quickly.
+        for (int s = 0; s < 10 && !kick_done.load(std::memory_order_acquire); ++s)
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      const auto s0 = std::chrono::steady_clock::now();
+      helper.shutdown();
+      const auto sm = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - s0)
+                          .count();
+      VRP_TEARDOWN_LOG("XR: PowerMizer kick helper stopped (%d kicks, shutdown %lld ms)", n,
+                       static_cast<long long>(sm));
+      kick_finished->store(true, std::memory_order_release);
+    });
     const auto t0 = std::chrono::steady_clock::now();
     VRP_TEARDOWN_LOG("XR: shutdown vkDestroyInstance enter");
     vkDestroyInstance(vk_inst, nullptr);
     const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0)
                         .count();
+    kick_done.store(true, std::memory_order_release);
+    // Cap join: XR DestroyInstance already done — do not stall Host on helper ICD quirks.
+    constexpr auto kJoinBudget = std::chrono::milliseconds(400);
+    const auto join_deadline = std::chrono::steady_clock::now() + kJoinBudget;
+    while (!kick_finished->load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < join_deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    if (kick_finished->load(std::memory_order_acquire)) {
+      kicker.join();
+    } else {
+      VRP_TEARDOWN_LOG("XR: PowerMizer kick helper still draining — detach (DestroyInstance %lld ms)",
+                       static_cast<long long>(ms));
+      kicker.detach();
+    }
     VRP_TEARDOWN_LOG("XR: shutdown vkDestroyInstance leave %lld ms", static_cast<long long>(ms));
+    if (ms >= 5000) {
+      // Next connect must restart Monado — residual ICD client blocks create.
+      crash_guard::mark_session_active();
+      VRP_TEARDOWN_LOG(
+          "XR: DestroyInstance slow (%lld ms) — leave unclean cookie for Monado restart",
+          static_cast<long long>(ms));
+    } else {
+      crash_guard::clear_session_cookie();
+    }
+  } else {
+    crash_guard::clear_session_cookie();
   }
-  crash_guard::clear_session_cookie();
-  // Safety net for a following process if anything still races the GPU.
   crash_guard::mark_vulkan_client_released();
   VRP_TEARDOWN_LOG("XR: shutdown end");
 }

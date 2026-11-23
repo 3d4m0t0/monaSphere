@@ -74,6 +74,12 @@ class XrVulkanApp {
   void shutdown_device();
   /** vkDestroyInstance while the runtime is still alive. Call after shutdown_device(). */
   void destroy_vk_instance();
+  /**
+   * Empty submits on graphics + video-decode queues (PowerMizer AUTO wake).
+   * Call while VkDevice / VkVideoSession still exist — before decoder.close /
+   * DestroyDevice — so NVIDIA's video thread can finish before DestroyInstance.
+   */
+  void kick_queues_for_teardown(int rounds = 20, int interval_ms = 50);
 
   /** Must be set before init(). Defaults: Oculus Touch + right hand. */
   void set_controller_prefs(ControllerProfile profile, ControllerHand hand);
