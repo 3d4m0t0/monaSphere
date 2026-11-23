@@ -209,6 +209,12 @@ class VrMenu {
     int desktop_monitor_span = 1;
     /** Busy-status label (app or title name). */
     std::string desktop_app_label;
+    /** [アプリ] live AppMenu: cycle Near/Cinema/Far seat. */
+    bool cycle_flat_seat = false;
+    /** Absolute preset index when cycle_flat_seat (0..kFlatScalePresetCount-1). */
+    int flat_seat_index = 0;
+    /** [アプリ] live AppMenu: stop app, destroy Virtual, restore launch place. */
+    bool leave_desktop_app = false;
   };
 
   struct PadInput {
@@ -441,6 +447,15 @@ class VrMenu {
   std::vector<DesktopApp> desktop_apps_;
   /** Index into desktop_apps_ while place_ == AppTitles. */
   int desktop_app_focus_ = -1;
+  /** True while a desktop [アプリ] session owns the Virtual (PS opens AppMenu). */
+  bool desktop_app_live_ = false;
+  /** Title bar label for AppMenu (= configured app / title name at launch). */
+  std::string app_live_label_;
+  /** Browser place to restore after Exit / process exit. */
+  Place app_return_place_ = Place::AppsList;
+  int app_return_focus_ = -1;
+  /** Synced Near/Cinema/Far index for AppMenu seat row (-1 = custom → show Near). */
+  int flat_seat_index_ = 1;
   std::vector<Entry> entries_;
   int cursor_ = 0;
   int scroll_ = 0;

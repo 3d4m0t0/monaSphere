@@ -942,7 +942,7 @@ void VrMenu::move_cursor(int delta) {
 }
 
 void VrMenu::page_cursor(int dir) {
-  if (screen_ != Screen::Browser || entries_.empty() || dir == 0) return;
+  if ((screen_ != Screen::Browser && screen_ != Screen::AppMenu) || entries_.empty() || dir == 0) return;
   const int n = static_cast<int>(entries_.size());
   const int page = std::max(1, kVisibleRows);
   const int max_scroll = std::max(0, n - page);
@@ -1285,6 +1285,68 @@ void VrMenu::show_apps_list() {
   bump();
 }
 
+void VrMenu::show_app_return_place() {
+  visible_ = true;
+  controls_visible_ = false;
+  close_controls_edit();
+  clear_desktop_app_live();
+  screen_ = Screen::Browser;
+  Place want = app_return_place_;
+  int focus = app_return_focus_;
+  if (want == Place::AppTitles) {
+    if (focus < 0 || focus >= static_cast<int>(desktop_apps_.size())) {
+      want = Place::AppsList;
+      focus = -1;
+    }
+  } else if (want != Place::AppsList) {
+    want = Place::AppsList;
+    focus = -1;
+  }
+  place_ = want;
+  desktop_app_focus_ = focus;
+  if (place_ == Place::AppTitles) {
+    refresh_dir({});
+  } else {
+    refresh_dir({});
+  }
+  bump();
+}
+
+void VrMenu::set_flat_seat_index(int index) {
+  if (index < -1 || index >= kFlatScalePresetCount) return;
+  if (flat_seat_index_ == index) return;
+  flat_seat_index_ = index;
+  if (visible_ && screen_ == Screen::AppMenu) {
+    const int keep = cursor_;
+    rebuild_app_menu();
+    cursor_ = std::clamp(keep, 0, std::max(0, static_cast<int>(entries_.size()) - 1));
+    sync_list_pose();
+    bump();
+  }
+}
+
+void VrMenu::clear_desktop_app_live() {
+  desktop_app_live_ = false;
+  if (screen_ == Screen::AppMenu) screen_ = Screen::Browser;
+}
+
+void VrMenu::rebuild_app_menu() {
+  entries_.clear();
+  const int idx = (flat_seat_index_ >= 0 && flat_seat_index_ < kFlatScalePresetCount) ? flat_seat_index_ : 0;
+  Entry dist;
+  // Screen distance presets (Near / Cinema / Far) — not seat wording.
+  dist.name = std::string("スクリーン距離  ") + kFlatScalePresets[idx].name;
+  dist.is_special = true;
+  entries_.push_back(std::move(dist));
+  Entry leave;
+  leave.name = "終了";
+  leave.is_special = true;
+  entries_.push_back(std::move(leave));
+  cursor_ = std::clamp(cursor_, 0, static_cast<int>(entries_.size()) - 1);
+  scroll_ = 0;
+  sync_list_pose();
+}
+
 void VrMenu::go_back() {
   if (screen_ == Screen::Format) {
     screen_ = Screen::Browser;
@@ -1496,8 +1558,13 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     } else {
       visible_ = true;
       controls_visible_ = false;
-      screen_ = Screen::Browser;
       close_controls_edit();
+      if (desktop_app_live_) {
+        screen_ = Screen::AppMenu;
+        rebuild_app_menu();
+      } else {
+        screen_ = Screen::Browser;
+      }
     }
     bump();
     return out;
@@ -1672,7 +1739,9 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
       return;
     }
     if (dy != 0) {
-      if (visible_ && (screen_ == Screen::Browser || screen_ == Screen::Format) && !controls_visible_) {
+      if (visible_ &&
+          (screen_ == Screen::Browser || screen_ == Screen::Format || screen_ == Screen::AppMenu) &&
+          !controls_visible_) {
         move_cursor(dy);
         nav_cooldown_ = 0.15f;
         return;
@@ -1690,7 +1759,8 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   const bool nav_down = in.nav_down || in.stick_y < -0.55f;
   const bool nav_left = in.nav_left || in.stick_x < -0.55f;
   const bool nav_right = in.nav_right || in.stick_x > 0.55f;
-  if (visible_ && !controls_visible_ && screen_ == Screen::Browser) {
+  if (visible_ && !controls_visible_ &&
+      (screen_ == Screen::Browser || screen_ == Screen::AppMenu)) {
     stick_seek_repeat_ = {};
     if (seek_gliding_) {
       seek_bar_sec_ = seek_target_sec_;
@@ -1926,6 +1996,21 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
           bump();
         } else {
           activate();
+        }
+      }
+    } else if (screen_ == Screen::AppMenu) {
+      if (!entries_.empty() && cursor_ >= 0 && cursor_ < static_cast<int>(entries_.size())) {
+        if (cursor_ == 0) {
+          flat_seat_index_ = next_flat_scale_preset(flat_seat_index_);
+          out.cycle_flat_seat = true;
+          out.flat_seat_index = flat_seat_index_;
+          rebuild_app_menu();
+          bump();
+        } else {
+          out.leave_desktop_app = true;
+          desktop_app_live_ = false;
+          visible_ = false;
+          bump();
         }
       }
     } else if (screen_ == Screen::Format) {

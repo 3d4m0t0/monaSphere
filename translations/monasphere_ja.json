@@ -481,6 +481,41 @@
       "translation": "再生速度1倍"
     },
     {
+      "context": "Preferences",
+      "source": "Live URL",
+      "translation": "Live URL"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "Slots #0–#9. Label and URL (https://…). Empty slots are unused. #0 defaults to YouTube.",
+      "translation": "スロット #0〜#9。ラベルと URL（https://…）。空欄は未使用。#0 の初期値は YouTube。"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "Label",
+      "translation": "ラベル"
+    },
+    {
+      "context": "PreferencesDialog",
+      "source": "#%1",
+      "translation": "#%1"
+    },
+    {
+      "context": "monaSphere",
+      "source": "Screen distance (Near/Cinema/Far)",
+      "translation": "スクリーン距離（Near/Cinema/Far）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Screen distance  %1",
+      "translation": "スクリーン距離  %1"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Screen distance: %1 (%2° / %3 m)",
+      "translation": "スクリーン距離: %1（%2° / %3 m）"
+    },
+    {
       "context": "HostWindow",
       "source": "Wait",
       "translation": "待機"

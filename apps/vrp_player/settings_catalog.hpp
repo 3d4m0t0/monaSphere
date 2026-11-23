@@ -26,6 +26,7 @@ enum class PrefsPage {
   Audio,      // 音声
   Sky,        // 空
   Live,       // Live
+  LiveUrl,    // Live URL (#0–#9)
   Decode,     // デコード
   Other,      // その他（ファイルダイアログ・サムネなど）
 };

@@ -35,6 +35,8 @@ class PreferencesDialog : public QDialog {
   void buildUi(const QHash<QString, QString>& values);
   QWidget* buildPage(vrp::settings::PrefsPage page, const QHash<QString, QString>& values);
   void addEntryRow(QFormLayout* form, const vrp::settings::Entry& e, const QString& value);
+  /** Live page: fixed slots live_app[0]…[9] (label + URL). */
+  void addLiveUrlSection(QFormLayout* form, const QHash<QString, QString>& values);
   /** Load a value hash into existing editors (Reset / Defaults). */
   void setEditorsFrom(const QHash<QString, QString>& values);
   /** Catalog defaults for keys that appear in this dialog. */
@@ -43,6 +45,8 @@ class PreferencesDialog : public QDialog {
   void wireHrtfTrimLock();
   /** When “Sky from timezone” is on, lat/lon editors are disabled (grayed out). */
   void wireSkyFromTimezone();
+
+  static constexpr int kLiveAppSlots = 10;
 
   QListWidget* sidebar_ = nullptr;
   QStackedWidget* stack_ = nullptr;

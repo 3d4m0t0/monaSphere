@@ -1578,10 +1578,17 @@ QStringList normalizeLiveExecArgs(const QStringList& fields) {
 void HostWindow::saveAppConf() const {
   setMonasphereConfKey(QStringLiteral("fsr"), QString::number(static_cast<int>(preferred_fsr_)));
   setMonasphereConfKey(QStringLiteral("live_fsr"), QString::number(static_cast<int>(live_fsr_)));
+  setMonasphereConfKey(QStringLiteral("fsr_scales"), QString::number(fsr_scales_));
+  setMonasphereConfKey(QStringLiteral("live_fsr_scales"), QString::number(live_fsr_scales_));
   setMonasphereConfKey(QStringLiteral("runtime"), usingWivrn() ? QStringLiteral("wivrn") : QStringLiteral("monado"));
-  setMonasphereConfKey(QStringLiteral("flat_fov"), QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("flat_fov"),
+                       QString::number(static_cast<double>(media_flat_fov_deg_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("flat_distance"),
-                       QString::number(static_cast<double>(opt_.screen_distance), 'f', 2));
+                       QString::number(static_cast<double>(media_flat_distance_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("flat_fov_app"),
+                       QString::number(static_cast<double>(app_flat_fov_deg_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("flat_distance_app"),
+                       QString::number(static_cast<double>(app_flat_distance_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("milkyway_gain"),
                        QString::number(static_cast<double>(milkyway_gain_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("file_thumb_distance"),
@@ -1644,9 +1651,13 @@ void HostWindow::loadAppConf() {
                                                  ? QStringLiteral("wivrn")
                                                  : QStringLiteral("monado"));
   defaults.insert(QStringLiteral("flat_fov"),
-                  QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2));
+                  QString::number(static_cast<double>(media_flat_fov_deg_), 'f', 2));
   defaults.insert(QStringLiteral("flat_distance"),
-                  QString::number(static_cast<double>(opt_.screen_distance), 'f', 2));
+                  QString::number(static_cast<double>(media_flat_distance_), 'f', 2));
+  defaults.insert(QStringLiteral("flat_fov_app"),
+                  QString::number(static_cast<double>(app_flat_fov_deg_), 'f', 2));
+  defaults.insert(QStringLiteral("flat_distance_app"),
+                  QString::number(static_cast<double>(app_flat_distance_), 'f', 2));
   if (!last_dir_migrated.isEmpty()) defaults.insert(QStringLiteral("last_dir"), last_dir_migrated);
   migrateYoutubeConfKeysToLive();
   commentOutStaleConf(/*allow_legacy=*/true);
@@ -1668,6 +1679,7 @@ void HostWindow::loadAppConf() {
   if (!user.open(QIODevice::ReadOnly | QIODevice::Text)) return;
   bool legacy_pad_gamepad = false;
   bool saw_gamepad_key = false;
+  bool have_app_flat = false;
   live_apps_.clear();
   live_desktop_apps_.clear();
   QMap<int, LiveAppEntry> live_by_index;
@@ -1760,11 +1772,31 @@ void HostWindow::loadAppConf() {
     } else if (line.startsWith(QStringLiteral("flat_fov="))) {
       bool ok = false;
       const float v = line.mid(9).toFloat(&ok);
-      if (ok && v >= 20.f && v <= 140.f) opt_.flat_fov_deg = v;
+      if (ok && v >= 20.f && v <= 140.f) {
+        media_flat_fov_deg_ = v;
+        opt_.flat_fov_deg = v;
+      }
     } else if (line.startsWith(QStringLiteral("flat_distance="))) {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
-      if (ok && v >= 2.f && v <= 40.f) opt_.screen_distance = v;
+      if (ok && v >= 2.f && v <= 40.f) {
+        media_flat_distance_ = v;
+        opt_.screen_distance = v;
+      }
+    } else if (line.startsWith(QStringLiteral("flat_fov_app="))) {
+      bool ok = false;
+      const float v = line.mid(QStringLiteral("flat_fov_app=").size()).trimmed().toFloat(&ok);
+      if (ok && v >= 20.f && v <= 140.f) {
+        app_flat_fov_deg_ = v;
+        have_app_flat = true;
+      }
+    } else if (line.startsWith(QStringLiteral("flat_distance_app="))) {
+      bool ok = false;
+      const float v = line.mid(QStringLiteral("flat_distance_app=").size()).trimmed().toFloat(&ok);
+      if (ok && v >= 2.f && v <= 40.f) {
+        app_flat_distance_ = v;
+        have_app_flat = true;
+      }
     } else if (line.startsWith(QStringLiteral("milkyway_gain="))) {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
@@ -2001,6 +2033,15 @@ void HostWindow::loadAppConf() {
     }
   }
   user.close();
+  // First upgrade: seed [アプリ] distance from video/Live when app keys were absent.
+  if (!have_app_flat) {
+    app_flat_fov_deg_ = media_flat_fov_deg_;
+    app_flat_distance_ = media_flat_distance_;
+    setMonasphereConfKey(QStringLiteral("flat_fov_app"),
+                         QString::number(static_cast<double>(app_flat_fov_deg_), 'f', 2));
+    setMonasphereConfKey(QStringLiteral("flat_distance_app"),
+                         QString::number(static_cast<double>(app_flat_distance_), 'f', 2));
+  }
   // Locked HRTF trim is fixed at 10 dB (unlock via Preferences Advanced).
   if (!hrtf_trim_unlock_) {
     if (hrtf_trim_db_ < 9.95f || hrtf_trim_db_ > 10.05f) {
@@ -3318,11 +3359,17 @@ void HostWindow::showPreferencesDialog() {
     // Prefer live members when they diverge from a stale conf read.
     if (key == QLatin1String("fsr")) v = QString::number(static_cast<int>(preferred_fsr_));
     else if (key == QLatin1String("live_fsr")) v = QString::number(static_cast<int>(live_fsr_));
+    else if (key == QLatin1String("fsr_scales")) v = QString::number(fsr_scales_);
+    else if (key == QLatin1String("live_fsr_scales")) v = QString::number(live_fsr_scales_);
     else if (key == QLatin1String("hz")) v = QString::number(preferred_hz_);
     else if (key == QLatin1String("flat_fov"))
-      v = QString::number(static_cast<double>(opt_.flat_fov_deg), 'f', 2);
+      v = QString::number(static_cast<double>(media_flat_fov_deg_), 'f', 2);
     else if (key == QLatin1String("flat_distance"))
-      v = QString::number(static_cast<double>(opt_.screen_distance), 'f', 2);
+      v = QString::number(static_cast<double>(media_flat_distance_), 'f', 2);
+    else if (key == QLatin1String("flat_fov_app"))
+      v = QString::number(static_cast<double>(app_flat_fov_deg_), 'f', 2);
+    else if (key == QLatin1String("flat_distance_app"))
+      v = QString::number(static_cast<double>(app_flat_distance_), 'f', 2);
     else if (key == QLatin1String("hwaccel")) v = hwaccel_ ? QStringLiteral("1") : QStringLiteral("0");
     else if (key == QLatin1String("vulkan_video"))
       v = vulkan_video_ ? QStringLiteral("1") : QStringLiteral("0");
@@ -3406,6 +3453,8 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
   for (auto it = values.cbegin(); it != values.cend(); ++it) {
     const QString& key = it.key();
     const QString& value = it.value();
+    // live_app[N] slots are applied as a group below (rebuild HMD list).
+    if (key.startsWith(QLatin1String("live_app["))) continue;
     const QString code = key + QLatin1Char('=') + value;
     if (!vrp::settings::assignmentOk(code, /*allow_legacy=*/false)) {
       appendLog(tr("Preferences: ignored invalid %1=%2").arg(key, value));
@@ -3456,11 +3505,25 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
     } else if (key == QLatin1String("flat_fov")) {
       bool ok = false;
       const float v = value.toFloat(&ok);
-      if (ok) opt_.flat_fov_deg = v;
+      if (ok) {
+        media_flat_fov_deg_ = v;
+        opt_.flat_fov_deg = v;
+      }
     } else if (key == QLatin1String("flat_distance")) {
       bool ok = false;
       const float v = value.toFloat(&ok);
-      if (ok) opt_.screen_distance = v;
+      if (ok) {
+        media_flat_distance_ = v;
+        opt_.screen_distance = v;
+      }
+    } else if (key == QLatin1String("flat_fov_app")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) app_flat_fov_deg_ = v;
+    } else if (key == QLatin1String("flat_distance_app")) {
+      bool ok = false;
+      const float v = value.toFloat(&ok);
+      if (ok) app_flat_distance_ = v;
     } else if (key == QLatin1String("hwaccel")) {
       hwaccel_ = value != QLatin1String("0");
     } else if (key == QLatin1String("vulkan_video")) {
@@ -6115,6 +6178,9 @@ void HostWindow::xrThreadMain() {
     vrp::GamepadInput gamepad;
     bool gamepad_was = false;
     bool gamepad_logged = false;
+    // Keep last pad face style while SDL is closed ([アプリ] pass-through / hook).
+    // Otherwise AppMenu's first paint flashes Xbox A/B after a DualSense session.
+    bool last_pad_sony = false;
     std::string last_gamepad_name;
     std::string last_gamepad_connection;
 
@@ -6644,6 +6710,7 @@ void HostWindow::xrThreadMain() {
     float look_yaw = 0.f;
     float look_pitch = 0.f;
     int flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
+    menu.set_flat_seat_index(flat_scale_index);
 
     xr_decoder_.store(&decoder, std::memory_order_release);
     xr_vulkan_tex_.store(&vulkan_tex, std::memory_order_release);
@@ -7046,35 +7113,77 @@ void HostWindow::xrThreadMain() {
 #endif
       const bool menus_closed =
           !menu.visible() && !menu.controls_visible() && !controls_help_.load();
+      // [アプリ] owns its own Near/Cinema/Far slot; video + browser Live share media_*.
+      const bool app_flat_seat =
+          yt_session_ && yt_session_->desktop_app_mode() && (yt_live || yt_loading);
+      {
+        static bool prev_app_flat_seat = false;
+        if (app_flat_seat != prev_app_flat_seat) {
+          if (app_flat_seat) {
+            opt_.flat_fov_deg = app_flat_fov_deg_;
+            opt_.screen_distance = app_flat_distance_;
+          } else {
+            opt_.flat_fov_deg = media_flat_fov_deg_;
+            opt_.screen_distance = media_flat_distance_;
+          }
+          flat_scale_index = vrp::find_flat_scale_preset(opt_.flat_fov_deg, opt_.screen_distance);
+          menu.set_flat_seat_index(flat_scale_index);
+          scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
+          prev_app_flat_seat = app_flat_seat;
+        }
+      }
       const bool can_flat_scale =
           opt_.projection == vrp::ProjectionMode::Flat && (menus_closed || yt_session);
       const bool scale_press = pad_face_y || input.flat_scale;
-      if (can_flat_scale && scale_press) {
-        flat_scale_index = vrp::next_flat_scale_preset(flat_scale_index);
+      auto apply_flat_seat = [&](int index) {
+        if (index < 0 || index >= vrp::kFlatScalePresetCount) return;
+        flat_scale_index = index;
         const auto& preset = vrp::kFlatScalePresets[flat_scale_index];
         opt_.flat_fov_deg = preset.fov_deg;
         opt_.screen_distance = preset.distance_m;
         scene.set_projection(opt_.projection, opt_.stereo, opt_.flat_fov_deg, opt_.screen_distance);
-        setMonasphereConfKey(QStringLiteral("flat_fov"),
-                             QString::number(static_cast<double>(preset.fov_deg), 'f', 2));
-        setMonasphereConfKey(QStringLiteral("flat_distance"),
-                             QString::number(static_cast<double>(preset.distance_m), 'f', 2));
+        menu.set_flat_seat_index(flat_scale_index);
+        if (app_flat_seat) {
+          app_flat_fov_deg_ = preset.fov_deg;
+          app_flat_distance_ = preset.distance_m;
+          setMonasphereConfKey(QStringLiteral("flat_fov_app"),
+                               QString::number(static_cast<double>(preset.fov_deg), 'f', 2));
+          setMonasphereConfKey(QStringLiteral("flat_distance_app"),
+                               QString::number(static_cast<double>(preset.distance_m), 'f', 2));
+        } else {
+          media_flat_fov_deg_ = preset.fov_deg;
+          media_flat_distance_ = preset.distance_m;
+          setMonasphereConfKey(QStringLiteral("flat_fov"),
+                               QString::number(static_cast<double>(preset.fov_deg), 'f', 2));
+          setMonasphereConfKey(QStringLiteral("flat_distance"),
+                               QString::number(static_cast<double>(preset.distance_m), 'f', 2));
+        }
+        // Match AppMenu row: screen distance + Near/Cinema/Far (not seat wording).
         const QString toast =
-            QStringLiteral("%1  %2° / %3 m")
-                .arg(QString::fromUtf8(preset.name))
-                .arg(static_cast<double>(preset.fov_deg), 0, 'f', 1)
-                .arg(static_cast<double>(preset.distance_m), 0, 'f', 0);
+            tr("Screen distance  %1").arg(QString::fromUtf8(preset.name));
         showHudToast(toast);
         QMetaObject::invokeMethod(
-            this, [this, toast] { appendLog(tr("Flat scale: %1").arg(toast)); }, Qt::QueuedConnection);
+            this,
+            [this, toast, fov = preset.fov_deg, dist = preset.distance_m] {
+              appendLog(tr("Screen distance: %1 (%2° / %3 m)")
+                            .arg(toast)
+                            .arg(static_cast<double>(fov), 0, 'f', 1)
+                            .arg(static_cast<double>(dist), 0, 'f', 0));
+            },
+            Qt::QueuedConnection);
+      };
+      if (can_flat_scale && scale_press) {
+        apply_flat_seat(vrp::next_flat_scale_preset(flat_scale_index));
       }
 
-      // Provisional Live FSR cycle: □ / X while browser Live, menus closed.
-      // Off → 1.3× → 1.5× → 2.0× → Off; writes conf live_fsr. Skips [アプリ] only.
+      // □ / X: Live browser → live_fsr cycle; else file decoder → preferred_fsr.
+      // Walks Off + Preferences-checked scales only (empty mask stays Off).
       const bool can_live_fsr_cycle =
           yt_live && yt_session_ && !yt_session_->desktop_app_mode() && menus_closed;
+      const bool can_file_fsr_cycle =
+          menus_closed && !yt_session && decoder.is_open() && !fsr_locked_8k_.load();
       if (can_live_fsr_cycle && pad_face_x) {
-        live_fsr_ = vrp::next_fsr_mode(live_fsr_);
+        live_fsr_ = vrp::next_fsr_mode(live_fsr_, live_fsr_scales_);
         const auto mode = live_fsr_;
         QMetaObject::invokeMethod(
             this,
@@ -9598,6 +9707,7 @@ void HostWindow::xrThreadMain() {
         constexpr float kHudDistanceM = 1.5f;
         constexpr float kHudAspect = 1.05f;
         auto apply_layout = [&](int kind) {
+          // AppMenu uses the same HUD distance/scale as the browser; compactness is paint-only.
           if (kind == 1 || kind == 2) {
             scene.set_hud_layout(0.70f, kHudDistanceM, kHudAspect);
           } else if (kind == 3 || kind == 4) {

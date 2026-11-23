@@ -139,17 +139,20 @@ void PreferencesDialog::buildUi(const QHash<QString, QString>& values) {
   stack_ = new QStackedWidget(this);
 
   const vrp::settings::PrefsPage pages[] = {
-      vrp::settings::PrefsPage::Video,  vrp::settings::PrefsPage::Audio,
-      vrp::settings::PrefsPage::Sky,    vrp::settings::PrefsPage::Live,
-      vrp::settings::PrefsPage::Decode, vrp::settings::PrefsPage::Other,
+      vrp::settings::PrefsPage::Video,   vrp::settings::PrefsPage::Audio,
+      vrp::settings::PrefsPage::Sky,     vrp::settings::PrefsPage::Live,
+      vrp::settings::PrefsPage::LiveUrl, vrp::settings::PrefsPage::Decode,
+      vrp::settings::PrefsPage::Other,
   };
   for (vrp::settings::PrefsPage page : pages) {
-    bool has = false;
-    for (const vrp::settings::Entry& e : vrp::settings::prefsEntries()) {
-      const auto p = vrp::settings::prefsPageFor(e);
-      if (p && *p == page) {
-        has = true;
-        break;
+    bool has = (page == vrp::settings::PrefsPage::LiveUrl);
+    if (!has) {
+      for (const vrp::settings::Entry& e : vrp::settings::prefsEntries()) {
+        const auto p = vrp::settings::prefsPageFor(e);
+        if (p && *p == page) {
+          has = true;
+          break;
+        }
       }
     }
     if (!has) continue;
@@ -218,6 +221,10 @@ QWidget* PreferencesDialog::buildPage(vrp::settings::PrefsPage page,
     addEntryRow(form, e, v);
   }
 
+  if (page == vrp::settings::PrefsPage::LiveUrl) {
+    addLiveUrlSection(form, values);
+  }
+
   if (any_adv) {
     auto* adv = new QLabel(tr("Advanced"), page_w);
     QFont af = adv->font();
@@ -242,6 +249,56 @@ QWidget* PreferencesDialog::buildPage(vrp::settings::PrefsPage page,
   outer->addStretch(1);
   scroll->setWidget(page_w);
   return scroll;
+}
+
+void PreferencesDialog::addLiveUrlSection(QFormLayout* form, const QHash<QString, QString>& values) {
+  auto* hint = new WrappingHintLabel(
+      tr("Slots #0–#9. Label and URL (https://…). Empty slots are unused. "
+         "#0 defaults to YouTube."),
+      this);
+  hint->setWordWrap(true);
+  hint->setForegroundRole(QPalette::WindowText);
+  QFont hinf = hint->font();
+  if (hinf.pointSizeF() > 0) hinf.setPointSizeF(hinf.pointSizeF() - 1.0);
+  hint->setFont(hinf);
+  hint->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+  form->addRow(QString(), hint);
+
+  for (int i = 0; i < kLiveAppSlots; ++i) {
+    const QString slot_key = QStringLiteral("live_app[%1]").arg(i);
+    QString raw = values.value(slot_key);
+    if (raw.isEmpty() && i == 0) raw = QStringLiteral("YouTube|https://www.youtube.com/");
+    QString name;
+    QString url;
+    const int bar = raw.indexOf(QLatin1Char('|'));
+    if (bar > 0) {
+      name = raw.left(bar).trimmed();
+      url = raw.mid(bar + 1).trimmed();
+    }
+
+    auto* row = new QWidget(this);
+    auto* lay = new QHBoxLayout(row);
+    lay->setContentsMargins(0, 0, 0, 0);
+    lay->setSpacing(8);
+    auto* name_edit = new QLineEdit(row);
+    name_edit->setPlaceholderText(tr("Label"));
+    name_edit->setText(name);
+    name_edit->setFixedWidth(QFontMetrics(name_edit->font()).horizontalAdvance(QString(12, QLatin1Char('M'))) +
+                             24);
+    auto* url_edit = new QLineEdit(row);
+    url_edit->setPlaceholderText(QStringLiteral("https://…"));
+    url_edit->setText(url);
+    url_edit->setMinimumWidth(QFontMetrics(url_edit->font()).horizontalAdvance(QString(28, QLatin1Char('M'))) +
+                              24);
+    url_edit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    lay->addWidget(name_edit, 0);
+    lay->addWidget(url_edit, 1);
+    row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    editors_.insert(QStringLiteral("live_app_name[%1]").arg(i), name_edit);
+    editors_.insert(QStringLiteral("live_app_url[%1]").arg(i), url_edit);
+    form->addRow(tr("#%1").arg(i), row);
+  }
 }
 
 void PreferencesDialog::addEntryRow(QFormLayout* form, const vrp::settings::Entry& e,
@@ -415,6 +472,9 @@ QHash<QString, QString> PreferencesDialog::prefsDefaults() {
     if (!e.default_value) continue;
     out.insert(QString::fromLatin1(e.key), QString::fromUtf8(e.default_value));
   }
+  out.insert(QStringLiteral("live_app[0]"), QStringLiteral("YouTube|https://www.youtube.com/"));
+  for (int i = 1; i < kLiveAppSlots; ++i)
+    out.insert(QStringLiteral("live_app[%1]").arg(i), QString());
   return out;
 }
 
@@ -423,9 +483,22 @@ void PreferencesDialog::setEditorsFrom(const QHash<QString, QString>& values) {
   for (auto it = editors_.begin(); it != editors_.end(); ++it) {
     const QString& key = it.key();
     QWidget* w = it.value();
+    // live_app name/url editors are filled from live_app[N] below.
+    if (key.startsWith(QLatin1String("live_app_name[")) ||
+        key.startsWith(QLatin1String("live_app_url["))) {
+      continue;
+    }
     QString v = values.value(key);
     if (v.isEmpty()) v = fallback.value(key);
-    if (auto* cb = qobject_cast<QCheckBox*>(w)) {
+    if (w->property("flagsEditor").toBool()) {
+      bool ok = false;
+      unsigned bits = static_cast<unsigned>(v.toInt(&ok));
+      if (!ok) bits = 7u;
+      for (QCheckBox* cb : w->findChildren<QCheckBox*>()) {
+        const int bi = cb->property("flagBit").toInt();
+        cb->setChecked((bits & (1u << bi)) != 0);
+      }
+    } else if (auto* cb = qobject_cast<QCheckBox*>(w)) {
       const bool on = v == QLatin1String("1") ||
                       v.compare(QLatin1String("on"), Qt::CaseInsensitive) == 0;
       cb->setChecked(on);
@@ -452,6 +525,21 @@ void PreferencesDialog::setEditorsFrom(const QHash<QString, QString>& values) {
       edit->setText(v);
     }
   }
+  for (int i = 0; i < kLiveAppSlots; ++i) {
+    const QString slot_key = QStringLiteral("live_app[%1]").arg(i);
+    const QString raw = values.contains(slot_key) ? values.value(slot_key) : fallback.value(slot_key);
+    QString name;
+    QString url;
+    const int bar = raw.indexOf(QLatin1Char('|'));
+    if (bar > 0) {
+      name = raw.left(bar).trimmed();
+      url = raw.mid(bar + 1).trimmed();
+    }
+    if (auto* ne = qobject_cast<QLineEdit*>(editors_.value(QStringLiteral("live_app_name[%1]").arg(i))))
+      ne->setText(name);
+    if (auto* ue = qobject_cast<QLineEdit*>(editors_.value(QStringLiteral("live_app_url[%1]").arg(i))))
+      ue->setText(url);
+  }
   // Re-apply dependent enablement (setChecked may no-op if already matching).
   if (auto* unlock = qobject_cast<QCheckBox*>(editors_.value(QStringLiteral("hrtf_trim_unlock")))) {
     if (auto* trim = qobject_cast<QDoubleSpinBox*>(editors_.value(QStringLiteral("hrtf_trim_db")))) {
@@ -476,8 +564,18 @@ QHash<QString, QString> PreferencesDialog::values() const {
   const bool hrtf_locked = unlock_cb && !unlock_cb->isChecked();
   for (auto it = editors_.cbegin(); it != editors_.cend(); ++it) {
     const QString& key = it.key();
+    if (key.startsWith(QLatin1String("live_app_name[")) ||
+        key.startsWith(QLatin1String("live_app_url["))) {
+      continue;
+    }
     QWidget* w = it.value();
-    if (auto* cb = qobject_cast<QCheckBox*>(w)) {
+    if (w->property("flagsEditor").toBool()) {
+      unsigned bits = 0;
+      for (const QCheckBox* cb : w->findChildren<QCheckBox*>()) {
+        if (cb->isChecked()) bits |= (1u << cb->property("flagBit").toInt());
+      }
+      out.insert(key, QString::number(bits));
+    } else if (auto* cb = qobject_cast<QCheckBox*>(w)) {
       out.insert(key, cb->isChecked() ? QStringLiteral("1") : QStringLiteral("0"));
     } else if (auto* combo = qobject_cast<QComboBox*>(w)) {
       out.insert(key, combo->currentData().toString());
@@ -491,6 +589,21 @@ QHash<QString, QString> PreferencesDialog::values() const {
       }
     } else if (auto* edit = qobject_cast<QLineEdit*>(w)) {
       out.insert(key, edit->text().trimmed());
+    }
+  }
+  for (int i = 0; i < kLiveAppSlots; ++i) {
+    const auto* ne =
+        qobject_cast<const QLineEdit*>(editors_.value(QStringLiteral("live_app_name[%1]").arg(i)));
+    const auto* ue =
+        qobject_cast<const QLineEdit*>(editors_.value(QStringLiteral("live_app_url[%1]").arg(i)));
+    if (!ne || !ue) continue;
+    const QString name = ne->text().trimmed();
+    const QString url = ue->text().trimmed();
+    const QString slot_key = QStringLiteral("live_app[%1]").arg(i);
+    if (name.isEmpty() && url.isEmpty()) {
+      out.insert(slot_key, QString());
+    } else {
+      out.insert(slot_key, name + QLatin1Char('|') + url);
     }
   }
   return out;

@@ -410,6 +410,14 @@ class HostWindow : public QMainWindow {
   bool sky_backdrop_baked_ = true;
   /** monasphere.conf `sky_bake_face`. Cubemap face size 1024/2048/4096 (default 2048). */
   int sky_bake_face_ = 2048;
+  /**
+   * Screen-distance slots (Near/Cinema/Far). `opt_.flat_fov_deg` / `screen_distance`
+   * mirror the active slot. Video + browser Live use media_*; [アプリ] uses app_*.
+   */
+  float media_flat_fov_deg_ = 70.f;
+  float media_flat_distance_ = 12.f;
+  float app_flat_fov_deg_ = 70.f;
+  float app_flat_distance_ = 12.f;
   /** monasphere.conf `surround_gain`. Stereo→4.0 rear for file / Live / [アプリ] (default 0.8; no UI). */
   float surround_gain_ = 0.8f;
   /** monasphere.conf `audio_normalize`. 1 = loudness match on file / Live / [アプリ] (default on; no UI). */

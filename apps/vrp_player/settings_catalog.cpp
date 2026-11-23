@@ -246,7 +246,8 @@ const QVector<Entry>& catalog() {
                  .visibility = Visibility::User,
                  .default_value = "70.00",  // Options::flat_fov_deg cinema seat
                  .label = QT_TR_NOOP("Flat FOV"),
-                 .description = QT_TR_NOOP("Vertical field of view of the flat screen in degrees."),
+                 .description = QT_TR_NOOP(
+                     "Vertical FOV for video and browser Live (degrees; Near/Cinema/Far)."),
                  .float_lo = 20.f,
                  .float_hi = 140.f});
     e.push_back({.key = "flat_distance",
@@ -255,7 +256,26 @@ const QVector<Entry>& catalog() {
                  .visibility = Visibility::User,
                  .default_value = "12.00",  // Options::screen_distance (Cinema)
                  .label = QT_TR_NOOP("Flat distance"),
-                 .description = QT_TR_NOOP("Distance to the flat screen in meters (seat preset)."),
+                 .description = QT_TR_NOOP(
+                     "Screen distance for video and browser Live in meters (Near/Cinema/Far)."),
+                 .float_lo = 2.f,
+                 .float_hi = 40.f});
+    e.push_back({.key = "flat_fov_app",
+                 .category = Category::Live,
+                 .kind = ValueKind::Float,
+                 .visibility = Visibility::Auto,
+                 .default_value = "70.00",
+                 .label = QT_TR_NOOP("Flat FOV (App)"),
+                 .description = QT_TR_NOOP("Vertical FOV for desktop [アプリ] (degrees)."),
+                 .float_lo = 20.f,
+                 .float_hi = 140.f});
+    e.push_back({.key = "flat_distance_app",
+                 .category = Category::Live,
+                 .kind = ValueKind::Float,
+                 .visibility = Visibility::Auto,
+                 .default_value = "12.00",
+                 .label = QT_TR_NOOP("Flat distance (App)"),
+                 .description = QT_TR_NOOP("Screen distance for desktop [アプリ] in meters."),
                  .float_lo = 2.f,
                  .float_hi = 40.f});
     e.push_back({.key = "hwaccel",
@@ -664,14 +684,15 @@ std::optional<PrefsPage> prefsPageFor(const Entry& e) {
   // live_chrome_scale: always leave at 1 (Wayland follows output / X11 uses virtual scale).
   // live_capture=window is disabled (monitor+virtual only).
   if (key == QLatin1String("volume") || key == QLatin1String("flat_fov") ||
-      key == QLatin1String("flat_distance") || key == QLatin1String("live_chrome_scale") ||
+      key == QLatin1String("flat_distance") || key == QLatin1String("flat_fov_app") ||
+      key == QLatin1String("flat_distance_app") || key == QLatin1String("live_chrome_scale") ||
       key == QLatin1String("live_capture") || key == QLatin1String("thumb_count") ||
       key == QLatin1String("thumb_edge") || key == QLatin1String("thumb_jpeg")) {
     return std::nullopt;
   }
-  // Decode page: hwaccel / Vulkan (conf Category may still be Video).
+  // Decode page: hwaccel / Vulkan / seek log (conf Category may still be Video).
   if (key == QLatin1String("hwaccel") || key == QLatin1String("vulkan_video") ||
-      key == QLatin1String("vulkan_h264_cb_cuda")) {
+      key == QLatin1String("vulkan_h264_cb_cuda") || key == QLatin1String("seek_detail_log")) {
     return PrefsPage::Decode;
   }
   switch (e.category) {
@@ -708,6 +729,8 @@ QString prefsPageTitle(PrefsPage p) {
       return QCoreApplication::translate("Preferences", "Sky");
     case PrefsPage::Live:
       return QCoreApplication::translate("Preferences", "Live");
+    case PrefsPage::LiveUrl:
+      return QCoreApplication::translate("Preferences", "Live URL");
     case PrefsPage::Decode:
       return QCoreApplication::translate("Preferences", "Decode");
     case PrefsPage::Other:
