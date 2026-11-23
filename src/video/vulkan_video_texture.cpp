@@ -69,6 +69,7 @@ bool VulkanVideoTexture::init(VkPhysicalDevice phys, VkDevice device, VkQueue qu
   }
 
   enabled_ = true;
+  device_lost_.store(false, std::memory_order_release);
   VRP_LOG("VulkanVideoTexture: armed (AVVkFrame mailbox: front+back, decode-ready only)");
   return true;
 }
@@ -286,29 +287,33 @@ bool VulkanVideoTexture::wait_avframe_decode(const AVFrame* frame, uint64_t time
       set_why("abort");
       return false;
     }
+    if (device_lost_.load(std::memory_order_acquire)) {
+      set_why("device_lost");
+      return false;
+    }
     const auto now = std::chrono::steady_clock::now();
     const double ms = std::chrono::duration<double, std::milli>(now - t0).count();
     // Newer seek_req while we wait (scrub stacked, or stop-seek during pre_flush):
     // leave without host-signalling need. Stale apply must not burn the full timeout.
-    if (seek_interrupt_ && seek_interrupt_->load(std::memory_order_acquire) && ms >= 50.0) {
+    // 5ms floor (was 50ms): stacked scrub aborts sooner toward CUDA discard cadence.
+    if (seek_interrupt_ && seek_interrupt_->load(std::memory_order_acquire) && ms >= 5.0) {
       uint64_t cur0 = 0;
       (void)vkGetSemaphoreCounterValue(device_, sems[0], &cur0);
-      VRP_LOG("seekdbg: wait_avframe seek_intr %.0fms need=%llu cur=%llu | %s", ms,
+      VRP_SEEK_LOG("seekdbg: wait_avframe seek_intr %.0fms need=%llu cur=%llu | %s", ms,
               static_cast<unsigned long long>(vals[0]),
               static_cast<unsigned long long>(cur0), debug_state().c_str());
       set_why("seek_intr");
       return false;
     }
     // PowerMizer AUTO: with play/demux paused, clocks stay low and decode CB stalls.
-    // Nudge the graphics queue periodically so clocks can ramp.
-    if (ms >= 200.0 && now >= next_stall_log) {
+    if (ms >= kick_after_ms && now >= next_stall_log) {
       uint64_t cur0 = 0;
       (void)vkGetSemaphoreCounterValue(device_, sems[0], &cur0);
-      VRP_LOG("seekdbg: wait_avframe stall %.0fms need=%llu cur=%llu | %s", ms,
+      VRP_SEEK_LOG("seekdbg: wait_avframe stall %.0fms need=%llu cur=%llu | %s", ms,
               static_cast<unsigned long long>(vals[0]),
               static_cast<unsigned long long>(cur0), debug_state().c_str());
       kick_gpu_activity();
-      next_stall_log = now + std::chrono::milliseconds(500);
+      next_stall_log = now + kick_period;
     }
     if (!infinite) {
       if (now >= deadline) {
@@ -616,6 +621,7 @@ void VulkanVideoTexture::sync_gpu_for_seek_reset() {
 void VulkanVideoTexture::kick_gpu_activity() {
 #if defined(VRP_HAS_FFMPEG)
   std::lock_guard<std::mutex> lock(mu_);
+  if (device_lost_.load(std::memory_order_relaxed)) return;
   if (!device_ || !queue_ || !cmd_ || !fence_) return;
   if (fence_pending_) {
     (void)recover_from_stall_unlocked();
@@ -675,7 +681,7 @@ void VulkanVideoTexture::release_held() {
   // If acquire fence is still pending, do not host_signal front (would leapfrog).
   if (fence_pending_ || (front_.held && !front_.eye_done)) {
     deferred_drop_front_ = front_.held != nullptr;
-    VRP_LOG("seekdbg: release_held keep_front pending=%d eye_done=%d had_front=%d had_back=%d | %s",
+    VRP_SEEK_LOG("seekdbg: release_held keep_front pending=%d eye_done=%d had_front=%d had_back=%d | %s",
             fence_pending_ ? 1 : 0, front_.eye_done ? 1 : 0, had_f, had_b,
             debug_state_locked().c_str());
     return;
@@ -684,7 +690,7 @@ void VulkanVideoTexture::release_held() {
   if (!return_to_ffmpeg(front_, 16'000'000ull)) abandon_slot_locked(front_);
   valid_.store(false, std::memory_order_release);
   present_gen_.fetch_add(1, std::memory_order_acq_rel);
-  VRP_LOG("seekdbg: release_held had_front=%d had_back=%d | %s", had_f, had_b,
+  VRP_SEEK_LOG("seekdbg: release_held had_front=%d had_back=%d | %s", had_f, had_b,
           debug_state_locked().c_str());
 }
 
@@ -704,18 +710,18 @@ void VulkanVideoTexture::release_all_for_flush() {
   if (!return_to_ffmpeg(back_, 2'000'000'000ull)) abandon_slot_locked(back_);
   valid_.store(false, std::memory_order_release);
   present_gen_.fetch_add(1, std::memory_order_acq_rel);
-  VRP_LOG("seekdbg: release_all_for_flush had_front=%d had_back=%d | %s", had_f, had_b,
+  VRP_SEEK_LOG("seekdbg: release_all_for_flush had_front=%d had_back=%d | %s", had_f, had_b,
           debug_state_locked().c_str());
 }
 
 void VulkanVideoTexture::release_back() {
   std::lock_guard<std::mutex> lock(mu_);
   if (!back_.held) {
-    VRP_LOG("seekdbg: release_back (empty) | %s", debug_state_locked().c_str());
+    VRP_SEEK_LOG("seekdbg: release_back (empty) | %s", debug_state_locked().c_str());
     return;
   }
   if (!return_to_ffmpeg(back_, 16'000'000ull)) abandon_slot_locked(back_);
-  VRP_LOG("seekdbg: release_back | %s", debug_state_locked().c_str());
+  VRP_SEEK_LOG("seekdbg: release_back | %s", debug_state_locked().c_str());
 }
 
 VkImageView VulkanVideoTexture::y_view() const {
@@ -891,6 +897,7 @@ bool VulkanVideoTexture::rebuild_views(Slot& slot, AVFrame* frame) {
 
 bool VulkanVideoTexture::acquire_gpu(Slot& slot) {
   if (!slot.held || !slot.held->data[0] || !cmd_ || !fence_) return false;
+  if (device_lost_.load(std::memory_order_acquire)) return false;
   if (slot.acquired) {
     slot.prepared = true;
     return true;
@@ -936,6 +943,11 @@ bool VulkanVideoTexture::acquire_gpu(Slot& slot) {
     return true;
   }
 
+  // Serialize with kick_gpu_activity on the shared cmd_/fence_. prepare_display
+  // unlocks mu_ before calling us; without this lock a seek-path kick can
+  // vkResetCommandBuffer under our feet → DEVICE_LOST.
+  std::lock_guard<std::mutex> lock(mu_);
+  if (device_lost_.load(std::memory_order_relaxed)) return false;
   if (!layout_fence_idle()) return false;
 
   vkResetCommandBuffer(cmd_, 0);
@@ -1002,6 +1014,11 @@ bool VulkanVideoTexture::acquire_gpu(Slot& slot) {
     if (queue_mu_) qlock = std::unique_lock<std::mutex>(*queue_mu_);
     qr = vkQueueSubmit(queue_, 1, &si, fence_);
   }
+  if (qr == VK_ERROR_DEVICE_LOST) {
+    device_lost_.store(true, std::memory_order_release);
+    VRP_ERR("VulkanVideoTexture: acquire DEVICE_LOST — latching (no further submits)");
+    return false;
+  }
   if (qr != VK_SUCCESS) {
     VRP_ERR("VulkanVideoTexture: acquire submit failed (%d)", static_cast<int>(qr));
     return false;
@@ -1049,7 +1066,7 @@ bool VulkanVideoTexture::try_present(const AVFrame* vulkan_frame, bool full_rang
     const int n = late_n.fetch_add(1) + 1;
     if (n <= 12 || (n % 20) == 0 || std::strcmp(why, "seek_intr") == 0 ||
         std::strcmp(why, "abort") == 0) {
-      VRP_LOG("seekdbg: wait_avframe fail why=%s elapsed=%.1fms budget=%.0fms #%d | %s", why, ms,
+      VRP_SEEK_LOG("seekdbg: wait_avframe fail why=%s elapsed=%.1fms budget=%.0fms #%d | %s", why, ms,
               static_cast<double>(wait_ns) / 1.0e6, n, debug_state().c_str());
     }
     if (wait_why) *wait_why = why;
@@ -1093,6 +1110,7 @@ bool VulkanVideoTexture::try_present(const AVFrame* vulkan_frame, bool full_rang
 
 bool VulkanVideoTexture::prepare_display() {
   if (!device_ || !enabled_) return false;
+  if (device_lost_.load(std::memory_order_acquire)) return false;
   std::unique_lock<std::mutex> lock(mu_);
   (void)layout_fence_idle();
 
@@ -1201,7 +1219,7 @@ void VulkanVideoTexture::mark_eye_done() {
   if (!return_to_ffmpeg(front_, 16'000'000ull)) abandon_slot_locked(front_);
   if (!back_.held) valid_.store(false, std::memory_order_release);
   present_gen_.fetch_add(1, std::memory_order_acq_rel);
-  VRP_LOG("seekdbg: deferred front drop after eye_done | %s", debug_state_locked().c_str());
+  VRP_SEEK_LOG("seekdbg: deferred front drop after eye_done | %s", debug_state_locked().c_str());
 }
 
 }  // namespace vrp

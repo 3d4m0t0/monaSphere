@@ -1094,6 +1094,18 @@ void VideoDecoder::set_seek_scrubbing(bool active) {
   pkt_cv_.notify_all();
 }
 
+void VideoDecoder::set_seek_accurate_land(bool active) {
+  seek_accurate_land_.store(active, std::memory_order_release);
+}
+
+void VideoDecoder::retarget_seek(double sec) {
+  if (!open_.load()) return;
+  if (duration_sec_ > 0) sec = std::clamp(sec, 0.0, duration_sec_);
+  else if (sec < 0) sec = 0;
+  // Only move the land target — keep position at the last decoded PTS.
+  seek_target_.store(sec, std::memory_order_release);
+}
+
 void VideoDecoder::start_decode_thread() {
   stop_decode_thread();
   decode_stop_.store(false);
@@ -1166,19 +1178,25 @@ void VideoDecoder::demux_loop() {
         continue;
       }
 
-      // Scrub / seek-busy (approach to land): tiny queue so the file cursor cannot
-      // run ~10s past the still — that made audio (from cursor) lead video (from
-      // buffered packets) after start_presentation.
+      // Scrub / seek-busy: tiny hold so the file cursor cannot race past the still.
       const bool scrub = seek_scrubbing_.load();
       const bool hold = scrub || seek_req_.load() || seek_busy_.load();
-      const size_t target_bytes = hold ? kHoldMaxBytes : prefetch_target_bytes_;
-      const size_t max_pkts = hold ? kHoldMaxPackets : kMaxPackets;
       const int astream = ff_->audio_stream;
       const bool playing_now = playing_.load();
       const bool priming_now = priming_.load();
       // Audio only while presenting. Land keeps the tiny video hold-queue so the
       // open GOP stays intact; audio queue is cleared on land / start_presentation.
       const bool want_audio = astream >= 0 && !scrub && playing_now;
+      // Shared A/V: Soft holds ~340ms. A 2s video soft-target let demux run that
+      // far ahead of the picture while Soft played near the tip → audio led by
+      // ~queue depth a few seconds after seek resume. Match video readahead to Soft.
+      constexpr size_t kAvSyncMaxPackets = 64;
+      const size_t av_sync_bytes =
+          want_audio ? prefetch_bytes_for_seconds(0.35, info_.bitrate) : prefetch_target_bytes_;
+      const size_t target_bytes = hold ? kHoldMaxBytes : av_sync_bytes;
+      const size_t max_pkts =
+          hold ? kHoldMaxPackets
+               : (want_audio ? std::min(kMaxPackets, kAvSyncMaxPackets) : kMaxPackets);
       // Settle still: do not demux ahead (was filling q=1600 / ~20MiB and starving arm).
       // Priming / playing / scrub / seek-await still demux normally.
       if (!playing_now && !priming_now && !hold && !scrub && !awaiting_frame_after_seek_) {
@@ -1401,7 +1419,7 @@ void VideoDecoder::discard_packets_after_land() {
     clear_audio_packet_queue_locked();
     pkt_cv_.notify_all();
   }
-  VRP_LOG("seek: discard audio queue after land (keep video GOP)");
+  VRP_SEEK_LOG("seek: discard audio queue after land (keep video GOP)");
 }
 
 void VideoDecoder::decode_loop() {
@@ -1425,21 +1443,33 @@ void VideoDecoder::decode_loop() {
     }
 
     if (consume_seek_abandon()) {
-      VRP_LOG("seek: decode abandon awaiting (host timeout/clear)");
+      VRP_SEEK_LOG("seek: decode abandon awaiting (host timeout/clear)");
       awaiting_frame_after_seek_ = false;
+      seek_kf_parked_ = false;
       seek_skips = 0;
       if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
     }
 
     if (seek_req_.exchange(false)) {
       seek_skips = 0;
+      seek_kf_parked_ = false;
       seek_abandon_.store(false);
       if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
       const double t = seek_target_.load();
       const uint64_t issue = seek_issue_gen_.load(std::memory_order_acquire);
       seek_apply_gen_.store(issue, std::memory_order_release);
       set_decode_phase("seek_apply");
-      VRP_LOG("seek: decode seek_req target=%.3f scrub=%d play=%d issue=%llu", t,
+      seek_timing_t0_ = clock::now();
+      seek_await_t0_ = {};
+      seek_timing_pre_flush_ms_ = 0.0;
+      seek_timing_av_seek_ms_ = 0.0;
+      seek_timing_flush_ms_ = 0.0;
+      seek_timing_recycle_n_ = 0;
+      seek_timing_recycle_ms_ = 0.0;
+      seek_timing_present_n_ = 0;
+      seek_timing_present_ms_ = 0.0;
+      seek_timing_bail_req_n_ = 0;
+      VRP_SEEK_LOG("seek: decode seek_req target=%.3f scrub=%d play=%d issue=%llu", t,
               seek_scrubbing_.load() ? 1 : 0, playing_.load() ? 1 : 0,
               static_cast<unsigned long long>(issue));
       demux_pause_.store(true);
@@ -1467,14 +1497,15 @@ void VideoDecoder::decode_loop() {
           bool ok = vulkan_tex_->recycle_frame(ff_->frame, kPreFlushWaitNs, &why);
           const double wms =
               std::chrono::duration<double, std::milli>(clock::now() - wt0).count();
-          if (!ok || wms >= 20.0) {
-            VRP_LOG("seekdbg: pre_flush recycle ok=%d why=%s %.1fms | %s", ok ? 1 : 0,
+          seek_timing_pre_flush_ms_ = wms;
+          if (!ok || wms >= 5.0 || vrp_seek_detail_enabled()) {
+            VRP_SEEK_LOG("seekdbg: pre_flush recycle ok=%d why=%s %.1fms | %s", ok ? 1 : 0,
                     why ? why : "?", wms, vulkan_tex_->debug_state().c_str());
           }
           if (!ok && why && std::strcmp(why, "seek_intr") == 0) {
             // Newer seek while we waited — do not av_seek/flush/reopen for this stale issue.
             superseded = true;
-            VRP_LOG("seekdbg: pre_flush superseded by newer seek_req — requeue");
+            VRP_SEEK_LOG("seekdbg: pre_flush superseded by newer seek_req — requeue");
           } else if (!ok) {
             // Orphan the in-flight AVVkFrame (no unref / no host need-signal) and reopen.
             leak_avframe(ff_->frame);
@@ -1504,7 +1535,7 @@ void VideoDecoder::decode_loop() {
           if (latest_issue != issue) {
             seek_apply_gen_.store(latest_issue, std::memory_order_release);
             seek_req_.store(false, std::memory_order_release);
-            VRP_LOG("seekdbg: apply coalesced issue %llu→%llu target=%.3f",
+            VRP_SEEK_LOG("seekdbg: apply coalesced issue %llu→%llu target=%.3f",
                     static_cast<unsigned long long>(issue),
                     static_cast<unsigned long long>(latest_issue), t_apply);
           }
@@ -1521,9 +1552,10 @@ void VideoDecoder::decode_loop() {
           av_seek_frame(ff_->fmt, ff_->video_stream, ts, AVSEEK_FLAG_BACKWARD);
           const double seek_ms =
               std::chrono::duration<double, std::milli>(clock::now() - seek_t0).count();
+          seek_timing_av_seek_ms_ = seek_ms;
           set_decode_phase("seek_flush");
           const uint64_t applied = seek_apply_gen_.load(std::memory_order_acquire);
-          VRP_LOG("seekdbg: enter flush target=%.3f issue=%llu unsafe=%d | %s", sec,
+          VRP_SEEK_LOG("seekdbg: enter flush target=%.3f issue=%llu unsafe=%d | %s", sec,
                   static_cast<unsigned long long>(applied), flush_unsafe ? 1 : 0,
                   vulkan_tex_ && vulkan_tex_->enabled() ? vulkan_tex_->debug_state().c_str()
                                                          : "novk");
@@ -1536,7 +1568,7 @@ void VideoDecoder::decode_loop() {
             if (reopen_vulkan_codec_keep_hw()) {
               flush_ms =
                   std::chrono::duration<double, std::milli>(clock::now() - flush_t0).count();
-              VRP_LOG("seekdbg: reopen codec (skip flush) %.1fms target=%.3f", flush_ms, sec);
+              VRP_SEEK_LOG("seekdbg: reopen codec (skip flush) %.1fms target=%.3f", flush_ms, sec);
             } else {
               VRP_ERR("seekdbg: reopen failed — attempting flush anyway");
               avcodec_flush_buffers(ff_->codec);
@@ -1547,16 +1579,17 @@ void VideoDecoder::decode_loop() {
             avcodec_flush_buffers(ff_->codec);
             flush_ms =
                 std::chrono::duration<double, std::milli>(clock::now() - flush_t0).count();
-            if (seek_ms >= 20.0 || flush_ms >= 20.0) {
-              VRP_LOG("seekdbg: av_seek_frame %.1fms flush %.1fms target=%.3f", seek_ms, flush_ms,
+            if (seek_ms >= 20.0 || flush_ms >= 20.0 || vrp_seek_detail_enabled()) {
+              VRP_SEEK_LOG("seekdbg: av_seek_frame %.1fms flush %.1fms target=%.3f", seek_ms, flush_ms,
                       sec);
             } else {
-              VRP_LOG("seekdbg: flush done %.1fms target=%.3f", flush_ms, sec);
+              VRP_SEEK_LOG("seekdbg: flush done %.1fms target=%.3f", flush_ms, sec);
             }
           }
+          seek_timing_flush_ms_ = flush_ms;
           position_sec_.store(sec);
           if (flush_unsafe && (seek_ms >= 20.0 || flush_ms >= 20.0)) {
-            VRP_LOG("seekdbg: av_seek_frame %.1fms recovery %.1fms target=%.3f", seek_ms, flush_ms,
+            VRP_SEEK_LOG("seekdbg: av_seek_frame %.1fms recovery %.1fms target=%.3f", seek_ms, flush_ms,
                     sec);
           }
         }
@@ -1568,16 +1601,17 @@ void VideoDecoder::decode_loop() {
       demux_pause_.store(false);
       pkt_cv_.notify_all();
       next_deadline = clock::now();
-      // Scrub: always clear shown-PTS so each preview is one fresh keyframe still.
-      // Keeping it across scrub seeks forced KF+1/+2 after regress skips (10↔11).
-      // Stop-seek / play: keep newest on forward seeks to avoid replaying earlier pictures.
+      // Scrub / KF seek: clear shown-PTS (KF land must not inherit a prior pause
+      // still — that made the next pause jump back to the previous pause KF).
+      // Accurate stop-seek: keep newest on forward seeks to avoid replaying earlier pictures.
       {
         const double applied = position_sec_.load();
-        if (seek_scrubbing_.load() ||
+        if (seek_scrubbing_.load() || !seek_accurate_land_.load(std::memory_order_acquire) ||
             !(seek_shown_pts_ >= 0.0 && applied + frame_duration_ >= seek_shown_pts_))
           seek_shown_pts_ = -1.0;
       }
       awaiting_frame_after_seek_ = true;
+      seek_await_t0_ = clock::now();
       set_decode_phase("seek_await");
       {
         std::lock_guard<std::mutex> fl(frame_mu_);
@@ -1614,6 +1648,7 @@ void VideoDecoder::decode_loop() {
 
     bool got = false;
     const bool scrub_preview = seek_scrubbing_.load();
+    const bool accurate_land = seek_accurate_land_.load(std::memory_order_acquire);
     // Never start another decode/present while a newer seek is already armed —
     // return to loop top and consume seek_req first.
     if (seek_req_.load()) {
@@ -1621,11 +1656,12 @@ void VideoDecoder::decode_loop() {
       continue;
     }
     if (open_.load() && (playing_.load() || awaiting_frame_after_seek_)) {
-      // Stop-seek: discard until the bar. Scrub: also discard until target so
-      // keyframe→approach is not flashed (10→11); one still per seek.
-      const double present_after =
-          (awaiting_frame_after_seek_ && seek_skips < 300) ? seek_target_.load() : -1.0;
-      // Discard (present_after / seek bail) uses recycle_frame (wait + consumer +1).
+      // KF land (default): first GPU frame after av_seek — no present_after grind.
+      // Exact land: park KF in the mailbox first (host holds it until play), then
+      // discard until near seek_target so approach frames never replace the still.
+      const bool need_present_after = awaiting_frame_after_seek_ && accurate_land &&
+                                      seek_kf_parked_ && seek_skips < 300;
+      const double present_after = need_present_after ? seek_target_.load() : -1.0;
       got = decode_next(scratch, /*convert_rgba=*/true, present_after);
     }
     if (got && awaiting_frame_after_seek_ && scratch.width == 0) {
@@ -1640,37 +1676,84 @@ void VideoDecoder::decode_loop() {
       }
       if (awaiting_frame_after_seek_) {
         const double target = seek_target_.load();
-        // Rewind used to use (pts >= target) which instantly "lands" on the old
-        // forward frame (e.g. pts=315 target=307) and clears seek_busy early.
-        const bool near =
+        // KF land: first GPU frame is enough (scrub or stop). Exact: near target.
+        const bool keyframe_ok = !accurate_land;
+        // Past-target on accurate land → re-av_seek (cannot rewind by presenting).
+        if (accurate_land && seek_kf_parked_ && scratch.pts_sec > target + 0.08) {
+          seek_req_.store(true, std::memory_order_release);
+          ++seek_skips;
+          if ((seek_skips % 30) == 1) {
+            VRP_LOG("vktime: land-overshoot reseek pts=%.3f target=%.3f skips=%d",
+                    scratch.pts_sec, target, seek_skips);
+          }
+          next_deadline = clock::now();
+          continue;
+        }
+        const bool near_target =
             std::fabs(scratch.pts_sec - target) <= 0.08 || seek_skips >= 300;
+        const bool near = keyframe_ok || near_target;
         // Vulkan scrub/stop must land a gpu frame — gpu=0 must not clear seek_busy.
         const bool needs_gpu = vulkan_tex_ && vulkan_tex_->enabled();
         if (needs_gpu && !scratch.gpu && seek_skips < 300) {
           ++seek_skips;
           if ((seek_skips % 30) == 1) {
-            VRP_LOG("seek: wait gpu pts=%.3f target=%.3f scrub=%d skips=%d", scratch.pts_sec,
-                    target, scrub_preview ? 1 : 0, seek_skips);
+            VRP_SEEK_LOG("seek: wait gpu pts=%.3f target=%.3f scrub=%d acc=%d skips=%d",
+                    scratch.pts_sec, target, scrub_preview ? 1 : 0, accurate_land ? 1 : 0,
+                    seek_skips);
           }
           next_deadline = clock::now();
           continue;
         }
+        // Accurate stop-seek: publish KF once for the eye, keep seek_busy for catch-up.
+        if (accurate_land && !seek_kf_parked_) {
+          {
+            std::lock_guard<std::mutex> fl(frame_mu_);
+            latest_ = std::move(scratch);
+            ++latest_seq_;
+          }
+          seek_kf_parked_ = true;
+          VRP_SEEK_LOG("seek: park KF pts=%.3f target=%.3f (hold until play)", latest_.pts_sec,
+                       target);
+          next_deadline = clock::now();
+          continue;
+        }
         if (!near && seek_skips < 300) {
-          // present_after should already have skipped; tolerate rare early frames
-          // without publishing them to the mailbox / latest_.
+          // present_after should already have skipped; do not publish approach frames.
           ++seek_skips;
           next_deadline = clock::now();
           continue;
         }
-        // Publish only the landed still — never intermediate approach frames.
         {
           std::lock_guard<std::mutex> fl(frame_mu_);
           latest_ = std::move(scratch);
           ++latest_seq_;
         }
-        VRP_LOG("seek: decode landed pts=%.3f target=%.3f scrub=%d gpu=%d skips=%d",
-                latest_.pts_sec, target, scrub_preview ? 1 : 0, latest_.gpu ? 1 : 0,
-                seek_skips);
+        const double approach_ms =
+            seek_await_t0_.time_since_epoch().count() == 0
+                ? 0.0
+                : std::chrono::duration<double, std::milli>(clock::now() - seek_await_t0_).count();
+        const double total_ms =
+            seek_timing_t0_.time_since_epoch().count() == 0
+                ? 0.0
+                : std::chrono::duration<double, std::milli>(clock::now() - seek_timing_t0_).count();
+        // KF land: first GPU frame (CUDA-like). Exact land may have skipped through the GOP.
+        // Always log Vulkan land timing — host-visible without seek_detail_log.
+        if (needs_gpu) {
+          VRP_LOG("vktime: decode-land scrub=%d acc=%d pts=%.3f target=%.3f skips=%d "
+                  "pre_flush=%.0fms av_seek=%.0fms flush=%.0fms approach=%.0fms total=%.0fms "
+                  "recycle_n=%d recycle_ms=%.0f present_n=%d present_ms=%.0f bail_req=%d",
+                  scrub_preview ? 1 : 0,
+                  (accurate_land || seek_accurate_land_.load()) ? 1 : 0, latest_.pts_sec, target,
+                  seek_skips, seek_timing_pre_flush_ms_, seek_timing_av_seek_ms_,
+                  seek_timing_flush_ms_, approach_ms, total_ms, seek_timing_recycle_n_,
+                  seek_timing_recycle_ms_, seek_timing_present_n_, seek_timing_present_ms_,
+                  seek_timing_bail_req_n_);
+        } else {
+          VRP_SEEK_LOG("seek: decode landed pts=%.3f target=%.3f scrub=%d acc=%d gpu=%d skips=%d",
+                  latest_.pts_sec, target, scrub_preview ? 1 : 0,
+                  (accurate_land || seek_accurate_land_.load()) ? 1 : 0, latest_.gpu ? 1 : 0,
+                  seek_skips);
+        }
         seek_skips = 0;
         awaiting_frame_after_seek_ = false;
         seek_busy_.store(false);
@@ -2235,6 +2318,7 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
   playback_started_.store(false);
   seek_busy_.store(false);
   seek_scrubbing_.store(false);
+  seek_accurate_land_.store(false);
   looped_.store(false);
   prefetch_target_bytes_ = prefetch_bytes_for_seconds(2.0, info_.bitrate);
   prefetch_resume_bytes_ = prefetch_bytes_for_seconds(1.0, info_.bitrate);
@@ -2302,7 +2386,7 @@ bool VideoDecoder::reopen_vulkan_codec_keep_hw() {
     avcodec_free_context(&ff_->codec);
     return false;
   }
-  VRP_LOG("seekdbg: vulkan codec reopened (hwctx kept)");
+  VRP_SEEK_LOG("seekdbg: vulkan codec reopened (hwctx kept)");
   return true;
 #else
   return false;
@@ -2353,6 +2437,7 @@ void VideoDecoder::close() {
   priming_.store(false);
   playback_started_.store(false);
   seek_scrubbing_.store(false);
+  seek_accurate_land_.store(false);
   seek_req_.store(false);
   seek_busy_.store(false);
   awaiting_frame_after_seek_ = false;
@@ -2415,6 +2500,10 @@ void VideoDecoder::play() {
   // Resume must bring demux and decode back; otherwise play() only sets a flag.
   if (!decode_thread_.joinable()) start_decode_thread();
   seek_scrubbing_.store(false);
+  // Keep accurate_land while a pause/stop seek is still landing — clearing it
+  // here demoted the land to KF and the next pause jumped back a whole GOP.
+  if (!seek_busy_.load(std::memory_order_acquire))
+    seek_accurate_land_.store(false, std::memory_order_release);
   // Shared demux + file audio: skip video-only prime (would advance the cursor
   // without audio). Host arms audio then start_presentation; A/V demux together.
   if (audio_stream_ >= 0) {
@@ -2433,6 +2522,8 @@ void VideoDecoder::play() {
 void VideoDecoder::start_presentation() {
   if (!open_.load() || playing_.load()) return;
   priming_.store(false);
+  seek_accurate_land_.store(false, std::memory_order_release);
+  seek_shown_pts_ = -1.0;
   // Never clear video here — that punches the same post-land GOP hole as a full
   // land discard (frozen/2-frame stutter until the next keyframe). Audio queue
   // must start empty so Soft cannot play pre-land PCM; demux refills A/V together.
@@ -2441,6 +2532,16 @@ void VideoDecoder::start_presentation() {
     clear_audio_packet_queue_locked();
     pkt_cv_.notify_all();
   }
+  playing_.store(true);
+  pkt_cv_.notify_all();
+}
+
+void VideoDecoder::resume_presentation() {
+  if (!open_.load() || playing_.load()) return;
+  priming_.store(false);
+  seek_accurate_land_.store(false, std::memory_order_release);
+  seek_shown_pts_ = -1.0;
+  // Keep audio packets demuxed around the still — Soft discard_until trims to it.
   playing_.store(true);
   pkt_cv_.notify_all();
 }
@@ -2488,6 +2589,7 @@ std::string VideoDecoder::seek_debug_state() const {
      << " req=" << (seek_req_.load() ? 1 : 0)
      << " busy=" << (seek_busy_.load() ? 1 : 0)
      << " scrub=" << (seek_scrubbing_.load() ? 1 : 0)
+     << " acc=" << (seek_accurate_land_.load() ? 1 : 0)
      << " play=" << (playing_.load() ? 1 : 0)
      << " prime=" << (priming_.load() ? 1 : 0)
      << " demux_pause=" << (demux_pause_.load() ? 1 : 0)
@@ -2515,7 +2617,7 @@ void VideoDecoder::seek_to(double sec) {
   const uint64_t issue = seek_issue_gen_.fetch_add(1, std::memory_order_acq_rel) + 1;
   seek_req_.store(true);
   av_resync_.store(false);
-  VRP_LOG("seekdbg: host seek_to sec=%.3f issue=%llu apply=%llu phase=%s req=1 busy=1 scrub=%d",
+  VRP_SEEK_LOG("seekdbg: host seek_to sec=%.3f issue=%llu apply=%llu phase=%s req=1 busy=1 scrub=%d",
           sec, static_cast<unsigned long long>(issue),
           static_cast<unsigned long long>(seek_apply_gen_.load(std::memory_order_acquire)),
           decode_phase_.load(std::memory_order_acquire)
@@ -2529,7 +2631,7 @@ void VideoDecoder::clear_seek_in_flight() {
   seek_busy_.store(false);
   seek_abandon_.store(true);
   if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
-  VRP_LOG("seekdbg: clear_seek_in_flight | %s", seek_debug_state().c_str());
+  VRP_SEEK_LOG("seekdbg: clear_seek_in_flight | %s", seek_debug_state().c_str());
 }
 
 void VideoDecoder::force_resume_after_seek() {
@@ -2537,6 +2639,7 @@ void VideoDecoder::force_resume_after_seek() {
   seek_busy_.store(false);
   seek_abandon_.store(true);
   seek_scrubbing_.store(false);
+  seek_accurate_land_.store(false);
   priming_.store(false);
   playback_started_.store(true);
   // If decode wedged inside seek_av_seek/flush, demux_pause would otherwise stick
@@ -2544,7 +2647,7 @@ void VideoDecoder::force_resume_after_seek() {
   demux_pause_.store(false);
   pkt_cv_.notify_all();
   if (vulkan_tex_) vulkan_tex_->set_present_abort(false);
-  VRP_LOG("seekdbg: force_resume_after_seek | %s", seek_debug_state().c_str());
+  VRP_SEEK_LOG("seekdbg: force_resume_after_seek | %s", seek_debug_state().c_str());
 }
 
 bool VideoDecoder::consume_seek_abandon() { return seek_abandon_.exchange(false); }
@@ -2645,6 +2748,20 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
         (void)codec;
         av_packet_unref(ff_->packet);
         lock.unlock();
+        // DEVICE_LOST: reopen cannot recover the VkDevice — stop hammering get_hw_format.
+        if (vulkan_tex_ && vulkan_tex_->device_lost()) {
+          VRP_ERR("seekdbg: send_packet fail after DEVICE_LOST — halt decode (no reopen)");
+          playing_.store(false);
+          seek_busy_.store(false);
+          awaiting_frame_after_seek_ = false;
+          demux_pause_.store(false);
+          pkt_cv_.notify_all();
+          set_decode_phase("send_device_lost");
+          out = {};
+          out.width = 0;
+          out.height = 0;
+          return true;
+        }
         VRP_ERR("seekdbg: send_packet timeout — kick then reopen");
         for (int i = 0; i < 4 && !decode_stop_.load(); ++i) {
           if (vulkan_tex_) vulkan_tex_->kick_gpu_activity();
@@ -2719,13 +2836,28 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
           }
           // Half a frame: 0.04s accepted the previous 60fps picture (~16ms early).
           const double seek_early = std::max(frame_duration_ * 0.5, 0.001);
+          const bool accurate_now =
+              seek_accurate_land_.load(std::memory_order_acquire);
           const bool skip_before =
               present_after_sec >= 0.0 && out.pts_sec + seek_early < present_after_sec;
+          // Accurate land cannot rewind: frames past the bar must not hit the mailbox
+          // (backward scrub adopt used to present them → on-screen fast-forward).
+          const bool skip_past = present_after_sec >= 0.0 && accurate_now &&
+                                 out.pts_sec > present_after_sec + 0.08;
+          if (skip_past) seek_req_.store(true, std::memory_order_release);
+          const bool skip_frame = skip_before || skip_past;
           const bool drop_for_seek = seek_req_.load();
-          const bool want_mailbox = convert_rgba && !skip_before && !drop_for_seek;
-          // Seek land: kick_gpu during wait; short last-resort if still stalled.
+          const bool want_mailbox = convert_rgba && !skip_frame && !drop_for_seek;
+          // Approach discard (mpv-like): short wait + early kick, never mailbox/present.
+          // Land frame only: long seek_busy wait before try_present.
+          const bool approach_discard = skip_before;
           const uint64_t wait_ns =
-              seek_busy_.load(std::memory_order_acquire) ? 2'000'000'000ull : 0ull;
+              want_mailbox
+                  ? (seek_busy_.load(std::memory_order_acquire) ? 2'000'000'000ull : 0ull)
+                  : (approach_discard ? 16'000'000ull
+                                      : (seek_busy_.load(std::memory_order_acquire)
+                                             ? 2'000'000'000ull
+                                             : 0ull));
           const char* wait_why = "ok";
           set_decode_phase("wait_avframe");
           lock.unlock();
@@ -2787,8 +2919,8 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
               out.height = 0;
               return true;
             }
-            if (skip_before) {
-              set_decode_phase("present_after_skip");
+            if (skip_frame) {
+              set_decode_phase(skip_past ? "present_after_past" : "present_after_skip");
               out.width = 0;
               out.height = 0;
               return true;
@@ -2806,14 +2938,32 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
           if (seek_picture && seek_shown_pts_ >= 0.0 &&
               out.pts_sec + frame_duration_ * 0.5 < seek_shown_pts_) {
             set_decode_phase("present_pts_regress");
+            const auto rt0 = std::chrono::steady_clock::now();
             (void)vulkan_tex_->recycle_frame(ff_->frame, wait_ns, &wait_why);
+            note_recycle_wait(std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - rt0)
+                                  .count(),
+                              "regress");
             lock.lock();
             out.width = 0;
             out.height = 0;
             return true;
           }
+          const auto pt0 = std::chrono::steady_clock::now();
           const bool presented =
               vulkan_tex_->try_present(ff_->frame, full, wait_ns, &wait_why);
+          {
+            const double pms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - pt0)
+                                   .count();
+            ++seek_timing_present_n_;
+            seek_timing_present_ms_ += pms;
+            if (pms >= 2.0 || !presented || vrp_seek_detail_enabled()) {
+              VRP_SEEK_LOG("seekdbg: try_present ok=%d %.1fms why=%s pts=%.3f | %s",
+                      presented ? 1 : 0, pms, wait_why ? wait_why : "?", out.pts_sec,
+                      vulkan_tex_->debug_state().c_str());
+            }
+          }
           if (!presented && wait_why && std::strcmp(wait_why, "timeout") == 0 &&
               seek_busy_.load()) {
             recover_land_timeout();
@@ -2843,7 +2993,7 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
           static std::atomic<int> drop_n{0};
           const int n = drop_n.fetch_add(1) + 1;
           if (n <= 8 || (n % 30) == 0 || (wait_why && std::strcmp(wait_why, "ok") != 0)) {
-            VRP_LOG("seekdbg: try_present fail #%d why=%s pos=%.3f seek=%d req=%d | %s", n,
+            VRP_SEEK_LOG("seekdbg: try_present fail #%d why=%s pos=%.3f seek=%d req=%d | %s", n,
                     wait_why ? wait_why : "?", out.pts_sec, seek_busy_.load() ? 1 : 0,
                     seek_req_.load() ? 1 : 0, vulkan_tex_->debug_state().c_str());
           }

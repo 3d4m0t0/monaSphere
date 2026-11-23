@@ -26,6 +26,7 @@
 #include "capture/gnome_virtual_display.hpp"
 #include "capture/kde_virtual_display.hpp"
 #include "capture/kwin_window_placer.hpp"
+#include "capture/screencast_portal.hpp"
 #if defined(VRP_HAS_PIPEWIRE)
 #include "capture/pipewire_capture.hpp"
 #include "video/pipewire_dma_texture.hpp"
@@ -88,6 +89,7 @@
 #include <QPointer>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QAbstractButton>
 
 #include <memory>
 
@@ -178,6 +180,9 @@ void HostWindow::finishAppTeardown() {
       if (xr_app_) xr_app_->drop_ffmpeg_hwctx();
     }
     VRP_ERR("XR thread did not exit on app teardown — detaching (last resort)");
+    // DestroyInstance likely wedged in NVIDIA ICD — next create needs Monado restart.
+    vrp::crash_guard::mark_session_active();
+    vrp::crash_guard::mark_vulkan_client_released();
     if (xr_thread_.joinable()) xr_thread_.detach();
     // Detach left Monado running → ~QProcess would waitForFinished and SEGV into
     // onMonadoFinished while widgets die. Stop + disconnect before QObject teardown.
@@ -396,17 +401,22 @@ bool HostWindow::ensureMonadoReady() {
   // Do not restart on a clean vk-release stamp: DestroyInstance with Monado alive
   // already dropped the client; settle+restart races a new compositor against residual.
   const bool unclean = vrp::crash_guard::consume_unclean_session();
-  if (unclean && !usingWivrn() && !monado_external_) {
-    appendLog(tr("Previous session crashed — restarting Monado"));
+  const bool vk_residual = vrp::crash_guard::vulkan_client_release_recent(30000);
+  if ((unclean || vk_residual) && !usingWivrn() && !monado_external_) {
+    appendLog(unclean ? tr("Previous session crashed — restarting Monado")
+                      : tr("Previous Vulkan release was slow — restarting Monado"));
     stopMonadoProcess();
     stopSystemdMonadoForOwnedStart();
     clearStaleMonadoSocket();
+    (void)vrp::crash_guard::settle_vulkan_client_release(vk_residual ? 8000 : 2500);
   } else if (unclean && usingWivrn() && !monado_external_) {
     appendLog(tr("Previous session crashed — restarting WiVRn"));
     stopMonadoProcess();  // also stops owned wivrn when runtime is wivrn
   } else if (unclean) {
     appendLog(tr("Previous session crashed — external runtime; clearing stale IPC only"));
     clearStaleMonadoSocket();
+  } else if (vk_residual) {
+    (void)vrp::crash_guard::settle_vulkan_client_release(5000);
   }
 
   if (usingWivrn()) {
@@ -5772,8 +5782,8 @@ void HostWindow::xrThreadMain() {
           this,
           [this, vk_probe, ff_vk] {
             appendLog(vk_probe);
-            appendLog(ff_vk ? tr("FFmpeg Vulkan hwctx: injected (file decode still CUDA/VA-API "
-                                 "unless vulkan_video=1)")
+            appendLog(ff_vk ? tr("FFmpeg Vulkan hwctx: injected (file decode CUDA/VA-API unless "
+                                 "Experimental vulkan_video=1)")
                             : tr("FFmpeg Vulkan hwctx: not injected"));
           },
           Qt::QueuedConnection);
@@ -6001,7 +6011,7 @@ void HostWindow::xrThreadMain() {
         menu.set_desktop_apps(std::move(apps));
       }
       menu.set_volume_cap(1.f);
-      audio.set_volume(menu.volume());
+      audio.set_volume(menu.effective_volume());
       menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
       menu.set_fsr(preferred_fsr_);
       fsr.set_mode(preferred_fsr_);
@@ -6212,6 +6222,22 @@ void HostWindow::xrThreadMain() {
     bool stop_seek_sent = false;
     bool stop_upload_sent = false;
     bool stop_seek_pending = false;
+    /** Vulkan: bind land raw (not stale scrub FSR) until play or fresh FSR of land. */
+    bool hold_land_raw = false;
+    /** Stop-seek: keep parked KF on eye until start_presentation (no approach FF). */
+    bool hold_kf_until_play = false;
+    /**
+     * Audio-track switch: keep the pre-switch eye still through seek/arm.
+     * Unlike hold_kf_until_play, never promote the parked KF into the eye.
+     */
+    bool hold_prev_eye_until_play = false;
+    /** Defer track-switch A/V resync until arm_stop_seek is in scope. */
+    bool audio_track_resync_pending = false;
+    double audio_track_resync_sec = -1.0;
+    /** Last display bind kind during stop-seek (for vktime land-bind breadcrumbs). */
+    const char* land_bind_kind = "none";
+    uint64_t land_bind_gen = 0;
+    std::chrono::steady_clock::time_point land_bind_log_at{};
     std::chrono::steady_clock::time_point seek_land_from{};
     std::chrono::steady_clock::time_point seek_scrub_kick_at{};
     bool seek_resume_force = false;
@@ -6222,10 +6248,25 @@ void HostWindow::xrThreadMain() {
     std::chrono::steady_clock::time_point stop_decoded_from{};
     double last_scrub_seek_sec = -1.0;
     std::chrono::steady_clock::time_point last_scrub_seek_at{};
+    /** Stop-seek already has a showable front — show without waiting for promote. */
+    bool stop_fast_land = false;
+    /** Background accurate seek under an already-shown scrub still. */
+    bool stop_sync_pending = false;
+    /** Vulkan seek stage timing (always-on vktime: lines). */
+    std::chrono::steady_clock::time_point vktime_arm_at{};
+    std::chrono::steady_clock::time_point vktime_scrub_issue_at{};
+    std::chrono::steady_clock::time_point vktime_promote_wait_log{};
+    bool vktime_scrub_was_busy = false;
+    double vktime_arm_to_land_ms = -1.0;
+    double vktime_arm_to_shown_ms = -1.0;
     double stop_seek_sec = 0;
     uint64_t stop_seq = 0;
     uint64_t stop_present_gen = 0;
     double stop_pts = -1.0;
+    /** Still PTS at user pause — resume arms audio here (no video seek). */
+    double pause_still_sec = -1.0;
+    /** Unpause keeps decoder audio queue; Soft arms via discard_until at still. */
+    bool pause_inplace_resume = false;
     // Translucent flat panel (startup / after Stop) until playback shows frames again.
     bool show_idle_screen = true;
     bool yt_suppress_idle_uploaded = false;
@@ -6254,8 +6295,12 @@ void HostWindow::xrThreadMain() {
       stop_decoded_from = {};
       last_scrub_seek_sec = -1.0;
       last_scrub_seek_at = {};
+      stop_fast_land = false;
+      stop_sync_pending = false;
       stop_seq = 0;
       stop_pts = -1.0;
+      pause_still_sec = -1.0;
+      pause_inplace_resume = false;
       show_idle_screen = true;
       have_pending_thumb = false;
       thumb_idx = -1;
@@ -6418,7 +6463,7 @@ void HostWindow::xrThreadMain() {
           (void)audio.ensure_output(adev);
           // Shared video demux — no second avformat_open / audio av_seek_frame.
           if (decoder.has_file_audio() && audio.attach_file_demux(&decoder)) {
-            audio.set_volume(menu.volume());
+            audio.set_volume(menu.effective_volume());
             audio.set_rate(1.f);
             const QString dev = QString::fromStdString(audio.device_name());
             QMetaObject::invokeMethod(
@@ -6547,27 +6592,65 @@ void HostWindow::xrThreadMain() {
       }
       menu.set_seek_frame_dt(seek_dt);
 
-      // Shared demux reads ~2s ahead into the video packet queue while presenting.
-      // Pause freezes the still but leaves the file cursor at that ahead point; a
-      // plain play() then arms audio from the cursor while video drains older
-      // packets → audio leads until the next seek. Rewind demux to the still on
-      // user pause so unpause arms A/V from the same place.
+      // In-place pause/resume: freeze mailbox + Soft PCM (no flush, no video seek).
+      // Re-arming from demux after Soft flush starts audio ahead of the still.
       auto pause_av_rewind = [&]() {
         play_wanted = false;
+        pause_still_sec = decoder.is_open() ? decoder.position() : -1.0;
+        pause_inplace_resume = false;
         decoder.pause();
-        audio.pause();
-        if (decoder.is_open() && decoder.has_file_audio() && audio.is_open() &&
-            audio.has_audio())
-          decoder.seek_to(decoder.position());
+        if (decoder.has_file_audio() && audio.is_open() && audio.has_audio())
+          audio.pause_hold_buffer();
+        else
+          audio.pause();
+        wait_stop_frame = false;
+        stop_frame_shown = false;
+        hold_land_raw = false;
+        hold_kf_until_play = false;
+        hold_prev_eye_until_play = false;
+        audio_track_resync_pending = false;
+        audio_track_resync_sec = -1.0;
+        seek_settle = false;
+        stop_pts = -1.0;
+        stop_fast_land = false;
+        stop_sync_pending = false;
+        stop_seek_pending = false;
+        seek_audio_arm_pending = false;
+        seek_audio_arm_sec = -1.0;
+        seek_land_from = {};
+        seek_resume_force = false;
+        decoder.set_seek_scrubbing(false);
+      };
+      auto resume_after_pause = [&]() {
+        play_wanted = true;
+        show_idle_screen = false;
+        const double still = pause_still_sec;
+        pause_still_sec = -1.0;
+        pause_inplace_resume = false;
+        if (still >= 0.0 && decoder.has_file_audio() && audio.is_open() && audio.has_audio()) {
+          if (audio.resume_hold_buffer()) {
+            // Video first, then Soft — old path played Soft ~24ms (blocking fade) before
+            // video and audio crept ahead on every pause/resume.
+            decoder.resume_presentation();
+            audio.go_live_hold_buffer();
+            return;
+          }
+          // Soft empty (long pause / underrun) — arm at still, keep audio packet queue.
+          pause_inplace_resume = true;
+          seek_audio_arm_sec = still;
+          audio.begin_arm_at(still);
+          seek_audio_arm_pending = true;
+          decoder.play();
+          return;
+        }
+        decoder.play();
       };
       const int cmd = cmd_.exchange(0);
       if (cmd == 1) {
         // Keep A/V in lockstep — independent toggles desync after audio reopen.
         const bool active = decoder.is_playing() || decoder.is_priming();
         if (!active) {
-          play_wanted = true;
-          show_idle_screen = false;
-          decoder.play();
+          resume_after_pause();
         } else {
           pause_av_rewind();
         }
@@ -7025,7 +7108,7 @@ void HostWindow::xrThreadMain() {
         (void)texture.upload_idle_screen();
         if (texture.view()) scene.set_texture(texture.view(), texture.sampler());
         scene.set_content_aspect(16.f / 9.f);
-        menu.show_apps_list();
+        menu.show_app_return_place();
         help_swallow_back_ = true;
         help_swallow_menu_ = true;
         hud_paint();
@@ -7525,11 +7608,9 @@ void HostWindow::xrThreadMain() {
         if (decoder.is_playing() || decoder.is_priming()) {
           pause_av_rewind();
         } else {
-          play_wanted = true;
-          show_idle_screen = false;
           // Stop left us on Flat idle; put 180/360 back before the first frame.
           restore_media_projection();
-          decoder.play();
+          resume_after_pause();
         }
       }
       if (menu_out.apply_format) {
@@ -7591,15 +7672,10 @@ void HostWindow::xrThreadMain() {
         decoder.set_rate(menu_out.rate);
         audio.set_rate(menu_out.rate);
         menu.set_rate(menu_out.rate);
-        // Rate change is a pause plus the normal play start, so audio is armed
-        // with the picture instead of catching up afterwards. Rewind demux so
-        // the arm cursor matches the still (same gap as user pause).
+        // Rate change: same as pause→unpause so A/V re-arm from the still together.
         if (play_wanted && (decoder.is_playing() || decoder.is_priming())) {
-          decoder.pause();
-          audio.pause();
-          if (decoder.has_file_audio() && audio.is_open() && audio.has_audio())
-            decoder.seek_to(decoder.position());
-          decoder.play();
+          pause_av_rewind();
+          resume_after_pause();
         }
         hud_paint();
       }
@@ -7674,36 +7750,88 @@ void HostWindow::xrThreadMain() {
             force_fsr_refresh = true;
           }
         }
+        // Scrub: KF preview. Stop: accurate land (skip until near bar).
+        decoder.set_seek_accurate_land(stop_seek);
         decoder.seek_to(sec);
-        VRP_LOG("seekdbg: begin_decoder_seek after | %s", decoder.seek_debug_state().c_str());
+        VRP_SEEK_LOG("seekdbg: begin_decoder_seek after | %s", decoder.seek_debug_state().c_str());
       };
-      auto arm_stop_seek = [&](double sec) {
-        VRP_LOG("seek: arm stop-seek sec=%.3f play_wanted=%d vulkan=%d fsr=%d seq=%llu",
-                sec, play_wanted ? 1 : 0, decoder.vulkan_path_active() ? 1 : 0,
-                fsr.enabled() ? 1 : 0,
+      auto vktime_ms_since = [&](std::chrono::steady_clock::time_point from) -> double {
+        if (from.time_since_epoch().count() == 0) return -1.0;
+        return std::chrono::duration<double, std::milli>(now - from).count();
+      };
+      // Paused seek: brief land still. Playing seek: settle 0 — resume audio on land.
+      const double stop_settle_sec = play_wanted ? 0.0 : 0.5;
+      const double stop_settle_ms = stop_settle_sec * 1000.0;
+      const double stop_near_sec = 0.08;
+      auto arm_stop_seek = [&](double sec, bool force_seek = false, bool keep_prev_eye = false) {
+        // Accurate land at bar. Pause decode so A/V start together after Soft ready.
+        VRP_LOG("seek: arm stop-seek sec=%.3f play_wanted=%d force=%d prev_eye=%d vulkan=%d fsr=%d seq=%llu",
+                sec, play_wanted ? 1 : 0, force_seek ? 1 : 0, keep_prev_eye ? 1 : 0,
+                decoder.vulkan_path_active() ? 1 : 0, fsr.enabled() ? 1 : 0,
                 static_cast<unsigned long long>(decoder.frame_seq()));
         audio.pause();
         decoder.pause();
-        begin_decoder_seek(sec, /*stop_seek=*/true);
+        decoder.set_seek_scrubbing(false);
+        // Seek invalidates in-place Soft hold — always start_presentation on land.
+        pause_inplace_resume = false;
+        pause_still_sec = -1.0;
+
+        const double pos = decoder.position();
+        const bool near_pos =
+            !force_seek && !decoder.seek_in_flight() && std::fabs(pos - sec) <= stop_near_sec;
+        const bool have_front =
+            !decoder.vulkan_path_active() ||
+            (vulkan_tex.enabled() && vulkan_tex.sampling_index() >= 0);
+        const bool have_fsr_still =
+            fsr.enabled() && fsr.output_view() && fsr.output_sampler();
+        const bool have_eye = have_front || have_fsr_still;
+
+        stop_fast_land = false;
+        stop_sync_pending = false;
         stop_seek_sec = sec;
         stop_seek_sent = true;
         wait_stop_frame = true;
         stop_frame_shown = false;
+        hold_land_raw = false;
+        hold_kf_until_play = false;
+        hold_prev_eye_until_play = keep_prev_eye;
+        land_bind_kind = "hold_prev_eye";
+        land_bind_gen = 0;
+        land_bind_log_at = {};
         stop_seq = decoder.frame_seq();
         stop_present_gen = vulkan_tex.enabled() ? vulkan_tex.present_generation() : 0;
-        stop_pts = -1.0;
         stop_upload_sent = false;
         seek_land_from = now;
+        vktime_arm_at = now;
+        vktime_arm_to_land_ms = -1.0;
+        vktime_arm_to_shown_ms = -1.0;
+        vktime_promote_wait_log = {};
         seek_settle = false;
         seek_resume_force = false;
         seek_audio_arm_retry_at = {};
-        // Arm at target PTS (shared demux — no second av_seek). Prefill waits
-        // for land via seek_in_flight, then host commit + start_presentation.
+        stop_pts = -1.0;
+
+        if (near_pos) {
+          decoder.set_seek_accurate_land(false);
+          stop_pts = pos >= 0.0 ? pos : sec;
+          stop_fast_land = have_eye;
+          stop_decoded_from = now;
+          vktime_arm_to_land_ms = 0.0;
+          VRP_SEEK_LOG("seek: fast land sec=%.3f pts=%.3f", sec, stop_pts);
+        } else {
+          begin_decoder_seek(sec, /*stop_seek=*/true);
+          if (decoder.vulkan_path_active()) {
+            VRP_LOG("vktime: stop-arm sec=%.3f seq=%llu | %s", sec,
+                    static_cast<unsigned long long>(stop_seq),
+                    vulkan_tex.debug_state().c_str());
+          }
+        }
+
         if (play_wanted && audio.is_open() && audio.has_audio()) {
           seek_audio_arm_sec = sec;
           audio.begin_arm_at(sec);
           seek_audio_arm_pending = true;
-          VRP_LOG("seek: begin_arm_at arm=%.3f (stop-seek)", sec);
+          VRP_SEEK_LOG("seek: begin_arm_at arm=%.3f (stop-seek)", sec);
         } else {
           audio.cancel_arm();
           seek_audio_arm_pending = false;
@@ -7711,12 +7839,31 @@ void HostWindow::xrThreadMain() {
         }
         hud_paint();
       };
+      if (audio_track_resync_pending) {
+        audio_track_resync_pending = false;
+        const double sec = audio_track_resync_sec;
+        audio_track_resync_sec = -1.0;
+        play_wanted = true;
+        show_idle_screen = false;
+        pause_inplace_resume = false;
+        pause_still_sec = -1.0;
+        // force_seek: near-pos fast-path leaves the video pkt queue skewed vs Soft.
+        // keep_prev_eye: do not promote parked KF onto the eye during land.
+        arm_stop_seek(sec, /*force_seek=*/true, /*keep_prev_eye=*/true);
+      }
       if (scrubbing) {
         if (!was_scrubbing) {
           menu.clear_seek_bar_drawn();
           last_scrub_seek_sec = -1.0;
           last_scrub_seek_at = {};
+          stop_fast_land = false;
+          stop_sync_pending = false;
         }
+        // Scrub replaces the pause still — next unpause must not arm from there.
+        pause_still_sec = -1.0;
+        pause_inplace_resume = false;
+        hold_kf_until_play = false;
+        hold_prev_eye_until_play = false;
         decoder.pause();
         audio.pause();
         decoder.set_seek_scrubbing(true);
@@ -7724,31 +7871,49 @@ void HostWindow::xrThreadMain() {
         seek_settle = false;
         wait_stop_frame = false;
         stop_frame_shown = false;
+        hold_land_raw = false;
         stop_seek_sent = false;
         stop_pts = -1.0;
         stop_upload_sent = false;
         stop_seek_pending = false;
+        stop_sync_pending = false;
         seek_land_from = {};
         const double bar = menu.seek_bar_sec();
         // 1e9 = first seek of this scrub gesture (last_scrub_seek_sec < 0).
         const double moved =
             last_scrub_seek_sec < 0.0 ? 1.0e9 : std::fabs(bar - last_scrub_seek_sec);
-        // One seek = one still: never re-issue while the previous scrub seek is
-        // in flight (that replayed the same GOP as 10↔11). Coalesce to the
-        // latest bar once the prior land completes.
+        // One seek = one still: coalesce to latest bar once prior scrub lands.
         const bool cooled =
             last_scrub_seek_at.time_since_epoch().count() == 0 ||
             (now - last_scrub_seek_at) >= std::chrono::milliseconds(120);
-        if (!decoder.seek_in_flight() && cooled &&
-            (moved >= 0.75 || last_scrub_seek_sec < 0.0)) {
-          VRP_LOG("seek: scrub seek_to sec=%.3f (moved=%.3f)", bar, moved);
+        const bool want_scrub_move = moved >= 0.75 || last_scrub_seek_sec < 0.0;
+        if (cooled && want_scrub_move && !decoder.seek_in_flight()) {
+          const double cool_ms = vktime_ms_since(last_scrub_seek_at);
+          VRP_SEEK_LOG("seek: scrub seek_to sec=%.3f (moved=%.3f)", bar, moved);
           begin_decoder_seek(bar, /*stop_seek=*/false);
           last_scrub_seek_sec = bar;
           last_scrub_seek_at = now;
+          vktime_scrub_issue_at = now;
+          vktime_scrub_was_busy = true;
+          if (decoder.vulkan_path_active()) {
+            VRP_LOG("vktime: scrub-issue sec=%.3f moved=%.3f cool=%.0fms | %s", bar, moved,
+                    cool_ms, vulkan_tex.debug_state().c_str());
+          }
+        }
+        if (vktime_scrub_was_busy && !decoder.seek_in_flight()) {
+          if (decoder.vulkan_path_active()) {
+            VRP_LOG("vktime: scrub-busy-clear +%.0fms from_issue phase=%s | %s",
+                    vktime_ms_since(vktime_scrub_issue_at),
+                    decoder.decode_phase() ? decoder.decode_phase() : "?",
+                    vulkan_tex.debug_state().c_str());
+          }
+          vktime_scrub_was_busy = false;
         }
       } else {
         decoder.set_seek_scrubbing(false);
         if (seek_release) {
+          pause_still_sec = -1.0;
+          pause_inplace_resume = false;
           stop_seek_pending = true;
           stop_seek_sec = menu_out.seek_sec;
         } else if (was_scrubbing && !wait_stop_frame && !seek_settle && !stop_seek_pending) {
@@ -7764,7 +7929,8 @@ void HostWindow::xrThreadMain() {
       }
       was_scrubbing = scrubbing;
       const bool seek_settling =
-          seek_settle && std::chrono::duration<double>(now - seek_settle_from).count() < 0.5;
+          seek_settle &&
+          std::chrono::duration<double>(now - seek_settle_from).count() < stop_settle_sec;
       const bool hold_play = scrubbing || seek_settling || wait_stop_frame || stop_seek_pending;
       // Scrub / new stop-seek aborts audio arm; settle hold must not (overlaps demux).
       if (seek_audio_arm_pending && (scrubbing || stop_seek_pending)) {
@@ -7794,7 +7960,7 @@ void HostWindow::xrThreadMain() {
         audio.begin_arm_at(arm);
         seek_audio_arm_pending = true;
         seek_audio_arm_retry_at = {};
-        VRP_LOG("seek: begin_arm_at arm=%.3f (%s)", arm, why);
+        VRP_SEEK_LOG("seek: begin_arm_at arm=%.3f (%s)", arm, why);
         return true;
       };
       auto retry_arm_if_failed = [&](vrp::AudioPlayer::ArmPoll& poll, const char* why) {
@@ -8045,8 +8211,18 @@ void HostWindow::xrThreadMain() {
         stop_pts = decoder.position();
         stop_upload_sent = !decoder.vulkan_path_active();
         stop_decoded_from = now;
+        vktime_arm_to_land_ms = vktime_ms_since(vktime_arm_at);
+        stop_sync_pending = false;
+        if (play_wanted && audio.is_open() && audio.has_audio() &&
+            (!seek_audio_arm_pending || std::fabs(stop_pts - seek_audio_arm_sec) > 0.25))
+          (void)kick_audio_arm(stop_pts, "land");
         if (decoder.vulkan_path_active()) {
-          VRP_LOG("seek: decode land pts=%.3f gen=%llu arm_gen=%llu samp=%d | %s",
+          VRP_LOG("vktime: stop-decode-land +%.0fms pts=%.3f gen=%llu arm_gen=%llu samp=%d | %s",
+                  vktime_arm_to_land_ms, stop_pts,
+                  static_cast<unsigned long long>(vulkan_tex.present_generation()),
+                  static_cast<unsigned long long>(stop_present_gen),
+                  vulkan_tex.sampling_index(), vulkan_tex.debug_state().c_str());
+          VRP_SEEK_LOG("seek: decode land pts=%.3f gen=%llu arm_gen=%llu samp=%d | %s",
                   stop_pts,
                   static_cast<unsigned long long>(vulkan_tex.present_generation()),
                   static_cast<unsigned long long>(stop_present_gen),
@@ -8055,20 +8231,34 @@ void HostWindow::xrThreadMain() {
           vrp::VideoFrame landed;
           if (decoder.take_latest(landed) && !landed.gpu && !landed.rgba.empty())
             pending_upload = std::move(landed);
-          VRP_LOG("seek: decode land pts=%.3f (cpu/gpu path)", stop_pts);
+          VRP_SEEK_LOG("seek: decode land pts=%.3f (cpu/gpu path)", stop_pts);
         } else {
-          VRP_LOG("seek: decode land pts=%.3f", stop_pts);
+          VRP_SEEK_LOG("seek: decode land pts=%.3f", stop_pts);
         }
       } else if (wait_stop_frame && !scrubbing && stop_pts < 0.0 &&
                  decoder.seek_in_flight()) {
         static std::chrono::steady_clock::time_point land_wait_log{};
         if (land_wait_log.time_since_epoch().count() == 0 ||
-            (now - land_wait_log) >= std::chrono::milliseconds(500)) {
-          const double waited =
-              seek_land_from.time_since_epoch().count() == 0
-                  ? 0.0
-                  : std::chrono::duration<double>(now - seek_land_from).count();
-          VRP_LOG("seek: wait decode land after %.2fs busy=1 gen=%llu | %s", waited,
+            (now - land_wait_log) >= std::chrono::milliseconds(200)) {
+          const double waited = vktime_ms_since(seek_land_from);
+          if (decoder.vulkan_path_active()) {
+            VRP_LOG("vktime: stop-wait-land +%.0fms phase=%s flip=%d | %s", waited,
+                    decoder.decode_phase() ? decoder.decode_phase() : "?",
+                    vulkan_tex.pending_flip() ? 1 : 0, decoder.seek_debug_state().c_str());
+            VRP_LOG("vktime: stop-wait-display +%.0fms bind=%s src_y=%d samp=%d "
+                    "hold_raw=%d shown=%d fsr_busy=%d fsr_out=%d ep=%llu/%llu/%llu "
+                    "need_proc=%d force=%d | %s",
+                    waited, land_bind_kind ? land_bind_kind : "?",
+                    vulkan_tex.y_view() ? 1 : 0, vulkan_tex.sampling_index(),
+                    hold_land_raw ? 1 : 0, stop_frame_shown ? 1 : 0,
+                    fsr.busy() ? 1 : 0, fsr.debug_has_output() ? 1 : 0,
+                    static_cast<unsigned long long>(fsr.debug_epoch()),
+                    static_cast<unsigned long long>(fsr.debug_submit_epoch()),
+                    static_cast<unsigned long long>(fsr.debug_published_epoch()),
+                    fsr_need_process ? 1 : 0, force_fsr_refresh ? 1 : 0,
+                    vulkan_tex.debug_state().c_str());
+          }
+          VRP_SEEK_LOG("seek: wait decode land after %.2fs busy=1 gen=%llu | %s", waited / 1000.0,
                   static_cast<unsigned long long>(vulkan_tex.present_generation()),
                   decoder.seek_debug_state().c_str());
           land_wait_log = now;
@@ -8077,7 +8267,9 @@ void HostWindow::xrThreadMain() {
       const bool reveal_stop = wait_stop_frame && !scrubbing && stop_pts >= 0.0;
       // During stop-land only: kick can free an eye-done front so back can promote.
       // Do not kick while scrubbing — it races DPB with in-flight send_packet.
-      if (vulkan_tex.enabled() && wait_stop_frame && !scrubbing) {
+      // Do not kick while holding KF — that would return the parked still.
+      if (vulkan_tex.enabled() && wait_stop_frame && !scrubbing && !hold_kf_until_play &&
+          !hold_prev_eye_until_play) {
         if (seek_scrub_kick_at.time_since_epoch().count() == 0 ||
             (now - seek_scrub_kick_at) >= std::chrono::milliseconds(200)) {
           if (vulkan_tex.pending_flip()) (void)vulkan_tex.kick_decode_stall();
@@ -8589,12 +8781,20 @@ void HostWindow::xrThreadMain() {
           // Zero-copy AVVkFrame (SRO) for eye and FSR.
           if (scene.wait_previous_submit(0)) vulkan_tex.mark_eye_done();
 
-          bool sampling_changed = vulkan_tex.prepare_display();
-          // Prior eye submit still holds sampling_ → brief wait so the flip can proceed.
-          if (!sampling_changed && vulkan_tex.pending_flip()) {
-            if (scene.wait_previous_submit(8'000'000ull)) {
-              vulkan_tex.mark_eye_done();
-              sampling_changed = vulkan_tex.prepare_display();
+          // While holding the parked KF / pre-switch eye, do not promote land into
+          // front — that would drop the views the eye is still sampling.
+          const bool skip_promote_for_kf =
+              (hold_kf_until_play || hold_prev_eye_until_play) && !decoder.is_playing() &&
+              (wait_stop_frame || stop_frame_shown || seek_settle);
+          bool sampling_changed = false;
+          if (!skip_promote_for_kf) {
+            sampling_changed = vulkan_tex.prepare_display();
+            // Prior eye submit still holds sampling_ → brief wait so the flip can proceed.
+            if (!sampling_changed && vulkan_tex.pending_flip()) {
+              if (scene.wait_previous_submit(8'000'000ull)) {
+                vulkan_tex.mark_eye_done();
+                sampling_changed = vulkan_tex.prepare_display();
+              }
             }
           }
           nv12_mode = vulkan_tex.full_range() ? 2 : 1;
@@ -8609,6 +8809,32 @@ void HostWindow::xrThreadMain() {
             pending_video_rebind = true;
             video_updated = true;
             vulkan_front_promoted = true;
+            if (scrubbing) {
+              VRP_LOG("vktime: scrub-promote +%.0fms from_issue samp=%d | %s",
+                      vktime_ms_since(vktime_scrub_issue_at), vulkan_tex.sampling_index(),
+                      vulkan_tex.debug_state().c_str());
+            } else if (wait_stop_frame && !hold_kf_until_play && !hold_prev_eye_until_play) {
+              // First promote after stop-seek = parked KF (accurate) or land (KF-only).
+              hold_kf_until_play = true;
+              VRP_LOG("vktime: kf-park +%.0fms from_arm samp=%d | %s",
+                      vktime_ms_since(vktime_arm_at), vulkan_tex.sampling_index(),
+                      vulkan_tex.debug_state().c_str());
+            } else if (reveal_stop && !stop_frame_shown) {
+              VRP_LOG("vktime: stop-promote +%.0fms from_arm land=%.0fms samp=%d | %s",
+                      vktime_ms_since(vktime_arm_at), vktime_ms_since(stop_decoded_from),
+                      vulkan_tex.sampling_index(), vulkan_tex.debug_state().c_str());
+            }
+          } else if ((reveal_stop && !stop_frame_shown) ||
+                     (scrubbing && !decoder.seek_in_flight() && vulkan_tex.pending_flip())) {
+            if (vktime_promote_wait_log.time_since_epoch().count() == 0 ||
+                (now - vktime_promote_wait_log) >= std::chrono::milliseconds(100)) {
+              VRP_LOG("vktime: promote-wait +%.0fms scrub=%d flip=%d | %s",
+                      reveal_stop ? vktime_ms_since(stop_decoded_from)
+                                  : vktime_ms_since(vktime_scrub_issue_at),
+                      scrubbing ? 1 : 0, vulkan_tex.pending_flip() ? 1 : 0,
+                      vulkan_tex.debug_state().c_str());
+              vktime_promote_wait_log = now;
+            }
           }
           // Mailbox: at most front+back. Stall → return eye-done front to free DPB.
           {
@@ -8729,12 +8955,48 @@ void HostWindow::xrThreadMain() {
         // output_view() every frame afterward (Live already did; file path did not,
         // so after the first poll the panel stayed on bootstrap raw forever).
         bool bound_file_video = false;
-        if (fsr.enabled()) {
+        const char* this_bind = "none";
+        // Parked KF / pre-switch eye: keep it on the eye until presentation starts.
+        // Do not paint accurate-land approach / land frames (looked like fast-forward).
+        const bool holding_eye =
+            (hold_kf_until_play || hold_prev_eye_until_play) && !decoder.is_playing() &&
+            (wait_stop_frame || stop_frame_shown || seek_settle || hold_land_raw);
+        if (holding_eye) {
           (void)fsr.poll();
-          if (fsr.output_view() && fsr.output_sampler()) {
+          pending_video_rebind = false;
+          fsr_need_process = false;
+          if (hold_prev_eye_until_play) {
+            // Leave the last eye bind alone — never latch the parked KF.
+            this_bind = "hold_prev_eye";
+          } else if (vulkan_front_promoted && src_y && src_samp) {
+            // First latch frame: bind once so the eye has the KF views.
+            bound_file_video = queue_file_raw();
+            if (bound_file_video) this_bind = "kf_park";
+          } else {
+            this_bind = "hold_kf";
+          }
+        } else if (fsr.enabled()) {
+          const bool fsr_fresh = fsr.poll();
+          // After stop-land: never re-bind the previous scrub FSR still. Hold raw
+          // land until a new FSR pass publishes (or playback starts).
+          if (hold_land_raw && fsr_fresh && fsr.output_view() && fsr.output_sampler()) {
+            hold_land_raw = false;
+            VRP_LOG("vktime: land FSR ready — release hold_land_raw "
+                    "ep=%llu sub=%llu pub=%llu gen=%llu samp=%d from_arm=+%.0fms",
+                    static_cast<unsigned long long>(fsr.debug_epoch()),
+                    static_cast<unsigned long long>(fsr.debug_submit_epoch()),
+                    static_cast<unsigned long long>(fsr.debug_published_epoch()),
+                    static_cast<unsigned long long>(vulkan_tex.present_generation()),
+                    vulkan_tex.sampling_index(), vktime_ms_since(vktime_arm_at));
+          }
+          if (hold_land_raw && src_y && src_samp && src_w > 0 && src_h > 0) {
+            bound_file_video = queue_file_raw();
+            if (bound_file_video) this_bind = "land_raw_hold";
+          } else if (fsr.output_view() && fsr.output_sampler()) {
             scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
             force_fsr_refresh = false;
             bound_file_video = true;
+            this_bind = fsr_fresh ? "fsr_fresh" : "fsr_front";
           }
           if (pending_video_rebind && src_y && src_samp && src_w > 0 && src_h > 0) {
             // CUDA/VAAPI/RGBA: stash views. Vulkan: arm need_process only — grab
@@ -8750,8 +9012,9 @@ void HostWindow::xrThreadMain() {
               fsr_src_nv12 = nv12_mode;
             }
             fsr_need_process = true;
-            if (!fsr.output_view()) {
+            if (hold_land_raw || !fsr.output_view()) {
               bound_file_video = queue_file_raw() || bound_file_video;
+              if (bound_file_video && this_bind[0] == 'n') this_bind = "raw_bootstrap";
             }
             pending_video_rebind = false;
             force_fsr_refresh = false;
@@ -8759,88 +9022,230 @@ void HostWindow::xrThreadMain() {
         } else if (pending_video_rebind && src_y && src_samp && src_w > 0 && src_h > 0) {
           (void)fsr.poll();
           bound_file_video = queue_file_raw();
+          if (bound_file_video) this_bind = "raw_nofsr";
           pending_video_rebind = false;
           force_fsr_refresh = false;
         }
-        // Decode has landed (reveal_stop). Vulkan waits until prepare_display has
-        // promoted that frame onto the sampling front, then binds it. Other paths
-        // may settle after 150ms so A/V is not stuck on upload.
+        // Decode has landed (reveal_stop). Prefer prepare_display promotion; after
+        // 150ms grace (same as CUDA) settle anyway so land→play is not one beat late.
         if (reveal_stop && !stop_frame_shown) {
           auto on_stop_frame_shown = [&] {
-            // Re-arm only if land PTS drifted from the parallel stop-seek target.
-            // Same region stays on the in-flight arm (cache already warm).
+            // KF commit: arm only at stop_pts. While sync pending, land handler arms.
             if (!play_wanted || stop_pts < 0.0) return;
+            if (stop_sync_pending) return;
             if (seek_audio_arm_pending &&
                 std::fabs(stop_pts - seek_audio_arm_sec) <= 0.25) {
               return;
             }
             (void)kick_audio_arm(stop_pts, "frame_shown");
           };
+          const bool grace = stop_decoded_from.time_since_epoch().count() != 0 &&
+                             (now - stop_decoded_from) >= std::chrono::milliseconds(150);
           if (decoder.vulkan_path_active()) {
-            if (vulkan_front_promoted && src_y) {
-              bound_file_video = queue_file_raw() || bound_file_video;
+            const bool have_fsr =
+                fsr.enabled() && fsr.output_view() && fsr.output_sampler();
+            // With KF / prev-eye hold: land may sit in mailbox back — treat seek-done as shown.
+            const bool pic_ready =
+                hold_kf_until_play || hold_prev_eye_until_play ||
+                ((vulkan_front_promoted || stop_fast_land) && (src_y || have_fsr));
+            if (pic_ready || grace) {
+              if (hold_prev_eye_until_play) {
+                // Keep pre-switch still on eye; never bind parked KF.
+                this_bind = "hold_prev_eye";
+                hold_land_raw = false;
+              } else if (hold_kf_until_play) {
+                // Keep KF on eye through settle; promote land only when play starts.
+                this_bind = "hold_kf_landed";
+                hold_land_raw = false;
+              } else if (src_y) {
+                hold_land_raw = true;
+                bound_file_video = queue_file_raw() || bound_file_video;
+                if (bound_file_video) this_bind = "land_raw_first";
+                // Kick FSR from the land still; until it publishes keep raw on screen.
+                if (fsr.enabled()) {
+                  fsr_src_nv12 = nv12_mode;
+                  fsr_need_process = true;
+                  force_fsr_refresh = true;
+                }
+              } else if (have_fsr) {
+                // Instant show from scrub FSR still (mailbox may already be empty).
+                scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
+                bound_file_video = true;
+                this_bind = "fsr_instant";
+                hold_land_raw = false;
+              }
+              // Land complete — leave wait_stop_frame so settle→play can run and the
+              // 3s land TIMEOUT path does not fire after a successful shown.
+              wait_stop_frame = false;
               stop_frame_shown = true;
+              stop_fast_land = false;
               seek_settle = true;
               seek_settle_from = now;
+              seek_land_from = {};
+              vktime_arm_to_shown_ms = vktime_ms_since(vktime_arm_at);
               on_stop_frame_shown();
-              VRP_LOG("seek: frame shown pts=%.3f pic=1 grace=0 bound=%d settle=0.5s",
-                      stop_pts, bound_file_video ? 1 : 0);
+              VRP_LOG("vktime: stop-shown +%.0fms from_arm land=%.0fms grace=%d pic=%d bound=%d "
+                      "hold_raw=1 bind=%s samp=%d gen=%llu fsr_busy=%d fsr_out=%d "
+                      "ep=%llu/%llu/%llu need_proc=%d",
+                      vktime_arm_to_shown_ms, vktime_ms_since(stop_decoded_from), grace ? 1 : 0,
+                      pic_ready ? 1 : 0, bound_file_video ? 1 : 0,
+                      this_bind ? this_bind : "?", vulkan_tex.sampling_index(),
+                      static_cast<unsigned long long>(vulkan_tex.present_generation()),
+                      fsr.busy() ? 1 : 0, fsr.debug_has_output() ? 1 : 0,
+                      static_cast<unsigned long long>(fsr.debug_epoch()),
+                      static_cast<unsigned long long>(fsr.debug_submit_epoch()),
+                      static_cast<unsigned long long>(fsr.debug_published_epoch()),
+                      fsr_need_process ? 1 : 0);
+              VRP_SEEK_LOG("seek: frame shown pts=%.3f pic=%d grace=%d bound=%d settle=%.2fs",
+                      stop_pts, pic_ready ? 1 : 0, grace ? 1 : 0, bound_file_video ? 1 : 0,
+                      stop_settle_sec);
             }
           } else {
             const bool has_picture = src_y && src_samp && src_w > 0 && src_h > 0;
             const bool pic_ready =
                 has_picture && (video_updated || stop_upload_sent || bound_file_video);
-            const bool grace = stop_decoded_from.time_since_epoch().count() != 0 &&
-                               (now - stop_decoded_from) >= std::chrono::milliseconds(150);
             if (pic_ready || grace) {
               if (pic_ready && !bound_file_video && (!fsr.enabled() || !fsr.output_view()))
                 (void)queue_file_raw();
+              wait_stop_frame = false;
               stop_frame_shown = true;
+              stop_fast_land = false;
               seek_settle = true;
               seek_settle_from = now;
+              seek_land_from = {};
               on_stop_frame_shown();
-              VRP_LOG("seek: frame shown pts=%.3f pic=%d grace=%d bound=%d settle=0.5s",
-                      stop_pts, pic_ready ? 1 : 0, grace ? 1 : 0, bound_file_video ? 1 : 0);
+              VRP_SEEK_LOG("seek: frame shown pts=%.3f pic=%d grace=%d bound=%d settle=%.2fs",
+                      stop_pts, pic_ready ? 1 : 0, grace ? 1 : 0, bound_file_video ? 1 : 0,
+                      stop_settle_sec);
             }
           }
         }
-        // Keep the landed Vulkan still bound until a new FSR pass replaces it.
-        // Otherwise the next frame has nothing queued and the previous picture returns.
-        if (decoder.vulkan_path_active() && reveal_stop && stop_frame_shown && src_y &&
-            !(fsr.enabled() && fsr.output_view())) {
-          (void)queue_file_raw();
+        // Keep landed Vulkan still on screen through settle and arm wait — do not
+        // fall back to the previous scrub eye/FSR descriptors.
+        if (hold_land_raw && src_y && src_samp && src_w > 0 && src_h > 0 &&
+            !decoder.is_playing()) {
+          if (queue_file_raw()) this_bind = "land_raw_hold";
+        } else if (decoder.vulkan_path_active() && reveal_stop && stop_frame_shown && src_y &&
+                   !(fsr.enabled() && fsr.output_view())) {
+          if (queue_file_raw()) this_bind = "land_raw_nofsr";
+        }
+
+        // Breadcrumb: what the eye actually binds during wait / shown / settle.
+        if (decoder.vulkan_path_active() &&
+            (wait_stop_frame || stop_frame_shown || hold_land_raw)) {
+          const uint64_t gen_now = vulkan_tex.present_generation();
+          const bool bind_changed =
+              (this_bind && land_bind_kind && std::strcmp(this_bind, land_bind_kind) != 0) ||
+              gen_now != land_bind_gen;
+          const bool due = land_bind_log_at.time_since_epoch().count() == 0 ||
+                           (now - land_bind_log_at) >= std::chrono::milliseconds(100);
+          if (bind_changed || due) {
+            const double settle_left_ms =
+                seek_settle
+                    ? std::max(0.0, stop_settle_ms -
+                                        std::chrono::duration<double, std::milli>(
+                                            now - seek_settle_from)
+                                            .count())
+                    : -1.0;
+            VRP_LOG("vktime: land-bind +%.0fms kind=%s→%s src_y=%d samp=%d gen=%llu "
+                    "hold_raw=%d shown=%d settle=%d left=%.0fms "
+                    "fsr_busy=%d fsr_out=%d ep=%llu/%llu/%llu need=%d force=%d",
+                    vktime_ms_since(vktime_arm_at),
+                    land_bind_kind ? land_bind_kind : "?", this_bind ? this_bind : "?",
+                    src_y ? 1 : 0, vulkan_tex.sampling_index(),
+                    static_cast<unsigned long long>(gen_now), hold_land_raw ? 1 : 0,
+                    stop_frame_shown ? 1 : 0, seek_settle ? 1 : 0, settle_left_ms,
+                    fsr.busy() ? 1 : 0, fsr.debug_has_output() ? 1 : 0,
+                    static_cast<unsigned long long>(fsr.debug_epoch()),
+                    static_cast<unsigned long long>(fsr.debug_submit_epoch()),
+                    static_cast<unsigned long long>(fsr.debug_published_epoch()),
+                    fsr_need_process ? 1 : 0, force_fsr_refresh ? 1 : 0);
+            land_bind_kind = this_bind ? this_bind : "none";
+            land_bind_gen = gen_now;
+            land_bind_log_at = now;
+          }
         }
       }
 
-      // Still stays up through the 0.5s settle after the landed frame is shown.
+      // Still stays up through settle after the landed frame is shown.
       // Recompute settle here — seek_settle may have just started on this tick.
       const bool seek_settling_now =
-          seek_settle && std::chrono::duration<double>(now - seek_settle_from).count() < 0.5;
-      if (stop_frame_shown && !seek_settling_now && !scrubbing && !decoder.seek_in_flight() &&
-          !decoder.is_playing() && !decoder.is_priming()) {
-        VRP_LOG("seek: resume after settle pts=%.3f play_wanted=%d", stop_pts,
-                play_wanted ? 1 : 0);
-        wait_stop_frame = false;
-        thumb_latched = false;
-        seek_settle = false;
-        seek_land_from = {};
-        stop_decoded_from = {};
-        if (play_wanted) {
-          // Still on screen at land PTS. Start A/V together — no priming, no
-          // demux-queue wipe on commit. Shared demux feeds both from the land cursor.
-          stop_frame_shown = false;
-          seek_resume_force = true;
-          if (!seek_audio_arm_pending && audio.is_open() && audio.has_audio()) {
-            const double arm = stop_pts >= 0.0 ? stop_pts : decoder.position();
-            (void)kick_audio_arm(arm, "after_settle");
-          }
-          if (!try_start_with_arm("after_settle", /*ignore_hold=*/true)) {
-            VRP_LOG("seek: after settle — waiting arm Ready pts=%.3f pending=%d", stop_pts,
-                    seek_audio_arm_pending ? 1 : 0);
-          }
-        } else {
-          stop_frame_shown = false;
+          seek_settle &&
+          std::chrono::duration<double>(now - seek_settle_from).count() < stop_settle_sec;
+      if (seek_settling_now && decoder.vulkan_path_active()) {
+        static std::chrono::steady_clock::time_point settle_log_at{};
+        if (settle_log_at.time_since_epoch().count() == 0 ||
+            (now - settle_log_at) >= std::chrono::milliseconds(50)) {
+          const double elapsed =
+              std::chrono::duration<double, std::milli>(now - seek_settle_from).count();
+          VRP_LOG("vktime: stop-settle +%.0fms elapsed=%.0fms left=%.0fms bind=%s "
+                  "hold_raw=%d fsr_busy=%d fsr_out=%d ep=%llu/%llu/%llu",
+                  vktime_ms_since(vktime_arm_at), elapsed,
+                  std::max(0.0, stop_settle_ms - elapsed),
+                  land_bind_kind ? land_bind_kind : "?", hold_land_raw ? 1 : 0,
+                  fsr.busy() ? 1 : 0, fsr.debug_has_output() ? 1 : 0,
+                  static_cast<unsigned long long>(fsr.debug_epoch()),
+                  static_cast<unsigned long long>(fsr.debug_submit_epoch()),
+                  static_cast<unsigned long long>(fsr.debug_published_epoch()));
+          settle_log_at = now;
         }
+      }
+      // After land(/settle): commit audio + start_presentation together at stop_pts
+      // (A/V lock). play_wanted uses settle 0 — resume as soon as Soft is Ready.
+      // wait_stop_frame is cleared at stop-shown; do not require it here.
+      if (stop_frame_shown && !seek_settling_now && !scrubbing &&
+          !decoder.is_playing() && !decoder.is_priming()) {
+        if (decoder.seek_in_flight() || stop_sync_pending) {
+          static std::chrono::steady_clock::time_point resume_block_log{};
+          if (resume_block_log.time_since_epoch().count() == 0 ||
+              (now - resume_block_log) >= std::chrono::milliseconds(200)) {
+            VRP_LOG("vktime: stop-resume-wait seek_busy pts=%.3f +%.0fms | %s", stop_pts,
+                    vktime_ms_since(vktime_arm_at), decoder.seek_debug_state().c_str());
+            resume_block_log = now;
+          }
+        } else if (stop_pts < 0.0) {
+          VRP_LOG("vktime: stop-resume-abort pts unset — drop shown");
+          clear_land_ux_for_play();
+        } else {
+          thumb_latched = false;
+          if (play_wanted) {
+            seek_resume_force = true;
+            const double arm_sec =
+                (seek_audio_arm_sec >= 0.0) ? seek_audio_arm_sec : stop_pts;
+            if (audio.is_open() && audio.has_audio() &&
+                (!seek_audio_arm_pending ||
+                 std::fabs(arm_sec - stop_pts) > 0.25)) {
+              (void)kick_audio_arm(stop_pts, "after_settle");
+            }
+            if (try_start_with_arm("after_settle", /*ignore_hold=*/true)) {
+              VRP_LOG("seek: resume after settle pts=%.3f play_wanted=1", stop_pts);
+              if (decoder.vulkan_path_active()) {
+                VRP_LOG("vktime: stop-play +%.0fms from_arm land=%.0f shown=%.0f settle=%.0fms "
+                        "play_wanted=%d bind=%s hold_raw=%d fsr_out=%d ep=%llu/%llu/%llu",
+                        vktime_ms_since(vktime_arm_at), vktime_arm_to_land_ms,
+                        vktime_arm_to_shown_ms, stop_settle_ms, play_wanted ? 1 : 0,
+                        land_bind_kind ? land_bind_kind : "?", hold_land_raw ? 1 : 0,
+                        fsr.debug_has_output() ? 1 : 0,
+                        static_cast<unsigned long long>(fsr.debug_epoch()),
+                        static_cast<unsigned long long>(fsr.debug_submit_epoch()),
+                        static_cast<unsigned long long>(fsr.debug_published_epoch()));
+              }
+            } else {
+              static std::chrono::steady_clock::time_point arm_wait_log{};
+              if (arm_wait_log.time_since_epoch().count() == 0 ||
+                  (now - arm_wait_log) >= std::chrono::milliseconds(200)) {
+                VRP_SEEK_LOG("seek: after settle — waiting arm Ready pts=%.3f pending=%d",
+                             stop_pts, seek_audio_arm_pending ? 1 : 0);
+                arm_wait_log = now;
+              }
+            }
+          } else {
+            clear_land_ux_for_play();
+          }
+        }
+      } else if ((hold_land_raw || stop_frame_shown || seek_settle) && decoder.is_playing()) {
+        // Presentation started — drop land UX even while Soft unmute is still pending.
+        clear_land_ux_for_play();
       } else if (wait_stop_frame && !scrubbing &&
                  seek_land_from.time_since_epoch().count() != 0) {
         const double land_wait =
@@ -8865,7 +9270,7 @@ void HostWindow::xrThreadMain() {
           static std::chrono::steady_clock::time_point flush_wait_log{};
           if (flush_wait_log.time_since_epoch().count() == 0 ||
               (now - flush_wait_log) >= std::chrono::milliseconds(500)) {
-            VRP_LOG("seek: wait flush/apply after %.2fs | %s", land_wait,
+            VRP_SEEK_LOG("seek: wait flush/apply after %.2fs | %s", land_wait,
                     decoder.seek_debug_state().c_str());
             flush_wait_log = now;
           }
@@ -8879,7 +9284,7 @@ void HostWindow::xrThreadMain() {
             if (!scene.wait_previous_submit(0))
               (void)scene.wait_previous_submit(50'000'000ull);
             if (phase && std::strcmp(phase, "send_packet") == 0) {
-              VRP_LOG("seekdbg: skip release_held — decode in send_packet");
+              VRP_SEEK_LOG("seekdbg: skip release_held — decode in send_packet");
             } else {
               vulkan_tex.release_held();
             }
@@ -8906,7 +9311,7 @@ void HostWindow::xrThreadMain() {
           static std::chrono::steady_clock::time_point deep_wait_log{};
           if (deep_wait_log.time_since_epoch().count() == 0 ||
               (now - deep_wait_log) >= std::chrono::milliseconds(500)) {
-            VRP_LOG("seek: wait decode land after %.2fs busy=1 gen=%llu | %s", land_wait,
+            VRP_SEEK_LOG("seek: wait decode land after %.2fs busy=1 gen=%llu | %s", land_wait,
                     static_cast<unsigned long long>(vulkan_tex.present_generation()),
                     decoder.seek_debug_state().c_str());
             deep_wait_log = now;
@@ -9196,6 +9601,10 @@ void HostWindow::xrThreadMain() {
           force_fsr_refresh = false;
         }
         if (fsr_need_process && !fsr.busy()) {
+          // During stop wait before land is shown, do not FSR mid-approach frames.
+          if (wait_stop_frame && !stop_frame_shown && !hold_land_raw) {
+            fsr_need_process = false;
+          } else {
           VkImageView py = fsr_src_y;
           VkImageView puv = fsr_src_uv ? fsr_src_uv : fsr_src_y;
           VkSampler ps = fsr_src_samp;
@@ -9222,14 +9631,31 @@ void HostWindow::xrThreadMain() {
             }
           }
           if (py && ps && pw > 0 && ph > 0) {
-            (void)fsr.process(py, puv ? puv : py, ps, pw, ph, pnv, src_layout);
+            const bool land_fsr =
+                hold_land_raw || stop_frame_shown || force_fsr_refresh;
+            const bool published =
+                fsr.process(py, puv ? puv : py, ps, pw, ph, pnv, src_layout);
             fsr_need_process = false;
-            (void)fsr.poll();
+            const bool polled = fsr.poll();
             if (fsr.output_view() && fsr.output_sampler()) {
               scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
               force_fsr_refresh = false;
             }
+            if (land_fsr && decoder.vulkan_path_active()) {
+              VRP_LOG("vktime: land-fsr-submit published=%d polled=%d out=%d busy=%d "
+                      "ep=%llu/%llu/%llu hold_raw=%d shown=%d wait=%d "
+                      "src=%dx%d nv12=%d from_arm=+%.0fms | %s",
+                      published ? 1 : 0, polled ? 1 : 0, fsr.debug_has_output() ? 1 : 0,
+                      fsr.busy() ? 1 : 0,
+                      static_cast<unsigned long long>(fsr.debug_epoch()),
+                      static_cast<unsigned long long>(fsr.debug_submit_epoch()),
+                      static_cast<unsigned long long>(fsr.debug_published_epoch()),
+                      hold_land_raw ? 1 : 0, stop_frame_shown ? 1 : 0,
+                      wait_stop_frame ? 1 : 0, pw, ph, pnv,
+                      vktime_ms_since(vktime_arm_at), vulkan_tex.debug_state().c_str());
+            }
           }
+          } // else: not holding stop eye
         } else if (fsr.poll() && fsr.output_view() && fsr.output_sampler()) {
           scene.queue_texture_gamma(fsr.output_view(), fsr.output_sampler());
           force_fsr_refresh = false;

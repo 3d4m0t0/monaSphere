@@ -14,10 +14,11 @@
 #include <unistd.h>
 
 /**
- * Persist log gates (monasphere.conf):
+ * Persist / detail log gates (monasphere.conf):
  *   live_display_log=0|1  → ~/.config/monasphere/live-display.log (+ /tmp/…)
  *   live_teardown_log=0|1 → ~/.config/monasphere/live-teardown.log (+ /tmp/…)
- * Defaults: live_display_log off (dma breadcrumbs heavy); live_teardown_log on.
+ *   seek_detail_log=0|1   → verbose seek/scrub breadcrumbs on stdout (VRP_SEEK_LOG)
+ * Defaults: live_display_log off; live_teardown_log on; seek_detail_log off.
  */
 inline std::atomic<bool>& vrp_persist_display_enabled_flag() {
   static std::atomic<bool> on{false};
@@ -27,17 +28,27 @@ inline std::atomic<bool>& vrp_persist_teardown_enabled_flag() {
   static std::atomic<bool> on{true};
   return on;
 }
+inline std::atomic<bool>& vrp_seek_detail_enabled_flag() {
+  static std::atomic<bool> on{false};
+  return on;
+}
 inline void vrp_set_persist_display_log(bool on) {
   vrp_persist_display_enabled_flag().store(on, std::memory_order_release);
 }
 inline void vrp_set_persist_teardown_log(bool on) {
   vrp_persist_teardown_enabled_flag().store(on, std::memory_order_release);
 }
+inline void vrp_set_seek_detail_log(bool on) {
+  vrp_seek_detail_enabled_flag().store(on, std::memory_order_release);
+}
 inline bool vrp_persist_display_enabled() {
   return vrp_persist_display_enabled_flag().load(std::memory_order_acquire);
 }
 inline bool vrp_persist_teardown_enabled() {
   return vrp_persist_teardown_enabled_flag().load(std::memory_order_acquire);
+}
+inline bool vrp_seek_detail_enabled() {
+  return vrp_seek_detail_enabled_flag().load(std::memory_order_acquire);
 }
 
 /**
@@ -165,6 +176,14 @@ inline void vrp_format_log_stamp(char* buf, size_t n) {
     if (vrp_persist_display_enabled()) {     \
       VRP_LOG(__VA_ARGS__);                  \
       vrp_persist_display_log(__VA_ARGS__);  \
+    }                                        \
+  } while (0)
+
+/** Seek/scrub breadcrumbs when seek_detail_log=1 (Preferences → Decode). */
+#define VRP_SEEK_LOG(...)                    \
+  do {                                       \
+    if (vrp_seek_detail_enabled()) {         \
+      VRP_LOG(__VA_ARGS__);                  \
     }                                        \
   } while (0)
 

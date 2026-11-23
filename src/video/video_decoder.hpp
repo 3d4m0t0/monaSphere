@@ -255,12 +255,28 @@ class VideoDecoder {
   void play();
   /** Begin presenting frames. Called after audio is armed for this start. */
   void start_presentation();
+  /**
+   * In-place unpause: set playing without clearing the audio packet queue.
+   * Host arms Soft at the still via discard_until; clearing would drop those packets
+   * and force demux from a cursor ahead of the picture.
+   */
+  void resume_presentation();
   void pause();
   void toggle();
   void seek_relative(double delta_sec);
   void seek_to(double sec);
   /** True while LB/RB key-repeat scrubbing — demux keeps only a tiny queue. */
   void set_seek_scrubbing(bool active);
+  /**
+   * Stop-seek: decode+discard from KF until |pts-target|<=0.08 (present_after).
+   * Scrub preview leaves this false (first KF after av_seek).
+   */
+  void set_seek_accurate_land(bool active);
+  bool seek_accurate_land() const { return seek_accurate_land_.load(); }
+  /** Latest seek_to / scrub target (host adopt / near checks). */
+  double seek_target() const { return seek_target_.load(); }
+  /** Update land target without re-av_seek (adopt refine when bar moved slightly). */
+  void retarget_seek(double sec);
   /** True once after the first decoded frame following a seek (for A/V resync). */
   bool consume_av_resync();
   /** True until that post-seek frame is decoded. Playback must not start before then. */
@@ -362,8 +378,21 @@ class VideoDecoder {
   std::atomic<bool> playback_started_{false};
   std::atomic<size_t> priming_need_bytes_{0};  // threshold for current priming
   bool awaiting_frame_after_seek_ = false;  // decode thread only
+  /** Accurate land: KF already in mailbox for eye hold; catch-up continues. */
+  bool seek_kf_parked_ = false;  // decode thread only
   /** Newest PTS shown during this scrub. Older pictures are not displayed. */
   double seek_shown_pts_ = -1.0;
+  /** Decode-thread only: last Vulkan seek approach timings (logged on land). */
+  std::chrono::steady_clock::time_point seek_timing_t0_{};
+  std::chrono::steady_clock::time_point seek_await_t0_{};
+  double seek_timing_pre_flush_ms_ = 0.0;
+  double seek_timing_av_seek_ms_ = 0.0;
+  double seek_timing_flush_ms_ = 0.0;
+  int seek_timing_recycle_n_ = 0;
+  double seek_timing_recycle_ms_ = 0.0;
+  int seek_timing_present_n_ = 0;
+  double seek_timing_present_ms_ = 0.0;
+  int seek_timing_bail_req_n_ = 0;
   std::atomic<bool> seek_busy_{false};
   std::atomic<bool> seek_abandon_{false};
   /** Decode-thread progress label for seek hang diagnosis (string literal only). */
@@ -381,6 +410,8 @@ class VideoDecoder {
   /** Abort blocking FFmpeg IO (open / read) so XR halt cannot hang on USB. */
   std::atomic<bool> io_abort_{false};
   std::atomic<bool> seek_scrubbing_{false};
+  /** Stop-seek accurate land: |pts-target|<=0.08. Scrub: first KF after av_seek. */
+  std::atomic<bool> seek_accurate_land_{false};
   std::atomic<uint64_t> seek_serial_{0};
   mutable std::mutex pkt_mu_;
   std::condition_variable pkt_cv_;

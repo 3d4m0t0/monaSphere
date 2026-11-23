@@ -96,6 +96,8 @@ class VulkanVideoTexture {
    * seek has paused demux/play (otherwise decode CB can sit at need=cur+1 for seconds).
    */
   void kick_gpu_activity();
+  /** True after vkQueueSubmit returns VK_ERROR_DEVICE_LOST — device is dead. */
+  bool device_lost() const { return device_lost_.load(std::memory_order_acquire); }
   /** Free mailbox back only — keeps front on screen (scrub DPB relief). */
   void release_back();
   void reset();
@@ -158,6 +160,7 @@ class VulkanVideoTexture {
   VkCommandBuffer cmd_ = VK_NULL_HANDLE;
   VkFence fence_ = VK_NULL_HANDLE;
   bool fence_pending_ = false;
+  std::atomic<bool> device_lost_{false};
   VkSemaphore pending_wait_sem_[2]{};
   uint64_t pending_wait_val_[2]{};
   uint32_t pending_wait_count_ = 0;

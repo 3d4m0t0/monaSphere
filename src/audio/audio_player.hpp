@@ -88,6 +88,20 @@ class AudioPlayer {
 
   void play();
   void pause();
+  /**
+   * In-place pause: silence Soft but keep queued PCM (no flush).
+   * Pair with resume_hold_buffer() so A/V continue from the same still.
+   */
+  void pause_hold_buffer();
+  /**
+   * True if Soft still holds PCM from pause (no play yet).
+   * Host must resume video first, then go_live_hold_buffer().
+   */
+  bool resume_hold_buffer();
+  /** Start Soft after video resume_presentation (non-blocking fade). */
+  void go_live_hold_buffer();
+  /** Advance in-place resume Soft fade (call once per XR frame). */
+  void tick_hold_fade();
   /** Soft-mute + flush ring; device keeps running and outputs silence to the HMD. */
   void mute_output();
   /** Gain 0, then drop queued PCM. Volume returns on the next prefill. */
@@ -268,6 +282,8 @@ class AudioPlayer {
   uint64_t arm_epoch_ = 0;
   double arm_sec_ = 0.0;
   std::chrono::steady_clock::time_point arm_phase_from_{};
+  /** Wall time when start_presentation armed Soft fill (0 = not yet). */
+  std::chrono::steady_clock::time_point present_at_{};
   /** begin_arm_at with no demux (live / no audio) — poll returns Ready until commit. */
   bool arm_instant_ready_ = false;
   /** Shared file demux (owned by VideoDecoder). nullptr = legacy own-fmt mode. */

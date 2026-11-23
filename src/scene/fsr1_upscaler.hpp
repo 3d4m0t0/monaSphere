@@ -57,6 +57,12 @@ class Fsr1Upscaler {
   int output_width() const { return out_w_; }
   int output_height() const { return out_h_; }
 
+  /** Seek/land diagnostics — epoch pairing after invalidate vs process. */
+  uint64_t debug_epoch() const { return epoch_; }
+  uint64_t debug_submit_epoch() const { return submit_epoch_; }
+  uint64_t debug_published_epoch() const { return published_epoch_; }
+  bool debug_has_output() const { return output_view() != VK_NULL_HANDLE; }
+
  private:
   struct Rt {
     VkImage image = VK_NULL_HANDLE;
