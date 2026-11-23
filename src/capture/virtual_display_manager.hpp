@@ -142,6 +142,13 @@ class VirtualDisplayManager : public QObject {
 
   bool refresh_identity(QString* error_out = nullptr);
 
+  /**
+   * Re-place Virtual at KdeVirtualDisplay::preferredPlaceOrigin() and return the
+   * portal uniqueId ("XxY") from Qt QScreen when visible. Empty if unknown.
+   * Call before ScreenCast Start so Remember restore can match.
+   */
+  QString pinPortalGeometry();
+
   static int spanFromName(const QString& name_or_output);
   static Spec normalize(Spec want);
 

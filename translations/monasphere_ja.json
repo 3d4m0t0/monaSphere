@@ -1815,6 +1815,66 @@
       "context": "Preferences",
       "source": "Seek thumbnails as JPEG",
       "translation": "シークサムネを JPEG で保持"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Live: restore token missing from system PermissionStore — Remember was revoked or already consumed without update",
+      "translation": "Live: システムの PermissionStore に復元トークンがありません — Remember が取り消されたか、更新前に消費されました"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Live: no restore token (prior Live output remembered) — setup needed",
+      "translation": "Live: 復元トークンがありません（以前の Live 出力は記録あり）— セットアップが必要です"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Live capture setup",
+      "translation": "Live キャプチャのセットアップ"
+    },
+    {
+      "context": "HostWindow",
+      "source": "ScreenCast Remember is missing or no longer valid.\n\nWithout it, Live will ask for host permission again.\n\nSet up live capture now? (pick Virtual-monaSphere, enable Remember)",
+      "translation": "ScreenCast の Remember が無いか、無効になっています。\n\nこのままだと Live 開始時にホストで許可が再度求められます。\n\n今すぐセットアップしますか？（Virtual-monaSphere を選び、Remember を有効に）"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Live capture setup is complete.\n\nScreenCast Remember is saved. HMD Live should start without asking for host permission again.",
+      "translation": "Live キャプチャのセットアップが完了しました。\n\nScreenCast の Remember を保存しました。HMD の Live は、ホストで許可を求めずに開始できるはずです。"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Live capture setup did not finish.\n\nRestore verify failed — HMD Live may ask for host permission again.\n\nRun Tools → Set up live capture… and enable Remember.",
+      "translation": "Live キャプチャのセットアップが完了しませんでした。\n\n復元の確認に失敗しました。HMD の Live で再度ホスト許可が求められる可能性があります。\n\nツール → Live キャプチャを設定… で Remember を有効にしてください。"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Live capture setup failed.\n\nOn the host share dialog, pick Virtual-monaSphere and enable Remember, then try Tools → Set up live capture… again.",
+      "translation": "Live キャプチャのセットアップに失敗しました。\n\nホストの共有ダイアログで Virtual-monaSphere を選び Remember を有効にしてから、ツール → Live キャプチャを設定… を再実行してください。"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Live capture setup did not finish.\n\nNo restore token was returned. On the KDE share dialog, enable Remember / allow restore, then run Tools → Set up live capture… again.",
+      "translation": "Live キャプチャのセットアップが完了しませんでした。\n\n復元トークンが返りませんでした。KDE の共有ダイアログで Remember / 復元を許可してから、ツール → Live キャプチャを設定… を再実行してください。"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Waiting for host approval…\n\n1. A ScreenCast share dialog will appear on the host.\n2. Pick %1.\n3. Enable Remember / allow restore.\n4. Confirm.\n\nThis dialog stays open until setup finishes.",
+      "translation": "ホストでの許可待ち…\n\n1. ホストに ScreenCast 共有ダイアログが出ます。\n2. %1 を選びます。\n3. Remember / 復元を許可します。\n4. 確定します。\n\nセットアップが終わるまでこのダイアログは開いたままです。"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Token saved.\n\nVerifying ScreenCast restore (no HMD preview)…\nLeave this dialog open.",
+      "translation": "トークンを保存しました。\n\nScreenCast の復元を確認しています（HMD プレビューなし）…\nこのダイアログはそのままにしてください。"
+    },
+    {
+      "context": "HostWindow",
+      "source": "Token saved.\n\nVerifying ScreenCast restore for x%1 (no HMD preview)…\nLeave this dialog open.",
+      "translation": "トークンを保存しました。\n\nx%1 の ScreenCast 復元を確認しています（HMD プレビューなし）…\nこのダイアログはそのままにしてください。"
+    },
+    {
+      "context": "HostWindow",
+      "source": "x%1 OK.\n\nNext: on the host share dialog, pick %2 and enable Remember.",
+      "translation": "x%1 OK。\n\n次: ホストの共有ダイアログで %2 を選び、Remember を有効にしてください。"
     }
   ]
 }

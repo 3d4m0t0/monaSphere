@@ -778,6 +778,8 @@ void YouTubeSession::start(const Config& cfg) {
                             .arg(vr.span)
                             .arg(restore_token_.size()));
       }
+      // Pin before Chrome/prefetch — SelectSources restore matches uniqueId now.
+      (void)pinAndVerifyPortalRestore();
       setState(State::VDispReady);
       set_busy_progress(-1);
       const QString title = !cfg_.launch_title.isEmpty()
@@ -1753,31 +1755,115 @@ void YouTubeSession::kickEarlyYtAudioRoute() {
 #endif
 }
 
+QString YouTubeSession::pinAndVerifyPortalRestore() {
+  if (desk_ != DesktopEnv::Kde || !cfg_.virtual_display || !vdisp_mgr_ || !vdisp_mgr_->alive()) {
+    return {};
+  }
+  const QString now_id = vdisp_mgr_->pinPortalGeometry();
+  const QString saved = cfg_.restore_output_id.trimmed();
+  if (!restore_token_.isEmpty() && !saved.isEmpty() && !now_id.isEmpty() && now_id != saved) {
+    VRP_LOG("screencast: portal id %s != saved %s — clear token (SelectSources would fail)",
+            now_id.toUtf8().constData(), saved.toUtf8().constData());
+    emit logMessage(
+        tr("ScreenCast: portal id %1 ≠ saved %2 — silent restore impossible (re-Remember)")
+            .arg(now_id, saved));
+    restore_token_.clear();
+    cfg_.restore_token.clear();
+    vdisp_mgr_->clearToken(vdisp_mgr_->active_span());
+    emit restoreOutputIdChanged(QString());
+    if (portal_ && (portal_->preparing() || portal_->prepare_ready() || portal_->busy())) {
+      portal_->stop();
+    }
+  } else if (!restore_token_.isEmpty() && !saved.isEmpty() && now_id == saved) {
+    VRP_LOG("screencast: portal id %s matches Remember — ready for SelectSources",
+            now_id.toUtf8().constData());
+    emit logMessage(tr("ScreenCast: portal id %1 matches Remember — silent restore").arg(now_id));
+  } else if (!restore_token_.isEmpty() && saved.isEmpty() && !now_id.isEmpty()) {
+    VRP_LOG("screencast: portal id %s (no saved id — attempting restore)",
+            now_id.toUtf8().constData());
+    emit logMessage(tr("ScreenCast: portal id %1 (no saved id yet — attempting restore)")
+                        .arg(now_id));
+  } else if (!now_id.isEmpty()) {
+    VRP_LOG("screencast: portal id %s (pinned; restore_token=%s)", now_id.toUtf8().constData(),
+            restore_token_.isEmpty() ? "no" : "yes");
+  }
+  return now_id;
+}
+
 void YouTubeSession::prefetchPortalRestore() {
   if (!portal_ || desk_ != DesktopEnv::Kde || desktopAppMode()) return;
   if (restore_token_.isEmpty()) return;
   if (portal_->busy()) return;
   // Streaming / switch must keep the existing ScreenCast node.
   if (active_.load(std::memory_order_acquire) || switch_hold_content_) return;
+  // SelectSources consumes restore_token and matches uniqueId immediately —
+  // Virtual must already sit at the Remembered origin (not after Start).
+  portal_prefetching_ = true;
+  portal_begin_pending_ = false;
+  (void)pinAndVerifyPortalRestore();
+  if (restore_token_.isEmpty()) {
+    portal_prefetching_ = false;
+    emit logMessage(tr("ScreenCast: skip prefetch — restore token cleared after pin verify"));
+    if (portal_begin_pending_) {
+      portal_begin_pending_ = false;
+      QTimer::singleShot(0, this, [this] { beginPortal(false); });
+    }
+    return;
+  }
   const QString parent = portalParentWindow();
   emit logMessage(tr("ScreenCast: prefetch CreateSession while Chrome starts…"));
   portal_->prepare(parent, restore_token_, /*persist_mode*/ 2,
                    ScreencastPortal::SourceKind::Monitor,
                    ScreencastPortal::SessionMode::VideoOnly);
+  portal_prefetching_ = false;
+  if (portal_begin_pending_ || state_ == State::Placed) {
+    portal_begin_pending_ = false;
+    // Place finished during pin processEvents — finish Start now that prepare ran.
+    QTimer::singleShot(0, this, [this] { beginPortal(false); });
+  }
 }
 
 void YouTubeSession::beginPortal(bool after_reject) {
   if (state_ != State::Placed && state_ != State::Portal) return;
+  // pinPortalGeometry processEvents can deliver place-ok → here while prefetch
+  // still owns the portal sequence. Queue until prefetch returns.
+  if (portal_prefetching_) {
+    portal_begin_pending_ = true;
+    VRP_LOG("screencast: beginPortal deferred (prefetch/pin in progress)");
+    return;
+  }
   setState(State::Portal);
 
   // Snapshot host seat before ScreenCast / Virtual pointer steal it.
   rememberSeatCursor();
 
+  // Re-pin before Start (prefetch already pinned before SelectSources).
+  if (desk_ == DesktopEnv::Kde && cfg_.virtual_display) {
+    (void)pinAndVerifyPortalRestore();
+  }
+
   // Prefetch during Chrome launch: only Start remains (place-before-Start kept).
   if (portal_ && (portal_->preparing() || portal_->prepare_ready()) &&
       desk_ == DesktopEnv::Kde && !restore_token_.isEmpty()) {
     emit logMessage(tr("ScreenCast: finishing prefetched restore (Start)…"));
+    // Restore path can still fall back to a dialog — arm primary like interactive.
+    {
+      QString arm_err;
+      (void)KwinWindowPlacer::arm_portal_dialog_on_primary(&arm_err);
+    }
     portal_->finishStart();
+    armPortalWatchdog(!restore_token_.isEmpty() && !after_reject);
+    return;
+  }
+
+  // Nested beginPortal already called start() (defer=false) during an older race —
+  // do not start again; SelectSources will call Start.
+  if (portal_ && portal_->busy() && desk_ == DesktopEnv::Kde) {
+    emit logMessage(tr("ScreenCast: session already in progress — waiting for Start"));
+    {
+      QString arm_err;
+      (void)KwinWindowPlacer::arm_portal_dialog_on_primary(&arm_err);
+    }
     armPortalWatchdog(!restore_token_.isEmpty() && !after_reject);
     return;
   }
@@ -1815,7 +1901,13 @@ void YouTubeSession::beginPortal(bool after_reject) {
     }
   } else {
     emit logMessage(tr("ScreenCast: restoring previous share…"));
-    // GNOME Meta path never uses portal Start — no grant toast.
+    // If restore soft-fails into a chooser, keep the dialog on the primary.
+    if (desk_ == DesktopEnv::Kde) {
+      QString arm_err;
+      if (KwinWindowPlacer::arm_portal_dialog_on_primary(&arm_err)) {
+        emit logMessage(tr("ScreenCast: portal dialog armed -> primary (restore)"));
+      }
+    }
   }
 
   auto launch = [this, interactive, after_reject] {
@@ -2193,6 +2285,18 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
       vdisp_mgr_->setToken(span, restore_token_);
     } else {
       emit restoreTokenChanged(restore_token_);
+    }
+    // Persist the portal uniqueId that matched this Remember grant.
+    QString oid;
+    if (vdisp_mgr_ && vdisp_mgr_->alive()) oid = vdisp_mgr_->pinPortalGeometry();
+    if (oid.isEmpty()) oid = KdeVirtualDisplay::queryQtPortalUniqueId(output_name_);
+    if (oid.isEmpty()) {
+      oid = KdeVirtualDisplay::portalUniqueIdFromPoint(KdeVirtualDisplay::preferredPlaceOrigin());
+    }
+    if (!oid.isEmpty()) {
+      cfg_.restore_output_id = oid;
+      emit restoreOutputIdChanged(oid);
+      emit logMessage(tr("ScreenCast: saved portal output id %1 for silent restore").arg(oid));
     }
   } else {
     emit logMessage(tr("Live ScreenCast: portal returned no restore_token "

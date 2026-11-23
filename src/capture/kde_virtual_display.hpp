@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QObject>
+#include <QPoint>
 #include <QProcess>
 #include <QRect>
 #include <QString>
@@ -74,6 +75,21 @@ class KdeVirtualDisplay : public QObject {
    */
   static bool enableOutput(const QString& output_name, int x, int y, float scale = 1.f,
                            const std::function<void()>& on_step = {});
+
+  /**
+   * KDE ScreenCast Remember keys outputs by QScreen::geometry().topLeft() as
+   * "XxY" (not by connector name). Prefer primary's right edge in Qt DIP.
+   */
+  static QPoint preferredPlaceOrigin();
+  /** Same string format xdg-desktop-portal-kde uses for Output::uniqueId. */
+  static QString portalUniqueIdFromPoint(QPoint top_left);
+  /** Qt QScreen name match → portal uniqueId; empty if Virtual is not in Qt yet. */
+  static QString queryQtPortalUniqueId(const QString& output_name);
+  /**
+   * kscreen-doctor position as "XxY". May be physical (scale×DIP) on X11 —
+   * prefer queryQtPortalUniqueId for Remember matching.
+   */
+  static QString queryKscreenPortalUniqueId(const QString& output_name);
   /**
    * Geometry from kscreen-doctor -j (works even when Qt is xcb and misses
    * compositor-only Virtual-* outputs).

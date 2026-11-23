@@ -202,6 +202,24 @@ ScreencastPortal::ScreencastPortal(QObject* parent) : QObject(parent) {
 
 ScreencastPortal::~ScreencastPortal() { stop(); }
 
+bool ScreencastPortal::permissionStoreHasRestoreToken(const QString& restore_token) {
+  if (restore_token.isEmpty()) return false;
+  QDBusMessage msg = QDBusMessage::createMethodCall(
+      QStringLiteral("org.freedesktop.impl.portal.PermissionStore"),
+      QStringLiteral("/org/freedesktop/impl/portal/PermissionStore"),
+      QStringLiteral("org.freedesktop.impl.portal.PermissionStore"),
+      QStringLiteral("Lookup"));
+  msg << QStringLiteral("screencast") << restore_token;
+  const QDBusMessage reply =
+      QDBusConnection::sessionBus().call(msg, QDBus::Block, /*timeout*/ 2000);
+  if (reply.type() == QDBusMessage::ErrorMessage) {
+    VRP_LOG("screencast: PermissionStore Lookup miss (%s)",
+            reply.errorName().toUtf8().constData());
+    return false;
+  }
+  return reply.type() == QDBusMessage::ReplyMessage;
+}
+
 void ScreencastPortal::fail(const QString& err) {
   VRP_LOG("screencast: FAIL %s", err.toUtf8().constData());
   ++epoch_;
@@ -218,6 +236,14 @@ void ScreencastPortal::fail(const QString& err) {
 
 void ScreencastPortal::prepare(const QString& parent_window, const QString& restore_token,
                                uint32_t persist_mode, SourceKind kind, SessionMode mode) {
+  // pinPortalGeometry processEvents can re-enter beginPortal→start() while prefetch
+  // is still in pinAndVerify. Never flip defer_start_ on an in-flight non-deferred
+  // session — that strands Start ("SelectSources ok — Start deferred") forever.
+  if (busy_) {
+    VRP_LOG("screencast: prepare ignored — already in progress (defer=%d sources=%d)",
+            defer_start_ ? 1 : 0, sources_selected_ ? 1 : 0);
+    return;
+  }
   defer_start_ = true;
   sources_selected_ = false;
   finish_pending_ = false;

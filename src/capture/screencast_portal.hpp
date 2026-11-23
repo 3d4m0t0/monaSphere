@@ -77,6 +77,14 @@ class ScreencastPortal : public QObject {
   /** True when SelectSources requested Embedded DE cursor in the stream. */
   bool embedded_cursor() const { return embedded_cursor_; }
 
+  /**
+   * Non-destructive PermissionStore probe (does not consume the token).
+   * True if `screencast` table still has this restore_token id.
+   * False if empty, store missing, or entry gone (revoked / already used / orphaned conf).
+   * Does not prove Start will succeed (monitor may still be missing).
+   */
+  static bool permissionStoreHasRestoreToken(const QString& restore_token);
+
  signals:
   void started(vrp::ScreencastPortal::Result result);
   void failed(const QString& error);

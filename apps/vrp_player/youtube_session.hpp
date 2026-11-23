@@ -35,7 +35,7 @@ namespace vrp {
  * GNOME managed Virtual: RD+ScreenCast VIRTUAL → Meta-* (after PW) → evacuate
  *   portal dialogs to primary → (later) place browser. Soft HMD cursor while
  *   ScreenCast cursor_mode=Hidden.
- * GNOME spare MONITOR: live_virtual=0 + live_output= → place → portal MONITOR.
+ * GNOME spare MONITOR: live_virtual=0 → place on fixed Virtual name / Meta.
  */
 class YouTubeSession : public QObject {
   Q_OBJECT
@@ -72,7 +72,12 @@ class YouTubeSession : public QObject {
     /** Absolute path of libmonasphere_padhook.so for LD_PRELOAD. */
     QString pad_hook_lib;
     QString restore_token;
-    QString output_hint;  // Virtual-monaSphere
+    /**
+     * KDE ScreenCast restore uniqueId ("1920x0") from QScreen topLeft at Remember.
+     * Empty → skip pre-check (legacy tokens).
+     */
+    QString restore_output_id;
+    QString output_hint;  // always Virtual-monaSphere when virtual_display
     /** krfb --name (monaSphere). Empty → derive from output_hint. */
     QString virtual_name;
     bool virtual_display = true;
@@ -227,6 +232,8 @@ class YouTubeSession : public QObject {
   void logMessage(const QString& msg);
   void toast(const QString& msg);
   void restoreTokenChanged(const QString& token);
+  /** KDE portal uniqueId ("XxY") captured when Remember succeeds. */
+  void restoreOutputIdChanged(const QString& output_id);
   void stateChanged(vrp::YouTubeSession::State state);
   void streamingStarted();
   void stopped();
@@ -261,6 +268,13 @@ class YouTubeSession : public QObject {
   void armPortalWatchdog(bool had_token);
   /** Wayland/X11 parent handle string for xdg-desktop-portal. */
   QString portalParentWindow() const;
+  /**
+   * KDE: place Virtual at preferred origin and verify portal uniqueId ("XxY")
+   * against cfg_.restore_output_id. Must run *before* SelectSources — the portal
+   * matches restore_data at SelectSources (token consumed), not at Start.
+   * Clears restore_token_ on mismatch. Returns current uniqueId (may be empty).
+   */
+  QString pinAndVerifyPortalRestore();
   /** KDE restore: CreateSession+SelectSources while Chrome is cold-starting. */
   void prefetchPortalRestore();
   /**
@@ -356,6 +370,12 @@ class YouTubeSession : public QObject {
   int portal_restore_retries_ = 0;
   /** True after falling back to interactive picker once this start(). */
   bool portal_retry_used_ = false;
+  /**
+   * prefetchPortalRestore / pinAndVerify run processEvents; place may call
+   * beginPortal nested. Defer that beginPortal until prefetch returns.
+   */
+  bool portal_prefetching_ = false;
+  bool portal_begin_pending_ = false;
   /**
    * GNOME managed Virtual: portal Start creates the MONITOR first; browser launch
    * waits until onPortalStarted (see launchBrowserAfterGnomeVirtual).

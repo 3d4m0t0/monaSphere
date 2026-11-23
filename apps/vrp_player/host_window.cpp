@@ -135,6 +135,8 @@ HostWindow::HostWindow(vrp::PlayerOptions opt, QString shader_dir, QWidget* pare
   loadMonadoModeTable();
   // KDE: warm Chrome for already_running Live. GNOME: resolve/dialog only (no warm).
   QTimer::singleShot(1200, this, [this] { ensureLiveChromeWarm(); });
+  // After UI is up: stale/missing ScreenCast Remember → offer setup (KDE only).
+  QTimer::singleShot(900, this, [this] { maybeOfferLiveSetupAtStartup(); });
   if (!usingWivrn()) {
     QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
   }
@@ -1420,9 +1422,15 @@ void migrateYoutubeConfKeysToLive() {
       changed = true;
     }
     if (out_key == QLatin1String("live_output") || out_key == QLatin1String("youtube_output")) {
-      if (val.contains(QLatin1String("monaSphereYT"))) {
-        val.replace(QStringLiteral("monaSphereYT"), QStringLiteral("monaSphere"));
+      // Name is fixed; drop custom overrides and normalize legacy YT suffix.
+      const QString fixed = QStringLiteral("Virtual-monaSphere");
+      if (val.contains(QLatin1String("monaSphereYT")) ||
+          (!val.isEmpty() && val != fixed && val != QLatin1String("monaSphere"))) {
+        val = fixed;
         clear_token = true;
+        changed = true;
+      } else if (val == QLatin1String("monaSphere")) {
+        val = fixed;
         changed = true;
       }
     }
@@ -1816,6 +1824,9 @@ void HostWindow::loadAppConf() {
         const int span = sm.captured(1).toInt();
         if (span >= 1 && span <= 3) legacy_span_tok[span - 1] = sm.captured(2).trimmed();
       }
+    } else if (line.startsWith(QStringLiteral("live_restore_output_id="))) {
+      live_restore_output_id_ =
+          line.mid(QStringLiteral("live_restore_output_id=").size()).trimmed();
     } else if (line.startsWith(QStringLiteral("youtube_url="))) {
       // Legacy — migrate into live_app[0] only when no live_app entries exist.
       const QString u = line.mid(12).trimmed();
@@ -1924,6 +1935,7 @@ void HostWindow::loadAppConf() {
       const QString v = line.mid(13).trimmed().toLower();
       live_capture_monitor_ = (v != QLatin1String("window"));
     } else if (line.startsWith(QStringLiteral("live_output="))) {
+      // Retired — fixed Virtual-monaSphere; keep only as "used Live before" marker.
       live_output_ = line.mid(12).trimmed();
     } else if (line.startsWith(QStringLiteral("live_virtual="))) {
       bool ok = false;
@@ -2233,6 +2245,10 @@ void HostWindow::saveTokenForSpan(int /*span*/, const QString& token) {
   live_restore_tokens_.clear();
   if (!token.isEmpty()) live_restore_tokens_.insert(1, token);
   setMonasphereConfKey(QStringLiteral("live_restore_token"), token);
+  if (token.isEmpty()) {
+    live_restore_output_id_.clear();
+    setMonasphereConfKey(QStringLiteral("live_restore_output_id"), {});
+  }
 }
 
 void HostWindow::syncTokensIntoManager() {
@@ -2369,9 +2385,12 @@ void HostWindow::ensureYouTubeSession() {
               live_restore_token_ = t;
               live_restore_tokens_.clear();
               if (!t.isEmpty()) live_restore_tokens_.insert(1, t);
-              // Persist non-empty; empty clear stays in-memory.
-              if (!t.isEmpty()) {
-                setMonasphereConfKey(QStringLiteral("live_restore_token"), t);
+              setMonasphereConfKey(QStringLiteral("live_restore_token"), t);
+              if (t.isEmpty()) {
+                live_restore_output_id_.clear();
+                setMonasphereConfKey(QStringLiteral("live_restore_output_id"), {});
+                appendLog(tr("Live: cleared restore token"));
+              } else {
                 appendLog(tr("Live: saved restore token (%1 chars)").arg(t.size()));
               }
             });
@@ -2384,8 +2403,16 @@ void HostWindow::ensureYouTubeSession() {
   connect(yt_session_, &vrp::YouTubeSession::toast, this, [this](const QString& m) {
     showHudToast(m);
   });
+  connect(yt_session_, &vrp::YouTubeSession::restoreOutputIdChanged, this, [this](const QString& id) {
+    live_restore_output_id_ = id;
+    setMonasphereConfKey(QStringLiteral("live_restore_output_id"), id);
+  });
   connect(yt_session_, &vrp::YouTubeSession::restoreTokenChanged, this, [this](const QString& t) {
     // Session → manager (Host persists via manager::tokenChanged).
+    if (t.isEmpty()) {
+      live_restore_output_id_.clear();
+      setMonasphereConfKey(QStringLiteral("live_restore_output_id"), {});
+    }
     if (!vdisp_mgr_) return;
     const int span = vdisp_mgr_->active_span() > 0
                          ? vdisp_mgr_->active_span()
@@ -2406,21 +2433,30 @@ void HostWindow::ensureYouTubeSession() {
       yt_setup_continue_ = false;
       appendLog(tr("Live setup: restore verify failed — HMD live apps may ask host to approve again"));
       showHudToast(tr("Setup: restore verify failed"));
+      showLiveSetupStatus(
+          tr("Live capture setup did not finish.\n\n"
+             "Restore verify failed — HMD Live may ask for host permission again.\n\n"
+             "Run Tools → Set up live capture… and enable Remember."),
+          /*finished=*/true);
     } else if (yt_setup_phase_ == YtSetupPhase::Capture) {
       yt_setup_phase_ = YtSetupPhase::None;
       yt_setup_queue_.clear();
       yt_setup_continue_ = false;
       showHudToast(tr("Live setup failed"));
+      showLiveSetupStatus(
+          tr("Live capture setup failed.\n\n"
+             "On the host share dialog, pick Virtual-monaSphere and enable Remember, "
+             "then try Tools → Set up live capture… again."),
+          /*finished=*/true);
     } else {
       showHudToast(tr("Live capture failed"));
     }
   });
   connect(yt_session_, &vrp::YouTubeSession::streamingStarted, this, [this] {
     if (yt_session_) {
-      live_output_ = yt_session_->output_name();
-      if (!live_output_.isEmpty()) {
-        setMonasphereConfKey(QStringLiteral("live_output"), live_output_);
-      }
+      // Fixed Virtual-monaSphere — remember only that Live ran (startup setup offer).
+      live_output_ = vrp::KdeVirtualDisplay::outputNameForSpan(1);
+      setMonasphereConfKey(QStringLiteral("live_output"), live_output_);
     }
     // Host Tools setup: Capture (interactive token) then optional Refresh (silent restore).
     if (yt_setup_phase_ == YtSetupPhase::Capture) {
@@ -2436,12 +2472,22 @@ void HostWindow::ensureYouTubeSession() {
                       .arg(live_session_span_));
         showHudToast(tr("No token — check Remember on host dialog"));
         QTimer::singleShot(800, this, [this] { stopYouTubeCapture(); });
+        showLiveSetupStatus(
+            tr("Live capture setup did not finish.\n\n"
+               "No restore token was returned. On the KDE share dialog, enable "
+               "Remember / allow restore, then run Tools → Set up live capture… again."),
+            /*finished=*/true);
         return;
       }
       appendLog(tr("Live setup: x%1 token saved (%2 chars) — stopping, then verifying restore…")
                     .arg(live_session_span_)
                     .arg(tok.size()));
       showHudToast(tr("Token x%1 saved — verifying…").arg(live_session_span_));
+      showLiveSetupStatus(
+          tr("Token saved.\n\n"
+             "Verifying ScreenCast restore (no HMD preview)…\n"
+             "Leave this dialog open."),
+          /*finished=*/false);
       QTimer::singleShot(1000, this, [this] { stopYouTubeCapture(); });
       return;
     }
@@ -2456,11 +2502,21 @@ void HostWindow::ensureYouTubeSession() {
         yt_setup_phase_ = YtSetupPhase::None;
         showHudToast(tr("x%1 OK — next: approve x%2 on host").arg(live_session_span_).arg(next));
         appendLog(tr("Live setup: continuing with x%1…").arg(next));
+        showLiveSetupStatus(
+            tr("x%1 OK.\n\nNext: on the host share dialog, pick %2 and enable Remember.")
+                .arg(live_session_span_)
+                .arg(vrp::KdeVirtualDisplay::outputNameForSpan(next)),
+            /*finished=*/false);
       } else {
         yt_setup_continue_ = false;
         yt_setup_phase_ = YtSetupPhase::None;
         showHudToast(tr("Setup OK — all spans ready"));
         appendLog(tr("Live setup: all queued spans registered"));
+        showLiveSetupStatus(
+            tr("Live capture setup is complete.\n\n"
+               "ScreenCast Remember is saved. HMD Live should start without asking "
+               "for host permission again."),
+            /*finished=*/true);
       }
       QTimer::singleShot(1000, this, [this] { stopYouTubeCapture(); });
       return;
@@ -2561,6 +2617,12 @@ void HostWindow::ensureYouTubeSession() {
       yt_setup_phase_ = YtSetupPhase::Refresh;
       appendLog(tr("Live setup: verifying ScreenCast restore for x%1 (no HMD preview)…")
                     .arg(live_session_span_));
+      showLiveSetupStatus(
+          tr("Token saved.\n\n"
+             "Verifying ScreenCast restore for x%1 (no HMD preview)…\n"
+             "Leave this dialog open.")
+              .arg(live_session_span_),
+          /*finished=*/false);
       const int span = live_session_span_;
       QTimer::singleShot(3500, this, [this, span] {
         if (yt_setup_phase_ != YtSetupPhase::Refresh) return;
@@ -2596,6 +2658,47 @@ void HostWindow::ensureYouTubeSession() {
   });
 }
 
+void HostWindow::showLiveSetupStatus(const QString& body, bool finished) {
+  if (shutting_down_.load(std::memory_order_acquire)) return;
+  if (!yt_setup_status_dialog_) {
+    auto* d = new QDialog(this);
+    d->setWindowTitle(tr("Live capture setup"));
+    d->setModal(false);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    d->setMinimumWidth(420);
+    auto* lay = new QVBoxLayout(d);
+    yt_setup_status_label_ = new QLabel(d);
+    yt_setup_status_label_->setWordWrap(true);
+    yt_setup_status_label_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    lay->addWidget(yt_setup_status_label_);
+    yt_setup_status_buttons_ = new QDialogButtonBox(d);
+    lay->addWidget(yt_setup_status_buttons_);
+    connect(d, &QDialog::destroyed, this, [this] {
+      yt_setup_status_dialog_.clear();
+      yt_setup_status_label_ = nullptr;
+      yt_setup_status_buttons_ = nullptr;
+    });
+    yt_setup_status_dialog_ = d;
+  }
+  if (yt_setup_status_label_) yt_setup_status_label_->setText(body);
+  if (yt_setup_status_buttons_) {
+    yt_setup_status_buttons_->clear();
+    if (finished) {
+      yt_setup_status_buttons_->addButton(QDialogButtonBox::Ok);
+      connect(yt_setup_status_buttons_, &QDialogButtonBox::accepted, yt_setup_status_dialog_,
+              &QDialog::accept, Qt::UniqueConnection);
+    }
+  }
+  yt_setup_status_dialog_->show();
+  yt_setup_status_dialog_->raise();
+  yt_setup_status_dialog_->activateWindow();
+}
+
+void HostWindow::closeLiveSetupStatus() {
+  if (!yt_setup_status_dialog_) return;
+  yt_setup_status_dialog_->close();
+}
+
 void HostWindow::beginNextSetupSpan(bool first) {
   if (yt_setup_queue_.isEmpty()) {
     yt_setup_phase_ = YtSetupPhase::None;
@@ -2613,19 +2716,64 @@ void HostWindow::beginNextSetupSpan(bool first) {
   virtualSizeForSpan(span, &setup_w, &setup_h);
   QStringList left;
   for (int s : yt_setup_queue_) left << QStringLiteral("x%1").arg(s);
+  const QString out_name = vrp::KdeVirtualDisplay::outputNameForSpan(span);
   appendLog(tr("Live setup: Remember %1 at x%2 (%3×%4)%5")
-                .arg(vrp::KdeVirtualDisplay::outputNameForSpan(span))
+                .arg(out_name)
                 .arg(span)
                 .arg(setup_w)
                 .arg(setup_h)
                 .arg(left.isEmpty() ? QString()
                                     : tr(" — then %1").arg(left.join(QStringLiteral(", ")))));
   if (!first) {
-    showHudToast(tr("Host: pick %1 (Remember)")
-                     .arg(vrp::KdeVirtualDisplay::outputNameForSpan(span)));
+    showHudToast(tr("Host: pick %1 (Remember)").arg(out_name));
   }
+  showLiveSetupStatus(
+      tr("Waiting for host approval…\n\n"
+         "1. A ScreenCast share dialog will appear on the host.\n"
+         "2. Pick %1.\n"
+         "3. Enable Remember / allow restore.\n"
+         "4. Confirm.\n\n"
+         "This dialog stays open until setup finishes.")
+          .arg(out_name),
+      /*finished=*/false);
   beginYouTubeCapture(/*host_setup=*/true, /*url_override=*/{}, /*desktop_exec=*/{},
                       /*desktop_args=*/{}, span);
+}
+
+void HostWindow::maybeOfferLiveSetupAtStartup() {
+  if (shutting_down_.load(std::memory_order_acquire)) return;
+  // GNOME Live uses Mutter RecordVirtual — no ScreenCast restore_token Remember.
+  if (vrp::detect_desktop_env() != vrp::DesktopEnv::Kde) return;
+
+  reloadLiveCaptureConf();
+  const QString tok = live_restore_token_;
+  const bool had_token = !tok.isEmpty();
+  const bool in_store =
+      had_token && vrp::ScreencastPortal::permissionStoreHasRestoreToken(tok);
+  if (had_token && in_store) return;
+
+  // Fresh install (never Remember'd): do not nag — Tools menu is enough.
+  // Offer when conf still has a dead token, or prior Live left a marker.
+  const bool used_live_before = !live_output_.trimmed().isEmpty() ||
+                                !live_restore_output_id_.trimmed().isEmpty();
+  if (!had_token && !used_live_before) return;
+
+  if (had_token && !in_store) {
+    appendLog(tr("Live: restore token missing from system PermissionStore — "
+                 "Remember was revoked or already consumed without update"));
+    // Drop stale conf so HMD Live does not pretend restore will work.
+    saveTokenForSpan(1, {});
+  } else {
+    appendLog(tr("Live: no restore token (prior Live output remembered) — setup needed"));
+  }
+
+  const auto ans = QMessageBox::question(
+      this, tr("Live capture setup"),
+      tr("ScreenCast Remember is missing or no longer valid.\n\n"
+         "Without it, Live will ask for host permission again.\n\n"
+         "Set up live capture now? (pick Virtual-monaSphere, enable Remember)"),
+      QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+  if (ans == QMessageBox::Yes) setupYouTubeCapture();
 }
 
 void HostWindow::setupYouTubeCapture() {
@@ -2928,7 +3076,11 @@ void HostWindow::reloadLiveCaptureConf() {
       const QString v = line.mid(13).trimmed().toLower();
       live_capture_monitor_ = (v != QLatin1String("window"));
     } else if (line.startsWith(QStringLiteral("live_output="))) {
+      // Retired — fixed Virtual-monaSphere; keep only as "used Live before" marker.
       live_output_ = line.mid(12).trimmed();
+    } else if (line.startsWith(QStringLiteral("live_restore_output_id="))) {
+      live_restore_output_id_ =
+          line.mid(QStringLiteral("live_restore_output_id=").size()).trimmed();
     } else if (line.startsWith(QStringLiteral("live_virtual="))) {
       bool ok = false;
       const int v = line.mid(13).toInt(&ok);
@@ -3033,21 +3185,13 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
     cfg.launch_title = cfg.desktop_label;
   }
   cfg.restore_token = host_setup ? QString() : tokenForSpan(span);
+  cfg.restore_output_id = host_setup ? QString() : live_restore_output_id_;
   cfg.virtual_display = live_virtual_;
   cfg.virtual_w = use_w;
   cfg.virtual_h = use_h;
-  // KDE managed: fixed Virtual-monaSphere (span → WxH only). GNOME managed: portal
-  // VIRTUAL creates the output. Spare MONITOR: pass live_output= substring.
-  if (live_virtual_) {
-    cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
-    cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
-  } else if (!live_output_.isEmpty()) {
-    cfg.virtual_name.clear();
-    cfg.output_hint = live_output_;
-  } else {
-    cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
-    cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
-  }
+  // Always Virtual-monaSphere (span → resolution only). Name is not user-configurable.
+  cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
+  cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
   cfg.virtual_scale = live_virtual_scale_;
   cfg.chrome_scale = live_chrome_scale_;
   cfg.use_default_chrome_profile = live_chrome_default_profile_;
@@ -3101,7 +3245,7 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
     }
   }
   yt_session_->start(cfg);
-  live_output_ = yt_session_->output_name();
+  live_output_ = vrp::KdeVirtualDisplay::outputNameForSpan(span);
 #endif
 }
 
@@ -3210,13 +3354,22 @@ void HostWindow::showPreferencesDialog() {
     else if (key == QLatin1String("live_browser")) {
       if (live_browser_ == vrp::LiveBrowser::Firefox) v = QStringLiteral("firefox");
       else v = QStringLiteral("chrome");
-    } else if (key == QLatin1String("live_output"))
-      v = live_output_;
-    else if (key == QLatin1String("thumb_count")) v = QString::number(seek_thumb_count_);
+    } else if (key == QLatin1String("thumb_count")) v = QString::number(seek_thumb_count_);
     else if (key == QLatin1String("thumb_edge")) v = QString::number(seek_thumb_edge_);
     else if (key == QLatin1String("thumb_jpeg"))
       v = thumb_jpeg_ ? QStringLiteral("1") : QStringLiteral("0");
     cur.insert(key, v);
+  }
+  // Live URL slots #0–#9 (label|url). Sparse conf indices map to fixed slots.
+  for (int i = 0; i < 10; ++i) {
+    const QString slot = QStringLiteral("live_app[%1]").arg(i);
+    QString v = monasphereConfValue(slot);
+    if (v.isEmpty() && i == 0 && !live_apps_.isEmpty()) {
+      const LiveAppEntry& a = live_apps_.front();
+      if (!a.name.isEmpty() && !a.url.isEmpty()) v = a.name + QLatin1Char('|') + a.url;
+    }
+    if (v.isEmpty() && i == 0) v = QStringLiteral("YouTube|https://www.youtube.com/");
+    cur.insert(slot, v);
   }
 
   PreferencesDialog dlg(cur, this);
@@ -3368,12 +3521,12 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
       live_browser_ = value.compare(QLatin1String("firefox"), Qt::CaseInsensitive) == 0
                           ? vrp::LiveBrowser::Firefox
                           : vrp::LiveBrowser::Chrome;
-    } else if (key == QLatin1String("live_output")) {
-      live_output_ = value;
     } else if (key == QLatin1String("live_display_log")) {
       vrp_set_persist_display_log(value == QLatin1String("1"));
     } else if (key == QLatin1String("live_teardown_log")) {
       vrp_set_persist_teardown_log(value == QLatin1String("1"));
+    } else if (key == QLatin1String("seek_detail_log")) {
+      vrp_set_seek_detail_log(value == QLatin1String("1"));
     } else if (key == QLatin1String("thumb_count")) {
       bool ok = false;
       const int v = value.toInt(&ok);

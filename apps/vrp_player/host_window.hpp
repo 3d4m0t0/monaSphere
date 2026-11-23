@@ -14,6 +14,7 @@
 
 #include <QHash>
 #include <QMainWindow>
+#include <QPointer>
 #include <QProcess>
 #include <QMap>
 #include <QString>
@@ -27,6 +28,8 @@
 #include <vector>
 
 class QCloseEvent;
+class QDialog;
+class QDialogButtonBox;
 class QLabel;
 class QPlainTextEdit;
 class QMenu;
@@ -90,6 +93,14 @@ class HostWindow : public QMainWindow {
   void applyPreferences(const QHash<QString, QString>& values);
   /** Host Tools → Set up live capture… (one Remember for Virtual-monaSphere). */
   void setupYouTubeCapture();
+  /**
+   * KDE: if conf token is missing from PermissionStore (or empty after prior Live),
+   * offer Tools → Set up live capture. Safe Lookup only — does not consume the token.
+   */
+  void maybeOfferLiveSetupAtStartup();
+  /** Non-modal host status dialog while Tools → Set up live capture runs. */
+  void showLiveSetupStatus(const QString& body, bool finished);
+  void closeLiveSetupStatus();
   /** Start next span in yt_setup_queue_ (interactive Capture). */
   void beginNextSetupSpan(bool first);
   /** HMD live_app entry: start (or restart) ScreenCast + Chromium --app. */
@@ -518,7 +529,10 @@ class HostWindow : public QMainWindow {
   /** Chromium --force-device-scale-factor (keep 1 when Virtual is already scaled). */
   float live_chrome_scale_ = 1.f;
   int live_cursor_scale_ = 1;
+  /** Filled with fixed Virtual-monaSphere after Live; not a user setting. */
   QString live_output_;
+  /** KDE portal uniqueId ("1920x0") saved with Remember for silent restore. */
+  QString live_restore_output_id_;
   bool live_chrome_default_profile_ = true;
   /**
    * Conf `live_chrome_warm` (default on): pre-open Chrome at host start so Live
@@ -544,6 +558,10 @@ class HostWindow : public QMainWindow {
   bool yt_setup_continue_ = false;
   /** Tools → Set up: after Streaming, auto-stop (keep vdisp + token). */
   bool yt_host_setup_stop_after_stream_ = false;
+  /** Stays open during setup; OK appears when finished (success or failure). */
+  QPointer<QDialog> yt_setup_status_dialog_;
+  QLabel* yt_setup_status_label_ = nullptr;
+  QDialogButtonBox* yt_setup_status_buttons_ = nullptr;
   /** Host setup / post-setup: do not bind live frames on the HMD Flat panel. */
   std::atomic<bool> yt_hmd_suppress_live_{false};
   /** HMD open: wait for prior session Idle before restore (cap retries). */

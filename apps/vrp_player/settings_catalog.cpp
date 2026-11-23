@@ -455,13 +455,14 @@ const QVector<Entry>& catalog() {
                  .description = QT_TR_NOOP("Browser used for Live URLs."),
                  .enum_values = kBrowser,
                  .enum_ignore_case = true});
-    e.push_back({.key = "live_output",
+    // live_output retired: Virtual name is always Virtual-monaSphere (not user-configurable).
+    e.push_back({.key = "live_restore_output_id",
                  .category = Category::Live,
                  .kind = ValueKind::String,
-                 .visibility = Visibility::Advanced,
+                 .visibility = Visibility::Secret,
                  .default_value = "",
-                 .label = QT_TR_NOOP("Live output name"),
-                 .description = QT_TR_NOOP("Optional connector/output name override. Leave empty for auto."),
+                 .label = "",
+                 .description = "",
                  .string_allow_empty = true});
     e.push_back({.key = "live_display_log",
                  .category = Category::Live,

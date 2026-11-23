@@ -4,11 +4,13 @@
 
 #include <QElapsedTimer>
 #include <QFileInfo>
+#include <QGuiApplication>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
 #include <QRegularExpression>
+#include <QScreen>
 #include <QStandardPaths>
 #include <QThread>
 
@@ -315,6 +317,37 @@ bool KdeVirtualDisplay::enableOutput(const QString& output_name, int x, int y, f
   }
   if (on_step) on_step();
   return true;
+}
+
+QPoint KdeVirtualDisplay::preferredPlaceOrigin() {
+  if (QScreen* primary = QGuiApplication::primaryScreen()) {
+    return QPoint(primary->geometry().right() + 1, primary->geometry().top());
+  }
+  return QPoint(0, 0);
+}
+
+QString KdeVirtualDisplay::portalUniqueIdFromPoint(QPoint top_left) {
+  return QStringLiteral("%1x%2").arg(top_left.x()).arg(top_left.y());
+}
+
+QString KdeVirtualDisplay::queryQtPortalUniqueId(const QString& output_name) {
+  if (output_name.isEmpty()) return {};
+  for (QScreen* s : QGuiApplication::screens()) {
+    if (!s) continue;
+    const QString n = s->name();
+    if (n == output_name || n.contains(output_name, Qt::CaseInsensitive) ||
+        output_name.contains(n, Qt::CaseInsensitive)) {
+      return portalUniqueIdFromPoint(s->geometry().topLeft());
+    }
+  }
+  return {};
+}
+
+QString KdeVirtualDisplay::queryKscreenPortalUniqueId(const QString& output_name) {
+  QRect r;
+  QString matched;
+  if (!queryOutputRect(output_name, &r, &matched) || r.isEmpty()) return {};
+  return portalUniqueIdFromPoint(r.topLeft());
 }
 
 bool KdeVirtualDisplay::queryOutputRect(const QString& output_name_substr, QRect* out,

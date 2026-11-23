@@ -238,6 +238,45 @@ void VirtualDisplayManager::commit_identity(const Spec& want, const QString& mat
   }
 }
 
+QString VirtualDisplayManager::pinPortalGeometry() {
+  if (backend_ != Backend::KdeKrfb) return {};
+  const QString out = !output_name_.isEmpty()
+                          ? output_name_
+                          : (vdisp_ ? vdisp_->output_name() : KdeVirtualDisplay::outputNameForSpan(1));
+  if (out.isEmpty()) return {};
+  const QPoint origin = KdeVirtualDisplay::preferredPlaceOrigin();
+  const float sc = scale() >= 1.f ? scale() : 1.f;
+  (void)KdeVirtualDisplay::enableOutput(out, origin.x(), origin.y(), sc);
+  // Let Qt / KWin publish the new QScreen geometry (portal uniqueId source).
+  QElapsedTimer wait;
+  wait.start();
+  QString id;
+  while (wait.elapsed() < 2500) {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+    id = KdeVirtualDisplay::queryQtPortalUniqueId(out);
+    if (!id.isEmpty()) {
+      const QString expect = KdeVirtualDisplay::portalUniqueIdFromPoint(origin);
+      if (id == expect) break;
+    }
+    QThread::msleep(100);
+  }
+  if (id.isEmpty()) {
+    // Qt may not list compositor-only Virtual (xcb host). Fall back to the
+    // origin we asked for — same formula portal uses when the screen is visible.
+    id = KdeVirtualDisplay::portalUniqueIdFromPoint(origin);
+    VRP_LOG("Virtual: pinPortalGeometry %s Qt-id=missing expect=%s (using expect)",
+            out.toUtf8().constData(), id.toUtf8().constData());
+  } else {
+    VRP_LOG("Virtual: pinPortalGeometry %s id=%s origin=%d,%d", out.toUtf8().constData(),
+            id.toUtf8().constData(), origin.x(), origin.y());
+  }
+  emit logMessage(tr("Virtual: portal geometry id %1 (place %2,%3)")
+                      .arg(id)
+                      .arg(origin.x())
+                      .arg(origin.y()));
+  return id;
+}
+
 bool VirtualDisplayManager::refresh_identity(QString* error_out) {
   if (!have_current_ && !alive()) {
     if (error_out) *error_out = QStringLiteral("no virtual");

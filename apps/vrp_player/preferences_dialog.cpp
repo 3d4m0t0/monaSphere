@@ -76,7 +76,6 @@ void sizeEditorToContents(QWidget* editor, vrp::settings::ValueKind kind, const 
     const QFontMetrics fm(edit->font());
     int chars = 12;
     if (kind == vrp::settings::ValueKind::SizeWxH) chars = 10;
-    else if (QLatin1String(key) == QLatin1String("live_output")) chars = 24;
     else if (kind == vrp::settings::ValueKind::String) chars = 20;
     const int w = fm.horizontalAdvance(QString(chars, QLatin1Char('M'))) + 24;
     edit->setFixedWidth(w);
