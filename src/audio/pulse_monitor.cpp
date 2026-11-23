@@ -567,9 +567,10 @@ void PulseMonitor::destroy_yt_null_sink() {
 #endif
 }
 
-int PulseMonitor::route_browser_to_yt_sink(bool mute_hmd_until_moved) {
+int PulseMonitor::route_browser_to_yt_sink(bool mute_hmd_until_moved, const std::string& hmd_sink) {
 #if !defined(VRP_HAS_PULSE)
   (void)mute_hmd_until_moved;
+  (void)hmd_sink;
   return 0;
 #else
   // pactl-only: no Pulse mainloop. Soft start must never block on this.
@@ -583,12 +584,29 @@ int PulseMonitor::route_browser_to_yt_sink(bool mute_hmd_until_moved) {
     VRP_LOG("PulseMonitor: route skip — %s missing", kYtSinkName);
     return 0;
   }
+  // Soft's hardware sink index — guests rematched here bypass yt.monitor (peak=0 stereo leak).
+  uint32_t hmd_idx = 0;
+  if (!hmd_sink.empty() && hmd_sink != "default") {
+    FILE* sinks = popen("pactl list short sinks 2>/dev/null", "r");
+    if (sinks) {
+      char line[512];
+      while (std::fgets(line, sizeof(line), sinks)) {
+        unsigned id = 0;
+        char name[256] = {};
+        if (std::sscanf(line, "%u %255s", &id, name) == 2 && name == hmd_sink) {
+          hmd_idx = id;
+          break;
+        }
+      }
+      (void)pclose(sinks);
+    }
+  }
 
   FILE* list = popen("pactl list sink-inputs 2>/dev/null", "r");
   if (!list) return 0;
 
   int moved = 0;
-  int browser_seen = 0;
+  int guest_seen = 0;
   int dumped = 0;
   int cur = -1;
   bool browser = false;
@@ -609,7 +627,11 @@ int PulseMonitor::route_browser_to_yt_sink(bool mute_hmd_until_moved) {
               app_bin.empty() ? "?" : app_bin.c_str(), have_sink ? sink_idx : 0u);
       ++dumped;
     }
-    if (ours || !browser) {
+    const bool on_yt = have_sink && sink_idx == yt_idx;
+    const bool on_hmd = have_sink && hmd_idx != 0 && sink_idx == hmd_idx;
+    // Browser/media guests, or any non-Soft stream PipeWire rematched onto Soft's sink.
+    const bool guest = !ours && (browser || on_hmd);
+    if (!guest) {
       cur = -1;
       browser = ours = false;
       sink_idx = 0;
@@ -700,19 +722,22 @@ int PulseMonitor::route_browser_to_yt_sink(bool mute_hmd_until_moved) {
   if (do_dump) dump_inputs = false;
 
   if (moved > 0) {
-    VRP_LOG("PulseMonitor: moved %d browser stream(s) -> %s (seen=%d)", moved, kYtSinkName,
-            browser_seen);
+    VRP_LOG("PulseMonitor: moved %d guest stream(s) -> %s (seen=%d)", moved, kYtSinkName,
+            guest_seen);
     return moved;
   }
-  if (browser_seen == 0) {
+  if (guest_seen == 0) {
     // Throttle: place/route polls used to spam this every 500ms.
-    static int no_browser_logs = 0;
-    if ((no_browser_logs++ % 8) == 0)
-      VRP_LOG("PulseMonitor: no browser sink-input yet (will retry)");
+    static int no_guest_logs = 0;
+    if ((no_guest_logs++ % 8) == 0)
+      VRP_LOG("PulseMonitor: no guest sink-input yet (will retry)");
     return 0;
   }
-  VRP_LOG("PulseMonitor: browser already on %s (seen=%d)", kYtSinkName, browser_seen);
-  return -browser_seen;
+  // Stable on yt — keep quiet after the first confirmation (route keeper polls often).
+  static int stable_logs = 0;
+  if ((stable_logs++ % 30) == 0)
+    VRP_LOG("PulseMonitor: guest already on %s (seen=%d)", kYtSinkName, guest_seen);
+  return -guest_seen;
 #endif
 }
 

@@ -2329,6 +2329,12 @@ void AudioPlayer::start_live_thread(const std::string& monitor_source) {
                     st_->live_real_frames.load(std::memory_order_relaxed)),
                 ring_frames(), queued, soft_acc_n, pll_rate, st_->use_stereo_upmix ? 1 : 0,
                 st_->live_mon.source().c_str());
+        // peak≈0 with growing real frames ⇒ guest left monaSphereYt (HMD stereo leak).
+        if (peak < 0.001 && frames_in > 0) {
+          VRP_LOG("live audio: WARNING Soft feed silent — re-routing guest off HMD");
+          (void)PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/false,
+                                                       device_name_);
+        }
         peak = 0.0;
         frames_in = 0;
         frames_queued = 0;
@@ -2547,37 +2553,33 @@ void AudioPlayer::request_start_live_monitor() {
         return;
       }
     }
-    // Soft is live: move-only retries (never mute). Stuck mute after a failed move
-    // was the Soft/Chrome race that caused multi-second Live silence.
+    // Soft is live: keep move-only retries for the whole Live session. PipeWire often
+    // rematches guest streams back onto the HMD after the old ~27s worker exited —
+    // Soft then queues silence (peak=0) while the HMD plays raw stereo (no HRTF).
     const uint64_t route_gen = gen;
-    std::thread([this, route_gen] {
-      VRP_LOG("Audio: live route worker start");
-      (void)PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/false);
-      int stable_on_yt = 0;
+    const std::string hmd_sink = device_name_;
+    std::thread([this, route_gen, hmd_sink] {
+      VRP_LOG("Audio: live route keeper start (hmd='%s')",
+              hmd_sink.empty() ? "(default)" : hmd_sink.c_str());
+      (void)PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/false, hmd_sink);
       int elapsed_ms = 0;
-      for (int i = 0; i < 80; ++i) {
-        if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
-        if (!live_monitor_.load(std::memory_order_acquire)) return;
-        // Fast at first (catch media start), then back off.
-        const int sleep_ms = (i < 20) ? 100 : (i < 40) ? 250 : 500;
+      int i = 0;
+      while (live_op_gen_.load(std::memory_order_acquire) == route_gen &&
+             live_monitor_.load(std::memory_order_acquire)) {
+        // Fast at first (catch media start), then a steady keep-alive poll.
+        const int sleep_ms = (i < 20) ? 100 : (i < 40) ? 250 : (i < 80) ? 500 : 2000;
         std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
         elapsed_ms += sleep_ms;
+        ++i;
         if (live_op_gen_.load(std::memory_order_acquire) != route_gen) return;
         if (!live_monitor_.load(std::memory_order_acquire)) return;
-        const int n = PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/false);
+        const int n =
+            PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/false, hmd_sink);
         if (n > 0) {
-          VRP_LOG("Audio: live route retry moved %d stream(s) (t+%dms)", n, elapsed_ms);
-          stable_on_yt = 0;
-        } else if (n < 0) {
-          if (++stable_on_yt >= 2) {
-            VRP_LOG("Audio: live route worker done (browser on yt, t+%dms)", elapsed_ms);
-            return;
-          }
-        } else {
-          stable_on_yt = 0;
+          VRP_LOG("Audio: live route keeper moved %d stream(s) (t+%dms)", n, elapsed_ms);
         }
       }
-      VRP_LOG("Audio: live route worker done");
+      VRP_LOG("Audio: live route keeper stop (t+%dms)", elapsed_ms);
     }).detach();
 #endif
   }).detach();

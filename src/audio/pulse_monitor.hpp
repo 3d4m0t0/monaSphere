@@ -52,16 +52,20 @@ class PulseMonitor {
   /** Unload monaSphereYt null sink (Pulse module + PipeWire node). */
   static void destroy_yt_null_sink();
   /**
-   * Move browser sink-inputs onto monaSphereYt (pactl; no Pulse mainloop).
+   * Move guest sink-inputs onto monaSphereYt (pactl; no Pulse mainloop).
    * Soft start must not await this — call from an async retry worker only.
    *
    * @param mute_hmd_until_moved  true only during Soft startup / early kick:
    *   mute HMD browser streams until move succeeds (avoids a loud unattenuated
    *   burst before Soft HRTF owns the path). false once Soft is live — never
    *   leave a stream muted (Soft/Chrome race → multi-second silence).
-   * @return >0 moved count; 0 no browser yet; <0 browsers already on yt (stable).
+   * @param hmd_sink  Soft's Pulse sink name. Non-Soft streams still on this sink
+   *   are moved too (desktop [アプリ] / PipeWire rematch) — otherwise Soft hears
+   *   silence on yt.monitor while the HMD plays raw stereo.
+   * @return >0 moved count; 0 no guest yet; <0 guests already on yt (stable).
    */
-  static int route_browser_to_yt_sink(bool mute_hmd_until_moved = false);
+  static int route_browser_to_yt_sink(bool mute_hmd_until_moved = false,
+                                     const std::string& hmd_sink = {});
   /** Move yt streams back to the default sink, then destroy the null sink. */
   static int restore_browser_routing();
   /** Mute or unmute a Pulse sink by name. Empty or unsafe names are ignored. */

@@ -7654,18 +7654,19 @@ void HostWindow::xrThreadMain() {
       // returns). Scrub never release_held. Stop-seek skips it during send_packet;
       // the decode thread returns both slots in release_all_for_flush after send returns.
       auto begin_decoder_seek = [&](double sec, bool stop_seek) {
-        VRP_LOG("seekdbg: begin_decoder_seek sec=%.3f stop=%d before | %s", sec, stop_seek ? 1 : 0,
+        VRP_SEEK_LOG("seekdbg: begin_decoder_seek sec=%.3f stop=%d before | %s", sec, stop_seek ? 1 : 0,
                 decoder.seek_debug_state().c_str());
         if (vulkan_tex.enabled()) {
           // Finish the current eye submit so decode's release_all_for_flush can
           // return front without tearing L/R or wedging avcodec_flush_buffers.
-          if (!scene.wait_previous_submit(0))
+          // Scrub: non-blocking only — 50ms wait made Vulkan scrub feel a beat behind CUDA.
+          if (!scene.wait_previous_submit(0) && stop_seek)
             (void)scene.wait_previous_submit(50'000'000ull);
           vulkan_tex.mark_eye_done();
           if (stop_seek) {
             const char* phase = decoder.decode_phase();
             if (phase && std::strcmp(phase, "send_packet") == 0) {
-              VRP_LOG("seekdbg: skip release_held — decode in send_packet");
+              VRP_SEEK_LOG("seekdbg: skip release_held — decode in send_packet");
             } else {
               vulkan_tex.release_held();
             }
@@ -9146,6 +9147,7 @@ void HostWindow::xrThreadMain() {
         const float lis_yaw = hmd_yaw - look_yaw;
         const float lis_pitch = hmd_pitch - look_pitch;
         audio.set_listener_orientation(lis_yaw, lis_pitch);
+        audio.tick_hold_fade();
         if (audio.live_monitor_active()) {
           static auto last_lis_log = std::chrono::steady_clock::time_point{};
           const auto tnow = std::chrono::steady_clock::now();

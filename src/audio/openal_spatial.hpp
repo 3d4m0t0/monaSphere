@@ -34,6 +34,11 @@ class OpenAlSpatial {
   bool configure(uint64_t channel_mask, int channels, int sample_rate,
                  const std::string& pulse_sink = {});
 
+  /**
+   * Publish HMD listener orientation. Never blocks the XR thread: stores atomics and
+   * try_locks Soft. Live PCM feed holds Soft's mutex during alBufferData — a blocking
+   * set_listener here used to stall xrWaitFrame (visual + HRTF logs freeze together).
+   */
   void set_listener_orientation(float yaw_rad, float pitch_rad);
   void set_gain(float linear_0_1);
   /** While held, play() does not start sources (queued PCM stays silent). */

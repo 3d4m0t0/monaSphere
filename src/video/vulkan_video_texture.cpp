@@ -632,7 +632,13 @@ void VulkanVideoTexture::kick_gpu_activity() {
   si.pCommandBuffers = &cmd_;
   std::unique_lock<std::mutex> qlock;
   if (queue_mu_) qlock = std::unique_lock<std::mutex>(*queue_mu_);
-  if (vkQueueSubmit(queue_, 1, &si, fence_) != VK_SUCCESS) return;
+  const VkResult qr = vkQueueSubmit(queue_, 1, &si, fence_);
+  if (qr == VK_ERROR_DEVICE_LOST) {
+    device_lost_.store(true, std::memory_order_release);
+    VRP_ERR("VulkanVideoTexture: kick submit DEVICE_LOST — latching");
+    return;
+  }
+  if (qr != VK_SUCCESS) return;
   fence_pending_ = true;
   pending_wait_count_ = 0;
   // Non-blocking drain on next kick / acquire; brief poll so we do not pile up.

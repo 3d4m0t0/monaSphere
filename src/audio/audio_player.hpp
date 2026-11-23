@@ -216,6 +216,9 @@ class AudioPlayer {
   float live_base_gain_ = 1.f;
   /** File switch: listener stays at 0 until the new stream is prefilled. */
   bool switch_muted_ = false;
+  /** Soft in-place resume: ramp gain over XR frames (avoids blocking sleep ahead of video). */
+  std::atomic<int> hold_fade_left_{0};
+  std::atomic<float> hold_fade_target_{0.f};
   float rate_ = 1.f;
   float surround_gain_ = 0.8f;
   bool loudness_normalize_ = true;

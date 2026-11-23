@@ -368,17 +368,35 @@ bool OpenAlSpatial::configure(uint64_t channel_mask, int channels, int sample_ra
 #endif
 }
 
-void OpenAlSpatial::set_listener_orientation(float yaw_rad, float pitch_rad) {
+void OpenAlSpatial::apply_pending_orient_unlocked() {
 #if defined(VRP_HAS_OPENAL)
-  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (!pending_orient_.exchange(false, std::memory_order_acq_rel)) return;
   if (!impl_->ready || !impl_->context) return;
-  alcMakeContextCurrent(impl_->context);
+  const float yaw_rad = pending_yaw_.load(std::memory_order_relaxed);
+  const float pitch_rad = pending_pitch_.load(std::memory_order_relaxed);
   const float cp = std::cos(pitch_rad);
   const float sp = std::sin(pitch_rad);
   const float cy = std::cos(yaw_rad);
   const float sy = std::sin(yaw_rad);
   const ALfloat orient[6] = {sy * cp, sp, -cy * cp, -sy * sp, cp, cy * sp};
   alListenerfv(AL_ORIENTATION, orient);
+#else
+  pending_orient_.store(false, std::memory_order_release);
+#endif
+}
+
+void OpenAlSpatial::set_listener_orientation(float yaw_rad, float pitch_rad) {
+  pending_yaw_.store(yaw_rad, std::memory_order_relaxed);
+  pending_pitch_.store(pitch_rad, std::memory_order_relaxed);
+  pending_orient_.store(true, std::memory_order_release);
+#if defined(VRP_HAS_OPENAL)
+  // Soft's live feeder often holds mu_ across alBufferData. Blocking here freezes the
+  // XR frame loop (HMD tracking + the 30s HRTF listener log stop together).
+  std::unique_lock<std::recursive_mutex> lock(mu_, std::try_to_lock);
+  if (!lock.owns_lock()) return;
+  if (!impl_->ready || !impl_->context) return;
+  alcMakeContextCurrent(impl_->context);
+  apply_pending_orient_unlocked();
 #else
   (void)yaw_rad;
   (void)pitch_rad;
@@ -453,6 +471,7 @@ int OpenAlSpatial::min_queued_frames() {
   // Must reclaim here: otherwise free_count stays stale and Soft looks "full" forever.
   if (impl_->context) {
     alcMakeContextCurrent(impl_->context);
+    apply_pending_orient_unlocked();
     for (Speaker& sp : impl_->speakers) sp.reclaim_processed();
   }
   int min_q = impl_->speakers.front().queued_frames;
@@ -473,6 +492,7 @@ int OpenAlSpatial::queue_interleaved_s16(const int16_t* frames, int frame_count)
   if (!impl_->ready || !impl_->context || !frames || frame_count <= 0 || impl_->speakers.empty())
     return 0;
   alcMakeContextCurrent(impl_->context);
+  apply_pending_orient_unlocked();
 
   int offset = 0;
   while (offset < frame_count) {
