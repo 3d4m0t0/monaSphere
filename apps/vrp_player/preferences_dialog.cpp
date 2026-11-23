@@ -139,10 +139,10 @@ void PreferencesDialog::buildUi(const QHash<QString, QString>& values) {
   stack_ = new QStackedWidget(this);
 
   const vrp::settings::PrefsPage pages[] = {
-      vrp::settings::PrefsPage::Video,   vrp::settings::PrefsPage::Audio,
-      vrp::settings::PrefsPage::Sky,     vrp::settings::PrefsPage::Live,
-      vrp::settings::PrefsPage::LiveUrl, vrp::settings::PrefsPage::Decode,
-      vrp::settings::PrefsPage::Other,
+      vrp::settings::PrefsPage::Video,     vrp::settings::PrefsPage::Audio,
+      vrp::settings::PrefsPage::Sky,       vrp::settings::PrefsPage::Live,
+      vrp::settings::PrefsPage::LiveUrl,   vrp::settings::PrefsPage::Decode,
+      vrp::settings::PrefsPage::Thumbnail, vrp::settings::PrefsPage::Other,
   };
   for (vrp::settings::PrefsPage page : pages) {
     bool has = (page == vrp::settings::PrefsPage::LiveUrl);

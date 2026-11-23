@@ -28,7 +28,8 @@ enum class PrefsPage {
   Live,       // Live
   LiveUrl,    // Live URL (#0–#9)
   Decode,     // デコード
-  Other,      // その他（ファイルダイアログ・サムネなど）
+  Thumbnail,  // サムネイル（ファイルダイアログ・プレビュー）
+  Other,      // その他
 };
 
 enum class ValueKind {

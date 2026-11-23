@@ -17,9 +17,6 @@ namespace vrp {
 HudPaintResult paint_vr_menu(const VrMenu::Snapshot& snap, int width = 1280, int height = 720,
                              bool sony_face = false, bool menu_option = false);
 
-/** Semi-transparent file-dialog thumbnail card. Empty when there is no preview. */
-QImage paint_file_thumb(const VrMenu::Snapshot& snap);
-
 /** Centered control-guide card (startup). Close with B/×. Surrounding pixels stay transparent. */
 HudPaintResult paint_controls_help(int width = 1280, int height = 720, bool sony_face = false,
                                    bool menu_option = false);

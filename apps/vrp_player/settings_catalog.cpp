@@ -533,9 +533,69 @@ const QVector<Entry>& catalog() {
                  .label = QT_TR_NOOP("Live teardown log"),
                  .description = QT_TR_NOOP("Write Live teardown breadcrumbs for debugging.")});
 
-    // --- Thumbs ---
+    // --- Thumbs (file-dialog preview + advanced seek strip) ---
     static_assert(vrp::kSeekThumbCount == 128);
     static_assert(vrp::kSeekThumbMaxEdge == 4096);
+    static_assert(vrp::kFilePreviewFrameMax == 20);
+    e.push_back({.key = "file_thumb_count",
+                 .category = Category::Thumbs,
+                 .kind = ValueKind::Int,
+                 .visibility = Visibility::User,
+                 .default_value = "5",
+                 .label = QT_TR_NOOP("Preview frame count"),
+                 .description = QT_TR_NOOP(
+                     "How many file-dialog preview frames to extract, spaced evenly through the clip."),
+                 .int_lo = 1,
+                 .int_hi = vrp::kFilePreviewFrameMax});
+    e.push_back({.key = "file_thumb_distance",
+                 .category = Category::Thumbs,
+                 .kind = ValueKind::Float,
+                 .visibility = Visibility::User,
+                 .default_value = "0.70",
+                 .label = QT_TR_NOOP("Preview distance (m)"),
+                 .description = QT_TR_NOOP(
+                     "How far the file-dialog preview sits in front of the viewer."),
+                 .float_lo = 0.30f,
+                 .float_hi = 3.00f});
+    e.push_back({.key = "file_thumb_x",
+                 .category = Category::Thumbs,
+                 .kind = ValueKind::Float,
+                 .visibility = Visibility::User,
+                 .default_value = "0.00",
+                 .label = QT_TR_NOOP("Preview X (m)"),
+                 .description = QT_TR_NOOP("Horizontal offset (positive = right)."),
+                 .float_lo = -2.00f,
+                 .float_hi = 2.00f});
+    e.push_back({.key = "file_thumb_y",
+                 .category = Category::Thumbs,
+                 .kind = ValueKind::Float,
+                 .visibility = Visibility::User,
+                 .default_value = "-0.50",
+                 .label = QT_TR_NOOP("Preview height (m)"),
+                 .description = QT_TR_NOOP("Vertical offset (negative = lower)."),
+                 .float_lo = -2.00f,
+                 .float_hi = 2.00f});
+    e.push_back({.key = "file_thumb_pitch_deg",
+                 .category = Category::Thumbs,
+                 .kind = ValueKind::Float,
+                 .visibility = Visibility::User,
+                 .default_value = "60.00",
+                 .label = QT_TR_NOOP("Preview tilt (°)"),
+                 .description = QT_TR_NOOP(
+                     "Recline into depth (0 = upright facing you, 90 = flat away)."),
+                 .float_lo = 0.f,
+                 .float_hi = 90.f});
+    e.push_back({.key = "file_thumb_half_w",
+                 .category = Category::Thumbs,
+                 .kind = ValueKind::Float,
+                 .visibility = Visibility::User,
+                 .default_value = "0.30",
+                 .label = QT_TR_NOOP("Preview half-width (m)"),
+                 .description = QT_TR_NOOP(
+                     "Half-width of the preview card in meters. 180/360 previews use a slightly "
+                     "smaller size."),
+                 .float_lo = 0.10f,
+                 .float_hi = 1.50f});
     e.push_back({.key = "thumb_count",
                  .category = Category::Thumbs,
                  .kind = ValueKind::Int,
@@ -561,57 +621,6 @@ const QVector<Entry>& catalog() {
                  .default_value = "1",
                  .label = QT_TR_NOOP("Seek thumbnails as JPEG"),
                  .description = QT_TR_NOOP("Store seek thumbs as JPEG in memory (saves RAM).")});
-
-    // --- Other (file-dialog preview pose) ---
-    e.push_back({.key = "file_thumb_distance",
-                 .category = Category::Other,
-                 .kind = ValueKind::Float,
-                 .visibility = Visibility::User,
-                 .default_value = "0.60",
-                 .label = QT_TR_NOOP("Preview distance (m)"),
-                 .description = QT_TR_NOOP(
-                     "How far the file-dialog preview sits in front of the viewer."),
-                 .float_lo = 0.30f,
-                 .float_hi = 3.00f});
-    e.push_back({.key = "file_thumb_x",
-                 .category = Category::Other,
-                 .kind = ValueKind::Float,
-                 .visibility = Visibility::User,
-                 .default_value = "0.00",
-                 .label = QT_TR_NOOP("Preview X (m)"),
-                 .description = QT_TR_NOOP("Horizontal offset (positive = right)."),
-                 .float_lo = -2.00f,
-                 .float_hi = 2.00f});
-    e.push_back({.key = "file_thumb_y",
-                 .category = Category::Other,
-                 .kind = ValueKind::Float,
-                 .visibility = Visibility::User,
-                 .default_value = "-0.35",
-                 .label = QT_TR_NOOP("Preview height (m)"),
-                 .description = QT_TR_NOOP("Vertical offset (negative = lower)."),
-                 .float_lo = -2.00f,
-                 .float_hi = 2.00f});
-    e.push_back({.key = "file_thumb_pitch_deg",
-                 .category = Category::Other,
-                 .kind = ValueKind::Float,
-                 .visibility = Visibility::User,
-                 .default_value = "60",
-                 .label = QT_TR_NOOP("Preview tilt (°)"),
-                 .description = QT_TR_NOOP(
-                     "Recline into depth (0 = upright facing you, 90 = flat away)."),
-                 .float_lo = 0.f,
-                 .float_hi = 90.f});
-    e.push_back({.key = "file_thumb_half_w",
-                 .category = Category::Other,
-                 .kind = ValueKind::Float,
-                 .visibility = Visibility::User,
-                 .default_value = "0.46",
-                 .label = QT_TR_NOOP("Preview half-width (m)"),
-                 .description = QT_TR_NOOP(
-                     "Half-width of the preview card in meters. 180/360 previews use a slightly "
-                     "smaller size."),
-                 .float_lo = 0.10f,
-                 .float_hi = 1.50f});
 
     // --- Hidden ---
     e.push_back({.key = "live_restore_token",
@@ -661,7 +670,7 @@ QString categoryTitle(Category c) {
     case Category::Live:
       return QStringLiteral("Live");
     case Category::Thumbs:
-      return QStringLiteral("Thumbs");
+      return QStringLiteral("Thumbnail");
     case Category::Other:
       return QStringLiteral("Other");
     case Category::Hidden:
@@ -680,7 +689,7 @@ std::optional<PrefsPage> prefsPageFor(const Entry& e) {
   }
   const QLatin1String key(e.key);
   // Volume: HMD menu only. Seat FOV/distance: HMD presets only.
-  // Seek thumbs (thumb_*): unused (strip disabled). File-dialog preview is separate (fixed 1024).
+  // Seek thumbs (thumb_*): unused (strip disabled). File-dialog preview uses file_thumb_*.
   // live_chrome_scale: always leave at 1 (Wayland follows output / X11 uses virtual scale).
   // live_capture=window is disabled (monitor+virtual only).
   if (key == QLatin1String("volume") || key == QLatin1String("flat_fov") ||
@@ -707,7 +716,7 @@ std::optional<PrefsPage> prefsPageFor(const Entry& e) {
     case Category::Other:
       return PrefsPage::Other;
     case Category::Thumbs:
-      return PrefsPage::Decode;
+      return PrefsPage::Thumbnail;
     case Category::Session:
       // Hz belongs with display; pad/hand/gamepad/runtime stay in existing menus.
       if (key == QLatin1String("hz")) return PrefsPage::Video;
@@ -719,7 +728,7 @@ std::optional<PrefsPage> prefsPageFor(const Entry& e) {
 }
 
 QString prefsPageTitle(PrefsPage p) {
-  // English source; monasphere_ja.json maps to 映像/音声/空/Live/Live URL/デコード/その他.
+  // English source; monasphere_ja.json maps to 映像/音声/空/Live/Live URL/デコード/サムネイル/その他.
   switch (p) {
     case PrefsPage::Video:
       return QCoreApplication::translate("Preferences", "Video");
@@ -733,6 +742,8 @@ QString prefsPageTitle(PrefsPage p) {
       return QCoreApplication::translate("Preferences", "Live URL");
     case PrefsPage::Decode:
       return QCoreApplication::translate("Preferences", "Decode");
+    case PrefsPage::Thumbnail:
+      return QCoreApplication::translate("Preferences", "Thumbnail");
     case PrefsPage::Other:
       return QCoreApplication::translate("Preferences", "Other");
   }

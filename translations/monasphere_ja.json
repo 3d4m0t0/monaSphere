@@ -1432,8 +1432,23 @@
     },
     {
       "context": "Preferences",
+      "source": "Thumbnail",
+      "translation": "サムネイル"
+    },
+    {
+      "context": "Preferences",
       "source": "Other",
       "translation": "その他"
+    },
+    {
+      "context": "Preferences",
+      "source": "Preview frame count",
+      "translation": "サムネイル枚数"
+    },
+    {
+      "context": "Preferences",
+      "source": "How many file-dialog preview frames to extract, spaced evenly through the clip.",
+      "translation": "ファイルダイアログのプレビューを何枚作るか。再生時間を均等に区切って抽出する。"
     },
     {
       "context": "Preferences",

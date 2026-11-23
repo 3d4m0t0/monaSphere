@@ -381,16 +381,16 @@ void VrMenu::apply_format_index(int index) {
   }
 }
 
-void VrMenu::set_preview(std::vector<uint8_t> rgba, int w, int h) {
-  auto buf = std::make_shared<const std::vector<uint8_t>>(std::move(rgba));
-  preview_rgba_ = std::move(buf);
+void VrMenu::set_preview(std::vector<std::vector<uint8_t>> frames, int w, int h) {
+  auto buf = std::make_shared<const std::vector<std::vector<uint8_t>>>(std::move(frames));
+  preview_frames_ = std::move(buf);
   preview_w_ = w;
   preview_h_ = h;
   ++gen_;
 }
 
 void VrMenu::clear_preview() {
-  preview_rgba_.reset();
+  preview_frames_.reset();
   preview_w_ = preview_h_ = 0;
   ++gen_;
 }
@@ -2125,7 +2125,7 @@ void VrMenu::publish_hud_snapshot() {
   s.display_hz = display_hz_;
   s.preview_w = preview_w_;
   s.preview_h = preview_h_;
-  s.preview_rgba = preview_rgba_;
+  s.preview_frames = preview_frames_;
   s.network_loading = network_busy();
   s.network_spin_phase = dlna_spin_phase_;
   std::lock_guard lock(mu_);

@@ -289,10 +289,13 @@ class HostWindow : public QMainWindow {
   uint64_t hud_paint_serial_ = 0;
   /** Bar time in the seek-bar paint that produced hud_pixels_gen_. */
   double hud_painted_seek_sec_ = 0;
-  std::vector<uint8_t> thumb_pixels_;
+  /** File-dialog preview frames (10%…50%); uploaded to VRAM once, cycled 1s. */
+  std::vector<std::vector<uint8_t>> thumb_frames_;
   int thumb_w_ = 0;
   int thumb_h_ = 0;
   uint64_t thumb_gen_ = 0;
+  /** Identity of snap.preview_frames (0 = none); avoids re-bake/VRAM on every HUD paint. */
+  uint64_t thumb_preview_token_ = 0;
   std::atomic<bool> xr_stop_{false};
   std::atomic<bool> xr_running_{false};
   /** True only inside the XR frame loop. request_exit is for a stuck WaitFrame. */
@@ -400,12 +403,13 @@ class HostWindow : public QMainWindow {
   bool thumb_jpeg_ = true;
   /** monasphere.conf `milkyway_gain`. Gaia sky intensity (default 1.0; no UI). */
   float milkyway_gain_ = 1.f;
-  /** File-dialog preview pose (monasphere.conf `file_thumb_*`). */
-  float file_thumb_distance_ = 0.60f;
+  /** File-dialog preview (monasphere.conf `file_thumb_*`). */
+  int file_thumb_count_ = 5;
+  float file_thumb_distance_ = 0.70f;
   float file_thumb_x_ = 0.f;
-  float file_thumb_y_ = -0.35f;
+  float file_thumb_y_ = -0.50f;
   float file_thumb_pitch_deg_ = 60.f;
-  float file_thumb_half_w_ = 0.46f;
+  float file_thumb_half_w_ = 0.30f;
   /** monasphere.conf `sky_backdrop`. true=baked cubemap (default), false=layers. No UI. */
   bool sky_backdrop_baked_ = true;
   /** monasphere.conf `sky_bake_face`. Cubemap face size 1024/2048/4096 (default 2048). */

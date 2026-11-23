@@ -993,22 +993,6 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
 
 }  // namespace
 
-QImage paint_file_thumb(const VrMenu::Snapshot& snap) {
-  const bool ready = snap.visible && snap.screen == VrMenu::Screen::Browser && snap.preview_w > 0 &&
-                     snap.preview_h > 0 && snap.preview_rgba &&
-                     snap.preview_rgba->size() >= static_cast<size_t>(snap.preview_w * snap.preview_h * 4);
-  if (!ready) return {};
-  QImage img(snap.preview_w, snap.preview_h, QImage::Format_RGBA8888);
-  img.fill(Qt::transparent);
-  QPainter p(&img);
-  p.setOpacity(0.78);
-  QImage frame(snap.preview_rgba->data(), snap.preview_w, snap.preview_h, snap.preview_w * 4,
-               QImage::Format_RGBA8888);
-  p.drawImage(QRect(0, 0, snap.preview_w, snap.preview_h), frame);
-  p.end();
-  return img;
-}
-
 void paint_seek_bar_only(HudCanvas& c, const VrMenu::Snapshot& snap, int width, int height,
                           const QFont& hint_font) {
   const PlaybackPanel panel = playback_panel(snap, width, height, hint_font);

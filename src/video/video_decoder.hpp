@@ -169,10 +169,21 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs = k
                                      int thumb_h = 90, SeekThumbStep on_thumb = {}, SeekThumbRawStep on_raw = {},
                                      int max_edge = kSeekThumbMaxEdge, bool allow_hwaccel = true);
 
+/** File-dialog preview frames, cycled every 1s in VRAM. Spaced at (i+1)/(count+1). */
+inline constexpr int kFilePreviewFrameMax = 20;
+inline constexpr int kFilePreviewFrameDefault = 5;
+inline constexpr int kFilePreviewCycleMs = 1000;
+
 /**
- * Single mid-clip preview frame. Safe from a worker thread.
+ * File-dialog preview frames (count clamped to 1…kFilePreviewFrameMax). Safe from a worker thread.
  * Scales uniformly so the long edge is at most max_edge. Does not enlarge a smaller frame.
- * Writes the stored size to out_w and out_h.
+ * All frames share out_w×out_h. Returns false if no frame could be decoded.
+ */
+bool extract_video_previews(const std::string& path, int max_edge, int count,
+                            std::vector<std::vector<uint8_t>>& out_frames, int& out_w, int& out_h);
+
+/**
+ * Single mid-clip preview. Prefer extract_video_previews for the file dialog.
  */
 bool extract_video_preview(const std::string& path, int max_edge, std::vector<uint8_t>& out_rgba, int& out_w,
                            int& out_h);

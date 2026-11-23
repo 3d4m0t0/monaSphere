@@ -91,6 +91,7 @@
 #include <QRegularExpression>
 #include <QAbstractButton>
 
+#include <array>
 #include <memory>
 
 #include <chrono>
@@ -1017,6 +1018,13 @@ void HostWindow::paintHudNow() {
     hud_verts_.clear();
     hud_pixels_kind_ = 0;
     hud_pixels_gen_ = ++hud_paint_serial_;
+    // Leave file dialog: drop CPU preview cache so XR discards VRAM slots.
+    if (thumb_preview_token_ != 0 || !thumb_frames_.empty()) {
+      thumb_preview_token_ = 0;
+      thumb_frames_.clear();
+      thumb_w_ = thumb_h_ = 0;
+      thumb_gen_ = hud_pixels_gen_;
+    }
     hud_paint_done_.store(snap.gen);
     return;
   }
@@ -1024,10 +1032,36 @@ void HostWindow::paintHudNow() {
       help     ? vrp::paint_controls_help(hud_w_, hud_h_, face_sony_.load(), menu_option_.load())
       : kind == 5 ? vrp::paint_hud_toast(toast, hud_w_, hud_h_)
                   : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load(), menu_option_.load());
-  // Skip thumb work while DLNA/network spinner owns the list (lightening 9).
-  QImage thumb = (!help && snap.visible && !snap.network_loading) ? vrp::paint_file_thumb(snap) : QImage();
-  if (!thumb.isNull() && thumb.format() != QImage::Format_RGBA8888) {
-    thumb = thumb.convertToFormat(QImage::Format_RGBA8888);
+  // Bake 0.78 opacity once per preview payload (token = shared_ptr identity).
+  const uint64_t preview_token =
+      (kind == 2 && !snap.network_loading && snap.preview_frames && !snap.preview_frames->empty() &&
+       snap.preview_w > 0 && snap.preview_h > 0)
+          ? reinterpret_cast<uint64_t>(snap.preview_frames.get())
+          : 0ull;
+  bool need_thumb_update = false;
+  {
+    std::lock_guard<std::mutex> lock(hud_pixels_mu_);
+    need_thumb_update = (preview_token != thumb_preview_token_);
+  }
+  std::vector<std::vector<uint8_t>> thumb_frames;
+  int thumb_w = 0;
+  int thumb_h = 0;
+  if (need_thumb_update && preview_token != 0) {
+    thumb_w = snap.preview_w;
+    thumb_h = snap.preview_h;
+    const size_t need = static_cast<size_t>(thumb_w) * static_cast<size_t>(thumb_h) * 4u;
+    thumb_frames.reserve(snap.preview_frames->size());
+    for (const auto& src : *snap.preview_frames) {
+      if (src.size() < need) continue;
+      std::vector<uint8_t> dst(need);
+      for (size_t i = 0; i < need; ++i) {
+        dst[i] = static_cast<uint8_t>((static_cast<unsigned>(src[i]) * 200u) / 256u);  // ≈0.78
+      }
+      thumb_frames.push_back(std::move(dst));
+    }
+    if (thumb_frames.empty()) {
+      thumb_w = thumb_h = 0;
+    }
   }
   {
     std::lock_guard<std::mutex> lock(hud_pixels_mu_);
@@ -1042,19 +1076,13 @@ void HostWindow::paintHudNow() {
     hud_pixels_kind_ = kind;
     hud_pixels_gen_ = ++hud_paint_serial_;
     if (kind == 4) hud_painted_seek_sec_ = snap.position_sec;
-    if (thumb.isNull() || thumb.width() <= 0 || thumb.height() <= 0) {
-      thumb_pixels_.clear();
-      thumb_w_ = thumb_h_ = 0;
-    } else {
-      thumb_w_ = thumb.width();
-      thumb_h_ = thumb.height();
-      thumb_pixels_.resize(static_cast<size_t>(thumb_w_ * thumb_h_ * 4));
-      for (int y = 0; y < thumb_h_; ++y) {
-        std::memcpy(thumb_pixels_.data() + static_cast<size_t>(y * thumb_w_ * 4), thumb.constScanLine(y),
-                    static_cast<size_t>(thumb_w_ * 4));
-      }
+    if (need_thumb_update) {
+      thumb_preview_token_ = preview_token;
+      thumb_frames_ = std::move(thumb_frames);
+      thumb_w_ = thumb_w;
+      thumb_h_ = thumb_h;
+      thumb_gen_ = hud_pixels_gen_;
     }
-    thumb_gen_ = hud_pixels_gen_;
   }
   hud_paint_done_.store(snap.gen);
 }
@@ -1591,6 +1619,7 @@ void HostWindow::saveAppConf() const {
                        QString::number(static_cast<double>(app_flat_distance_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("milkyway_gain"),
                        QString::number(static_cast<double>(milkyway_gain_), 'f', 2));
+  setMonasphereConfKey(QStringLiteral("file_thumb_count"), QString::number(file_thumb_count_));
   setMonasphereConfKey(QStringLiteral("file_thumb_distance"),
                        QString::number(static_cast<double>(file_thumb_distance_), 'f', 2));
   setMonasphereConfKey(QStringLiteral("file_thumb_x"),
@@ -1801,6 +1830,10 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const float v = line.mid(14).toFloat(&ok);
       if (ok && v >= 0.2f && v <= 2.5f) milkyway_gain_ = v;
+    } else if (line.startsWith(QStringLiteral("file_thumb_count="))) {
+      bool ok = false;
+      const int v = line.mid(QStringLiteral("file_thumb_count=").size()).trimmed().toInt(&ok);
+      if (ok && v >= 1 && v <= vrp::kFilePreviewFrameMax) file_thumb_count_ = v;
     } else if (line.startsWith(QStringLiteral("file_thumb_distance="))) {
       bool ok = false;
       const float v = line.mid(QStringLiteral("file_thumb_distance=").size()).trimmed().toFloat(&ok);
@@ -3385,6 +3418,8 @@ void HostWindow::showPreferencesDialog() {
       v = QString::number(static_cast<double>(hrtf_trim_db_), 'f', 1);
     else if (key == QLatin1String("milkyway_gain"))
       v = QString::number(static_cast<double>(milkyway_gain_), 'f', 2);
+    else if (key == QLatin1String("file_thumb_count"))
+      v = QString::number(file_thumb_count_);
     else if (key == QLatin1String("file_thumb_distance"))
       v = QString::number(static_cast<double>(file_thumb_distance_), 'f', 2);
     else if (key == QLatin1String("file_thumb_x"))
@@ -3559,6 +3594,10 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
       bool ok = false;
       const float v = value.toFloat(&ok);
       if (ok) milkyway_gain_ = v;
+    } else if (key == QLatin1String("file_thumb_count")) {
+      bool ok = false;
+      const int v = value.toInt(&ok);
+      if (ok && v >= 1 && v <= vrp::kFilePreviewFrameMax) file_thumb_count_ = v;
     } else if (key == QLatin1String("file_thumb_distance")) {
       bool ok = false;
       const float v = value.toFloat(&ok);
@@ -6093,9 +6132,21 @@ void HostWindow::xrThreadMain() {
     vrp::VideoTexture hud_tex;
     hud_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
                  /*nearest_filter=*/false);
-    vrp::VideoTexture thumb_tex;
-    thumb_tex.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
-                   /*nearest_filter=*/false);
+    std::array<vrp::VideoTexture, vrp::kFilePreviewFrameMax> thumb_tex;
+    for (auto& t : thumb_tex) {
+      t.init(xr.physical_device(), xr.device(), xr.queue(), xr.queue_family(), &xr.queue_mutex(),
+             /*nearest_filter=*/false);
+    }
+    uint64_t uploaded_thumb = 0;
+    int thumb_vram_count = 0;
+    uint32_t thumb_present_mask = 0;
+    int thumb_expect = 0;
+    int thumb_show_i = -1;
+    std::vector<std::vector<uint8_t>> thumb_upload_frames;
+    int thumb_upload_w = 0;
+    int thumb_upload_h = 0;
+    size_t thumb_upload_i = 0;
+    auto thumb_cycle_start = std::chrono::steady_clock::time_point{};
     vrp::VrMenu menu;
     {
       std::filesystem::path start;
@@ -6193,7 +6244,7 @@ void HostWindow::xrThreadMain() {
       bool pending = false;
       bool ok = false;
       std::string path;
-      std::vector<uint8_t> rgba;
+      std::vector<std::vector<uint8_t>> frames;
       int w = 0;
       int h = 0;
     } preview_result;
@@ -6226,19 +6277,20 @@ void HostWindow::xrThreadMain() {
         std::lock_guard<std::mutex> lock(preview_result_mu);
         preview_result = {};
       }
-      preview_thread = std::thread([&, path, gen] {
-        std::vector<uint8_t> rgba;
+      const int thumb_count = std::clamp(file_thumb_count_, 1, vrp::kFilePreviewFrameMax);
+      preview_thread = std::thread([&, path, gen, thumb_count] {
+        std::vector<std::vector<uint8_t>> frames;
         int pw = 0;
         int ph = 0;
-        const bool ok = vrp::extract_video_preview(path, 1024, rgba, pw, ph);
+        const bool ok = vrp::extract_video_previews(path, 1024, thumb_count, frames, pw, ph);
         {
           std::lock_guard<std::mutex> lock(preview_result_mu);
           if (preview_gen.load(std::memory_order_acquire) == gen) {
             preview_result.gen = gen;
             preview_result.pending = true;
-            preview_result.ok = ok && pw > 0 && ph > 0;
+            preview_result.ok = ok && pw > 0 && ph > 0 && !frames.empty();
             preview_result.path = path;
-            preview_result.rgba = std::move(rgba);
+            preview_result.frames = std::move(frames);
             preview_result.w = pw;
             preview_result.h = ph;
           }
@@ -6261,7 +6313,7 @@ void HostWindow::xrThreadMain() {
       }
       if (!done.ok || xr_stop_.load() || shutting_down_.load()) return;
       if (menu.highlighted_video_path() != done.path) return;
-      menu.set_preview(std::move(done.rgba), done.w, done.h);
+      menu.set_preview(std::move(done.frames), done.w, done.h);
       preview_path_done = done.path;
       hud_paint();
     };
@@ -9783,11 +9835,11 @@ void HostWindow::xrThreadMain() {
           }
         }
 
-        static uint64_t uploaded_thumb = 0;
-        static bool thumb_shown = false;
-        if (thumb_tex.poll_present()) thumb_shown = true;
-        vrp::VideoFrame thumb_frame;
-        bool thumb_upload = false;
+        for (int i = 0; i < thumb_vram_count; ++i) {
+          if (thumb_tex[static_cast<size_t>(i)].poll_present()) {
+            thumb_present_mask |= (1 << i);
+          }
+        }
         bool thumb_pixels = false;
         float thumb_aspect = 9.f / 16.f;
         vrp::ProjectionMode thumb_proj = vrp::ProjectionMode::Flat;
@@ -9799,38 +9851,82 @@ void HostWindow::xrThreadMain() {
         }
         {
           std::lock_guard<std::mutex> lock(hud_pixels_mu_);
-          thumb_pixels = thumb_w_ > 0 && thumb_h_ > 0 && !thumb_pixels_.empty();
+          thumb_pixels = thumb_w_ > 0 && thumb_h_ > 0 && !thumb_frames_.empty();
           if (thumb_pixels) {
-            // Match card aspect to the preview frame (incl. 180/360 equirect).
             const float disp = vrp::frame_display_aspect(static_cast<float>(thumb_w_),
                                                          static_cast<float>(thumb_h_), thumb_stereo,
                                                          thumb_full);
             thumb_aspect = 1.f / disp;
           }
           if (thumb_pixels && thumb_gen_ != uploaded_thumb) {
-            thumb_frame.width = thumb_w_;
-            thumb_frame.height = thumb_h_;
-            thumb_frame.rgba = thumb_pixels_;
+            thumb_present_mask = 0;
+            thumb_vram_count = 0;
+            thumb_expect = static_cast<int>(thumb_frames_.size());
+            thumb_show_i = -1;
+            thumb_cycle_start = {};
+            thumb_upload_frames = thumb_frames_;
+            thumb_upload_w = thumb_w_;
+            thumb_upload_h = thumb_h_;
+            thumb_upload_i = 0;
             uploaded_thumb = thumb_gen_;
-            thumb_upload = true;
+          } else if (!thumb_pixels && uploaded_thumb != 0) {
+            thumb_present_mask = 0;
+            thumb_vram_count = 0;
+            thumb_expect = 0;
+            thumb_show_i = -1;
+            thumb_cycle_start = {};
+            thumb_upload_frames.clear();
+            thumb_upload_i = 0;
+            uploaded_thumb = 0;
           }
         }
-        if (thumb_upload && want_kind == 2) {
+        if (want_kind == 2 && thumb_upload_i < thumb_upload_frames.size() &&
+            thumb_upload_i < thumb_tex.size()) {
           (void)scene.wait_previous_submit(5'000'000ull);
-          (void)thumb_tex.try_upload(thumb_frame);
+          vrp::VideoFrame thumb_frame;
+          thumb_frame.width = thumb_upload_w;
+          thumb_frame.height = thumb_upload_h;
+          thumb_frame.rgba = thumb_upload_frames[thumb_upload_i];
+          if (thumb_tex[thumb_upload_i].try_upload(thumb_frame)) {
+            thumb_vram_count = static_cast<int>(thumb_upload_i) + 1;
+            ++thumb_upload_i;
+            if (thumb_upload_i >= thumb_upload_frames.size()) thumb_upload_frames.clear();
+          }
         }
-        if (want_kind == 2 && thumb_pixels && thumb_shown && thumb_tex.view()) {
+        // 1st frame: show + arm 1s. Later: advance when due and next is present
+        // (if late, show as soon as ready and re-arm). Full cache: wrap cycle.
+        if (want_kind == 2 && thumb_pixels && thumb_expect > 0) {
+          const uint32_t full_mask = (uint32_t{1} << thumb_expect) - 1u;
+          const bool all_ready = thumb_upload_frames.empty() && thumb_vram_count >= thumb_expect &&
+                                 (thumb_present_mask & full_mask) == full_mask;
+          const auto now = std::chrono::steady_clock::now();
+          if (thumb_show_i < 0) {
+            if (thumb_present_mask & 1) {
+              thumb_show_i = 0;
+              thumb_cycle_start = now;
+            }
+          } else {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - thumb_cycle_start)
+                                .count();
+            if (ms >= vrp::kFilePreviewCycleMs) {
+              const int next = all_ready ? (thumb_show_i + 1) % thumb_expect : thumb_show_i + 1;
+              if (next >= 0 && next < thumb_expect && (thumb_present_mask & (1 << next))) {
+                thumb_show_i = next;
+                thumb_cycle_start = now;
+              }
+            }
+          }
+        }
+        if (thumb_show_i >= 0 && thumb_tex[static_cast<size_t>(thumb_show_i)].view()) {
+          auto& slot = thumb_tex[static_cast<size_t>(thumb_show_i)];
           scene.set_thumb_format(thumb_proj, thumb_stereo);
-          // 180/360: slightly smaller card than flat.
-          const float half_w = (thumb_proj != vrp::ProjectionMode::Flat)
-                                   ? file_thumb_half_w_ * 0.75f
-                                   : file_thumb_half_w_;
-          scene.set_thumb_pose(half_w, thumb_aspect, file_thumb_x_, file_thumb_y_,
-                               file_thumb_distance_, file_thumb_pitch_deg_);
-          scene.set_thumb_texture(thumb_tex.view(), thumb_tex.sampler(), true);
+          const float half_w = (thumb_proj != vrp::ProjectionMode::Flat) ? file_thumb_half_w_ * 0.75f
+                                                                         : file_thumb_half_w_;
+          scene.set_thumb_pose(half_w, thumb_aspect, file_thumb_x_, file_thumb_y_, file_thumb_distance_,
+                               file_thumb_pitch_deg_);
+          scene.set_thumb_texture(slot.view(), slot.sampler(), true);
         } else {
-          scene.set_thumb_texture(thumb_tex.view(), thumb_tex.sampler(), false);
-          if (!thumb_pixels || want_kind != 2) thumb_shown = false;
+          scene.set_thumb_texture(VK_NULL_HANDLE, VK_NULL_HANDLE, false);
         }
       }
 
@@ -10163,7 +10259,7 @@ void HostWindow::xrThreadMain() {
 #if defined(VRP_HAS_PIPEWIRE)
     pw_dma_tex.shutdown();
 #endif
-    thumb_tex.shutdown();
+    for (auto& t : thumb_tex) t.shutdown();
     hud_tex.shutdown();
     seek_tex.shutdown();
     texture.shutdown();

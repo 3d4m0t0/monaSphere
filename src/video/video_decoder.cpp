@@ -626,8 +626,24 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
   strip.jpeg.reserve(static_cast<size_t>(count));
   strip.times_sec.reserve(static_cast<size_t>(count));
 
-  auto* rgba_buf = static_cast<uint8_t*>(av_malloc(av_image_get_buffer_size(AV_PIX_FMT_RGBA, thumb_w, thumb_h, 1)));
-  av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, thumb_w, thumb_h, 1);
+  constexpr int kSwsAlign = 32;
+  constexpr size_t kSwsTail = 256;
+  const int rgba_bytes = av_image_get_buffer_size(AV_PIX_FMT_RGBA, thumb_w, thumb_h, kSwsAlign);
+  auto* rgba_buf = static_cast<uint8_t*>(
+      av_malloc(rgba_bytes > 0 ? static_cast<size_t>(rgba_bytes) + kSwsTail : 0));
+  if (!rgba_buf) {
+    av_frame_free(&rgba);
+    av_frame_free(&sw_frame);
+    av_frame_free(&frame);
+    av_packet_free(&packet);
+    avcodec_free_context(&codec);
+    av_buffer_unref(&hw_device);
+    avformat_close_input(&fmt);
+    strip.status = "メモリ不足";
+    return strip;
+  }
+  std::memset(rgba_buf, 0, static_cast<size_t>(rgba_bytes) + kSwsTail);
+  av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, thumb_w, thumb_h, kSwsAlign);
   const bool enc_ok = static_cast<bool>(on_raw) || enc.open(thumb_w, thumb_h);
   int made = 0;
   bool stop = !enc_ok;
@@ -750,17 +766,22 @@ ThumbnailStrip build_thumbnail_strip(const std::string& path, int max_thumbs, in
 #endif
 }
 
-bool extract_video_preview(const std::string& path, int max_edge, std::vector<uint8_t>& out_rgba, int& out_w,
-                           int& out_h) {
-  out_rgba.clear();
+bool extract_video_previews(const std::string& path, int max_edge, int count,
+                            std::vector<std::vector<uint8_t>>& out_frames, int& out_w, int& out_h) {
+  out_frames.clear();
   out_w = out_h = 0;
 #if !defined(VRP_HAS_FFMPEG)
   (void)path;
   (void)max_edge;
+  (void)count;
   return false;
 #else
   std::lock_guard<std::mutex> offline(ffmpeg_offline_mu());
   max_edge = std::max(64, std::min(max_edge, 2048));
+  count = std::max(1, std::min(count, kFilePreviewFrameMax));
+  constexpr int kMaxDim = 8192;
+  constexpr int kMaxPacketsPerSeek = 96;
+
   AVFormatContext* fmt = nullptr;
   if (avformat_open_input(&fmt, path.c_str(), nullptr, nullptr) < 0) return false;
   if (avformat_find_stream_info(fmt, nullptr) < 0) {
@@ -773,13 +794,17 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
     return false;
   }
   AVStream* st = fmt->streams[vstream];
+  if (!st || !st->codecpar) {
+    avformat_close_input(&fmt);
+    return false;
+  }
   double duration = 0;
   if (st->duration > 0 && st->time_base.den > 0) {
     duration = static_cast<double>(st->duration) * av_q2d(st->time_base);
   } else if (fmt->duration > 0) {
     duration = static_cast<double>(fmt->duration) / AV_TIME_BASE;
   }
-  const double t = duration > 1.0 ? duration * 0.1 : 0.0;
+  if (!(duration >= 0.0) || !std::isfinite(duration)) duration = 0.0;
 
   const AVCodec* dec = avcodec_find_decoder(st->codecpar->codec_id);
   if (!dec) {
@@ -798,17 +823,12 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
   }
   codec->thread_count = 1;
   codec->get_format = avcodec_default_get_format;
-  // Browser thumbs stay on the CPU path — never attach NVDEC here.
+  // File-dialog thumbs stay on the CPU path — never attach NVDEC here.
   codec->hw_device_ctx = nullptr;
   if (avcodec_open2(codec, dec, nullptr) < 0) {
     avcodec_free_context(&codec);
     avformat_close_input(&fmt);
     return false;
-  }
-  if (t > 0 && st->time_base.den > 0) {
-    const int64_t ts = static_cast<int64_t>(t / av_q2d(st->time_base));
-    av_seek_frame(fmt, vstream, ts, AVSEEK_FLAG_BACKWARD);
-    avcodec_flush_buffers(codec);
   }
 
   AVFrame* frame = av_frame_alloc();
@@ -826,86 +846,173 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
   uint8_t* rgba_buf = nullptr;
   int dst_w = 0;
   int dst_h = 0;
-  int rgba_buf_size = 0;
+  int sws_src_w = 0;
+  int sws_src_h = 0;
+  int sws_src_fmt = -1;
 
-  bool ok = false;
-  bool scale_failed = false;
-  while (av_read_frame(fmt, packet) >= 0 && !scale_failed) {
-    if (packet->stream_index != vstream) {
-      av_packet_unref(packet);
-      continue;
+  auto decode_one_at = [&](double t_sec, std::vector<uint8_t>* out) -> bool {
+    if (!out) return false;
+    out->clear();
+    if (st->time_base.den > 0) {
+      const int64_t ts =
+          t_sec > 0.0 ? static_cast<int64_t>(t_sec / av_q2d(st->time_base)) : 0;
+      if (av_seek_frame(fmt, vstream, ts, AVSEEK_FLAG_BACKWARD) < 0) {
+        // Soft-fail: broken indexes often reject mid-file seeks.
+        if (t_sec > 0.0) return false;
+      }
     }
-    if (avcodec_send_packet(codec, packet) < 0) {
-      av_packet_unref(packet);
-      continue;
-    }
-    av_packet_unref(packet);
-    while (avcodec_receive_frame(codec, frame) == 0) {
-      if (frame->width < 2 || frame->height < 2 || frame->format < 0 || !frame->data[0]) continue;
-      // Reject hardware frames — preview is software-only.
-      if (frame->format == AV_PIX_FMT_CUDA || frame->format == AV_PIX_FMT_VAAPI ||
-          frame->format == AV_PIX_FMT_DRM_PRIME || frame->format == AV_PIX_FMT_VULKAN) {
+    avcodec_flush_buffers(codec);
+
+    bool got = false;
+    bool fatal = false;
+    int packets = 0;
+    while (!got && !fatal && packets < kMaxPacketsPerSeek && av_read_frame(fmt, packet) >= 0) {
+      if (packet->stream_index != vstream) {
+        av_packet_unref(packet);
         continue;
       }
-      if (!sws) {
-        dst_w = std::max(2, frame->width);
-        dst_h = std::max(2, frame->height);
-        const int long_edge = std::max(dst_w, dst_h);
-        if (long_edge > max_edge) {
-          const double s = static_cast<double>(max_edge) / static_cast<double>(long_edge);
-          dst_w = std::max(2, static_cast<int>(std::lround(dst_w * s)));
-          dst_h = std::max(2, static_cast<int>(std::lround(dst_h * s)));
+      ++packets;
+      const int send = avcodec_send_packet(codec, packet);
+      av_packet_unref(packet);
+      if (send == AVERROR(EAGAIN)) {
+        // Drain then retry is complex here; skip this packet on corrupt streams.
+        continue;
+      }
+      if (send < 0) continue;
+
+      while (!got && !fatal) {
+        const int rec = avcodec_receive_frame(codec, frame);
+        if (rec == AVERROR(EAGAIN) || rec == AVERROR_EOF) break;
+        if (rec < 0) break;
+
+        if (frame->width < 2 || frame->height < 2 || frame->width > kMaxDim || frame->height > kMaxDim ||
+            frame->format < 0 || !frame->data[0]) {
+          av_frame_unref(frame);
+          continue;
         }
-        dst_w &= ~1;
-        dst_h &= ~1;
-        rgba_buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, dst_w, dst_h, 1);
-        if (rgba_buf_size <= 0) {
-          scale_failed = true;
-          break;
+        if (frame->format == AV_PIX_FMT_CUDA || frame->format == AV_PIX_FMT_VAAPI ||
+            frame->format == AV_PIX_FMT_DRM_PRIME || frame->format == AV_PIX_FMT_VULKAN) {
+          av_frame_unref(frame);
+          continue;
         }
-        rgba_buf = static_cast<uint8_t*>(av_malloc(static_cast<size_t>(rgba_buf_size)));
-        if (!rgba_buf) {
-          scale_failed = true;
-          break;
+        const AVPixelFormat pix = static_cast<AVPixelFormat>(frame->format);
+        if (!sws_isSupportedInput(pix)) {
+          av_frame_unref(frame);
+          continue;
         }
-        if (av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, dst_w, dst_h, 1) < 0) {
-          av_free(rgba_buf);
-          rgba_buf = nullptr;
-          scale_failed = true;
-          break;
+
+        // Never sws_scale with a context built for a different source geometry/format.
+        if (sws && (frame->width != sws_src_w || frame->height != sws_src_h || frame->format != sws_src_fmt)) {
+          av_frame_unref(frame);
+          continue;
         }
-        const bool full = frame->color_range == AVCOL_RANGE_JPEG;
-        sws = sws_make(frame->width, frame->height, static_cast<AVPixelFormat>(frame->format), dst_w, dst_h,
-                       AV_PIX_FMT_RGBA, SWS_BILINEAR, full, /*dst_full=*/true);
+
         if (!sws) {
-          av_free(rgba_buf);
-          rgba_buf = nullptr;
-          scale_failed = true;
+          dst_w = std::max(2, frame->width);
+          dst_h = std::max(2, frame->height);
+          const int long_edge = std::max(dst_w, dst_h);
+          if (long_edge > max_edge) {
+            const double s = static_cast<double>(max_edge) / static_cast<double>(long_edge);
+            dst_w = std::max(2, static_cast<int>(std::lround(dst_w * s)));
+            dst_h = std::max(2, static_cast<int>(std::lround(dst_h * s)));
+          }
+          dst_w &= ~1;
+          dst_h &= ~1;
+          if (dst_w < 2 || dst_h < 2) {
+            fatal = true;
+            av_frame_unref(frame);
+            break;
+          }
+          // sws_scale SIMD can overrun a tightly packed last row; align + pad, then pack.
+          constexpr int kAlign = 32;
+          constexpr size_t kTailPad = 256;
+          const int rgba_buf_size = av_image_get_buffer_size(AV_PIX_FMT_RGBA, dst_w, dst_h, kAlign);
+          if (rgba_buf_size <= 0) {
+            fatal = true;
+            av_frame_unref(frame);
+            break;
+          }
+          rgba_buf = static_cast<uint8_t*>(
+              av_malloc(static_cast<size_t>(rgba_buf_size) + kTailPad));
+          if (!rgba_buf) {
+            fatal = true;
+            av_frame_unref(frame);
+            break;
+          }
+          std::memset(rgba_buf, 0, static_cast<size_t>(rgba_buf_size) + kTailPad);
+          if (av_image_fill_arrays(rgba->data, rgba->linesize, rgba_buf, AV_PIX_FMT_RGBA, dst_w, dst_h,
+                                   kAlign) < 0) {
+            av_free(rgba_buf);
+            rgba_buf = nullptr;
+            fatal = true;
+            av_frame_unref(frame);
+            break;
+          }
+          const bool full = frame->color_range == AVCOL_RANGE_JPEG;
+          sws = sws_make(frame->width, frame->height, pix, dst_w, dst_h, AV_PIX_FMT_RGBA, SWS_BILINEAR,
+                         full, /*dst_full=*/true);
+          if (!sws) {
+            av_free(rgba_buf);
+            rgba_buf = nullptr;
+            fatal = true;
+            av_frame_unref(frame);
+            break;
+          }
+          sws_src_w = frame->width;
+          sws_src_h = frame->height;
+          sws_src_fmt = frame->format;
+        }
+
+        // Reject frames whose plane strides are clearly too small (corrupt decode).
+        if (frame->linesize[0] != 0 && std::abs(frame->linesize[0]) < frame->width) {
+          av_frame_unref(frame);
+          continue;
+        }
+
+        if (sws_scale(sws, frame->data, frame->linesize, 0, frame->height, rgba->data, rgba->linesize) <=
+            0) {
+          av_frame_unref(frame);
+          continue;
+        }
+        if (!rgba->data[0] || rgba->linesize[0] < dst_w * 4) {
+          av_frame_unref(frame);
+          continue;
+        }
+        const size_t row = static_cast<size_t>(dst_w) * 4u;
+        const size_t need = row * static_cast<size_t>(dst_h);
+        try {
+          out->resize(need);
+        } catch (...) {
+          fatal = true;
+          av_frame_unref(frame);
           break;
         }
-      }
-      if (sws_scale(sws, frame->data, frame->linesize, 0, frame->height, rgba->data, rgba->linesize) <= 0) {
-        continue;
-      }
-      if (!rgba->data[0] || rgba->linesize[0] < dst_w * 4) continue;
-      const size_t row = static_cast<size_t>(dst_w) * 4u;
-      const size_t need = row * static_cast<size_t>(dst_h);
-      try {
-        out_rgba.resize(need);
-      } catch (...) {
-        scale_failed = true;
+        for (int y = 0; y < dst_h; ++y) {
+          std::memcpy(out->data() + static_cast<size_t>(y) * row, rgba->data[0] + y * rgba->linesize[0],
+                      row);
+        }
+        got = true;
+        av_frame_unref(frame);
         break;
       }
-      for (int y = 0; y < dst_h; ++y) {
-        std::memcpy(out_rgba.data() + static_cast<size_t>(y) * row, rgba->data[0] + y * rgba->linesize[0],
-                    row);
-      }
-      out_w = dst_w;
-      out_h = dst_h;
-      ok = true;
-      break;
     }
-    if (ok || scale_failed) break;
+    if (!got) out->clear();
+    return got;
+  };
+
+  out_frames.reserve(static_cast<size_t>(count));
+  for (int i = 0; i < count; ++i) {
+    // Even spacing that avoids exact 0/1 (often black): 1/(n+1) … n/(n+1).
+    const double frac = static_cast<double>(i + 1) / static_cast<double>(count + 1);
+    const double t = duration > 1.0 ? duration * frac : 0.0;
+    std::vector<uint8_t> one;
+    if (!decode_one_at(t, &one) || one.empty()) {
+      if (out_frames.empty()) break;
+      // Pad with the last good frame if a later seek fails.
+      out_frames.push_back(out_frames.back());
+      continue;
+    }
+    out_frames.push_back(std::move(one));
   }
 
   if (sws) sws_freeContext(sws);
@@ -915,8 +1022,26 @@ bool extract_video_preview(const std::string& path, int max_edge, std::vector<ui
   av_packet_free(&packet);
   avcodec_free_context(&codec);
   avformat_close_input(&fmt);
-  return ok;
+  if (out_frames.empty() || dst_w < 2 || dst_h < 2) {
+    out_frames.clear();
+    return false;
+  }
+  out_w = dst_w;
+  out_h = dst_h;
+  return true;
 #endif
+}
+
+bool extract_video_preview(const std::string& path, int max_edge, std::vector<uint8_t>& out_rgba, int& out_w,
+                           int& out_h) {
+  std::vector<std::vector<uint8_t>> frames;
+  if (!extract_video_previews(path, max_edge, 1, frames, out_w, out_h) || frames.empty()) {
+    out_rgba.clear();
+    out_w = out_h = 0;
+    return false;
+  }
+  out_rgba = std::move(frames.front());
+  return true;
 }
 
 struct VideoDecoder::FFmpegState {

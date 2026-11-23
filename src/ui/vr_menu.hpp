@@ -159,8 +159,8 @@ class VrMenu {
     float display_hz = 0.f; // measured / reported
     int preview_w = 0;
     int preview_h = 0;
-    /** Shared with the live menu buffer so HUD paints do not deep-copy megabytes. */
-    std::shared_ptr<const std::vector<uint8_t>> preview_rgba;
+    /** File-dialog frames (10%…50%). Shared so HUD paints do not deep-copy megabytes. */
+    std::shared_ptr<const std::vector<std::vector<uint8_t>>> preview_frames;
     /** DLNA discover/browse running on a worker thread. */
     bool network_loading = false;
     /** Radians; HUD draws three chasing dots from this. */
@@ -291,7 +291,7 @@ class VrMenu {
   void set_format(ProjectionMode proj, StereoLayout stereo, bool stereo_full);
   void set_audio_tracks(std::vector<AudioTrackRow> tracks, int current_index);
   void set_audio_track_index(int index);
-  void set_preview(std::vector<uint8_t> rgba, int w, int h);
+  void set_preview(std::vector<std::vector<uint8_t>> frames, int w, int h);
   void clear_preview();
   void notify_changed() { bump(); }
 
@@ -533,7 +533,7 @@ class VrMenu {
   std::string info_output_note_;
   std::string info_display_hz_;
 
-  std::shared_ptr<const std::vector<uint8_t>> preview_rgba_;
+  std::shared_ptr<const std::vector<std::vector<uint8_t>>> preview_frames_;
   int preview_w_ = 0;
   int preview_h_ = 0;
   Snapshot published_;
