@@ -60,6 +60,7 @@ bool entryValueOk(const Entry& e, const QString& v) {
       return false;
     }
     case ValueKind::Int:
+    case ValueKind::Flags:
       return confInt(v, e.int_lo, e.int_hi);
     case ValueKind::Float:
       return confFloat(v, e.float_lo, e.float_hi);
@@ -150,6 +151,7 @@ constexpr const char* kSkyBakeFace[] = {"1024", "2048", "4096", nullptr};
 constexpr const char* kLiveCapture[] = {"monitor", "window", nullptr};
 constexpr const char* kChromeProfile[] = {"default", "isolated", nullptr};
 constexpr const char* kBrowser[] = {"chrome", "chromium", "firefox", nullptr};
+constexpr const char* kFsrScales[] = {"1.2×", "1.5×", "2.0×", nullptr};
 
 }  // namespace
 
@@ -197,25 +199,45 @@ const QVector<Entry>& catalog() {
                  .label = QT_TR_NOOP("SDL gamepad")});
 
     // --- Video ---
+    // Cycle list for □ / X (bit0=1.2×, bit1=1.5×, bit2=2.0×). Current mode is fsr / live_fsr.
+    e.push_back({.key = "fsr_scales",
+                 .category = Category::Video,
+                 .kind = ValueKind::Flags,
+                 .visibility = Visibility::User,
+                 .default_value = "7",  // all scales
+                 .label = QT_TR_NOOP("FSR (file)"),
+                 .description = QT_TR_NOOP(
+                     "Scales cycled with □ / X during file playback. Checked sizes rotate with Off "
+                     "(切). Larger × is sharper but heavier."),
+                 .int_lo = 0,
+                 .int_hi = 7,
+                 .enum_values = kFsrScales});
+    e.push_back({.key = "live_fsr_scales",
+                 .category = Category::Video,
+                 .kind = ValueKind::Flags,
+                 .visibility = Visibility::User,
+                 .default_value = "7",
+                 .label = QT_TR_NOOP("FSR (Live browser)"),
+                 .description = QT_TR_NOOP(
+                     "Same □ / X cycle for browser Live (not desktop apps)."),
+                 .int_lo = 0,
+                 .int_hi = 7,
+                 .enum_values = kFsrScales});
+    // Active FSR mode (0=Off … 3=2.0×). Written by □ cycle; not shown in Preferences.
     e.push_back({.key = "fsr",
                  .category = Category::Video,
                  .kind = ValueKind::Int,
-                 .visibility = Visibility::User,
-                 .default_value = "2",  // 1.5× — Host may override from migration
-                 .label = QT_TR_NOOP("FSR (file)"),
-                 .description = QT_TR_NOOP(
-                     "Upscale decoded video before the HMD panel. Larger × = sharper but heavier "
-                     "(1.3× / 1.5× / 2.0×). Off leaves the source resolution."),
+                 .visibility = Visibility::Auto,
+                 .default_value = "2",
+                 .label = QT_TR_NOOP("FSR mode (file)"),
                  .int_lo = 0,
                  .int_hi = 3});
     e.push_back({.key = "live_fsr",
                  .category = Category::Video,
                  .kind = ValueKind::Int,
-                 .visibility = Visibility::User,
-                 .default_value = "3",  // 2.0×
-                 .label = QT_TR_NOOP("FSR (Live browser)"),
-                 .description = QT_TR_NOOP(
-                     "Same upscale for browser Live (not desktop apps). Larger × costs more GPU."),
+                 .visibility = Visibility::Auto,
+                 .default_value = "3",
+                 .label = QT_TR_NOOP("FSR mode (Live)"),
                  .int_lo = 0,
                  .int_hi = 3});
     e.push_back({.key = "flat_fov",
@@ -676,7 +698,7 @@ std::optional<PrefsPage> prefsPageFor(const Entry& e) {
 }
 
 QString prefsPageTitle(PrefsPage p) {
-  // English source; monasphere_ja.json maps to 映像/音声/空/Live/デコード/その他.
+  // English source; monasphere_ja.json maps to 映像/音声/空/Live/Live URL/デコード/その他.
   switch (p) {
     case PrefsPage::Video:
       return QCoreApplication::translate("Preferences", "Video");

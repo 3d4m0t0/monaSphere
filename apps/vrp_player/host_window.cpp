@@ -1689,12 +1689,23 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const int v = line.mid(9).toInt(&ok);
       if (ok && v >= 0 && v <= 3) live_fsr_ = static_cast<vrp::FsrMode>(v);
+    } else if (line.startsWith(QStringLiteral("fsr_scales="))) {
+      bool ok = false;
+      const int v = line.mid(QStringLiteral("fsr_scales=").size()).toInt(&ok);
+      if (ok && v >= 0 && v <= 7) fsr_scales_ = static_cast<unsigned>(v);
+    } else if (line.startsWith(QStringLiteral("live_fsr_scales="))) {
+      bool ok = false;
+      const int v = line.mid(QStringLiteral("live_fsr_scales=").size()).toInt(&ok);
+      if (ok && v >= 0 && v <= 7) live_fsr_scales_ = static_cast<unsigned>(v);
     } else if (line.startsWith(QStringLiteral("live_display_log="))) {
       const QString v = line.mid(QStringLiteral("live_display_log=").size()).trimmed();
       vrp_set_persist_display_log(v == QLatin1String("1"));
     } else if (line.startsWith(QStringLiteral("live_teardown_log="))) {
       const QString v = line.mid(QStringLiteral("live_teardown_log=").size()).trimmed();
       vrp_set_persist_teardown_log(v == QLatin1String("1"));
+    } else if (line.startsWith(QStringLiteral("seek_detail_log="))) {
+      const QString v = line.mid(QStringLiteral("seek_detail_log=").size()).trimmed();
+      vrp_set_seek_detail_log(v == QLatin1String("1"));
     } else if (line.startsWith(QStringLiteral("hz="))) {
       bool ok = false;
       const int v = line.mid(3).toInt(&ok);
@@ -3413,6 +3424,28 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
       bool ok = false;
       const int n = value.toInt(&ok);
       if (ok && n >= 0 && n <= 3) live_fsr_ = static_cast<vrp::FsrMode>(n);
+    } else if (key == QLatin1String("fsr_scales")) {
+      bool ok = false;
+      const int n = value.toInt(&ok);
+      if (ok && n >= 0 && n <= 7) {
+        fsr_scales_ = static_cast<unsigned>(n);
+        if (preferred_fsr_ != vrp::FsrMode::Off &&
+            (fsr_scales_ & vrp::fsr_mode_scale_bit(preferred_fsr_)) == 0) {
+          preferred_fsr_ = vrp::FsrMode::Off;
+          fsr_changed = true;
+        }
+      }
+    } else if (key == QLatin1String("live_fsr_scales")) {
+      bool ok = false;
+      const int n = value.toInt(&ok);
+      if (ok && n >= 0 && n <= 7) {
+        live_fsr_scales_ = static_cast<unsigned>(n);
+        if (live_fsr_ != vrp::FsrMode::Off &&
+            (live_fsr_scales_ & vrp::fsr_mode_scale_bit(live_fsr_)) == 0) {
+          live_fsr_ = vrp::FsrMode::Off;
+          setMonasphereConfKey(QStringLiteral("live_fsr"), QStringLiteral("0"));
+        }
+      }
     } else if (key == QLatin1String("hz")) {
       bool ok = false;
       const int n = value.toInt(&ok);
@@ -3732,7 +3765,7 @@ void HostWindow::rebuildFsrMenu() {
   // Upscale from decoded source (larger × = heavier). Not game-FSR “render cheaper”.
   const Item items[] = {
       {vrp::FsrMode::Off, QT_TR_NOOP("Off")},
-      {vrp::FsrMode::UltraQuality, QT_TR_NOOP("1.3×")},
+      {vrp::FsrMode::UltraQuality, QT_TR_NOOP("1.2×")},
       {vrp::FsrMode::Quality, QT_TR_NOOP("1.5×")},
       {vrp::FsrMode::Performance, QT_TR_NOOP("2.0×")},
   };
@@ -6997,13 +7030,30 @@ void HostWindow::xrThreadMain() {
         } else {
           arm_live_fsr(true);
         }
-        QString toast;
-        switch (mode) {
-          case vrp::FsrMode::Off: toast = QStringLiteral("Live FSR Off"); break;
-          case vrp::FsrMode::UltraQuality: toast = QStringLiteral("Live FSR 1.3×"); break;
-          case vrp::FsrMode::Quality: toast = QStringLiteral("Live FSR 1.5×"); break;
-          case vrp::FsrMode::Performance: toast = QStringLiteral("Live FSR 2.0×"); break;
-        }
+        const QString toast =
+            QStringLiteral("Live FSR %1").arg(QString::fromUtf8(vrp::fsr_mode_toast(mode)));
+        showHudToast(toast);
+        QMetaObject::invokeMethod(
+            this,
+            [this, toast] { appendLog(toast + QStringLiteral(" (□)")); },
+            Qt::QueuedConnection);
+      } else if (can_file_fsr_cycle && pad_face_x) {
+        preferred_fsr_ = vrp::next_fsr_mode(preferred_fsr_, fsr_scales_);
+        const auto mode = preferred_fsr_;
+        fsr.set_mode(mode);
+        menu.set_fsr(mode);
+        fsr.invalidate();
+        force_fsr_refresh = true;
+        pending_video_rebind = true;
+        QMetaObject::invokeMethod(
+            this,
+            [this, mode] {
+              setMonasphereConfKey(QStringLiteral("fsr"), QString::number(static_cast<int>(mode)));
+              rebuildFsrMenu();
+            },
+            Qt::QueuedConnection);
+        const QString toast =
+            QStringLiteral("FSR %1").arg(QString::fromUtf8(vrp::fsr_mode_toast(mode)));
         showHudToast(toast);
         QMetaObject::invokeMethod(
             this,

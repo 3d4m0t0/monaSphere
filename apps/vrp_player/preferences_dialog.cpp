@@ -84,25 +84,6 @@ void sizeEditorToContents(QWidget* editor, vrp::settings::ValueKind kind, const 
 }
 
 QString enumDisplayLabel(const char* key, const QString& value) {
-  if (QLatin1String(key) == QLatin1String("fsr") ||
-      QLatin1String(key) == QLatin1String("live_fsr")) {
-    bool ok = false;
-    const int n = value.toInt(&ok);
-    if (!ok) return value;
-    // Video path: scale is upscale from decoded source (larger × = heavier).
-    switch (n) {
-      case 0:
-        return QCoreApplication::translate("Preferences", "Off");
-      case 1:
-        return QStringLiteral("1.3×");
-      case 2:
-        return QStringLiteral("1.5×");
-      case 3:
-        return QStringLiteral("2.0×");
-      default:
-        return value;
-    }
-  }
   if (QLatin1String(key) == QLatin1String("hz")) {
     if (value == QLatin1String("0"))
       return QCoreApplication::translate("Preferences", "Auto (90 Hz)");
@@ -278,23 +259,37 @@ void PreferencesDialog::addEntryRow(QFormLayout* form, const vrp::settings::Entr
       editor = cb;
       break;
     }
+    case vrp::settings::ValueKind::Flags: {
+      bool ok = false;
+      unsigned bits = static_cast<unsigned>(value.toInt(&ok));
+      if (!ok) bits = static_cast<unsigned>(QString::fromUtf8(e.default_value).toInt());
+      auto* row = new QWidget(this);
+      row->setProperty("flagsEditor", true);
+      auto* lay = new QHBoxLayout(row);
+      lay->setContentsMargins(0, 0, 0, 0);
+      lay->setSpacing(12);
+      int bi = 0;
+      if (e.enum_values) {
+        for (const char* const* p = e.enum_values; *p; ++p, ++bi) {
+          auto* cb = new QCheckBox(QString::fromUtf8(*p), row);
+          cb->setChecked((bits & (1u << bi)) != 0);
+          cb->setProperty("flagBit", bi);
+          lay->addWidget(cb);
+        }
+      }
+      lay->addStretch(1);
+      row->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+      editor = row;
+      break;
+    }
     case vrp::settings::ValueKind::Int: {
-      // Special enums stored as int (fsr / hz).
-      if (QLatin1String(e.key) == QLatin1String("fsr") ||
-          QLatin1String(e.key) == QLatin1String("live_fsr") ||
-          QLatin1String(e.key) == QLatin1String("hz")) {
+      // Special enums stored as int (hz).
+      if (QLatin1String(e.key) == QLatin1String("hz")) {
         auto* combo = new QComboBox(this);
-        if (QLatin1String(e.key) == QLatin1String("hz")) {
-          const int opts[] = {0, 90, 120};
-          for (int o : opts) {
-            const QString s = QString::number(o);
-            combo->addItem(enumDisplayLabel(e.key, s), s);
-          }
-        } else {
-          for (int o = e.int_lo; o <= e.int_hi; ++o) {
-            const QString s = QString::number(o);
-            combo->addItem(enumDisplayLabel(e.key, s), s);
-          }
+        const int opts[] = {0, 90, 120};
+        for (int o : opts) {
+          const QString s = QString::number(o);
+          combo->addItem(enumDisplayLabel(e.key, s), s);
         }
         const int idx = combo->findData(value);
         combo->setCurrentIndex(idx >= 0 ? idx : 0);
@@ -356,17 +351,21 @@ void PreferencesDialog::addEntryRow(QFormLayout* form, const vrp::settings::Entr
   }
 
   if (!editor) return;
-  sizeEditorToContents(editor, e.kind, e.key);
+  if (e.kind != vrp::settings::ValueKind::Flags) sizeEditorToContents(editor, e.kind, e.key);
   editors_.insert(key, editor);
 
-  // Editor stays content-sized; stretch fills the rest of the field column.
-  auto* editor_cell = new QWidget(this);
-  auto* editor_row = new QHBoxLayout(editor_cell);
-  editor_row->setContentsMargins(0, 0, 0, 0);
-  editor_row->addWidget(editor, 0, Qt::AlignLeft | Qt::AlignVCenter);
-  editor_row->addStretch(1);
-  editor_cell->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-  form->addRow(label, editor_cell);
+  if (e.kind == vrp::settings::ValueKind::Flags) {
+    form->addRow(label, editor);
+  } else {
+    // Editor stays content-sized; stretch fills the rest of the field column.
+    auto* editor_cell = new QWidget(this);
+    auto* editor_row = new QHBoxLayout(editor_cell);
+    editor_row->setContentsMargins(0, 0, 0, 0);
+    editor_row->addWidget(editor, 0, Qt::AlignLeft | Qt::AlignVCenter);
+    editor_row->addStretch(1);
+    editor_cell->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    form->addRow(label, editor_cell);
+  }
 
   if (e.description && e.description[0]) {
     auto* hint = new WrappingHintLabel(

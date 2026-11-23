@@ -516,16 +516,6 @@ void draw_mode_chip(HudCanvas& c, const QRect& r, const QString& top, const QStr
          Qt::AlignCenter);
 }
 
-QString fsr_label(FsrMode m) {
-  switch (m) {
-    case FsrMode::Off: return QStringLiteral("FSR ") + VRP_TR("Off");
-    case FsrMode::UltraQuality: return QStringLiteral("FSR UQ");
-    case FsrMode::Quality: return QStringLiteral("FSR Q");
-    case FsrMode::Performance: return QStringLiteral("FSR P");
-  }
-  return QStringLiteral("FSR");
-}
-
 QString proj_label(ProjectionMode m) {
   switch (m) {
     case ProjectionMode::Flat: return VRP_TR("Flat");

@@ -14,24 +14,50 @@ enum class StereoLayout : uint8_t { Mono = 0, Sbs = 1, OverUnder = 2 };
 /** AMD FidelityFX Super Resolution 1 quality preset (spatial upscale). */
 enum class FsrMode : uint8_t {
   Off = 0,
-  UltraQuality = 1,  // ~1.3x
-  Quality = 2,       // ~1.5x
-  Performance = 3,   // ~2.0x
+  UltraQuality = 1,  // 1.2×
+  Quality = 2,       // 1.5×
+  Performance = 3,   // 2.0×
 };
+
+/** Bitmask for Preferences cycle list: bit0=1.2×, bit1=1.5×, bit2=2.0×. */
+inline constexpr unsigned kFsrScaleBit12 = 1u << 0;
+inline constexpr unsigned kFsrScaleBit15 = 1u << 1;
+inline constexpr unsigned kFsrScaleBit20 = 1u << 2;
+inline constexpr unsigned kFsrScaleMaskAll = kFsrScaleBit12 | kFsrScaleBit15 | kFsrScaleBit20;
+
+inline unsigned fsr_mode_scale_bit(FsrMode m) {
+  switch (m) {
+    case FsrMode::UltraQuality: return kFsrScaleBit12;
+    case FsrMode::Quality: return kFsrScaleBit15;
+    case FsrMode::Performance: return kFsrScaleBit20;
+    case FsrMode::Off:
+    default: return 0;
+  }
+}
 
 inline const char* fsr_mode_name(FsrMode m) {
   switch (m) {
     case FsrMode::Off: return "off";
-    case FsrMode::UltraQuality: return "fsr uq";
-    case FsrMode::Quality: return "fsr q";
-    case FsrMode::Performance: return "fsr perf";
+    case FsrMode::UltraQuality: return "1.2x";
+    case FsrMode::Quality: return "1.5x";
+    case FsrMode::Performance: return "2.0x";
+  }
+  return "?";
+}
+
+inline const char* fsr_mode_toast(FsrMode m) {
+  switch (m) {
+    case FsrMode::Off: return "切";
+    case FsrMode::UltraQuality: return "1.2×";
+    case FsrMode::Quality: return "1.5×";
+    case FsrMode::Performance: return "2.0×";
   }
   return "?";
 }
 
 inline float fsr_mode_scale(FsrMode m) {
   switch (m) {
-    case FsrMode::UltraQuality: return 1.3f;
+    case FsrMode::UltraQuality: return 1.2f;
     case FsrMode::Quality: return 1.5f;
     case FsrMode::Performance: return 2.0f;
     case FsrMode::Off:
@@ -39,16 +65,26 @@ inline float fsr_mode_scale(FsrMode m) {
   }
 }
 
-/** Off → UQ → Q → P → Off (Live □ / X provisional cycle). */
-inline FsrMode next_fsr_mode(FsrMode m) {
-  switch (m) {
-    case FsrMode::Off: return FsrMode::UltraQuality;
-    case FsrMode::UltraQuality: return FsrMode::Quality;
-    case FsrMode::Quality: return FsrMode::Performance;
-    case FsrMode::Performance: return FsrMode::Off;
+/** Cycle Off → enabled scales (mask) → Off. Empty mask stays Off. */
+inline FsrMode next_fsr_mode(FsrMode cur, unsigned scale_mask) {
+  const unsigned mask = scale_mask & kFsrScaleMaskAll;
+  if (mask == 0) return FsrMode::Off;
+  static constexpr FsrMode kOrder[] = {
+      FsrMode::Off, FsrMode::UltraQuality, FsrMode::Quality, FsrMode::Performance};
+  int i = 0;
+  for (; i < 4; ++i) {
+    if (kOrder[i] == cur) break;
+  }
+  for (int step = 1; step <= 4; ++step) {
+    const FsrMode n = kOrder[(i + step) % 4];
+    if (n == FsrMode::Off) return FsrMode::Off;
+    if (mask & fsr_mode_scale_bit(n)) return n;
   }
   return FsrMode::Off;
 }
+
+/** Backward-compatible full cycle (all scales enabled). */
+inline FsrMode next_fsr_mode(FsrMode m) { return next_fsr_mode(m, kFsrScaleMaskAll); }
 
 /**
  * FSR1 output long-edge is capped (~4096). On 8K sources the upscale is a no-op

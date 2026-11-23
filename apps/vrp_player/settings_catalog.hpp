@@ -35,6 +35,7 @@ enum class ValueKind {
   Int,
   Float,
   Enum,       // case-sensitive unless enum_ignore_case
+  Flags,      // bitmask int; enum_values[i] = bit i label (e.g. FSR scales)
   String,     // any non-empty, or empty allowed
   SizeWxH,    // e.g. 1280x720
 };

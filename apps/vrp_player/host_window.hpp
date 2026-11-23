@@ -426,9 +426,12 @@ class HostWindow : public QMainWindow {
   float sky_lat_ = 35.68f;
   float sky_lon_ = 139.65f;
   vrp::FsrMode preferred_fsr_ = vrp::FsrMode::Quality;
+  /** Preferences cycle mask (bit0=1.2×, bit1=1.5×, bit2=2.0×). □ / X walks Off+checked. */
+  unsigned fsr_scales_ = vrp::kFsrScaleMaskAll;
   /** Browser Live only (not [アプリ]); conf `live_fsr`, default Performance.
-   *  Provisional: □ / X cycles Off→1.3×→1.5×→2.0× while Live (menus closed). */
+   *  □ / X cycles Off → checked live_fsr_scales_ while Live (menus closed). */
   vrp::FsrMode live_fsr_ = vrp::FsrMode::Performance;
+  unsigned live_fsr_scales_ = vrp::kFsrScaleMaskAll;
   std::atomic<int> fsr_req_{-1};       // -1 none; else FsrMode
   /** 8K+ source: runtime FSR forced Off; preferred_fsr_ kept for restore. */
   std::atomic<bool> fsr_locked_8k_{false};
