@@ -298,8 +298,11 @@ HudCanvas::TextSprite HudCanvas::make_text(const QString& s, const QFont& font, 
   TextSprite text;
   const QFontMetrics metrics(font);
   text.width = metrics.horizontalAdvance(s);
-  text.height = std::max(1, metrics.height());
-  text.pad = 1;
+  // height() alone + AlignVCenter clipped descenders (j/g/y) and AA fringe.
+  const int ascent = metrics.ascent();
+  const int descent = metrics.descent();
+  text.height = std::max(1, ascent + descent + 2);
+  text.pad = 2;
   if (s.isEmpty() || text.width <= 0) return {};
   const int max_w = std::max(8, atlas_w_ - 4);
   for (int origin = 0; origin < text.width; origin += max_w) {
@@ -311,8 +314,8 @@ HudCanvas::TextSprite HudCanvas::make_text(const QString& s, const QFont& font, 
     painter.setRenderHint(QPainter::TextAntialiasing, true);
     painter.setFont(font);
     painter.setPen(color);
-    painter.drawText(QRect(text.pad - origin, text.pad, text.width, text.height),
-                     Qt::AlignLeft | Qt::AlignVCenter, s);
+    // Baseline draw — keeps full descender ink inside the sprite.
+    painter.drawText(text.pad - origin, text.pad + ascent, s);
     painter.end();
     const Sprite sprite = pack_image(img);
     if (sprite.w <= 0) return {};
@@ -464,9 +467,7 @@ void HudCanvas::scrolling_text(const QRect& r, const QString& s, const QFont& fo
 void HudCanvas::paint_cached(uint64_t key, const QRect& dest, int raster_w, int raster_h,
                              const std::function<void(QPainter&)>& draw) {
   if (!draw || dest.width() <= 0 || dest.height() <= 0 || raster_w <= 0 || raster_h <= 0) return;
-  const uint64_t stored = domain_key(3, key);
-  auto found = sprites_.find(stored);
-  if (found == sprites_.end()) {
+  blit_cached(key, dest, [&]() {
     QImage img(raster_w, raster_h, QImage::Format_RGBA8888);
     img.fill(Qt::transparent);
     {
@@ -476,6 +477,17 @@ void HudCanvas::paint_cached(uint64_t key, const QRect& dest, int raster_w, int 
       painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
       draw(painter);
     }
+    return img;
+  });
+}
+
+void HudCanvas::blit_cached(uint64_t key, const QRect& dest, const std::function<QImage()>& make) {
+  if (!make || dest.width() <= 0 || dest.height() <= 0) return;
+  const uint64_t stored = domain_key(3, key);
+  auto found = sprites_.find(stored);
+  if (found == sprites_.end()) {
+    const QImage img = make();
+    if (img.isNull() || img.width() <= 0 || img.height() <= 0) return;
     const Sprite sprite = pack_image(img);
     if (sprite.w <= 0) return;
     found = sprites_.emplace(stored, sprite).first;

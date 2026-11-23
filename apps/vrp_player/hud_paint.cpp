@@ -107,12 +107,8 @@ void draw_flat_square(QPainter& p, const QRect& r, bool selected, bool editing =
   const QRectF rf = QRectF(r).adjusted(0.5, 0.5, -0.5, -0.5);
   p.setPen(Qt::NoPen);
   p.setBrush(selected || editing ? QColor(235, 242, 250) : QColor(36, 42, 54));
-  p.drawRoundedRect(rf, 4.0, 4.0);
-  if (selected || editing) {
-    p.setBrush(Qt::NoBrush);
-    p.setPen(QPen(editing ? QColor(220, 140, 40) : QColor(40, 120, 200), 2.0));
-    p.drawRoundedRect(rf.adjusted(1, 1, -1, -1), 3.0, 3.0);
-  }
+  // Keep corners (tiny radius); no selection outline.
+  p.drawRoundedRect(rf, 1.0, 1.0);
 }
 
 enum class TransportIcon { Prev, Rewind, Play, Pause, Stop, Forward, Next };
@@ -125,92 +121,122 @@ QImage make_transport_icon(TransportIcon kind, int size, bool selected) {
   ip.setRenderHint(QPainter::Antialiasing, true);
   ip.setRenderHint(QPainter::SmoothPixmapTransform, true);
   const qreal m = size * 0.22;
-  const QRectF icon(m, m, size - 2 * m, size - 2 * m);
+  const QRectF box(m, m, size - 2 * m, size - 2 * m);
   const QColor ink = selected ? QColor(20, 28, 40) : QColor(245, 248, 252);
-  ip.setPen(QPen(ink, 1.0, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+  ip.setPen(Qt::NoPen);
   ip.setBrush(ink);
 
-  auto chevron = [&](qreal cx, bool left) {
+  // Shared body size so ▶ / ■ / ❚❚ read at the same scale inside the button.
+  const qreal glyph = box.height() * 0.70;
+  const qreal mid_x = box.center().x();
+  const qreal mid_y = box.center().y();
+  const qreal top = mid_y - glyph * 0.5;
+
+  // Equilateral triangle; point_right=false → ◀, true → ▶. `side` = triangle height.
+  auto tri = [&](qreal cx, qreal cy, qreal side, bool point_right) {
+    const qreal h = side * 0.8660254037844386;  // √3/2
     QPainterPath path;
-    const qreal w = icon.width() / 3.0;
-    const qreal mid = icon.center().y();
-    if (left) {
-      path.moveTo(cx + w / 2, icon.top());
-      path.lineTo(cx - w / 2, mid);
-      path.lineTo(cx + w / 2, icon.bottom());
+    if (point_right) {
+      path.moveTo(cx - h * 0.5, cy - side * 0.5);
+      path.lineTo(cx + h * 0.5, cy);
+      path.lineTo(cx - h * 0.5, cy + side * 0.5);
     } else {
-      path.moveTo(cx - w / 2, icon.top());
-      path.lineTo(cx + w / 2, mid);
-      path.lineTo(cx - w / 2, icon.bottom());
+      path.moveTo(cx + h * 0.5, cy - side * 0.5);
+      path.lineTo(cx - h * 0.5, cy);
+      path.lineTo(cx + h * 0.5, cy + side * 0.5);
     }
     path.closeSubpath();
     ip.drawPath(path);
   };
 
-  auto bar = [&](qreal x, qreal w) {
-    ip.drawRoundedRect(QRectF(x, icon.top(), w, icon.height()), size * 0.04, size * 0.04);
+  // Flat vertical bar (pause / cue stem), height = glyph.
+  auto vbar = [&](qreal x, qreal w) {
+    ip.fillRect(QRectF(x, top, w, glyph), ink);
+  };
+
+  // ⏩ / ⏪ — two equilateral tris side-by-side (no overlap), small gap between.
+  auto twin = [&](bool point_right) {
+    const qreal side = glyph * 0.78;
+    const qreal h = side * 0.8660254037844386;
+    const qreal gap = h * 0.12;
+    const qreal pair_w = h * 2 + gap;
+    const qreal cx0 = mid_x - pair_w * 0.5 + h * 0.5;
+    const qreal cx1 = cx0 + h + gap;
+    tri(cx0, mid_y, side, point_right);
+    tri(cx1, mid_y, side, point_right);
   };
 
   switch (kind) {
     case TransportIcon::Prev: {
-      const qreal bw = std::max(2.0, icon.width() / 8.0);
-      bar(icon.left(), bw);
-      const qreal cx = icon.center().x() + bw / 2;
-      chevron(cx - icon.width() / 6, true);
-      chevron(cx + icon.width() / 6, true);
+      // ｜◀
+      const qreal bw = std::max(2.0, glyph * 0.18);
+      const qreal gap = glyph * 0.10;
+      const qreal h = glyph * 0.8660254037844386;
+      const qreal total = bw + gap + h;
+      const qreal x0 = mid_x - total * 0.5;
+      vbar(x0, bw);
+      tri(x0 + bw + gap + h * 0.5, mid_y, glyph, false);
       break;
     }
     case TransportIcon::Next: {
-      const qreal bw = std::max(2.0, icon.width() / 8.0);
-      bar(icon.right() - bw, bw);
-      const qreal cx = icon.center().x() - bw / 2;
-      chevron(cx - icon.width() / 6, false);
-      chevron(cx + icon.width() / 6, false);
+      // ▶｜
+      const qreal bw = std::max(2.0, glyph * 0.18);
+      const qreal gap = glyph * 0.10;
+      const qreal h = glyph * 0.8660254037844386;
+      const qreal total = h + gap + bw;
+      const qreal x0 = mid_x - total * 0.5;
+      tri(x0 + h * 0.5, mid_y, glyph, true);
+      vbar(x0 + h + gap, bw);
       break;
     }
-    case TransportIcon::Rewind: {
-      chevron(icon.center().x(), true);
+    case TransportIcon::Rewind:
+      twin(false);
       break;
-    }
-    case TransportIcon::Forward: {
-      chevron(icon.center().x(), false);
+    case TransportIcon::Forward:
+      twin(true);
       break;
-    }
-    case TransportIcon::Play: {
-      QPainterPath path;
-      path.moveTo(icon.left() + icon.width() / 6, icon.top());
-      path.lineTo(icon.right() - icon.width() / 8, icon.center().y());
-      path.lineTo(icon.left() + icon.width() / 6, icon.bottom());
-      path.closeSubpath();
-      ip.drawPath(path);
+    case TransportIcon::Play:
+      tri(mid_x, mid_y, glyph, true);
       break;
-    }
     case TransportIcon::Pause: {
-      const qreal bw = std::max(3.0, icon.width() / 5.0);
-      const qreal gap = std::max(3.0, icon.width() / 6.0);
-      const qreal left = icon.center().x() - gap / 2 - bw;
-      bar(left, bw);
-      bar(left + bw + gap, bw);
+      // ❚❚ — same outer height/width budget as ■ stop.
+      const qreal bw = std::max(2.0, glyph * 0.28);
+      const qreal gap = std::max(2.0, glyph * 0.22);
+      const qreal left = mid_x - (bw * 2 + gap) * 0.5;
+      vbar(left, bw);
+      vbar(left + bw + gap, bw);
       break;
     }
-    case TransportIcon::Stop: {
-      const qreal s = icon.width() * 0.55;
-      ip.drawRoundedRect(QRectF(icon.center().x() - s / 2, icon.center().y() - s / 2, s, s),
-                         size * 0.05, size * 0.05);
+    case TransportIcon::Stop:
+      ip.fillRect(QRectF(mid_x - glyph * 0.5, top, glyph, glyph), ink);
       break;
-    }
   }
   ip.end();
   return img;
 }
 
-void paint_transport_icon(HudCanvas& c, const QRect& r, TransportIcon kind, bool selected) {
-  const int size = std::max(2, r.width() * 2);
-  c.paint_cached(hud_key({2, static_cast<uint64_t>(kind), static_cast<uint64_t>(size), selected ? 1ull : 0ull}),
-                 r, size, size, [&](QPainter& p) {
-                   const QImage hi = make_transport_icon(kind, size, selected);
-                   p.drawImage(QRect(0, 0, size, size), hi);
-                 });
+/** Flat square + glyph as one atlas sprite; VRAM sample only after first build. */
+void paint_transport_button(HudCanvas& c, const QRect& br, TransportIcon kind, bool selected) {
+  constexpr int kScale = 2;
+  const int sq = std::max(2, br.width());
+  const int raster = sq * kScale;
+  const int inset = 3 * kScale;
+  // Domain 31: composite button (bg+icon); replaces layered square+glyph.
+  c.blit_cached(
+      hud_key({31, static_cast<uint64_t>(kind), static_cast<uint64_t>(sq), selected ? 1ull : 0ull}), br,
+      [&]() {
+        QImage img(raster, raster, QImage::Format_RGBA8888);
+        img.fill(Qt::transparent);
+        {
+          QPainter p(&img);
+          p.setRenderHint(QPainter::Antialiasing, true);
+          p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+          draw_flat_square(p, QRect(0, 0, raster, raster), selected);
+          const QImage glyph = make_transport_icon(kind, raster - 2 * inset, selected);
+          p.drawImage(QRect(inset, inset, glyph.width(), glyph.height()), glyph);
+        }
+        return img;
+      });
 }
 
 using DpadDir = icons::DpadDir;
@@ -595,7 +621,8 @@ struct PlaybackPanel {
   int pad = 12;
   int scrub_y = 0;
   int title_y = 0;
-  int buttons_y = 0;
+  /** Under seek: transport → mute → vol → audio → format. */
+  int transport_y = 0;
   int info_y = 0;
   QRect bar;
   QRect time;
@@ -603,32 +630,105 @@ struct PlaybackPanel {
   int info_h = 0;
 };
 
+/** Title → seek (Y fixed) → [Transport][Mute][Vol][Audio][Fmt]. */
+constexpr int kTransportSq = 45;
+constexpr int kFmtW = 90;   // half of prior 180; audio chip matches
+constexpr int kFmtH = 45;
+constexpr int kAudioW = 90;
+constexpr int kAudioH = 45;
+constexpr int kVolW = 118;  // volume track panel (same size as before; mute is separate)
+constexpr int kBtnGap = 4;
+constexpr int kGroupGap = 6;
+constexpr int kTransportCount = 6;
+constexpr int kBarCorner = 1;  // keep corners on seek / volume tracks
+
+QImage make_speaker_glyph(int w, int h, bool lit, bool muted) {
+  QImage img(w, h, QImage::Format_RGBA8888);
+  img.fill(Qt::transparent);
+  QPainter p(&img);
+  p.setRenderHint(QPainter::Antialiasing, true);
+  const QColor ink = lit ? QColor(20, 28, 40) : QColor(245, 248, 252);
+  const qreal sx = static_cast<qreal>(w);
+  const qreal sy = static_cast<qreal>(h);
+  QPainterPath body;
+  const qreal x0 = sx * 0.04;
+  const qreal x1 = sx * 0.30;
+  const qreal x2 = sx * 0.52;
+  const qreal y0 = sy * 0.16;
+  const qreal y1 = sy * 0.84;
+  const qreal ym = sy * 0.50;
+  body.moveTo(x0, sy * 0.34);
+  body.lineTo(x1, sy * 0.34);
+  body.lineTo(x2, y0);
+  body.lineTo(x2, y1);
+  body.lineTo(x1, sy * 0.66);
+  body.lineTo(x0, sy * 0.66);
+  body.closeSubpath();
+  p.setPen(Qt::NoPen);
+  p.setBrush(ink);
+  p.drawPath(body);
+  p.setBrush(Qt::NoBrush);
+  p.setPen(QPen(ink, std::max(1.2, sx * 0.08), Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+  if (muted) {
+    // Slash through glyph center (equal margins on both ends).
+    p.drawLine(QPointF(sx * 0.14, sy * 0.86), QPointF(sx * 0.86, sy * 0.14));
+  } else {
+    p.drawArc(QRectF(sx * 0.42, ym - sy * 0.14, sx * 0.40, sy * 0.28), -55 * 16, 110 * 16);
+    p.drawArc(QRectF(sx * 0.48, ym - sy * 0.24, sx * 0.48, sy * 0.48), -55 * 16, 110 * 16);
+  }
+  return img;
+}
+
+/** Mute toggle: same square as transport; glyph cached in atlas / VRAM. */
+void paint_mute_button(HudCanvas& c, const QRect& br, bool muted, bool selected) {
+  constexpr int kScale = 2;
+  const int sq = std::max(2, br.width());
+  const int raster = sq * kScale;
+  const int inset = 6 * kScale;
+  c.blit_cached(
+      hud_key({33, static_cast<uint64_t>(sq), muted ? 1ull : 0ull, selected ? 1ull : 0ull}), br, [&]() {
+        QImage img(raster, raster, QImage::Format_RGBA8888);
+        img.fill(Qt::transparent);
+        {
+          QPainter p(&img);
+          p.setRenderHint(QPainter::Antialiasing, true);
+          p.setRenderHint(QPainter::SmoothPixmapTransform, true);
+          draw_flat_square(p, QRect(0, 0, raster, raster), selected);
+          const QImage glyph = make_speaker_glyph(raster - 2 * inset, raster - 2 * inset, selected, muted);
+          p.drawImage(QRect(inset, inset, glyph.width(), glyph.height()), glyph);
+        }
+        return img;
+      });
+}
+
+int playback_controls_row_w() {
+  const int transport_w = kTransportSq * kTransportCount + kBtnGap * (kTransportCount - 1);
+  return transport_w + kGroupGap + kTransportSq + kBtnGap + kVolW + kGroupGap + kAudioW + kBtnGap + kFmtW;
+}
+
 PlaybackPanel playback_panel(const VrMenu::Snapshot& snap, int width, int height, const QFont& time_font) {
   PlaybackPanel p;
   p.has_info = !snap.info_video_codec.empty() || !snap.info_res.empty() || !snap.info_audio_codec.empty();
   p.info_h = p.has_info ? 72 : 0;
   constexpr int kFootH = 40;
-  constexpr int kBtn = 48;
-  constexpr int kButtonsOff = 32;
-  const int scrub_off = kButtonsOff + kBtn + 14;
-  const int above_foot = p.has_info ? (scrub_off + 18 + (p.info_h - 8)) : (scrub_off + 16);
+  // Title row then a tight gap; panel_h shrinks by the same delta so seek screen Y stays put.
+  constexpr int kTitleOff = 4;
+  constexpr int kTitleH = 24;
+  constexpr int kTitleScrubGap = 8;
+  const int scrub_off = kTitleOff + kTitleH + kTitleScrubGap;
+  const int transport_off = scrub_off + 18;
+  const int info_off = transport_off + kTransportSq + 8;
+  const int above_foot =
+      p.has_info ? (info_off + (p.info_h - 8)) : (transport_off + kTransportSq + 10);
   p.panel_h = above_foot + kFootH;
   p.panel_y = height - p.panel_h;
-  constexpr int kGap = 4;
-  constexpr int kBtns = 6;
-  constexpr int kVolW = 100;
-  constexpr int kFmtW = 156;
-  constexpr int kFsrW = 88;
-  constexpr int kHzW = 80;
-  constexpr int kGroupGap = 6;
-  const int row_w = kBtn * kBtns + kGap * (kBtns - 1) + kGroupGap + kVolW + kGap + kFmtW + kGap + kFsrW +
-                    kGap + kHzW;
+  const int row_w = playback_controls_row_w();
   p.panel_w = row_w + p.pad * 2;
   p.panel_x = std::max(0, (width - p.panel_w) / 2);
-  p.title_y = p.panel_y + 4;
-  p.buttons_y = p.panel_y + kButtonsOff;
+  p.title_y = p.panel_y + kTitleOff;
   p.scrub_y = p.panel_y + scrub_off;
-  p.info_y = p.scrub_y + 18;
+  p.transport_y = p.panel_y + transport_off;
+  p.info_y = p.panel_y + info_off;
   const QString shown = fmt_time(snap.position_sec) + QStringLiteral(" / ") + fmt_time(snap.duration_sec);
   const QString wide = QStringLiteral("00:00:00 / 00:00:00");
   const int time_w = std::max(clock_label_width(shown, time_font), clock_label_width(wide, time_font)) + 6;
@@ -641,21 +741,40 @@ PlaybackPanel playback_panel(const VrMenu::Snapshot& snap, int width, int height
   return p;
 }
 
+/** Volume track only (mute button is separate). Same outer size as before. */
+void paint_volume_slider(HudCanvas& c, const QRect& area, float volume, bool selected, bool editing) {
+  constexpr int kBarH = 10;
+  if (selected || editing) {
+    c.paint_cached(hud_key({19, static_cast<uint64_t>(area.width()), static_cast<uint64_t>(area.height()),
+                            editing ? 1ull : 0ull}),
+                   area, area.width(), area.height(),
+                   [&](QPainter& p) { draw_flat_square(p, QRect(0, 0, area.width(), area.height()), true, editing); });
+  }
+  const QRect bar(area.x() + 6, area.y() + (area.height() - kBarH) / 2, std::max(16, area.width() - 12),
+                  kBarH);
+  c.rounded(bar, QColor(92, 48, 36, 220), kBarCorner);
+  const float t = std::clamp(volume, 0.f, 1.f);
+  const int fill_w = std::max(0, static_cast<int>(std::lround(bar.width() * static_cast<double>(t))));
+  if (fill_w > 0)
+    c.rounded(QRect(bar.x(), bar.y(), fill_w, bar.height()), QColor(50, 160, 255, 230), kBarCorner);
+}
+
 void paint_scrub_bar(HudCanvas& c, const VrMenu::Snapshot& snap, const QRect& bar, const QRect& time,
                      const QFont& hint_font) {
   const double duration = snap.duration_sec > 0 ? snap.duration_sec : 0;
   double ready = duration > 0 ? snap.thumb_cover_sec / duration : 1.0;
   ready = std::clamp(ready, 0.0, 1.0);
   const int ready_w = static_cast<int>(std::lround(bar.width() * ready));
-  c.rounded(bar, QColor(92, 48, 36, 220), 3);
+  c.rounded(bar, QColor(92, 48, 36, 220), kBarCorner);
   if (ready_w > 0) {
-    c.rounded(QRect(bar.x(), bar.y(), std::min(bar.width(), ready_w), bar.height()), QColor(30, 36, 48, 220), 3);
+    c.rounded(QRect(bar.x(), bar.y(), std::min(bar.width(), ready_w), bar.height()), QColor(30, 36, 48, 220),
+              kBarCorner);
   }
   double t = 0;
   if (duration > 0) t = snap.position_sec / duration;
   t = std::clamp(t, 0.0, 1.0);
   const int fill_w = std::max(0, static_cast<int>(bar.width() * t));
-  if (fill_w > 0) c.rounded(QRect(bar.x(), bar.y(), fill_w, bar.height()), QColor(50, 160, 255, 230), 3);
+  if (fill_w > 0) c.rounded(QRect(bar.x(), bar.y(), fill_w, bar.height()), QColor(50, 160, 255, 230), kBarCorner);
   const QString label = fmt_time(snap.position_sec) + QStringLiteral(" / ") + fmt_time(snap.duration_sec);
   c.clock(time, label, hint_font, kScrubClock, Qt::AlignRight | Qt::AlignVCenter);
 }
@@ -671,16 +790,7 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
   const int panel_h = panel.panel_h;
   const int pad = panel.pad;
 
-  const int gap = 4;
-  const int btn = 48;
   const int foot_h = 40;
-  const int chip_h = 48;
-  constexpr int kBtns = 6;
-  const int vol_w = 100;
-  const int fmt_w = 156;
-  const int fsr_w = 88;
-  const int hz_w = 80;
-  const int group_gap = 6;
   c.rounded(QRect(panel_x, top, panel_w, panel_h), QColor(16, 20, 30, 235), 8);
 
   const QString fname = snap.media_name.empty() ? VRP_TR(snap.title.c_str())
@@ -693,54 +803,73 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
            Qt::AlignVCenter | Qt::AlignRight);
   }
 
-  int x = panel_x + pad;
-  const int y = panel.buttons_y;
-
-  const int sel = std::clamp(snap.transport_cursor, 0, 9);
+  using Tr = VrMenu::Transport;
+  const int sel = std::clamp(snap.transport_cursor, 0, Tr::kTransportCount - 1);
   const bool editing = snap.controls_edit != VrMenu::ControlsEdit::None;
+  const bool vol_edit = snap.controls_edit == VrMenu::ControlsEdit::Volume;
+  const bool audio_edit = snap.controls_edit == VrMenu::ControlsEdit::AudioTrackPick;
+  const bool fmt_edit = snap.controls_edit == VrMenu::ControlsEdit::FormatPick;
 
-  const TransportIcon icons[kBtns] = {
+  // Seek bar Y unchanged. Standalone seek strip uses this rect.
+  paint_scrub_bar(c, snap, panel.bar, panel.time, hint_font);
+
+  // Under seek: transport → mute → volume → audio → format.
+  int x = panel_x + pad;
+  const int y = panel.transport_y;
+
+  const TransportIcon icons[kTransportCount] = {
       TransportIcon::Prev, TransportIcon::Rewind,
       snap.playing ? TransportIcon::Pause : TransportIcon::Play, TransportIcon::Stop,
       TransportIcon::Forward, TransportIcon::Next};
-  for (int i = 0; i < kBtns; ++i) {
-    const bool on = (!editing && sel == i);
-    c.paint_cached(hud_key({9, static_cast<uint64_t>(btn), on ? 1ull : 0ull}), QRect(x, y, btn, btn), btn, btn,
-                   [&](QPainter& painter) { draw_flat_square(painter, QRect(0, 0, btn, btn), on); });
-    paint_transport_icon(c, QRect(x, y, btn, btn), icons[i], on);
-    x += btn + gap;
+  for (int i = 0; i < kTransportCount; ++i) {
+    const bool on = (!editing && sel == Tr::kCuePrev + i);
+    const QRect br(x, y, kTransportSq, kTransportSq);
+    paint_transport_button(c, br, icons[i], on);
+    x += kTransportSq + kBtnGap;
   }
-  x += group_gap - gap;
+  x += kGroupGap - kBtnGap;
 
-  const int vol_pct = static_cast<int>(std::lround(snap.volume * 100.f));
-  const QRect vol_r(x, y, vol_w, chip_h);
-  draw_chip(c, vol_r, VRP_TR("Vol%1%").arg(vol_pct), hint_font, sel == 6,
-            snap.controls_edit == VrMenu::ControlsEdit::Volume);
-  x += vol_w + gap;
+  const QRect mute_r(x, y, kTransportSq, kTransportSq);
+  paint_mute_button(c, mute_r, snap.muted, !editing && sel == Tr::kMute);
+  x += kTransportSq + kBtnGap;
 
-  const QRect fmt_r(x, y, fmt_w, chip_h);
-  draw_mode_chip(c, fmt_r, proj_label(snap.projection), stereo_chip_label(snap), hint_font, sel == 7,
-                 snap.controls_edit == VrMenu::ControlsEdit::FormatPick);
-  x += fmt_w + gap;
+  const QRect vol_r(x, y, kVolW, kTransportSq);
+  paint_volume_slider(c, vol_r, snap.volume, sel == Tr::kVolume || vol_edit, vol_edit);
+  x += kVolW + kGroupGap;
 
-  const QRect fsr_r(x, y, fsr_w, chip_h);
-  draw_chip(c, fsr_r, fsr_label(snap.fsr_locked ? FsrMode::Off : snap.fsr), hint_font,
-            !snap.fsr_locked && sel == 8,
-            !snap.fsr_locked && snap.controls_edit == VrMenu::ControlsEdit::FsrPick,
-            snap.fsr_locked);
-  x += fsr_w + gap;
+  QString audio_label = QStringLiteral("—");
+  if (!snap.audio_tracks.empty()) {
+    const int ai = std::clamp(snap.audio_track_index, 0, static_cast<int>(snap.audio_tracks.size()) - 1);
+    QString chip = QString::fromStdString(snap.audio_tracks[static_cast<size_t>(ai)].chip);
+    if (chip.isEmpty()) {
+      chip = QString::fromStdString(snap.audio_tracks[static_cast<size_t>(ai)].label);
+      const int sp = chip.indexOf(QLatin1Char(' '));
+      if (sp > 0) chip = chip.mid(sp + 1).trimmed();
+    }
+    audio_label = chip.isEmpty() ? QString::number(ai + 1)
+                                 : QStringLiteral("%1:%2").arg(ai + 1).arg(chip);
+  }
+  const QRect audio_r(x, y + (kTransportSq - kAudioH) / 2, kAudioW, kAudioH);
+  {
+    const bool on = sel == Tr::kAudioTrack || audio_edit;
+    const QColor ink = on || audio_edit ? QColor(20, 28, 40) : QColor(245, 248, 252);
+    c.paint_cached(hud_key({8, static_cast<uint64_t>(audio_r.width()), static_cast<uint64_t>(audio_r.height()),
+                            on ? 1ull : 0ull, audio_edit ? 1ull : 0ull, 2ull, ink.rgba()},
+                           audio_label),
+                   audio_r, audio_r.width(), audio_r.height(), [&](QPainter& p) {
+                     draw_flat_square(p, QRect(0, 0, audio_r.width(), audio_r.height()), on, audio_edit);
+                     p.setRenderHint(QPainter::TextAntialiasing, true);
+                     p.setFont(hint_font);
+                     p.setPen(ink);
+                     p.drawText(QRect(0, 0, audio_r.width(), audio_r.height()).adjusted(3, 2, -3, -2),
+                                Qt::AlignCenter, audio_label);
+                   });
+  }
+  x += kAudioW + kBtnGap;
 
-  const QRect hz_r(x, y, hz_w, chip_h);
-  QString hz_chip;
-  if (snap.preferred_hz > 0) hz_chip = QStringLiteral("%1Hz").arg(snap.preferred_hz);
-  else if (snap.display_hz > 0.5f) hz_chip = QStringLiteral("%1Hz").arg(snap.display_hz, 0, 'f', 0);
-  else hz_chip = VRP_TR("Auto");
-  draw_chip(c, hz_r, hz_chip, hint_font, sel == 9,
-            snap.controls_edit == VrMenu::ControlsEdit::HzPick ||
-                snap.controls_edit == VrMenu::ControlsEdit::HzConfirm);
-
-  // Seek bar sits under the buttons. The standalone bar uses this same rect.
-  paint_scrub_bar(c, snap, panel.bar, panel.time, hint_font);
+  const QRect fmt_r(x, y + (kTransportSq - kFmtH) / 2, kFmtW, kFmtH);
+  draw_mode_chip(c, fmt_r, proj_label(snap.projection), stereo_chip_label(snap), hint_font,
+                 sel == Tr::kFormat || fmt_edit, fmt_edit);
 
   if (has_info) {
     const int info_top = panel.info_y;
@@ -759,90 +888,70 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
     auto v = [](const std::string& s) {
       return s.empty() ? QStringLiteral("-") : QString::fromStdString(s);
     };
-    line(QStringLiteral("V  codec:%1  res:%2  fps:%3  br:%4")
+    line(QStringLiteral("Video  codec:%1  res:%2  fps:%3  br:%4")
              .arg(v(snap.info_video_codec), v(snap.info_res), v(snap.info_fps),
                   v(snap.info_bitrate)));
-    line(QStringLiteral("A  codec:%1  rate:%2  ch:%3")
+    line(QStringLiteral("Audio  codec:%1  rate:%2  ch:%3")
              .arg(v(snap.info_audio_codec), v(snap.info_audio_rate), v(snap.info_audio_channels)));
-    line(QStringLiteral("O  hw:%1  path:%2  hz:%3")
+    line(QStringLiteral("Output  hw:%1  path:%2  hz:%3")
              .arg(v(snap.info_hwaccel), v(snap.info_output_note), v(snap.info_display_hz)));
   }
 
-  if (snap.controls_edit == VrMenu::ControlsEdit::HzConfirm) {
-    const int box_w = 220;
-    const int box_h = 96;
-    int box_x = hz_r.center().x() - box_w / 2;
-    box_x = std::clamp(box_x, panel_x + 4, panel_x + panel_w - box_w - 4);
-    const int box_y = std::max(4, hz_r.top() - box_h - 6);
-    const QRect box(box_x, box_y, box_w, box_h);
-    c.rounded(box, QColor(24, 30, 42, 240), 6);
-    const QString msg = VRP_TR("Hz change\nneeds restart");
-    c.text(box.adjusted(10, 8, -10, -40), msg, hint_font, QColor(220, 230, 245),
-           Qt::AlignTop | Qt::AlignHCenter | Qt::TextWordWrap);
-    const QRect btn_r(box.center().x() - 48, box.bottom() - 36, 96, 28);
-    c.rounded(btn_r, QColor(40, 120, 200, 230), 4);
-    c.text(btn_r, VRP_TR("[Restart]"), hint_font, QColor(255, 255, 255), Qt::AlignCenter);
-  } else if (snap.controls_edit == VrMenu::ControlsEdit::FsrPick ||
-             snap.controls_edit == VrMenu::ControlsEdit::FormatPick ||
-             snap.controls_edit == VrMenu::ControlsEdit::HzPick) {
-    const bool fsr = snap.controls_edit == VrMenu::ControlsEdit::FsrPick;
-    const bool hz = snap.controls_edit == VrMenu::ControlsEdit::HzPick;
-    const int n = fsr ? 4 : (hz ? 3 : format_menu_count(snap.projection));
+  if (snap.controls_edit == VrMenu::ControlsEdit::FormatPick) {
+    const int n = format_menu_count(snap.projection);
     const int row_h = 34;
-    const int box_w = fsr ? 140 : (hz ? 120 : 168);
+    const int box_w = 168;
     const int box_h = 12 + n * row_h;
-    const QRect anchor = fsr ? fsr_r : (hz ? hz_r : fmt_r);
-    int box_x = anchor.center().x() - box_w / 2;
+    int box_x = fmt_r.center().x() - box_w / 2;
     box_x = std::clamp(box_x, panel_x + 4, panel_x + panel_w - box_w - 4);
-    const int box_y = anchor.top() - box_h - 6;
+    const int box_y = fmt_r.top() - box_h - 6;
     const QRect box(box_x, std::max(4, box_y), box_w, box_h);
     c.rounded(box, QColor(24, 30, 42, 235), 6);
     for (int i = 0; i < n; ++i) {
-      QString label;
-      if (fsr) {
-        label = fsr_label(static_cast<FsrMode>(i));
-      } else if (hz) {
-        switch (i) {
-          case 1: label = QStringLiteral("90Hz"); break;
-          case 2: label = QStringLiteral("120Hz"); break;
-          default: label = VRP_TR("Auto 90Hz"); break;
-        }
-      } else {
-        const FormatChoice choice = format_menu_at(snap.projection, i);
-        const QRect row(box.x() + 6, box.y() + 6 + i * row_h, box.width() - 12, row_h - 4);
-        const bool mark = format_row_mark(snap, choice);
-        paint_format_row(c, row, format_choice_label(choice), hint_font, i == snap.picker_cursor, mark);
-        continue;
-      }
+      const FormatChoice choice = format_menu_at(snap.projection, i);
       const QRect row(box.x() + 6, box.y() + 6 + i * row_h, box.width() - 12, row_h - 4);
-      const bool on = (i == snap.picker_cursor);
-      if (on) c.rounded(row, QColor(40, 120, 200, 220), 4);
-      c.text(row.adjusted(10, 0, -6, 0), label, hint_font, on ? QColor(255, 255, 255) : QColor(210, 220, 235),
-             Qt::AlignVCenter | Qt::AlignLeft);
+      const bool mark = format_row_mark(snap, choice);
+      paint_format_row(c, row, format_choice_label(choice), hint_font, i == snap.picker_cursor, mark);
+    }
+  }
+
+  if (snap.controls_edit == VrMenu::ControlsEdit::AudioTrackPick) {
+    const int n = std::max(1, static_cast<int>(snap.audio_tracks.size()));
+    const int row_h = 34;
+    const int box_w = 220;
+    const int box_h = 12 + n * row_h;
+    int box_x = audio_r.center().x() - box_w / 2;
+    box_x = std::clamp(box_x, panel_x + 4, panel_x + panel_w - box_w - 4);
+    const int box_y = audio_r.top() - box_h - 6;
+    const QRect box(box_x, std::max(4, box_y), box_w, box_h);
+    c.rounded(box, QColor(24, 30, 42, 235), 6);
+    for (int i = 0; i < n; ++i) {
+      const QRect row(box.x() + 6, box.y() + 6 + i * row_h, box.width() - 12, row_h - 4);
+      QString label = QStringLiteral("—");
+      bool mark = false;
+      if (!snap.audio_tracks.empty() && i < static_cast<int>(snap.audio_tracks.size())) {
+        label = QString::fromStdString(snap.audio_tracks[static_cast<size_t>(i)].label);
+        mark = (i == snap.audio_track_index);
+      }
+      paint_format_row(c, row, label, hint_font, i == snap.picker_cursor, mark);
     }
   }
 
   const QRect foot(panel_x + pad, top + panel_h - foot_h, panel_w - pad * 2, foot_h);
   const char* a_src = "Execute";
   const char* b_src = "Close";
-  int left_kind = 0;  // 0 seek/speed, 1 volume, 2 up/down select, 4 none
+  int left_kind = 0;  // 0 seek/speed, 1 volume, 2 up/down select
   switch (snap.controls_edit) {
     case VrMenu::ControlsEdit::Volume:
       a_src = "Decide";
       b_src = "Cancel";
       left_kind = 1;
       break;
-    case VrMenu::ControlsEdit::FsrPick:
     case VrMenu::ControlsEdit::FormatPick:
-    case VrMenu::ControlsEdit::HzPick:
+    case VrMenu::ControlsEdit::AudioTrackPick:
       a_src = "Decide";
       b_src = "Cancel";
       left_kind = 2;
-      break;
-    case VrMenu::ControlsEdit::HzConfirm:
-      a_src = "Restart";
-      b_src = "Back";
-      left_kind = 4;
       break;
     default:
       break;
@@ -860,8 +969,23 @@ void paint_playback_controls(HudCanvas& c, const VrMenu::Snapshot& snap, int wid
     const QString seek = VRP_TR("Seek");
     const int seek_w = 22 + 2 + 22 + 8 + 26 + 4 + fm.horizontalAdvance(seek) + 14;
     if (fits(seek_w)) paint_lr_stick_cluster(c, lx, foot.y(), foot.height(), seek, body_font);
-  } else if (left_kind == 1 || left_kind == 2) {
-    const QString label = left_kind == 1 ? VRP_TR("Volume") : VRP_TR("Select");
+  } else if (left_kind == 1) {
+    // Volume: D-pad L/R (same steps) + L-stick analog L/R.
+    const QString label = VRP_TR("Volume");
+    constexpr int kDpad = 26;
+    constexpr int kStick = 26;
+    const int cluster_w = kDpad * 2 + 2 + 8 + kStick + 4 + fm.horizontalAdvance(label) + 14;
+    if (fits(cluster_w)) {
+      const int dy = foot.y() + (foot.height() - kDpad) / 2;
+      paint_dpad(c, QRect(lx, dy, kDpad, kDpad), DpadDir::Left);
+      paint_dpad(c, QRect(lx + kDpad + 2, dy, kDpad, kDpad), DpadDir::Right);
+      const int sx = lx + kDpad * 2 + 2 + 8;
+      paint_stick_icon(c, QRect(sx, foot.y() + (foot.height() - kStick) / 2, kStick, kStick),
+                       QStringLiteral("L"), StickMotion::AxisLR);
+      paint_footer_label(c, sx + kStick + 4, foot.y(), foot.height(), label, body_font);
+    }
+  } else if (left_kind == 2) {
+    const QString label = VRP_TR("Select");
     const int w = 26 + 2 + 26 + 4 + fm.horizontalAdvance(label) + 14;
     if (fits(w)) paint_stick_cluster(c, lx, foot.y(), foot.height(), label, body_font);
   }

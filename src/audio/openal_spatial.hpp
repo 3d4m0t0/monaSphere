@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>  // recursive_mutex
@@ -64,8 +65,13 @@ class OpenAlSpatial {
   std::unique_ptr<Impl> impl_;
   /** recursive: queue_interleaved_s16 calls play() while holding the lock. */
   mutable std::recursive_mutex mu_;
+  std::atomic<float> pending_yaw_{0.f};
+  std::atomic<float> pending_pitch_{0.f};
+  std::atomic<bool> pending_orient_{false};
   /** Caller must hold mu_. */
   void shutdown_unlocked();
+  /** Caller must hold mu_ and have a current Soft context. */
+  void apply_pending_orient_unlocked();
 };
 
 }  // namespace vrp

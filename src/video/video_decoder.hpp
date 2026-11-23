@@ -128,6 +128,17 @@ struct VideoInfo {
   std::string summary_line() const;
 };
 
+/** One selectable audio stream from the open file (shared demux). */
+struct AudioTrackInfo {
+  int stream_index = -1;
+  std::string label;  // picker row
+  std::string chip;   // short HUD chip text
+  std::string codec;
+  std::string language;
+  int channels = 0;
+  int sample_rate = 0;
+};
+
 /** Default seek-strip length. `thumb_count` in monasphere.conf overrides this. */
 inline constexpr int kSeekThumbCount = 128;
 inline constexpr int kSeekThumbCountMin = 4;
@@ -317,6 +328,15 @@ class VideoDecoder {
 
   /** File has an audio stream demuxed alongside video (shared AVFormatContext). */
   bool has_file_audio() const { return audio_stream_ >= 0; }
+  /** All audio streams in the open file (order = picker order). */
+  std::vector<AudioTrackInfo> list_audio_tracks() const;
+  /** Index into list_audio_tracks() for the active demux audio stream, or -1. */
+  int current_audio_track_index() const;
+  /**
+   * Switch shared-demux audio to list_audio_tracks()[list_index].
+   * Clears the audio packet queue. Caller must re-attach AudioPlayer.
+   */
+  bool select_audio_track(int list_index);
   /**
    * Pop next demuxed audio packet (ownership transferred as AVPacket*).
    * Returns nullptr when empty. Caller must av_packet_free.

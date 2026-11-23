@@ -640,8 +640,7 @@ int PulseMonitor::route_browser_to_yt_sink(bool mute_hmd_until_moved, const std:
       app_bin.clear();
       return;
     }
-    ++browser_seen;
-    const bool on_yt = have_sink && sink_idx == yt_idx;
+    ++guest_seen;
     char cmd[192];
     if (!on_yt) {
       // Startup only: mute HMD before move so the first second is not full-level
@@ -654,9 +653,10 @@ int PulseMonitor::route_browser_to_yt_sink(bool mute_hmd_until_moved, const std:
       const bool moved_ok = (std::system(cmd) == 0);
       if (moved_ok) {
         ++moved;
-        VRP_LOG("PulseMonitor: move sink-input #%d (%s / %s) -> %s", cur,
+        VRP_LOG("PulseMonitor: move sink-input #%d (%s / %s) -> %s%s", cur,
                 app_name.empty() ? "?" : app_name.c_str(),
-                app_bin.empty() ? "?" : app_bin.c_str(), kYtSinkName);
+                app_bin.empty() ? "?" : app_bin.c_str(), kYtSinkName,
+                on_hmd && !browser ? " (HMD leak)" : "");
       }
       // Soft live: always unmute (failed move may briefly leak on HMD — better than
       // multi-second silence from a stuck mute). Startup mute path: unmute only after

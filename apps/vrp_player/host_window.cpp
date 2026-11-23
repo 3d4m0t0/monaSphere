@@ -3586,6 +3586,51 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
     }
   }
 
+  // Live URL slots: rewrite live_app[0]…[9] and refresh HMD Roots list.
+  {
+    bool saw_live_slot = false;
+    QVector<LiveAppEntry> next;
+    next.reserve(10);
+    for (int i = 0; i < 10; ++i) {
+      const QString slot = QStringLiteral("live_app[%1]").arg(i);
+      if (!values.contains(slot)) continue;
+      saw_live_slot = true;
+      const QString raw = values.value(slot).trimmed();
+      if (raw.isEmpty()) {
+        setMonasphereConfKey(slot, QString());
+        continue;
+      }
+      const int bar = raw.indexOf(QLatin1Char('|'));
+      const QString name = bar > 0 ? raw.left(bar).trimmed() : QString();
+      const QString url = bar > 0 ? raw.mid(bar + 1).trimmed() : QString();
+      if (name.isEmpty() ||
+          !(url.startsWith(QLatin1String("http://")) || url.startsWith(QLatin1String("https://")))) {
+        appendLog(tr("Preferences: ignored invalid %1=%2").arg(slot, raw));
+        setMonasphereConfKey(slot, QString());
+        continue;
+      }
+      setMonasphereConfKey(slot, name + QLatin1Char('|') + url);
+      next.push_back({name, url});
+    }
+    if (saw_live_slot) {
+      if (next.isEmpty()) {
+        next.push_back({QStringLiteral("YouTube"), QStringLiteral("https://www.youtube.com/")});
+        setMonasphereConfKey(QStringLiteral("live_app[0]"),
+                             QStringLiteral("YouTube|https://www.youtube.com/"));
+      }
+      live_apps_ = next;
+      std::lock_guard<std::mutex> lock(menu_mu_);
+      if (vr_menu_) {
+        std::vector<vrp::VrMenu::LiveApp> apps;
+        apps.reserve(static_cast<size_t>(live_apps_.size()));
+        for (const LiveAppEntry& a : live_apps_) {
+          apps.push_back({a.name.toStdString(), a.url.toStdString()});
+        }
+        vr_menu_->set_live_apps(std::move(apps));
+      }
+    }
+  }
+
   // Unlock may arrive after trim in the hash; resolve locked=10 last.
   if (values.contains(QStringLiteral("hrtf_trim_unlock")) ||
       values.contains(QStringLiteral("hrtf_trim_db"))) {
@@ -6319,6 +6364,11 @@ void HostWindow::xrThreadMain() {
       stop_seek_sent = false;
       stop_upload_sent = false;
       stop_seek_pending = false;
+      hold_land_raw = false;
+      hold_kf_until_play = false;
+      hold_prev_eye_until_play = false;
+      audio_track_resync_pending = false;
+      audio_track_resync_sec = -1.0;
       seek_land_from = {};
       seek_resume_force = false;
       seek_audio_arm_pending = false;
@@ -6467,10 +6517,22 @@ void HostWindow::xrThreadMain() {
         }
         menu.set_media(path, decoder.duration());
         menu.set_media_info(vcodec, res, fps, bitrate, acodec, arate, ach, hw, out_note);
+        {
+          std::vector<vrp::VrMenu::AudioTrackRow> rows;
+          const auto tracks = decoder.list_audio_tracks();
+          rows.reserve(tracks.size());
+          for (const auto& t : tracks) {
+            vrp::VrMenu::AudioTrackRow row;
+            row.label = t.label;
+            row.chip = t.chip;
+            rows.push_back(std::move(row));
+          }
+          menu.set_audio_tracks(std::move(rows), decoder.current_audio_track_index());
+        }
         menu.set_preferred_hz(preferred_hz_);
         menu.set_display_hz(static_cast<float>(xr.status().display_hz));
         menu.set_format(opt_.projection, opt_.stereo, opt_.stereo_full);
-        audio.set_volume(menu.volume());
+        audio.set_volume(menu.effective_volume());
         decoder.set_rate(1.f);
         audio.set_rate(1.f);
         menu.set_rate(1.f);
@@ -6832,6 +6894,7 @@ void HostWindow::xrThreadMain() {
         last_gamepad_connection = gp.connection;
         pad_present = true;
         pad_sony = gp.sony_face;
+        last_pad_sony = gp.sony_face;
         {
           std::lock_guard<std::mutex> lock(gamepad_name_mu_);
           gamepad_seen_name_ = QString::fromStdString(gp.name);
@@ -7131,6 +7194,10 @@ void HostWindow::xrThreadMain() {
                   if (yt_session_->state() == vrp::YouTubeSession::State::Idle &&
                       !yt_session_->active() && !yt_session_->loading()) {
                     yt_live_unmute_req_.store(true, std::memory_order_release);
+                    if (yt_return_apps_menu_.exchange(false, std::memory_order_acq_rel)) {
+                      destroyVirtualForLeaveLive();
+                      yt_show_apps_after_stop_.store(true, std::memory_order_release);
+                    }
                     return;
                   }
                   const bool reuse_next =
@@ -7676,17 +7743,84 @@ void HostWindow::xrThreadMain() {
             Qt::QueuedConnection);
         hud_paint();
       }
+      if (menu_out.apply_audio_track) {
+        const bool was_playing = decoder.is_playing() || decoder.is_priming() || play_wanted;
+        const double still = decoder.is_open() ? decoder.position() : -1.0;
+        // Soft PCM is for the old codec — flush. Do not resume_hold / in-place resume.
+        play_wanted = false;
+        decoder.pause();
+        if (audio.is_open()) audio.mute_for_switch();
+        if (decoder.select_audio_track(menu_out.audio_track_index)) {
+          {
+            const auto& info = decoder.info();
+            std::string vcodec = info.codec.empty() ? "-" : info.codec;
+            std::string res = (info.width > 0)
+                                 ? (std::to_string(info.width) + "x" + std::to_string(info.height))
+                                 : "-";
+            std::string fps = info.fps > 0 ? (std::to_string(static_cast<int>(info.fps + 0.5)) + "fps") : "-";
+            std::string bitrate = "-";
+            if (info.bitrate > 0) bitrate = std::to_string(info.bitrate / 1000) + "kbps";
+            std::string acodec = info.audio_codec.empty() ? "-" : info.audio_codec;
+            std::string arate = "-";
+            if (info.audio_sample_rate > 0) arate = std::to_string(info.audio_sample_rate) + "Hz";
+            std::string ach = "-";
+            if (info.audio_channels > 0) ach = std::to_string(info.audio_channels) + "ch";
+            std::string hw = info.hwaccel.empty() ? "SW" : info.hwaccel;
+            const auto snap = menu.snapshot();
+            menu.set_media_info(vcodec, res, fps, bitrate, acodec, arate, ach, hw,
+                                snap.info_output_note.empty() ? std::string("-") : snap.info_output_note);
+          }
+          {
+            std::vector<vrp::VrMenu::AudioTrackRow> rows;
+            const auto tracks = decoder.list_audio_tracks();
+            rows.reserve(tracks.size());
+            for (const auto& t : tracks) {
+              vrp::VrMenu::AudioTrackRow row;
+              row.label = t.label;
+              row.chip = t.chip;
+              rows.push_back(std::move(row));
+            }
+            menu.set_audio_tracks(std::move(rows), decoder.current_audio_track_index());
+          }
+          if (!opt_.mute && decoder.has_file_audio() && audio.attach_file_demux(&decoder)) {
+            audio.set_volume(menu.effective_volume());
+            audio.set_rate(menu.rate());
+            if (was_playing && still >= 0.0) {
+              // Shared demux: video pkt queue is behind the tip while Soft restarts at
+              // the tip → audio leads. Must seek to realign; hold the pre-switch eye
+              // so the parked KF is never shown (see hold_prev_eye_until_play).
+              pause_inplace_resume = false;
+              pause_still_sec = -1.0;
+              play_wanted = true;
+              show_idle_screen = false;
+              audio_track_resync_pending = true;
+              audio_track_resync_sec = still;
+            } else if (still >= 0.0) {
+              audio.park_at(still);
+            }
+            const int idx = menu_out.audio_track_index + 1;
+            QMetaObject::invokeMethod(
+                this, [this, idx] { appendLog(tr("Audio track: %1").arg(idx)); },
+                Qt::QueuedConnection);
+          } else if (!opt_.mute) {
+            audio.clear_file();
+          }
+        } else if (was_playing) {
+          play_wanted = true;
+        }
+        hud_paint();
+      }
       if (menu_out.play) {
-        play_wanted = true;
-        show_idle_screen = false;
         restore_media_projection();
-        decoder.play();
+        resume_after_pause();
       }
       if (menu_out.pause) {
         pause_av_rewind();
       }
       if (menu_out.stop) {
         play_wanted = false;
+        pause_still_sec = -1.0;
+        pause_inplace_resume = false;
         show_idle_screen = true;
         decoder.pause();
         decoder.seek_to(menu.place_seek_bar(0.0));
@@ -7764,13 +7898,13 @@ void HostWindow::xrThreadMain() {
             Qt::QueuedConnection);
         hud_paint();
       }
-      if (std::fabs(menu_out.volume_delta) > 0.f) {
-        audio.set_volume(audio.volume() + menu_out.volume_delta);
-        menu.set_volume(audio.volume());
+      if (std::fabs(menu_out.volume_delta) > 0.f || menu_out.mute_changed) {
+        // Menu owns the slider level; mute zeros output without clearing that level.
+        audio.set_volume(menu.muted() ? 0.f : menu.volume());
         hud_paint();
       }
-      // Seek bar scrub: pause and seek to the bar (throttled) so the panel shows
-      // landed decode frames. On release, a final seek_to lands before play.
+      // Seek bar: pause decode for A/V lock. play_wanted: land → unmute+play with
+      // settle 0 (no 0.5s still). Paused: KF scrub + land still.
       const bool file_ui = menu.visible();
       const bool scrubbing = !file_ui && menu_out.seek_scrubbing;
       const bool seek_release = !file_ui && menu_out.seek;
@@ -8023,54 +8157,85 @@ void HostWindow::xrThreadMain() {
         seek_audio_arm_retry_at = now;
         poll = audio.poll_arm_at();
       };
+      // Stop-land still owns resume until after_settle starts play. settle expiry
+      // clears hold_play while stop_frame_shown/seek_settle remain — without this
+      // gate, arm_ready starts presentation, zeros stop_pts, and leaves shown stuck
+      // (land-bind spam → stop-resume-abort).
+      const bool land_owns_resume = stop_frame_shown || seek_settle;
+      auto clear_land_ux_for_play = [&] {
+        stop_frame_shown = false;
+        hold_land_raw = false;
+        hold_kf_until_play = false;
+        hold_prev_eye_until_play = false;
+        seek_settle = false;
+        stop_fast_land = false;
+        stop_sync_pending = false;
+        seek_land_from = {};
+        stop_decoded_from = {};
+        vktime_arm_at = {};
+      };
+      auto finish_arm_start = [&](const char* why) {
+        const double live_arm = arm_target_sec();
+        stop_pts = -1.0;
+        seek_resume_force = false;
+        seek_audio_arm_pending = false;
+        seek_audio_arm_sec = -1.0;
+        seek_audio_arm_retry_at = {};
+        clear_land_ux_for_play();
+        VRP_LOG("seek: audio live arm=%.3f (%s)", live_arm, why);
+      };
       auto try_start_with_arm = [&](const char* why, bool ignore_hold = false) -> bool {
-        if (!play_wanted || decoder.is_playing() || decoder.seek_in_flight()) return false;
+        if (!play_wanted || decoder.seek_in_flight()) return false;
+        // Soft unmute retry: demux already running — wait Soft depth then unmute.
+        if (decoder.is_playing()) {
+          if (!seek_audio_arm_pending || !audio.is_open() || !audio.has_audio()) return false;
+          (void)audio.poll_arm_at();
+          if (!audio.commit_arm()) return false;
+          finish_arm_start(why);
+          return true;
+        }
+        // hold_play: advance land→prefill only; Soft cannot fill while paused.
+        if (hold_play && !ignore_hold) {
+          if (seek_audio_arm_pending) (void)audio.poll_arm_at();
+          return false;
+        }
         if (!audio.is_open() || !audio.has_audio()) {
+          pause_inplace_resume = false;
           decoder.start_presentation();
           VRP_LOG("seek: start_presentation (no audio) (%s)", why);
-          stop_pts = -1.0;
-          seek_resume_force = false;
-          seek_audio_arm_pending = false;
-          seek_audio_arm_sec = -1.0;
+          finish_arm_start(why);
           return true;
         }
         if (!seek_audio_arm_pending) kick_audio_arm(arm_target_sec(), why);
         using ArmPoll = vrp::AudioPlayer::ArmPoll;
         ArmPoll poll = audio.poll_arm_at();
         retry_arm_if_failed(poll, "retry");
-        if (poll != ArmPoll::Ready) return false;
-        // hold_play is sampled at frame start — settle-end paths pass ignore_hold.
-        if (hold_play && !ignore_hold) return false;
-        // Unmute then start demux together (commit before start_presentation).
-        if (!audio.commit_arm()) {
-          seek_audio_arm_pending = true;
-          seek_audio_arm_retry_at = now;
-          VRP_LOG("seek: commit_arm failed (%s) — retry", why);
-          return false;
-        }
+        if (poll == ArmPoll::Failed) return false;
+        // Demux first (want_audio) — Soft fills under discard_until; unmute when deep.
+        pause_inplace_resume = false;
         decoder.start_presentation();
+        audio.on_shared_presentation_started();
         VRP_LOG("seek: start_presentation arm=%.3f (%s)", arm_target_sec(), why);
-        stop_pts = -1.0;
-        seek_resume_force = false;
-        seek_audio_arm_pending = false;
-        seek_audio_arm_sec = -1.0;
-        seek_audio_arm_retry_at = {};
+        clear_land_ux_for_play();  // video is live; Soft unmute may lag a few frames
+        seek_audio_arm_pending = true;
+        if (!audio.commit_arm()) return false;
+        finish_arm_start(why);
         return true;
       };
 
       if (decoder.consume_av_resync()) {
         // Never decoder.play() here — that re-arms mid-playback. Pause-rewind and
         // scrub land park while stopped; play_wanted starts arm+presentation.
-        if ((!play_wanted || hold_play) && !seek_audio_arm_pending && !yt_live &&
-            !audio.live_monitor_active()) {
+        if ((!play_wanted || hold_play || land_owns_resume) && !seek_audio_arm_pending &&
+            !yt_live && !audio.live_monitor_active()) {
           audio.park_at(decoder.position());
-        } else if (play_wanted && !hold_play && !decoder.is_playing() &&
+        } else if (play_wanted && !hold_play && !land_owns_resume && !decoder.is_playing() &&
                    !decoder.is_priming() && !decoder.seek_in_flight()) {
           (void)try_start_with_arm("av_resync");
         }
       }
 
-      // Poll arm during settle so demux/prefill overlap the 0.5s still.
+      // Poll arm during settle so demux/prefill overlap the still.
       if (seek_audio_arm_pending && play_wanted) {
         using ArmPoll = vrp::AudioPlayer::ArmPoll;
         ArmPoll poll = audio.poll_arm_at();
@@ -8078,14 +8243,20 @@ void HostWindow::xrThreadMain() {
       }
 
       // Commit armed audio + start_presentation together after settle.
+      // When land_owns_resume, only the after_settle path may start (ignore_hold).
       const bool playback_start =
-          decoder.consume_playback_started() && play_wanted && !hold_play && !decoder.is_playing() &&
+          decoder.consume_playback_started() && play_wanted && !hold_play &&
+          !land_owns_resume && !decoder.is_playing() &&
           (!decoder.seek_in_flight() || seek_resume_force);
       if (playback_start) {
         (void)try_start_with_arm(seek_resume_force ? "playback_started+force" : "playback_started");
-      } else if (play_wanted && !hold_play && !decoder.is_playing() && !decoder.seek_in_flight() &&
+      } else if (play_wanted && !hold_play && !land_owns_resume && !decoder.is_playing() &&
+                 !decoder.seek_in_flight() &&
                  (seek_audio_arm_pending || seek_resume_force) && !decoder.is_priming()) {
         (void)try_start_with_arm(seek_resume_force ? "resume_force" : "arm_ready");
+      } else if (play_wanted && seek_audio_arm_pending && decoder.is_playing() &&
+                 !decoder.seek_in_flight()) {
+        (void)try_start_with_arm("commit_retry");
       }
 
       // EOF auto-loop: treat as playback end → face forward again for 180/360.
@@ -8095,7 +8266,8 @@ void HostWindow::xrThreadMain() {
       }
 
       menu.set_playback(decoder.is_playing() || decoder.is_priming(), decoder.position());
-      menu.set_volume(audio.volume());
+      // Keep slider level while muted (audio path is forced to 0).
+      if (!menu.muted()) menu.set_volume(audio.volume());
       menu.set_preferred_hz(preferred_hz_);
       session_play_wanted_.store(play_wanted);
       if (decoder.is_open()) {
@@ -8110,7 +8282,8 @@ void HostWindow::xrThreadMain() {
       // Video end-of-stream loop → keep audio on the same timeline (avoids post-repeat silence).
       if (decoder.consume_looped() && audio.is_open() && decoder.seek_in_flight()) audio.mute_output();
       menu.note_seek_bar(!menu.visible() && !menu.controls_visible() &&
-                         (scrubbing || seek_now || stop_seek_pending || menu.seek_gliding() || seek_paint_wait));
+                         (scrubbing || seek_now || stop_seek_pending || menu.seek_gliding() ||
+                          seek_paint_wait));
       static bool seek_overlay_was = false;
       const bool seek_overlay = menu.seek_bar_only();
       if (seek_overlay != seek_overlay_was) {

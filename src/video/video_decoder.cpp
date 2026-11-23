@@ -1232,13 +1232,13 @@ void VideoDecoder::demux_loop() {
         const bool audio_hard =
             want_audio && (audio_pkt_q_.size() >= kAudioHardPackets ||
                            audio_pkt_bytes_ >= kAudioHardBytes);
-        // Stall when every active stream is soft-full, or one side hit a hard cap
-        // *and* the other does not need data. Never let a full Soft/audio queue
-        // alone freeze demux while video is starving.
-        const bool both_soft_full = video_full && (!want_audio || audio_full);
+        // Stall when video soft-full, unless audio is starving (arm prefill / Soft
+        // empty). Blocking demux for Soft during keep-playing seek left Soft below
+        // Ready forever → permanent mute after land.
+        const bool soft_stall = video_full && !audio_needs;
         const bool video_block = video_abs || (video_hard && !audio_needs);
         const bool audio_block = audio_hard && !video_needs;
-        if (both_soft_full || video_block || audio_block) {
+        if (soft_stall || video_block || audio_block) {
           pkt_cv_.wait_for(lk, std::chrono::milliseconds(8));
           continue;
         }
@@ -1405,6 +1405,91 @@ double VideoDecoder::file_audio_start_sec() const {
   const AVStream* ast = ff_->fmt->streams[audio_stream_];
   if (!ast || ast->start_time == AV_NOPTS_VALUE) return 0.0;
   return static_cast<double>(ast->start_time) * av_q2d(ast->time_base);
+#endif
+}
+
+std::vector<AudioTrackInfo> VideoDecoder::list_audio_tracks() const {
+  std::vector<AudioTrackInfo> out;
+#if !defined(VRP_HAS_FFMPEG)
+  return out;
+#else
+  if (!ff_ || !ff_->fmt) return out;
+  int ordinal = 0;
+  for (unsigned i = 0; i < ff_->fmt->nb_streams; ++i) {
+    AVStream* st = ff_->fmt->streams[i];
+    if (!st || !st->codecpar || st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+    ++ordinal;
+    AudioTrackInfo t;
+    t.stream_index = static_cast<int>(i);
+    t.channels = st->codecpar->ch_layout.nb_channels;
+    t.sample_rate = st->codecpar->sample_rate;
+    if (const char* cn = avcodec_get_name(st->codecpar->codec_id)) t.codec = cn;
+    if (st->metadata) {
+      if (const AVDictionaryEntry* lang = av_dict_get(st->metadata, "language", nullptr, 0)) {
+        if (lang->value) t.language = lang->value;
+      }
+      if (t.language.empty()) {
+        if (const AVDictionaryEntry* lang = av_dict_get(st->metadata, "LANGUAGE", nullptr, 0)) {
+          if (lang->value) t.language = lang->value;
+        }
+      }
+      if (const AVDictionaryEntry* title = av_dict_get(st->metadata, "title", nullptr, 0)) {
+        if (title->value && title->value[0]) {
+          // Prefer short title fragment in chip when language missing.
+          if (t.language.empty()) t.language = title->value;
+        }
+      }
+    }
+    if (t.language.size() > 8) t.language.resize(8);
+    t.chip = !t.language.empty() ? t.language : (!t.codec.empty() ? t.codec : std::to_string(ordinal));
+    t.label = std::to_string(ordinal);
+    if (!t.language.empty()) t.label += "  " + t.language;
+    if (!t.codec.empty()) t.label += "  " + t.codec;
+    if (t.channels > 0) t.label += "  " + std::to_string(t.channels) + "ch";
+    if (t.sample_rate > 0) t.label += "  " + std::to_string(t.sample_rate) + "Hz";
+    out.push_back(std::move(t));
+  }
+  return out;
+#endif
+}
+
+int VideoDecoder::current_audio_track_index() const {
+  const auto tracks = list_audio_tracks();
+  for (int i = 0; i < static_cast<int>(tracks.size()); ++i) {
+    if (tracks[static_cast<size_t>(i)].stream_index == audio_stream_) return i;
+  }
+  return tracks.empty() ? -1 : 0;
+}
+
+bool VideoDecoder::select_audio_track(int list_index) {
+#if !defined(VRP_HAS_FFMPEG)
+  (void)list_index;
+  return false;
+#else
+  if (!open_.load() || !ff_ || !ff_->fmt) return false;
+  const auto tracks = list_audio_tracks();
+  if (tracks.empty() || list_index < 0 || list_index >= static_cast<int>(tracks.size())) return false;
+  const int stream = tracks[static_cast<size_t>(list_index)].stream_index;
+  if (stream < 0 || stream >= static_cast<int>(ff_->fmt->nb_streams)) return false;
+  {
+    std::lock_guard<std::mutex> lock(ff_mu_);
+    ff_->audio_stream = stream;
+    audio_stream_ = stream;
+  }
+  {
+    std::lock_guard<std::mutex> lk(pkt_mu_);
+    clear_audio_packet_queue_locked();
+    pkt_cv_.notify_all();
+  }
+  AVCodecParameters* ap = ff_->fmt->streams[stream]->codecpar;
+  if (ap) {
+    if (const char* an = avcodec_get_name(ap->codec_id)) info_.audio_codec = an;
+    info_.audio_sample_rate = ap->sample_rate;
+    info_.audio_channels = ap->ch_layout.nb_channels;
+  }
+  VRP_LOG("decoder: audio track -> list=%d stream=%d (%s %dHz %dch)", list_index, stream,
+          info_.audio_codec.c_str(), info_.audio_sample_rate, info_.audio_channels);
+  return true;
 #endif
 }
 
@@ -2599,8 +2684,7 @@ void VideoDecoder::seek_to(double sec) {
   if (!open_.load()) return;
   if (duration_sec_ > 0) sec = std::clamp(sec, 0.0, duration_sec_);
   else if (sec < 0) sec = 0;
-  // Freeze presentation until the host has armed audio at the landed frame.
-  // Otherwise video runs while audio is still seeking and the offset sticks.
+  // Freeze until the host arms audio at the landed frame (A/V start together).
   playing_.store(false);
   priming_.store(false);
   playback_started_.store(false);

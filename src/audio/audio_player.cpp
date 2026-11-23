@@ -1336,16 +1336,35 @@ void AudioPlayer::start_thread() {
           const uint64_t ev = st_->underrun_events.load(std::memory_order_relaxed);
           if (ev > last_underrun_events) {
             const uint64_t fr = st_->underrun_frames.load(std::memory_order_relaxed);
+            const uint64_t delta = ev - last_underrun_events;
             VRP_LOG("audio underrun: +%llu events, %llu frames total (ring empty while output live)",
-                    static_cast<unsigned long long>(ev - last_underrun_events),
+                    static_cast<unsigned long long>(delta),
                     static_cast<unsigned long long>(fr));
+            // Continuous empty-ring underrun (~50/s) — Soft starved. Mute so we
+            // stop pumping silence; re-enable when PCM returns (below).
+            if (delta >= 40 && st_->output_live.load(std::memory_order_acquire) && st_->rb_ok &&
+                ma_pcm_rb_available_read(&st_->rb) == 0) {
+              st_->output_live.store(false, std::memory_order_release);
+              st_->underrun_auto_muted.store(true, std::memory_order_release);
+              VRP_LOG("audio underrun: auto-mute (ring empty sustained)");
+            }
             last_underrun_events = ev;
           }
           last_underrun_log = now;
         }
+#if defined(VRP_HAS_MINIAUDIO)
+        if (st_->underrun_auto_muted.load(std::memory_order_acquire) && st_->rb_ok &&
+            !st_->output_live.load(std::memory_order_acquire) &&
+            ma_pcm_rb_available_read(&st_->rb) >= static_cast<ma_uint32>(std::max(1, st_->out_rate / 20))) {
+          st_->output_live.store(true, std::memory_order_release);
+          st_->underrun_auto_muted.store(false, std::memory_order_release);
+          VRP_LOG("audio underrun: auto-unmute (ring recovered)");
+        }
+#endif
       }
 
-      if (st_->rb_ok) {
+      // Soft path never fills the miniaudio ring — do not block packet take on it.
+      if (!st_->use_spatial && st_->rb_ok) {
         const ma_uint32 avail = ma_pcm_rb_available_write(&st_->rb);
         if (avail < 4800) {
           std::this_thread::sleep_for(std::chrono::milliseconds(2));
@@ -1414,7 +1433,14 @@ void AudioPlayer::start_thread() {
             }
           } else if (frame_pts + dur < st_->discard_until_sec - 0.005) {
             drop_all = true;  // entirely before target — feed swr, do not play
-            st_->nopts_discard_streak = 0;
+            st_->nopts_discard_streak++;
+            // After seek, bad PTS origin can drop forever while video plays → mute.
+            if (st_->nopts_discard_streak >= 128 && file_demux_ && file_demux_->is_playing()) {
+              st_->discard_until_sec = -1.0;
+              st_->nopts_discard_streak = 0;
+              drop_all = false;
+              VRP_LOG("audio: clear discard_until (drop streak while video playing)");
+            }
           } else {
             if (frame_pts < st_->discard_until_sec && st_->frame->sample_rate > 0) {
               skip_in = static_cast<int>(
@@ -1784,25 +1810,43 @@ bool AudioPlayer::prefill_depth_ready() const {
 #endif
 }
 
+void AudioPlayer::on_shared_presentation_started() {
+  if (!st_ || !has_audio_) return;
+  // start_presentation cleared the demux audio queue — Soft refills KF→arm_sec.
+  // Keep discard trim so the first audible PCM is at arm_sec (A/V sync).
+  {
+    std::lock_guard<std::mutex> lock(st_->mu);
+    st_->discard_until_sec = std::max(0.0, arm_sec_);
+    st_->nopts_discard_streak = 0;
+  }
+  st_->output_live.store(false, std::memory_order_release);
+  st_->playing.store(true, std::memory_order_release);
+  playing_ = true;
+  present_at_ = std::chrono::steady_clock::now();
+  if (arm_phase_ == ArmPhase::Buffered || arm_phase_ == ArmPhase::Idle ||
+      arm_phase_ == ArmPhase::Seeking)
+    arm_phase_ = ArmPhase::Prefilling;
+  arm_phase_from_ = present_at_;
+}
+
 bool AudioPlayer::enable_output_after_prefill() {
 #if !defined(VRP_HAS_MINIAUDIO)
   return false;
 #else
   if (!st_ || !has_audio_) return false;
+  st_->playing.store(true, std::memory_order_release);
+  playing_ = true;
+  // Shared demux after start_presentation: unmute immediately. discard_until
+  // keeps A/V sync; Soft stays silent until the first post-trim PCM is queued
+  // (queue_interleaved → play). Waiting for Soft depth caused permanent mute.
+  const bool after_present = present_at_.time_since_epoch().count() != 0;
+  if (!after_present && !prefill_depth_ready()) return false;
   if (st_->use_spatial) {
-    const bool restore = switch_muted_;
     switch_muted_ = false;
     st_->spatial.set_hold_silence(false);
+    st_->spatial.set_gain(volume_);
     st_->spatial.play();
-    if (restore) {
-      const float target = volume_;
-      for (int i = 1; i <= 8; ++i) {
-        st_->spatial.set_gain(target * (static_cast<float>(i) / 8.f));
-        std::this_thread::sleep_for(std::chrono::milliseconds(4));
-      }
-    } else {
-      st_->spatial.set_gain(volume_);
-    }
+    st_->underrun_auto_muted.store(false, std::memory_order_release);
     playing_ = true;
     return true;
   }
@@ -1830,14 +1874,13 @@ void AudioPlayer::begin_arm_at(double sec) {
   quiesce_and_flush();
   arm_sec_ = sec;
   arm_instant_ready_ = false;
+  present_at_ = {};
   {
     std::lock_guard<std::mutex> lock(st_->mu);
     st_->discard_until_sec = std::max(0.0, sec);
     if (st_->codec) avcodec_flush_buffers(st_->codec);
   }
   if (file_demux_) {
-    // Wait for land (seek_in_flight), not applied_gen — that bumps at av_seek
-    // before land and would deadlock arm through settle.
     const bool wait_land = file_demux_->seek_in_flight();
     arm_phase_from_ = std::chrono::steady_clock::now();
     if (wait_land) {
@@ -1899,18 +1942,17 @@ AudioPlayer::ArmPoll AudioPlayer::poll_arm_at() {
     return ArmPoll::Pending;
   }
 
-  if (arm_phase_ == ArmPhase::Prefilling) {
-    // Soft may stay empty through settle (demux idle while paused). Ready lets
-    // host commit_arm + start_presentation together from the land cursor.
-    const bool soft_ready = prefill_depth_ready();
-    const bool land_ready =
-        file_demux_ && !file_demux_->seek_in_flight() && phase_s >= 0.05;
-    if (soft_ready || land_ready) {
+  if (arm_phase_ == ArmPhase::Prefilling || arm_phase_ == ArmPhase::Buffered) {
+    // After start_presentation: Ready immediately — commit unmutes; discard trims.
+    if (present_at_.time_since_epoch().count() != 0) {
       arm_phase_ = ArmPhase::Buffered;
-      VRP_LOG("audio poll_arm_at BUFFERED sec=%.3f soft=%d", arm_sec_, soft_ready ? 1 : 0);
       return ArmPoll::Ready;
     }
-    if (phase_s >= 5.0) {
+    if (prefill_depth_ready()) {
+      arm_phase_ = ArmPhase::Buffered;
+      return ArmPoll::Ready;
+    }
+    if (phase_s >= 8.0) {
       VRP_LOG("audio poll_arm_at PREFILL TIMEOUT sec=%.3f", arm_sec_);
       st_->playing.store(false, std::memory_order_release);
       playing_ = false;
@@ -1929,22 +1971,18 @@ bool AudioPlayer::commit_arm() {
     arm_instant_ready_ = false;
     return true;
   }
-  if (arm_phase_ != ArmPhase::Buffered) return false;
-  // Unmute only — do NOT touch video demux queues (that froze the picture while
-  // audio ran alone). discard_until was set in enter_shared_prefill(arm_sec_).
-  if (!enable_output_after_prefill()) {
-    st_->playing.store(false, std::memory_order_release);
-    playing_ = false;
-    arm_phase_ = ArmPhase::Idle;
-    return false;
-  }
+  if (arm_phase_ != ArmPhase::Prefilling && arm_phase_ != ArmPhase::Buffered) return false;
+  if (!enable_output_after_prefill()) return false;
   arm_phase_ = ArmPhase::Idle;
-  VRP_LOG("audio commit_arm sec=%.3f", arm_sec_);
+  const double arm = arm_sec_;
+  present_at_ = {};
+  VRP_LOG("audio commit_arm sec=%.3f", arm);
   return true;
 }
 
 void AudioPlayer::cancel_arm() {
   arm_instant_ready_ = false;
+  present_at_ = {};
   if (arm_phase_ == ArmPhase::Idle) return;
   arm_phase_ = ArmPhase::Idle;
   playing_ = false;
@@ -2604,7 +2642,7 @@ void AudioPlayer::request_start_live_monitor() {
     VRP_LOG("Audio: live start — Soft (monitor=%s); mute+route HMD browser ASAP", monitor.c_str());
     // Before Soft configure: mute/move any guest already playing on the HMD so the
     // first second is not full-level direct output (hrtf_trim only applies on Soft).
-    (void)PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/true);
+    (void)PulseMonitor::route_browser_to_yt_sink(/*mute_hmd_until_moved=*/true, device_name_);
 
     VRP_LOG("Audio: live start — configuring Soft HRTF");
     {

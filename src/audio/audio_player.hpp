@@ -116,13 +116,19 @@ class AudioPlayer {
   /** Mute, post demux seek, return immediately. Drive with poll_arm_at each tick. */
   void begin_arm_at(double sec);
   /**
-   * Pending = seeking/prefilling; Ready = land done (Soft may still be empty);
-   * Failed = retry begin_arm_at. Call commit_arm() then start_presentation.
+   * Pending = land/Soft fill; Ready = Soft has post-trim depth (safe to unmute);
+   * Failed = retry begin_arm_at.
+   * Shared demux: host must start_presentation before Soft can fill (want_audio).
    */
   enum class ArmPoll { Pending, Ready, Failed };
   ArmPoll poll_arm_at();
-  /** Unmute after Ready — pair with start_presentation so A/V start together. */
+  /** Unmute when Soft has post-trim depth. Safe to call every tick after presentation. */
   bool commit_arm();
+  /**
+   * Host called start_presentation. Reassert discard_until=arm_sec and keep Soft
+   * muted while demux refills — unmute only via commit_arm once Soft has depth.
+   */
+  void on_shared_presentation_started();
   /** Drop an in-flight arm (new seek / scrub). Leaves output muted. */
   void cancel_arm();
   /** True while Seeking/Prefilling/Buffered (not yet committed). */

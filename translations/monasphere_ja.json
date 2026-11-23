@@ -1457,23 +1457,43 @@
     },
     {
       "context": "Preferences",
-      "source": "Upscale decoded video before the HMD panel. Larger × = sharper but heavier (1.3× / 1.5× / 2.0×). Off leaves the source resolution.",
-      "translation": "デコード後の映像を HMD 表示前に拡大します。倍率が大きいほどシャープですが負荷も増えます（1.3× / 1.5× / 2.0×）。Off は元解像度のままです。"
+      "source": "Scales cycled with □ / X during file playback. Checked sizes rotate with Off (切). Larger × is sharper but heavier.",
+      "translation": "ファイル再生中に □ / X で切り替える倍率です。チェックした倍率とオフ（切）を順に切り替えます。倍率が大きいほどシャープですが負荷も増えます。"
     },
     {
       "context": "Preferences",
-      "source": "Same upscale for browser Live (not desktop apps). Larger × costs more GPU.",
-      "translation": "ブラウザ Live 用の同様の拡大です（デスクトップアプリには使いません）。倍率が大きいほど GPU 負荷が増えます。"
+      "source": "Same □ / X cycle for browser Live (not desktop apps).",
+      "translation": "ブラウザ Live 用の同様の □ / X 切替です（デスクトップアプリには使いません）。"
     },
     {
       "context": "Preferences",
-      "source": "Vertical field of view of the flat screen in degrees.",
-      "translation": "平面スクリーンの垂直視野角（度）。"
+      "source": "Vertical FOV for video and browser Live (degrees; Near/Cinema/Far).",
+      "translation": "動画・ブラウザ Live の平面スクリーン垂直視野角（度、Near/Cinema/Far）。"
     },
     {
       "context": "Preferences",
-      "source": "Distance to the flat screen in meters (seat preset).",
-      "translation": "平面スクリーンまでの距離（メートル、座席プリセット）。"
+      "source": "Screen distance for video and browser Live in meters (Near/Cinema/Far).",
+      "translation": "動画・ブラウザ Live のスクリーン距離（メートル、Near/Cinema/Far）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Vertical FOV for desktop [アプリ] (degrees).",
+      "translation": "デスクトップ［アプリ］の平面スクリーン垂直視野角（度）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Screen distance for desktop [アプリ] in meters.",
+      "translation": "デスクトップ［アプリ］のスクリーン距離（メートル）。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Flat FOV (App)",
+      "translation": "平面 FOV（アプリ）"
+    },
+    {
+      "context": "Preferences",
+      "source": "Flat distance (App)",
+      "translation": "平面距離（アプリ）"
     },
     {
       "context": "Preferences",

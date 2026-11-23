@@ -61,8 +61,16 @@ class HudCanvas {
   void clock(const QRect& r, const QString& s, const QFont& font, const QColor& color, int flags,
              float scale = 1.f);
   void scrolling_text(const QRect& r, const QString& s, const QFont& font, const QColor& color);
+  /**
+   * Rasterize once into the atlas (uploaded to VRAM with the atlas). Later frames only
+   * emit a quad that samples that sprite — `draw` is not called again.
+   */
   void paint_cached(uint64_t key, const QRect& dest, int raster_w, int raster_h,
                     const std::function<void(QPainter&)>& draw);
+  /**
+   * Same lifetime as paint_cached, but packs a finished QImage. `make` runs only on miss.
+   */
+  void blit_cached(uint64_t key, const QRect& dest, const std::function<QImage()>& make);
 
  private:
   struct Sprite {

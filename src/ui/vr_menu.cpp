@@ -145,6 +145,8 @@ void VrMenu::set_media(const std::string& path, double duration_sec) {
   seek_max_band_hold_sec_ = 0.f;
   thumb_cover_sec_ = 0;
   thumb_bar_force_ = false;
+  audio_tracks_.clear();
+  audio_track_index_ = 0;
   bump();
 }
 
@@ -202,6 +204,7 @@ double VrMenu::place_seek_bar(double sec) {
   bump();
   return sec;
 }
+
 
 bool VrMenu::arm_seek_delta(double delta_sec, double& target_sec) {
   if (media_path_.empty() || std::fabs(delta_sec) < 0.001) return false;
@@ -291,11 +294,7 @@ void VrMenu::set_fsr(FsrMode m) {
 void VrMenu::set_fsr_locked(bool locked) {
   if (fsr_locked_ == locked) return;
   fsr_locked_ = locked;
-  if (locked) {
-    fsr_ = FsrMode::Off;
-    pick_fsr_ = FsrMode::Off;
-    if (controls_edit_ == ControlsEdit::FsrPick) close_controls_edit();
-  }
+  if (locked) fsr_ = FsrMode::Off;
   bump();
 }
 
@@ -318,28 +317,6 @@ std::filesystem::path VrMenu::load_last_dir() const {
     if (line.rfind(k, 0) == 0) return fs::path(line.substr(9));
   }
   return {};
-}
-
-int VrMenu::hz_option_value(int index) {
-  switch (index) {
-    case 1: return 90;
-    case 2: return 120;
-    default: return 0;
-  }
-}
-
-int VrMenu::hz_option_index(int hz) {
-  if (hz >= 105) return 2;
-  if (hz >= 75) return 1;
-  return 0;
-}
-
-const char* VrMenu::hz_option_label(int index) {
-  switch (index) {
-    case 1: return "90Hz";
-    case 2: return "120Hz";
-    default: return "Auto 90Hz";
-  }
 }
 
 void VrMenu::set_preferred_hz(int hz) {
@@ -367,6 +344,25 @@ void VrMenu::set_format(ProjectionMode proj, StereoLayout stereo, bool stereo_fu
   projection_ = proj;
   stereo_ = stereo;
   stereo_full_ = stereo_full;
+  bump();
+}
+
+void VrMenu::set_audio_tracks(std::vector<AudioTrackRow> tracks, int current_index) {
+  audio_tracks_ = std::move(tracks);
+  if (audio_tracks_.empty()) {
+    audio_track_index_ = 0;
+  } else {
+    audio_track_index_ = std::clamp(current_index, 0, static_cast<int>(audio_tracks_.size()) - 1);
+  }
+  bump();
+}
+
+void VrMenu::set_audio_track_index(int index) {
+  if (audio_tracks_.empty()) {
+    audio_track_index_ = 0;
+  } else {
+    audio_track_index_ = std::clamp(index, 0, static_cast<int>(audio_tracks_.size()) - 1);
+  }
   bump();
 }
 
@@ -1270,6 +1266,7 @@ void VrMenu::show_file_browser() {
   visible_ = true;
   controls_visible_ = false;
   close_controls_edit();
+  clear_desktop_app_live();
   screen_ = Screen::Browser;
   place_ = Place::Roots;
   refresh_dir({});
@@ -1280,6 +1277,7 @@ void VrMenu::show_apps_list() {
   visible_ = true;
   controls_visible_ = false;
   close_controls_edit();
+  clear_desktop_app_live();
   screen_ = Screen::Browser;
   desktop_app_focus_ = -1;
   place_ = Place::AppsList;
@@ -1508,30 +1506,20 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   // B short: back in menus / close edit / toggle playback controls
   if (back_short) {
     if (controls_visible_ && controls_edit_ != ControlsEdit::None) {
-      if (controls_edit_ == ControlsEdit::HzConfirm) {
-        // Back to Hz list (keep pending pick).
-        controls_edit_ = ControlsEdit::HzPick;
-        picker_cursor_ = hz_option_index(pick_hz_);
-        bump();
-        return out;
-      }
       if (controls_edit_ == ControlsEdit::Volume && volume_ != pick_volume_) {
         out.volume_delta = pick_volume_ - volume_;
         volume_ = pick_volume_;
         save_volume();
-      }
-      if (controls_edit_ == ControlsEdit::FsrPick && !fsr_locked_ && fsr_ != pick_fsr_) {
-        // Restore mode from when the picker opened.
-        fsr_ = pick_fsr_;
-        out.fsr_changed = true;
-        out.fsr = fsr_;
       }
       close_controls_edit();
       bump();
       return out;
     }
     if (visible_) {
-      if (screen_ == Screen::Format) {
+      if (screen_ == Screen::AppMenu) {
+        visible_ = false;
+        bump();
+      } else if (screen_ == Screen::Format) {
         screen_ = Screen::Browser;
         bump();
       } else {
@@ -1646,28 +1634,19 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
   auto nav = [&](int dy, int dx) {
     if (nav_cooldown_ > 0) return;
     if (controls_visible_ && screen_ == Screen::Player) {
-      if (controls_edit_ == ControlsEdit::Volume && dy != 0) {
+      if (controls_edit_ == ControlsEdit::Volume && dx != 0) {
         const int pct = static_cast<int>(std::lround(volume_ * 100.f));
-        // 0–9%: ±1; 10% and above: ±5
+        // D-pad L/R: same steps as before (0–9%: ±1; 10%+: ±5).
         const int step = (pct < 10) ? 1 : 5;
-        out.volume_delta = (dy < 0) ? (step / 100.f) : -(step / 100.f);
+        out.volume_delta = (dx > 0) ? (step / 100.f) : -(step / 100.f);
         volume_ = std::clamp(volume_ + out.volume_delta, 0.f, volume_cap_);
+        if (muted_) {
+          muted_ = false;
+          out.mute_changed = true;
+        }
         save_volume();
         bump();
         nav_cooldown_ = 0.12f;
-        return;
-      }
-      if (controls_edit_ == ControlsEdit::FsrPick && dy != 0) {
-        if (fsr_locked_) {
-          nav_cooldown_ = 0.15f;
-          return;
-        }
-        picker_cursor_ = (picker_cursor_ + (dy < 0 ? -1 : 1) + 4) % 4;
-        fsr_ = static_cast<FsrMode>(picker_cursor_);
-        out.fsr_changed = true;
-        out.fsr = fsr_;
-        bump();
-        nav_cooldown_ = 0.15f;
         return;
       }
       if (controls_edit_ == ControlsEdit::FormatPick && dy != 0) {
@@ -1677,8 +1656,9 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         nav_cooldown_ = 0.15f;
         return;
       }
-      if (controls_edit_ == ControlsEdit::HzPick && dy != 0) {
-        picker_cursor_ = (picker_cursor_ + (dy < 0 ? -1 : 1) + kHzOptionCount) % kHzOptionCount;
+      if (controls_edit_ == ControlsEdit::AudioTrackPick && dy != 0) {
+        const int n = std::max(1, static_cast<int>(audio_tracks_.size()));
+        picker_cursor_ = (picker_cursor_ + (dy < 0 ? -1 : 1) + n) % n;
         bump();
         nav_cooldown_ = 0.15f;
         return;
@@ -1777,6 +1757,29 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
     if (visible_ && screen_ == Screen::Format) {
       if (nav_left) nav(0, -1);
       if (nav_right) nav(0, 1);
+    } else if (controls_visible_ && controls_edit_ == ControlsEdit::Volume) {
+      if (in.nav_left) nav(0, -1);
+      if (in.nav_right) nav(0, 1);
+      // L-stick X: analog volume (D-pad keeps discrete steps via nav).
+      constexpr float kDead = 0.20f;
+      const float mag = std::fabs(in.stick_x);
+      if (mag > kDead && dt > 0.f) {
+        const float t = std::clamp((mag - kDead) / (1.f - kDead), 0.f, 1.f);
+        // Full tilt ≈ 55%/s; light tilt is much slower.
+        const float rate = (0.12f + 0.43f * t * t) * (in.stick_x > 0.f ? 1.f : -1.f);
+        const float before = volume_;
+        volume_ = std::clamp(volume_ + rate * dt, 0.f, volume_cap_);
+        const float d = volume_ - before;
+        if (std::fabs(d) > 1.0e-6f) {
+          out.volume_delta += d;
+          if (muted_) {
+            muted_ = false;
+            out.mute_changed = true;
+          }
+          save_volume();
+          bump();
+        }
+      }
     } else {
       if (in.nav_left) nav(0, -1);
       if (in.nav_right) nav(0, 1);
@@ -1794,12 +1797,7 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
 
     if (confirm) {
       if (controls_edit_ == ControlsEdit::Volume) {
-        close_controls_edit();
-        bump();
-        return out;
-      }
-      if (controls_edit_ == ControlsEdit::FsrPick) {
-        // Selection already applied on cursor move — A only closes the picker.
+        // X / A: confirm current volume (already applied live).
         close_controls_edit();
         bump();
         return out;
@@ -1815,21 +1813,14 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
         bump();
         return out;
       }
-      if (controls_edit_ == ControlsEdit::HzPick) {
-        pick_hz_ = hz_option_value(picker_cursor_);
-        if (pick_hz_ == preferred_hz_) {
-          close_controls_edit();
-          bump();
-          return out;
+      if (controls_edit_ == ControlsEdit::AudioTrackPick) {
+        if (!audio_tracks_.empty()) {
+          const int n = static_cast<int>(audio_tracks_.size());
+          const int idx = std::clamp(picker_cursor_, 0, n - 1);
+          audio_track_index_ = idx;
+          out.apply_audio_track = true;
+          out.audio_track_index = idx;
         }
-        controls_edit_ = ControlsEdit::HzConfirm;
-        bump();
-        return out;
-      }
-      if (controls_edit_ == ControlsEdit::HzConfirm) {
-        preferred_hz_ = pick_hz_;
-        out.refresh_hz_restart = true;
-        out.preferred_hz = preferred_hz_;
         close_controls_edit();
         bump();
         return out;
@@ -1875,26 +1866,25 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
           }
           break;
         }
+        case kMute:
+          muted_ = !muted_;
+          out.mute_changed = true;
+          break;
         case kVolume:
           controls_edit_ = ControlsEdit::Volume;
           pick_volume_ = volume_;
+          break;
+        case kAudioTrack:
+          if (!audio_tracks_.empty()) {
+            controls_edit_ = ControlsEdit::AudioTrackPick;
+            picker_cursor_ = audio_track_index_;
+          }
           break;
         case kFormat:
           controls_edit_ = ControlsEdit::FormatPick;
           pick_proj_ = projection_;
           pick_stereo_ = stereo_;
           picker_cursor_ = static_cast<int>(projection_);
-          break;
-        case kFsr:
-          if (fsr_locked_) break;  // 8K+: FSR forced Off, picker disabled
-          controls_edit_ = ControlsEdit::FsrPick;
-          picker_cursor_ = static_cast<int>(fsr_);
-          pick_fsr_ = fsr_;
-          break;
-        case kHz:
-          controls_edit_ = ControlsEdit::HzPick;
-          picker_cursor_ = hz_option_index(preferred_hz_);
-          pick_hz_ = preferred_hz_;
           break;
         default:
           break;
@@ -1923,6 +1913,10 @@ VrMenu::Output VrMenu::update(const PadInput& in, float dt) {
           out.desktop_app_args = e.exec_args;
           out.desktop_monitor_span = e.monitor_span > 0 ? e.monitor_span : 1;
           out.desktop_app_label = e.name;
+          app_return_place_ = place_;
+          app_return_focus_ = desktop_app_focus_;
+          app_live_label_ = e.name;
+          desktop_app_live_ = true;
           visible_ = false;
           bump();
         } else if (e.is_video) {
@@ -1959,24 +1953,19 @@ void VrMenu::publish_hud_snapshot() {
     s.title = media_name_.empty() ? "Playback" : media_name_;
     switch (controls_edit_) {
       case ControlsEdit::Volume:
-        s.hint = "Up/Down: vol  A/B: OK";
-        break;
-      case ControlsEdit::FsrPick:
-        s.hint = "Up/Down: pick  A: close  B: undo";
+        s.hint = "L/R: vol  stick: analog  A: OK  B: cancel";
         break;
       case ControlsEdit::FormatPick:
+      case ControlsEdit::AudioTrackPick:
         s.hint = "Up/Down: pick  A: OK  B: cancel";
-        break;
-      case ControlsEdit::HzPick:
-        s.hint = "Up/Down: Hz  A: OK  B: cancel";
-        break;
-      case ControlsEdit::HzConfirm:
-        s.hint = "A: restart  B: back";
         break;
       default:
         s.hint = "L/R: move  Up+A: faster  Down+A: slower  A: OK  B: close";
         break;
     }
+  } else if (screen_ == Screen::AppMenu) {
+    s.title = app_live_label_.empty() ? "アプリ" : app_live_label_;
+    s.hint = "A: decide  B: close";
   } else if (place_ == Place::Roots) {
     s.title = "monaSphere";
     s.hint = "A: open  B: back";
@@ -2039,8 +2028,11 @@ void VrMenu::publish_hud_snapshot() {
   s.info_audio_channels = info_audio_channels_;
   s.info_hwaccel = info_hwaccel_;
   s.info_output_note = info_output_note_;
+  s.audio_tracks = audio_tracks_;
+  s.audio_track_index = audio_track_index_;
   s.info_display_hz = info_display_hz_;
   s.volume = volume_;
+  s.muted = muted_;
   s.rate = rate_;
   s.fsr = fsr_locked_ ? FsrMode::Off : fsr_;
   s.fsr_locked = fsr_locked_;

@@ -54,16 +54,37 @@ class VrMenu {
   VrMenu(const VrMenu&) = delete;
   VrMenu& operator=(const VrMenu&) = delete;
 
-  enum class Screen : uint8_t { Browser = 0, Format = 1, Player = 2 };
+  enum class Screen : uint8_t { Browser = 0, Format = 1, Player = 2, AppMenu = 3 };
 
   /** Sub-UI while playback controls are open. */
   enum class ControlsEdit : uint8_t {
     None = 0,
     Volume = 1,      // up/down adjusts; A keeps it, B restores and closes
-    FsrPick = 2,     // A on FSR → list; cursor applies live; A close / B revert
-    FormatPick = 3,
-    HzPick = 4,      // Auto / 90 / 120
-    HzConfirm = 5,   // restart notice → A restart / B back to HzPick
+    FormatPick = 2,
+    AudioTrackPick = 3,  // list + A confirms (same UX as FormatPick)
+  };
+
+  /**
+   * Layout under seek: [|<][<][>/||][□][>][>|] [Mute][Vol] [Audio] [Fmt].
+   * Cursor order matches left→right. FSR/Hz live in Preferences only.
+   */
+  enum Transport : int {
+    kCuePrev = 0,     // [|<] seek start / prev video if near start
+    kSeekBack = 1,    // [<]
+    kPlayPause = 2,
+    kStop = 3,
+    kSeekForward = 4, // [>]
+    kNextVideo = 5,   // [>|]
+    kMute = 6,
+    kVolume = 7,
+    kAudioTrack = 8,
+    kFormat = 9,
+    kTransportCount = 10,
+  };
+
+  struct AudioTrackRow {
+    std::string label;  // picker row, e.g. "1  ja  aac  2ch"
+    std::string chip;   // short chip bottom line, e.g. "ja"
   };
 
   struct Entry {
@@ -126,7 +147,11 @@ class VrMenu {
     std::string info_output_note;  // zero-copy / CPU path (ASCII)
     std::string info_display_hz;   // e.g. "120" / "-"
     float volume = 1.f;
+    /** Speaker mute (volume slider level is kept). */
+    bool muted = false;
     float rate = 1.f;
+    std::vector<AudioTrackRow> audio_tracks;
+    int audio_track_index = 0;
     FsrMode fsr = FsrMode::Off;
     /** True for 8K+ sources: FSR chip grayed, picker blocked. */
     bool fsr_locked = false;
@@ -160,6 +185,11 @@ class VrMenu {
     bool seek = false;
     double seek_sec = 0;
     float volume_delta = 0.f;
+    /** Mute button toggled; apply menu.muted() to the audio path. */
+    bool mute_changed = false;
+    /** Confirm audio-track picker (index into audio_tracks). */
+    bool apply_audio_track = false;
+    int audio_track_index = 0;
     bool rate_changed = false;
     float rate = 1.f;
     bool fsr_changed = false;
@@ -234,6 +264,9 @@ class VrMenu {
   void set_playback(bool playing, double position_sec);
   void set_volume(float v);
   float volume() const { return volume_; }
+  bool muted() const { return muted_; }
+  /** Output level after mute (0 when muted). */
+  float effective_volume() const { return muted_ ? 0.f : volume_; }
   /** Menu ceiling. 1 = Vol 100, the safe maximum. */
   void set_volume_cap(float linear_max);
   void set_rate(float r);
@@ -249,10 +282,9 @@ class VrMenu {
   int preferred_hz() const { return preferred_hz_; }
   void set_display_hz(float hz);
   float display_hz() const { return display_hz_; }
-  static int hz_option_value(int index);
-  static int hz_option_index(int hz);
-  static const char* hz_option_label(int index);
   void set_format(ProjectionMode proj, StereoLayout stereo, bool stereo_full);
+  void set_audio_tracks(std::vector<AudioTrackRow> tracks, int current_index);
+  void set_audio_track_index(int index);
   void set_preview(std::vector<uint8_t> rgba, int w, int h);
   void clear_preview();
   void notify_changed() { bump(); }
@@ -263,8 +295,17 @@ class VrMenu {
   bool controls_visible() const { return controls_visible_; }
   /** Show the file browser at Roots (e.g. after closing live capture). */
   void show_file_browser();
-  /** Show [アプリ] list (after desktop-app process exit). */
+  /** Show [アプリ] top list. Prefer show_app_return_place() after a live Exit. */
   void show_apps_list();
+  /**
+   * After [アプリ] Exit / process exit: reopen the place where the app was launched
+   * (AppsList or AppTitles), not always the top of [アプリ].
+   */
+  void show_app_return_place();
+  /** Current Near/Cinema/Far index (-1 = custom). Keeps AppMenu seat row in sync. */
+  void set_flat_seat_index(int index);
+  int flat_seat_index() const { return flat_seat_index_; }
+  bool desktop_app_live() const { return desktop_app_live_; }
   bool seek_bar_only() const { return seek_bar_only_; }
   /** While thumbs are still building, keep a seek bar up (unless playback controls are open). */
   void set_thumb_bar_force(bool on);
@@ -321,23 +362,6 @@ class VrMenu {
     AppTitles = 8,    // titles under one live_desktop_app
   };
 
-  /** [|<][<][>/||][□][>][>|] [Vol] [Fmt] [FSR] [Hz] */
-  enum Transport : int {
-    kCuePrev = 0,     // [|<] seek start / prev video if near start
-    kSeekBack = 1,    // [<]
-    kPlayPause = 2,
-    kStop = 3,
-    kSeekForward = 4, // [>]
-    kNextVideo = 5,   // [>|]
-    kVolume = 6,
-    kFormat = 7,
-    kFsr = 8,
-    kHz = 9,
-    kTransportCount = 10,
-  };
-
-  static constexpr int kHzOptionCount = 3;  // Auto, 90, 120
-
   void refresh_dir(const std::string& select_name = {});
   void move_cursor(int delta);
   void step_list_row(int dir);
@@ -372,6 +396,8 @@ class VrMenu {
   int format_option_count() const;
   void apply_format_index(int index);
   void page_cursor(int dir);
+  void rebuild_app_menu();
+  void clear_desktop_app_live();
 
   bool visible_ = true;
   bool controls_visible_ = false;
@@ -442,7 +468,6 @@ class VrMenu {
   int picker_cursor_ = 0;
   ProjectionMode pick_proj_ = ProjectionMode::Flat;
   StereoLayout pick_stereo_ = StereoLayout::Mono;
-  FsrMode pick_fsr_ = FsrMode::Off;
   float pick_volume_ = 0.2f;
 
   bool playing_ = false;
@@ -470,14 +495,16 @@ class VrMenu {
   bool rate_trigger_lock_ = false;
   AxisRepeat rate_trigger_repeat_{};
   float volume_ = 0.2f;
+  bool muted_ = false;
   /** Linear ceiling for the file volume control. Vol 100. */
   float volume_cap_ = 1.f;
   float rate_ = 1.f;
+  std::vector<AudioTrackRow> audio_tracks_;
+  int audio_track_index_ = 0;
   FsrMode fsr_ = FsrMode::Quality;
   bool fsr_locked_ = false;
-  int preferred_hz_ = 0;   // 0 = auto
+  int preferred_hz_ = 0;   // 0 = auto (Preferences / info only)
   float display_hz_ = 0.f;
-  int pick_hz_ = 0;        // pending selection while in HzPick / HzConfirm
   std::filesystem::path media_path_;
   std::string media_name_;
   std::string info_video_codec_;
