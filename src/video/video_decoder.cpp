@@ -2071,30 +2071,23 @@ bool VideoDecoder::open(const std::string& path, bool allow_hwaccel) {
       continue;
     }
 
-    // Preflight (NVIDIA only): Vulkan Video H.264 maxCodedExtent 4096², maxLevel 5.2
-    // (ffmpeg -v verbose on RTX 5060 Ti). Plus Constrained Baseline long≥3840 corruption
-    // class (vulkan_h264_cb_cuda=1). On AMD/RADV these NVIDIA caps/fingerprints are not
-    // applied — open2 / VA-API fallthrough decide.
+    // Preflight (NVIDIA only): all H.264 → CUDA when vulkan_h264_cb_cuda=1 (default).
+    // Vulkan Video H.264 seek/skip is slow; HEVC/AV1 may still use Vulkan when enabled.
+    // Caps check remains when the opt-out is set. AMD/RADV: not applied.
     constexpr uint32_t kVendorNvidia = 0x10DEu;
     if (type == AV_HWDEVICE_TYPE_VULKAN && dec->id == AV_CODEC_ID_H264 &&
         gpu_vendor_id_ == kVendorNvidia) {
+      if (vulkan_h264_cb_cuda_) {
+        VRP_LOG("hwaccel skip vulkan: H.264 → CUDA (vulkan_h264_cb_cuda=1)");
+        continue;
+      }
       const int w = ff_->codec->width > 0 ? ff_->codec->width : st->codecpar->width;
       const int h = ff_->codec->height > 0 ? ff_->codec->height : st->codecpar->height;
       const int level = ff_->codec->level > 0 ? ff_->codec->level : st->codecpar->level;
-      const int profile = ff_->codec->profile != AV_PROFILE_UNKNOWN ? ff_->codec->profile
-                                                                    : st->codecpar->profile;
-      const int long_edge = std::max(w, h);
       if (w > 4096 || h > 4096 || level > 52) {
         VRP_LOG("hwaccel skip vulkan: H.264 %dx%d level=%d outside NVIDIA Vulkan Video caps "
                 "(≤4096 / level 52; fall through to CUDA)",
                 w, h, level);
-        continue;
-      }
-      if (vulkan_h264_cb_cuda_ && profile == AV_PROFILE_H264_CONSTRAINED_BASELINE &&
-          long_edge >= 3840) {
-        VRP_LOG("hwaccel skip vulkan: H.264 Constrained Baseline %dx%d "
-                "(vulkan_h264_cb_cuda=1 NVIDIA fingerprint; fall through to CUDA)",
-                w, h);
         continue;
       }
     }

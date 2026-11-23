@@ -1803,6 +1803,16 @@
     },
     {
       "context": "Preferences",
+      "source": "Detailed seek log",
+      "translation": "詳細シークログ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Log scrub/land/arm breadcrumbs for every seek. Off keeps only milestones and timeouts.",
+      "translation": "シーク／スクラブ／着地／arm の詳細を毎回出力します。Off では節目とタイムアウトのみです。"
+    },
+    {
+      "context": "Preferences",
       "source": "Seek thumbnail count",
       "translation": "シークサムネ枚数"
     },

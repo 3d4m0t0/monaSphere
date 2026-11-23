@@ -5921,16 +5921,16 @@ void HostWindow::xrThreadMain() {
           [this, prefer, cb_cuda, is_nvidia] {
             if (prefer) {
               appendLog(is_nvidia
-                            ? tr("Vulkan Video: preferred (vulkan_video=1; CUDA fallback)")
-                            : tr("Vulkan Video: preferred (vulkan_video=1; VA-API fallback)"));
+                            ? tr("Vulkan Video (Experimental): on (vulkan_video=1; CUDA fallback)")
+                            : tr("Vulkan Video (Experimental): on (vulkan_video=1; VA-API fallback)"));
             } else {
               appendLog(is_nvidia
-                            ? tr("Vulkan Video: available (vulkan_video=0 → CUDA/NVDEC)")
-                            : tr("Vulkan Video: available (vulkan_video=0 → VA-API)"));
+                            ? tr("Vulkan Video (Experimental): off → CUDA/NVDEC")
+                            : tr("Vulkan Video (Experimental): off → VA-API"));
             }
             if (prefer && cb_cuda && is_nvidia) {
-              appendLog(tr("Vulkan Video: H.264 Constrained Baseline ≥3840 → CUDA "
-                           "(vulkan_h264_cb_cuda=1, NVIDIA)"));
+              appendLog(tr("Vulkan Video (Experimental): all H.264 → CUDA "
+                           "(vulkan_h264_cb_cuda=1)"));
             }
           },
           Qt::QueuedConnection);

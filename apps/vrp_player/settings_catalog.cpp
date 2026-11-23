@@ -248,18 +248,30 @@ const QVector<Entry>& catalog() {
                  .kind = ValueKind::Bool01,
                  .visibility = Visibility::Advanced,
                  .default_value = "0",
-                 .label = QT_TR_NOOP("Vulkan Video"),
+                 .label = QT_TR_NOOP("Vulkan Video (Experimental)"),
                  .description = QT_TR_NOOP(
-                     "Prefer FFmpeg Vulkan Video zero-copy. Off uses CUDA/NVDEC on NVIDIA.")});
+                     "Experimental. Prefer FFmpeg Vulkan Video zero-copy when available. "
+                     "Default off — use CUDA/NVDEC on NVIDIA (or VA-API elsewhere). "
+                     "Seek/scrub may be slower than CUDA until Vulkan Video improves.")});
     e.push_back({.key = "vulkan_h264_cb_cuda",
                  .category = Category::Video,
                  .kind = ValueKind::Bool01,
                  .visibility = Visibility::Advanced,
                  .default_value = "1",
-                 .label = QT_TR_NOOP("H.264 CB → CUDA (NVIDIA)"),
+                 .label = QT_TR_NOOP("H.264 → CUDA (Experimental)"),
                  .description = QT_TR_NOOP(
-                     "On NVIDIA, use CUDA for H.264 Constrained Baseline 4K+ instead of Vulkan "
-                     "Video. Ignored on AMD.")});
+                     "Experimental (Vulkan Video path). On NVIDIA, decode all H.264 with "
+                     "CUDA/NVDEC instead of Vulkan Video. Ignored when Vulkan Video is off, "
+                     "and on AMD.")});
+    e.push_back({.key = "seek_detail_log",
+                 .category = Category::Video,
+                 .kind = ValueKind::Bool01,
+                 .visibility = Visibility::Advanced,
+                 .default_value = "0",
+                 .label = QT_TR_NOOP("Detailed seek log"),
+                 .description = QT_TR_NOOP(
+                     "Log scrub/land/arm breadcrumbs for every seek. Off keeps only milestones "
+                     "and timeouts.")});
 
     // --- Audio ---
     e.push_back({.key = "volume",

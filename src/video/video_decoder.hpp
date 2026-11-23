@@ -234,8 +234,7 @@ class VideoDecoder {
   bool prefer_vulkan_video() const { return prefer_vulkan_video_; }
   /**
    * When true (conf `vulkan_h264_cb_cuda=1`, default) on NVIDIA, skip Vulkan Video
-   * for H.264 Constrained Baseline with long edge ≥3840 (fall through to CUDA).
-   * Ignored on non-NVIDIA (RADV / VA-API); that fingerprint is an NVIDIA driver class.
+   * for all H.264 (fall through to CUDA). HEVC/AV1 unchanged. Ignored on non-NVIDIA.
    */
   void set_vulkan_h264_cb_cuda(bool on) { vulkan_h264_cb_cuda_ = on; }
   bool vulkan_h264_cb_cuda() const { return vulkan_h264_cb_cuda_; }
