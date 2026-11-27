@@ -6864,7 +6864,7 @@ void HostWindow::xrThreadMain() {
       join_preview_worker();
       pending_upload = {};
       // Stop further BC7 submits; images are safe to drop now that the eye fence is idle.
-      (void)bc7.begin_build();
+      const uint64_t bc7_build = bc7.begin_build();
       {
         void* cu_ctx = decoder.cuda_context();
         cuda_tex.drain_copies(cu_ctx);
@@ -6888,12 +6888,35 @@ void HostWindow::xrThreadMain() {
       VRP_LOG("open_media: decoder.open -> %s", ok ? "ok" : "fail");
       const bool network_url =
           path.rfind("http://", 0) == 0 || path.rfind("https://", 0) == 0;
-      if (ok && !network_url) {
-        // No prebuilt seek-thumb strip — scrub keeps the last frame; release
-        // lands via decoder.seek_to (avoids USB/Vulkan demux contention).
-        decoder.disable_thumbnail_strip();
-      }
       const vrp::VideoInfo info = decoder.info();
+      if (ok && !network_url) {
+        // Only skip the strip when Vulkan Video is the active demux path (USB stall).
+        // vulkan_video=1 with CUDA/AV1 fallback still builds thumbs.
+        const bool vulkan_demux =
+            info.hwaccel.find("vulkan") != std::string::npos ||
+            info.hwaccel.find("Vulkan") != std::string::npos;
+        if (vulkan_demux) {
+          decoder.disable_thumbnail_strip();
+        } else {
+          vrp::SeekThumbRawStep raw;
+          if (nvidia_bc7) {
+            raw = [&bc7, bc7_build](int index, double /*time_sec*/, int /*planned*/, double interval,
+                                    int w, int h, const uint8_t* rgba, size_t /*rgba_bytes*/) {
+              return bc7.compress(index, rgba, w, h, interval, bc7_build);
+            };
+          }
+          decoder.start_thumbnail_build(
+              [this](vrp::ThumbnailStrip strip) {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this, strip = std::move(strip)] {
+                      if (!shutting_down_.load()) reportThumbnails(strip);
+                    },
+                    Qt::QueuedConnection);
+              },
+              seek_thumb_count_, 0, 0, raw, seek_thumb_edge_, hwaccel_);
+        }
+      }
       QMetaObject::invokeMethod(
           this, [this, info] { reportVideoOpen(info); }, Qt::QueuedConnection);
       if (ok) {
@@ -8118,10 +8141,9 @@ void HostWindow::xrThreadMain() {
       const bool menu_was = menu.visible();
       const bool controls_was = menu.controls_visible();
       if (decoder.is_open()) {
-        // Cover limits scrub range as the strip grows. Do NOT force seek-bar HUD
-        // for the whole build — that kept want_kind=4 / atlas uploads on the XR
-        // queue for minutes while SW thumbs hammer the same USB file as Vulkan Video.
-        menu.set_thumb_cover(decoder.thumb_cover_sec());
+        // Seeking decodes keyframes directly; never clamp seek range to thumbnail strip.
+        const double dur = decoder.info().duration_sec;
+        menu.set_thumb_cover(dur > 0.0 ? dur : 1.0e9);
       }
       menu.set_thumb_bar_force(false);
       const auto menu_out = menu.update(pad, ui_dt);
@@ -10600,17 +10622,24 @@ void HostWindow::xrThreadMain() {
           health = cur.tracking_valid ? "OK" : "Wait";
           detail = cur.tracking_valid ? "Drawing" : "Pose not ready";
         }
-        if (decoder.is_open() && gpu_nv12) {
+        if (decoder.is_open()) {
           static auto last_vid_dbg = std::chrono::steady_clock::time_point{};
           if (now - last_vid_dbg > std::chrono::seconds(30)) {
             last_vid_dbg = now;
-            const std::string err = cuda_tex.last_error();
-            VRP_LOG("NV12 copy ok=%llu fail=%llu flips=%llu valid=%d %dx%d gpu=%d err=%s",
-                    static_cast<unsigned long long>(cuda_tex.copy_ok()),
-                    static_cast<unsigned long long>(cuda_tex.copy_fail()),
-                    static_cast<unsigned long long>(cuda_tex.present_flips()),
-                    cuda_tex.has_valid_frame() ? 1 : 0, cuda_tex.width(), cuda_tex.height(),
-                    decoder.gpu_path_active() ? 1 : 0, err.c_str());
+            if (decoder.vulkan_path_active()) {
+              const std::string err = vulkan_tex.last_error();
+              VRP_LOG("Vulkan present valid=%d %dx%d err=%s",
+                      vulkan_tex.has_valid_frame() ? 1 : 0, vulkan_tex.width(),
+                      vulkan_tex.height(), err.empty() ? "ok" : err.c_str());
+            } else if (gpu_nv12) {
+              const std::string err = cuda_tex.last_error();
+              VRP_LOG("NV12 copy ok=%llu fail=%llu flips=%llu valid=%d %dx%d gpu=%d err=%s",
+                      static_cast<unsigned long long>(cuda_tex.copy_ok()),
+                      static_cast<unsigned long long>(cuda_tex.copy_fail()),
+                      static_cast<unsigned long long>(cuda_tex.present_flips()),
+                      cuda_tex.has_valid_frame() ? 1 : 0, cuda_tex.width(), cuda_tex.height(),
+                      decoder.gpu_path_active() ? 1 : 0, err.c_str());
+            }
           }
         }
         // Use this frame's measured ms (not a stale pre-render sample).

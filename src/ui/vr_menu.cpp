@@ -193,8 +193,7 @@ void VrMenu::set_thumb_cover(double sec) {
 }
 
 double VrMenu::place_seek_bar(double sec) {
-  double limit = duration_sec_ > 0 ? duration_sec_ : 0;
-  if (thumb_cover_sec_ + 0.05 < limit) limit = thumb_cover_sec_;
+  const double limit = duration_sec_ > 0 ? duration_sec_ : 0;
   if (limit > 0) sec = std::clamp(sec, 0.0, limit);
   else if (sec < 0) sec = 0;
   seek_bar_sec_ = sec;
@@ -210,8 +209,7 @@ bool VrMenu::arm_seek_delta(double delta_sec, double& target_sec) {
   if (media_path_.empty() || std::fabs(delta_sec) < 0.001) return false;
   if (stick_seek_repeat_.dir == 0 && !seek_gliding_ && !seek_bar_hold_) seek_bar_sec_ = position_sec_;
   if (stick_seek_repeat_.dir == 0 && !seek_gliding_) seek_target_sec_ = seek_bar_sec_;
-  double limit = duration_sec_ > 0 ? duration_sec_ : 1.0e9;
-  if (thumb_cover_sec_ + 0.05 < limit) limit = std::max(0.0, thumb_cover_sec_);
+  const double limit = duration_sec_ > 0 ? duration_sec_ : 1.0e9;
   const double next = std::clamp(seek_target_sec_ + delta_sec, 0.0, limit);
   if (std::fabs(next - seek_target_sec_) < 0.001) return false;
   seek_bar_sec_ = next;
@@ -710,8 +708,7 @@ void VrMenu::advance_seek_glide(float /*dt*/) {
   seek_frame_dt_ = 0;
   // Rate is video seconds per host second. A late paint must not drop this interval.
   if (!(elapsed > 0.0) || !seek_gliding_ || dir == 0) return;
-  double limit = duration_sec_ > 0 ? duration_sec_ : 1.0e9;
-  if (thumb_cover_sec_ + 0.05 < limit) limit = std::max(0.0, thumb_cover_sec_);
+  const double limit = duration_sec_ > 0 ? duration_sec_ : 1.0e9;
   const double next =
       std::clamp(seek_bar_sec_ + seek_step_sec_ * elapsed * static_cast<double>(dir), 0.0, limit);
   if (std::fabs(next - seek_bar_sec_) < 1.0e-6) return;
