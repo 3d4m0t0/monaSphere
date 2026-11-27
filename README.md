@@ -101,7 +101,7 @@ Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://curs
 
 | ライブラリ / Library | 用途 / Role |
 |----------------------|-------------|
-| Qt 6（Widgets） | ホスト UI / Host UI |
+| Qt 6 ≥ 6.12.0（Widgets） | ホスト UI（Vulkan Video AV1 動作に 6.12.0 以上が必須） / Host UI (6.12.0+ required for Vulkan Video AV1) |
 | OpenXR Loader | XR セッション / XR session |
 | Vulkan（loader / headers） | 描画 / Rendering |
 | Wayland client、wayland-scanner | DRM リース一覧（MIT） / DRM lease list (MIT) |
@@ -113,8 +113,9 @@ Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://curs
 
 | ライブラリ / Library | 用途 / Role |
 |----------------------|-------------|
-| FFmpeg（libavcodec / libavformat / libavutil / libswscale / libswresample） | 動画・音声デコード / Video and audio decode |
+| FFmpeg（libavcodec ≥ 61 / libavformat / libavutil / libswscale / libswresample） | 動画・音声デコード（Vulkan Video AV1 に libavcodec 61+ が必須。AppImage は 8.1.3 同梱） / Video and audio decode (libavcodec 61+ required for Vulkan Video AV1; AppImage ships 8.1.3) |
 | SDL2 | ゲームパッド / Gamepad |
+| wl-clipboard（`wl-copy`） | Live 音声入力の日本語など非 ASCII の入力（Wayland）/ Non-ASCII text input for Live voice (Wayland) |
 | PulseAudio（libpulse）+ pactl | 出力列挙・HMD プロファイル；Live は null sink / monitor / browser move / Device enum, HMD profiles; Live null sink, monitor, browser move |
 | OpenAL Soft（`libopenal.so.1`） | HRTF バイノーラル（世界固定スピーカー＋頭部追跡）。2ch は側差→BL/BR（file / Live / [アプリ] 共通） / HRTF binaural; 2ch side-diff→BL/BR shared |
 

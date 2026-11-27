@@ -398,6 +398,7 @@ class HostWindow : public QMainWindow {
    * monasphere.conf `vulkan_video` (Experimental). Default 0.
    * 0 = CUDA/NVDEC on NVIDIA (or VA-API elsewhere).
    * 1 = prefer FFmpeg Vulkan Video zero-copy when the XR device supports it.
+   * Needs libavcodec 61+ (AppImage ships FFmpeg 9 / lavc 63).
    */
   bool vulkan_video_ = false;
   /**

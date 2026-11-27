@@ -20,7 +20,8 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
 find_package(PkgConfig REQUIRED)
-find_package(Qt6 REQUIRED COMPONENTS Widgets Network DBus)
+# Qt 6.12.0+ is required for Vulkan Video AV1 stability (older Qt 6 triggers NVIDIA GL/Vulkan SEGV).
+find_package(Qt6 6.12.0 REQUIRED COMPONENTS Widgets Network DBus)
 # Wayland single-instance focus uses a Qt private type. Skip it when the
 # private component or that type is missing, so older distro Qt still builds.
 set(VRP_HAS_QT_GUI_PRIVATE OFF)
@@ -61,8 +62,13 @@ find_program(GLSLANG_VALIDATOR glslangValidator REQUIRED)
 set(VRP_HAS_FFMPEG OFF)
 pkg_check_modules(FFMPEG libavcodec libavformat libavutil libswscale libswresample)
 if(FFMPEG_FOUND)
+  if(FFMPEG_libavcodec_VERSION VERSION_LESS "61.0")
+    message(FATAL_ERROR
+      "FFmpeg libavcodec >= 61 is required for Vulkan Video AV1 "
+      "(found libavcodec ${FFMPEG_libavcodec_VERSION}).")
+  endif()
   set(VRP_HAS_FFMPEG ON)
-  message(STATUS "FFmpeg found — video playback enabled")
+  message(STATUS "FFmpeg found (libavcodec ${FFMPEG_libavcodec_VERSION}) — video playback enabled")
 else()
   message(WARNING "FFmpeg not found — build placeholder-only video path. Install ffmpeg devel packages and reconfigure.")
 endif()

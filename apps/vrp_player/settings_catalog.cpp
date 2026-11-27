@@ -299,6 +299,7 @@ const QVector<Entry>& catalog() {
                  .description = QT_TR_NOOP(
                      "Experimental. Prefer FFmpeg Vulkan Video zero-copy when available. "
                      "Default off — use CUDA/NVDEC on NVIDIA (or VA-API elsewhere). "
+                     "Needs libavcodec 61+ (AppImage ships FFmpeg 8.1.3). "
                      "Seek/scrub may be slower than CUDA until Vulkan Video improves.")});
     e.push_back({.key = "vulkan_h264_cb_cuda",
                  .category = Category::Video,

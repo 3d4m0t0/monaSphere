@@ -21,6 +21,11 @@
 #include <QStackedWidget>
 #include <QVBoxLayout>
 
+extern "C" {
+#include <libavcodec/version.h>
+#include <libavutil/avutil.h>
+}
+
 namespace {
 
 void configureFormLayout(QFormLayout* form) {

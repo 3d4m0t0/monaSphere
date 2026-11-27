@@ -57,9 +57,16 @@ VkVideoCodecOperationFlagsKHR decode_ops_for_queue(VkPhysicalDevice phys, uint32
   }
   vkGetPhysicalDeviceQueueFamilyProperties2(phys, &count, props.data());
   if (qf >= count) return 0;
-  constexpr VkVideoCodecOperationFlagsKHR kDecode =
-      VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR | VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR |
-      VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR | VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
+  // Guard AV1/VP9 with extension macros — older Vulkan-Headers (e.g. AppImage
+  // 1.4.309) may lack VP9 while having AV1.
+  VkVideoCodecOperationFlagsKHR kDecode =
+      VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR | VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR;
+#ifdef VK_KHR_video_decode_av1
+  kDecode |= VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR;
+#endif
+#ifdef VK_KHR_video_decode_vp9
+  kDecode |= VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR;
+#endif
   return video[qf].videoCodecOperations & kDecode;
 }
 
@@ -200,8 +207,12 @@ bool FfmpegVulkanDevice::init(VkInstance inst, VkPhysicalDevice phys, VkDevice a
     };
     allow(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_H264_BIT_KHR);
     allow(VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_H265_BIT_KHR);
+#ifdef VK_KHR_video_decode_av1
     allow(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR);
+#endif
+#ifdef VK_KHR_video_decode_vp9
     allow(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME, VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR);
+#endif
     const VkVideoCodecOperationFlagsKHR reported = decode_ops_for_queue(phys, decode_qf);
     if (reported != 0) caps &= reported;
     push_qf(decode_qf, decode_queue_count, VK_QUEUE_VIDEO_DECODE_BIT_KHR,

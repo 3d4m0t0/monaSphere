@@ -1371,6 +1371,11 @@
       "translation": "設定…"
     },
     {
+      "context": "Preferences",
+      "source": "Vulkan Video (Experimental)",
+      "translation": "Vulkan Video（実験的）"
+    },
+    {
       "context": "HostWindow",
       "source": "Preferences applied",
       "translation": "設定を適用しました"
@@ -1585,6 +1590,16 @@
       "context": "Preferences",
       "source": "Prefer FFmpeg Vulkan Video zero-copy. Off uses CUDA/NVDEC on NVIDIA.",
       "translation": "FFmpeg Vulkan Video（ゼロコピー）を優先します。Off 時は NVIDIA では CUDA/NVDEC です。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Experimental. Prefer FFmpeg Vulkan Video zero-copy when available. Default off — use CUDA/NVDEC on NVIDIA (or VA-API elsewhere). Needs libavcodec 61+ (verified on FFmpeg 9; AppImage ships 9.0.2). Seek/scrub may be slower than CUDA until Vulkan Video improves.",
+      "translation": "実験的。利用可能なら FFmpeg Vulkan Video（ゼロコピー）を優先します。既定は Off — NVIDIA では CUDA/NVDEC（それ以外は VA-API）。libavcodec 61+ が必要（FFmpeg 9 で確認、AppImage は 9.0.2 同梱）。シークは Vulkan Video 改善まで CUDA より遅くなることがあります。"
+    },
+    {
+      "context": "Preferences",
+      "source": "This build: FFmpeg %1 (libavcodec %2.%3.%4).",
+      "translation": "このビルド: FFmpeg %1（libavcodec %2.%3.%4）。"
     },
     {
       "context": "Preferences",

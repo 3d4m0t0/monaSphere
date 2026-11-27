@@ -1094,10 +1094,10 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
       vkGetPhysicalDeviceFeatures2(physical_device_, &qfeats);
       enable_vp9 = queried.videoDecodeVP9 == VK_TRUE;
     }
-#endif
     VkPhysicalDeviceVideoDecodeVP9FeaturesKHR vp9_feat{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VIDEO_DECODE_VP9_FEATURES_KHR};
     vp9_feat.videoDecodeVP9 = enable_vp9 ? VK_TRUE : VK_FALSE;
+#endif
 
     std::vector<const char*> dev_exts;
     bool ext_fd = false;
@@ -1125,7 +1125,9 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.timelineSemaphore = VK_TRUE;
     v12.pNext = with_video ? &v13 : nullptr;
+#if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
     if (enable_vp9) v13.pNext = &vp9_feat;
+#endif
 #if defined(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)
     VkPhysicalDeviceFaultFeaturesEXT fault_feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     fault_feat.deviceFault = fault ? VK_TRUE : VK_FALSE;
@@ -1234,10 +1236,28 @@ void XrVulkanApp::create_vulkan(std::atomic<bool>* cancel,
       return 0;
     };
     VRP_LOG("Vulkan Video: enabled on XR device (decode_qf=%u) codecs h264=%d h265=%d av1=%d vp9=%d",
-            video_decode_queue_family_, ext_on(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME),
+            video_decode_queue_family_,
+#if defined(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME)
+            ext_on(VK_KHR_VIDEO_DECODE_H264_EXTENSION_NAME),
+#else
+            0,
+#endif
+#if defined(VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME)
             ext_on(VK_KHR_VIDEO_DECODE_H265_EXTENSION_NAME),
+#else
+            0,
+#endif
+#if defined(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME)
             ext_on(VK_KHR_VIDEO_DECODE_AV1_EXTENSION_NAME),
-            ext_on(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME));
+#else
+            0,
+#endif
+#if defined(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
+            ext_on(VK_KHR_VIDEO_DECODE_VP9_EXTENSION_NAME)
+#else
+            0
+#endif
+    );
 
     // Phase 2: inject XR device into FFmpeg AVVulkanDeviceContext (playback still CUDA).
     std::vector<const char*> ext_ptrs;
