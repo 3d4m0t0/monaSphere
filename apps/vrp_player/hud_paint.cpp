@@ -1367,6 +1367,77 @@ HudPaintResult paint_hud_toast(const QString& text, int width, int height) {
   return canvas.take();
 }
 
+void draw_voice_mic_icon(QPainter& p, const QRect& cell, bool listening) {
+  // Line-art mic on red disc. Capsule + offset U (uniform clear gap, no overlap).
+  p.setRenderHint(QPainter::Antialiasing, true);
+  const QRectF r(cell);
+  const QColor disc = listening ? QColor(220, 48, 48) : QColor(150, 64, 64);
+  p.setPen(Qt::NoPen);
+  p.setBrush(disc);
+  p.drawEllipse(r);
+
+  const QColor ink(255, 255, 255, listening ? 250 : 215);
+  const qreal s = r.width();
+  const qreal cx = r.center().x();
+  const qreal lw = std::max(2.2, s * 0.075);
+  // Clear gap between stroke edges (path offset = gap + lw so strokes never overlap).
+  const qreal gap = std::max(lw * 0.55, s * 0.035);
+  const qreal d = gap + lw;
+  const qreal hw = s * 0.13;       // capsule half-width (stadium)
+  const qreal cap_h = s * 0.50;
+  const qreal arm_x = hw + d;      // cradle path inset from capsule path by d
+  const qreal stem_len = s * 0.10;
+  // Bottom cradle is capsule bottom-cap expanded by d (same radius family → even gap).
+  const qreal glyph_h = cap_h + d + stem_len;
+  const qreal cap_top = r.center().y() - glyph_h * 0.5;
+  const qreal cap_bot = cap_top + cap_h;
+  const qreal arc_cy = cap_bot - hw;  // stadium bottom-cap center
+  const qreal arm_top = cap_top + cap_h * 0.72;  // shorter uprights
+  const qreal cradle_bot = arc_cy + arm_x;
+
+  QPen pen(ink, lw);
+  pen.setCapStyle(Qt::RoundCap);
+  pen.setJoinStyle(Qt::RoundJoin);
+  p.setPen(pen);
+  p.setBrush(Qt::NoBrush);
+
+  const QRectF capsule(cx - hw, cap_top, hw * 2, cap_h);
+  p.drawRoundedRect(capsule, hw, hw);
+
+  QPainterPath cradle;
+  cradle.moveTo(cx - arm_x, arm_top);
+  cradle.lineTo(cx - arm_x, arc_cy);
+  cradle.arcTo(QRectF(cx - arm_x, arc_cy - arm_x, arm_x * 2, arm_x * 2), 180, 180);
+  cradle.lineTo(cx + arm_x, arm_top);
+  p.drawPath(cradle);
+
+  p.drawLine(QPointF(cx, cradle_bot), QPointF(cx, cradle_bot + stem_len));
+}
+
+HudPaintResult paint_live_voice(bool listening, float scale, int width, int height) {
+  // Mic-only panel; transcript lives in the browser search field.
+  HudCanvas& canvas = shared_hud_canvas();
+  canvas.begin(width, height);
+  if (!listening) return canvas.take();
+
+  constexpr int kMic = 72;
+  constexpr int kPad = 22;
+  const float s = std::clamp(scale, 0.95f, 1.45f);
+  const int side = std::max(kMic, static_cast<int>(std::lround(static_cast<double>(kMic) * s)));
+  const int box_w = static_cast<int>(kMic * 1.45) + kPad * 2;
+  const int box_h = box_w;
+  const QRect box((width - box_w) / 2, height / 3 - box_h / 2, box_w, box_h);
+  canvas.rounded(box, QColor(16, 20, 30, 220), 12);
+
+  const QRect mic_r(box.center().x() - side / 2, box.center().y() - side / 2, side, side);
+  // Rasterize at display size (quantized) so level pulses are crisp, not soft-upscales.
+  const int q = std::max(kMic, (side / 2) * 2);  // even px bucket
+  canvas.paint_cached(
+      hud_key({105, static_cast<uint64_t>(q), listening ? 1ull : 0ull}), mic_r, q, q,
+      [listening, q](QPainter& p) { draw_voice_mic_icon(p, QRect(0, 0, q, q), listening); });
+  return canvas.take();
+}
+
 HudPaintResult paint_controls_help(int width, int height, bool sony_face, bool menu_option) {
   // Flat seat uses Y (XInput) or △ (Sony). Keep face style in sync with Options branding.
   sony_face_buttons = sony_face || menu_option;

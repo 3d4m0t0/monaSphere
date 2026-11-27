@@ -2,7 +2,7 @@
 
 monaSphere の**ソースコード**は [MIT](LICENSE) です。コマンド名は `monasphere`。
 
-パッケージ／AppImage には MIT のコードに加え、下記のデータ・ライブラリが含まれることがあります。RPM の SPDX 表記は **`MIT AND CC0-1.0 AND CC-BY-SA-3.0-IGO`**（ソース MIT ＋ 星／星雲カタログ CC0 ＋ Gaia 天の川地図 CC BY-SA 3.0 IGO）です。
+パッケージ／AppImage には MIT のコードに加え、下記のデータ・ライブラリが含まれることがあります。RPM の SPDX 表記は **`MIT AND CC0-1.0 AND CC-BY-SA-3.0-IGO AND Apache-2.0`**（ソース MIT ＋ 星／星雲カタログ CC0 ＋ Gaia 天の川地図 CC BY-SA 3.0 IGO ＋ 同梱 Vosk `libvosk.so` Apache-2.0）です。
 
 ## 配布バイナリの方針
 
@@ -41,6 +41,7 @@ monaSphere の**ソースコード**は [MIT](LICENSE) です。コマンド名�
 | xdg-desktop-portal ScreenCast / RemoteDesktop | （デスクトップ実装依存） | KDE: ScreenCast 単独で MONITOR 選択。GNOME: RemoteDesktop+ScreenCast + `ConnectToEIS`。`restore_token` を `monasphere.conf` に保存 |
 | libei (`libei1`) | MIT | Wayland seat pointer inject（KWin EIS または portal `RemoteDesktop.ConnectToEIS`）。ヘッダは `third_party/libei/` |
 | KRFB `krfb-virtualmonitor`（任意・実行時） | GPL-2.0-or-later（KDE） | Plasma Wayland 仮想出力。同梱せず `PATH` 上のバイナリを起動／終了。`live_virtual=0` で無効 |
+| Vosk API `libvosk.so` | Apache-2.0 | Live 音声入力 / Live voice input。公式 vosk-api **v0.3.45** Linux x86_64 prebuilt を [`third_party/vosk/`](third_party/vosk/) に同梱 / bundled（install: `lib/monasphere/libvosk.so`）。SHA-256: [`SHA256SUMS`](third_party/vosk/SHA256SUMS)；実行時照合＋Help→About / runtime verify + About。モデルは同梱せずユーザー DL / models not bundled — user download（URL・配置 / paths: [`third_party/vosk/README.md`](third_party/vosk/README.md)）。対応 / langs: ja/en/de/fr/es/ko/zh（UI 7） |
 
 nonfree を有効にした FFmpeg **でビルドした**バイナリを「MIT のみ」「openSUSE OSS」として再配布しないでください。
 

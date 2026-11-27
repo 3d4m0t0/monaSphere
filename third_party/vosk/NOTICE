@@ -1,0 +1,9 @@
+Vosk API (libvosk.so)
+Copyright 2019-2022 Alpha Cephei Inc.
+
+This product bundles the official vosk-api Linux x86_64 prebuilt shared library
+from https://github.com/alphacep/vosk-api (release v0.3.45), licensed under the
+Apache License, Version 2.0. See LICENSE in this directory.
+
+monaSphere verifies the SHA-256 of the bundled libvosk.so against
+third_party/vosk/SHA256SUMS before loading it.

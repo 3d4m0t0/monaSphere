@@ -382,6 +382,11 @@
     },
     {
       "context": "monaSphere",
+      "source": "Recognizing",
+      "translation": "認識中"
+    },
+    {
+      "context": "monaSphere",
       "source": "Undo",
       "translation": "戻す"
     },
@@ -1823,8 +1828,38 @@
     },
     {
       "context": "Preferences",
+      "source": "Voice input",
+      "translation": "音声入力"
+    },
+    {
+      "context": "Preferences",
+      "source": "L3 opens voice input while browser Live is active (search phrases). Confirm types the text and Enter; Back clears, then cancels.",
+      "translation": "ブラウザ Live 中に L3 で音声入力を開く（検索フレーズ向け）。決定で文字入力＋Enter、戻るでクリア、空のとき再度戻るでキャンセル。"
+    },
+    {
+      "context": "Preferences",
+      "source": "Voice language",
+      "translation": "音声言語"
+    },
+    {
+      "context": "Preferences",
+      "source": "Speech recognition language (bundled Vosk small model).",
+      "translation": "音声認識の言語（同梱の Vosk small モデル）。"
+    },
+    {
+      "context": "Preferences",
       "source": "Cursor scale",
       "translation": "カーソル倍率"
+    },
+    {
+      "context": "Preferences",
+      "source": "Max capture FPS",
+      "translation": "キャプチャ上限 FPS"
+    },
+    {
+      "context": "Preferences",
+      "source": "PipeWire ScreenCast maxFramerate cap (60 or 90). Actual rate also depends on the compositor/virtual display.",
+      "translation": "PipeWire ScreenCast の最大フレームレート上限（60 または 90）。実効レートはコンポジタや仮想ディスプレイ側にも依存します。"
     },
     {
       "context": "Preferences",

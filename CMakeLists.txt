@@ -227,6 +227,8 @@ add_library(vrp_core STATIC
   src/audio/stereo_surround.cpp
   src/audio/loudness_normalizer.cpp
   src/audio/pulse_monitor.cpp
+  src/audio/voice_stt.cpp
+  src/audio/vosk_bundle.cpp
   src/scene/scene_renderer.cpp
   src/scene/fsr1_upscaler.cpp
   src/ui/vr_menu.cpp
@@ -258,10 +260,15 @@ target_link_libraries(vrp_core PUBLIC
   ${CMAKE_DL_LIBS}
 )
 target_compile_options(vrp_core PUBLIC ${OPENXR_CFLAGS_OTHER} ${VULKAN_CFLAGS_OTHER})
+target_compile_definitions(vrp_core PUBLIC "VRP_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\"")
 
 if(VRP_HAS_FFMPEG)
   target_compile_definitions(vrp_core PUBLIC VRP_HAS_FFMPEG=1)
   target_include_directories(vrp_core PUBLIC ${FFMPEG_INCLUDE_DIRS})
+  # pkg-config LIBRARY_DIRS must be on the link line; bare -lavcodec otherwise
+  # resolves to the distro SONAME (e.g. Ubuntu 24.04 libavcodec.so.60) even when
+  # headers come from a newer bundled FFmpeg under PKG_CONFIG_PATH.
+  target_link_directories(vrp_core PUBLIC ${FFMPEG_LIBRARY_DIRS})
   target_link_libraries(vrp_core PUBLIC ${FFMPEG_LIBRARIES})
   target_compile_options(vrp_core PUBLIC ${FFMPEG_CFLAGS_OTHER})
 endif()
@@ -467,3 +474,23 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/translations/
   PATTERN "monasphere_en.json" EXCLUDE
   PATTERN "monasphere_ja.json" EXCLUDE
 )
+
+# Optional official Vosk prebuilt (tools/fetch_vosk.sh). SHA-256 pinned in
+# third_party/vosk/SHA256SUMS; runtime refuses a mismatched bundled copy.
+set(VRP_VOSK_SO ${CMAKE_SOURCE_DIR}/third_party/vosk/linux-x86_64/libvosk.so)
+if(EXISTS "${VRP_VOSK_SO}")
+  install(FILES ${VRP_VOSK_SO} DESTINATION lib/monasphere RENAME libvosk.so)
+  install(FILES
+    ${CMAKE_SOURCE_DIR}/third_party/vosk/LICENSE
+    ${CMAKE_SOURCE_DIR}/third_party/vosk/NOTICE
+    ${CMAKE_SOURCE_DIR}/third_party/vosk/SHA256SUMS
+    ${CMAKE_SOURCE_DIR}/third_party/vosk/README.md
+    DESTINATION share/doc/monasphere/vosk
+  )
+  add_custom_command(TARGET vrp_player POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:vrp_player>/lib/monasphere
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${VRP_VOSK_SO}
+            $<TARGET_FILE_DIR:vrp_player>/lib/monasphere/libvosk.so
+    COMMENT "Copy bundled libvosk.so next to vrp_player"
+  )
+endif()

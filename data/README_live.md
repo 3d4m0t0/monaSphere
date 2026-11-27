@@ -249,8 +249,11 @@ Every live app is forced **borderless fullscreen** on the Virtual MONITOR.
 | ○ short | Browser **Back** (live browser only; not `[アプリ]`) |
 | PS long | Open/close VR menu (monaSphere-wide; [アプリ] swallows via pad filter) |
 | Options long | Also opens/closes VR menu |
+| L3 | 音声入力 / Voice input（`live_voice=1`）。HUD マイクのみ。AcceptWaveform false→PartialResult で検索窓を上書き、true→Result で上書きして継続。マイクUI中 □=削除(Backspace); ×=Enter+終了; ○=キャンセル+終了 |
 | L3+R3 | Recenter (monaSphere-wide) |
 | △ | Flat seat preset |
+
+**音声 / Voice (Vosk):** `libvosk.so` は同梱、**モデルは同梱しません** / library bundled, **models are not**. 必要な言語を `~/.local/share/monasphere/vosk/` へ配置（URL・ディレクトリ名は [`third_party/vosk/README.md`](../third_party/vosk/README.md)） / download languages you need — see vosk README. `live_voice_lang`: `ja` / `en` / `de` / `fr` / `es` / `ko` / `zh_CN` / `zh_TW`（zh_* は同一 Chinese small / zh_* share the Chinese small model）。
 
 View look (R stick) and seek are disabled while a live app is open. ○ never ends live.
 On **[アプリ]**, monaSphere grabs the physical pad and mirrors it through **uinput**
@@ -408,6 +411,8 @@ Silent Live: Soft never opened (hang/busy) or Chrome never landed on
 | `live_cursor_scale` | `1`–`6` stick/D-pad gain (default `1`; base speed scales with `live_virtual_size`) |
 | `live_chrome_profile` | `default` (system logins) or `isolated`. GNOME+Virtual: `default` → isolated if system Chrome is already Wayland |
 | `live_chrome_warm` | `1` (default) KDE pre-open Chrome; ignored on GNOME; `0` off; Firefox ignored |
+| `live_voice` | `1`（既定 / default）browser Live の L3 音声入力 / L3 voice input; `0` オフ / off |
+| `live_voice_lang` | Vosk 言語 / language: `ja` `en` `de` `fr` `es` `ko` `zh_CN` `zh_TW`（既定 / default `ja`）。モデルは**同梱せず** / models **not** bundled — `~/.local/share/monasphere/vosk/` へ DL（URL: [`third_party/vosk/README.md`](../third_party/vosk/README.md)） |
 | `live_output` | Output name substring for Chromium placement |
 | `live_restore_token` | ScreenCast Remember token for `Virtual-monaSphere` (shared by all spans) |
 | `live_setup_spans` | Kept for compat; setup always authenticates once at x1 size |

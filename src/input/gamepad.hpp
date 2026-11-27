@@ -37,6 +37,8 @@ class GamepadInput {
     bool recenter = false;     // Options / Start long press
     /** Right stick click (R3) alone. Clears stick look offset. */
     bool view_reset = false;
+    /** Left stick click (L3) edge. Browser Live voice input. */
+    bool l3 = false;
     bool seek_back = false;    // LB edge (repeat)
     bool seek_forward = false; // RB edge (repeat)
     bool seek_back_held = false;
@@ -103,6 +105,7 @@ class GamepadInput {
   bool prev_x_ = false;
   bool prev_y_ = false;
   bool prev_r3_ = false;
+  bool prev_l3_ = false;
   bool lb_held_ = false;
   bool rb_held_ = false;
   bool lb_repeating_ = false;

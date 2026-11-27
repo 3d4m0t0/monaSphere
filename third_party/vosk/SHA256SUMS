@@ -1,0 +1,6 @@
+# Official vosk-api v0.3.45 Linux x86_64 prebuilt (Alpha Cephei).
+# Source zip:
+#   https://github.com/alphacep/vosk-api/releases/download/v0.3.45/vosk-linux-x86_64-0.3.45.zip
+#   SHA256(zip)=bbdc8ed85c43979f6443142889770ea95cbfbc56cffb5c5dcd73afa875c5fbb2
+# Extracted libvosk.so must match this digest (proof of unmodified official binary).
+85c4654de3acdeb99abab86eeb2a6e603927d37089597c0fcc33d8638dc2ccaf  linux-x86_64/libvosk.so

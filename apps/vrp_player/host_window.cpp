@@ -8,6 +8,8 @@
 
 #include "audio/audio_player.hpp"
 #include "audio/pulse_monitor.hpp"
+#include "audio/voice_stt.hpp"
+#include "audio/vosk_bundle.hpp"
 #include "common.hpp"
 #include "common/crash_guard.hpp"
 #include "input/gamepad.hpp"
@@ -110,6 +112,24 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+
+namespace {
+
+/** Parse live_voice_lang conf/UI value; empty if unsupported. */
+QString parseLiveVoiceLang(QString v) {
+  const QString key = v.trimmed().toLower().replace(QLatin1Char('-'), QLatin1Char('_'));
+  if (key == QLatin1String("ja") || key == QLatin1String("en") || key == QLatin1String("de") ||
+      key == QLatin1String("fr") || key == QLatin1String("es") || key == QLatin1String("ko")) {
+    return key;
+  }
+  if (key == QLatin1String("zh_cn") || key == QLatin1String("cn") || key == QLatin1String("zh")) {
+    return QStringLiteral("zh_CN");
+  }
+  if (key == QLatin1String("zh_tw")) return QStringLiteral("zh_TW");
+  return {};
+}
+
+}  // namespace
 
 HostWindow::HostWindow(vrp::PlayerOptions opt, QString shader_dir, QWidget* parent)
     : QMainWindow(parent), opt_(std::move(opt)), shader_dir_(std::move(shader_dir)) {
@@ -952,6 +972,15 @@ void HostWindow::hideControlsHelp() {
   requestHudPaint();
 }
 
+void HostWindow::setLiveVoiceHud(bool on) {
+  if (!on) {
+    live_voice_hud_level_.store(0.f, std::memory_order_release);
+    live_voice_hud_scale_env_ = 0.f;
+  }
+  live_voice_ui_.store(on, std::memory_order_release);
+  requestHudPaint();
+}
+
 void HostWindow::showHudToast(const QString& text, int duration_ms) {
   {
     std::lock_guard<std::mutex> lock(hud_toast_mu_);
@@ -1007,7 +1036,29 @@ void HostWindow::paintHudNow() {
     }
   }
   const bool help = controls_help_.load();
+  const bool voice_ui = live_voice_ui_.load(std::memory_order_acquire);
+  float voice_scale = 1.f;
+  if (voice_ui) {
+    const float lvl = live_voice_hud_level_.load(std::memory_order_acquire);
+    // Instant attack from mic peak; slow return only on the way down.
+    if (lvl > live_voice_hud_scale_env_) {
+      live_voice_hud_scale_env_ = lvl;
+    } else {
+      live_voice_hud_scale_env_ *= 0.88f;
+    }
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    const float breath =
+        1.f + 0.03f * static_cast<float>(std::sin(static_cast<double>(ms) * 0.0052));
+    const float boost =
+        std::sqrt(std::clamp(live_voice_hud_scale_env_, 0.f, 1.f));
+    voice_scale = breath * (1.f + 0.42f * boost);
+  } else {
+    live_voice_hud_scale_env_ = 0.f;
+  }
   const int kind = help             ? 1
+                   : voice_ui              ? 6
                    : snap.visible   ? 2
                    : snap.controls_visible ? 3
                    : snap.seek_bar_only    ? 4
@@ -1030,6 +1081,7 @@ void HostWindow::paintHudNow() {
   }
   const vrp::HudPaintResult hud =
       help     ? vrp::paint_controls_help(hud_w_, hud_h_, face_sony_.load(), menu_option_.load())
+      : kind == 6 ? vrp::paint_live_voice(true, voice_scale, hud_w_, hud_h_)
       : kind == 5 ? vrp::paint_hud_toast(toast, hud_w_, hud_h_)
                   : vrp::paint_vr_menu(snap, hud_w_, hud_h_, face_sony_.load(), menu_option_.load());
   // Bake 0.78 opacity once per preview payload (token = shared_ptr identity).
@@ -1085,6 +1137,12 @@ void HostWindow::paintHudNow() {
     }
   }
   hud_paint_done_.store(snap.gen);
+  // Match ~16ms mic chunks so level pulses stay tight.
+  if (voice_ui) {
+    QTimer::singleShot(16, this, [this] {
+      if (live_voice_ui_.load(std::memory_order_acquire)) requestHudPaint();
+    });
+  }
 }
 
 void HostWindow::stopMonadoProcess() {
@@ -2051,6 +2109,17 @@ void HostWindow::loadAppConf() {
       bool ok = false;
       const int v = line.mid(17).toInt(&ok);
       if (ok && v >= 1 && v <= 6) live_cursor_scale_ = v;
+    } else if (line.startsWith(QStringLiteral("live_voice="))) {
+      const QString v = line.mid(QStringLiteral("live_voice=").size()).trimmed();
+      live_voice_ = (v != QLatin1String("0"));
+    } else if (line.startsWith(QStringLiteral("live_voice_lang="))) {
+      const QString parsed =
+          parseLiveVoiceLang(line.mid(QStringLiteral("live_voice_lang=").size()));
+      if (!parsed.isEmpty()) live_voice_lang_ = parsed;
+    } else if (line.startsWith(QStringLiteral("live_max_fps="))) {
+      bool ok = false;
+      const int v = line.mid(QStringLiteral("live_max_fps=").size()).trimmed().toInt(&ok);
+      if (ok) live_max_fps_ = (v >= 90) ? 90 : 60;
     } else if (line.startsWith(QStringLiteral("live_chrome_profile="))) {
       const QString v = line.mid(19).trimmed().toLower();
       live_chrome_default_profile_ = (v != QLatin1String("isolated"));
@@ -3214,6 +3283,17 @@ void HostWindow::reloadLiveCaptureConf() {
       bool ok = false;
       const int v = line.mid(17).toInt(&ok);
       if (ok && v >= 1 && v <= 6) live_cursor_scale_ = v;
+    } else if (line.startsWith(QStringLiteral("live_voice="))) {
+      const QString v = line.mid(QStringLiteral("live_voice=").size()).trimmed();
+      live_voice_ = (v != QLatin1String("0"));
+    } else if (line.startsWith(QStringLiteral("live_voice_lang="))) {
+      const QString parsed =
+          parseLiveVoiceLang(line.mid(QStringLiteral("live_voice_lang=").size()));
+      if (!parsed.isEmpty()) live_voice_lang_ = parsed;
+    } else if (line.startsWith(QStringLiteral("live_max_fps="))) {
+      bool ok = false;
+      const int v = line.mid(QStringLiteral("live_max_fps=").size()).trimmed().toInt(&ok);
+      if (ok) live_max_fps_ = (v >= 90) ? 90 : 60;
     } else if (line.startsWith(QStringLiteral("live_chrome_profile="))) {
       const QString v = line.mid(19).trimmed().toLower();
       live_chrome_default_profile_ = (v != QLatin1String("isolated"));
@@ -3460,10 +3540,17 @@ void HostWindow::showPreferencesDialog() {
     else if (key == QLatin1String("live_chrome_scale"))
       v = QString::number(static_cast<double>(live_chrome_scale_), 'f', 2);
     else if (key == QLatin1String("live_cursor_scale")) v = QString::number(live_cursor_scale_);
+    else if (key == QLatin1String("live_voice"))
+      v = live_voice_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("live_voice_lang"))
+      v = live_voice_lang_.isEmpty() ? QStringLiteral("ja") : live_voice_lang_;
+    else if (key == QLatin1String("live_max_fps")) v = QString::number(live_max_fps_);
     else if (key == QLatin1String("live_chrome_profile"))
       v = live_chrome_default_profile_ ? QStringLiteral("default") : QStringLiteral("isolated");
     else if (key == QLatin1String("live_chrome_warm"))
       v = live_chrome_warm_ ? QStringLiteral("1") : QStringLiteral("0");
+    else if (key == QLatin1String("gpu_kick"))
+      v = vrp_gpu_kick_enabled() ? QStringLiteral("1") : QStringLiteral("0");
     else if (key == QLatin1String("live_browser")) {
       if (live_browser_ == vrp::LiveBrowser::Firefox) v = QStringLiteral("firefox");
       else v = QStringLiteral("chrome");
@@ -3667,6 +3754,15 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
       bool ok = false;
       const int v = value.toInt(&ok);
       if (ok) live_cursor_scale_ = v;
+    } else if (key == QLatin1String("live_voice")) {
+      live_voice_ = value != QLatin1String("0");
+    } else if (key == QLatin1String("live_voice_lang")) {
+      const QString parsed = parseLiveVoiceLang(value);
+      if (!parsed.isEmpty()) live_voice_lang_ = parsed;
+    } else if (key == QLatin1String("live_max_fps")) {
+      bool ok = false;
+      const int v = value.toInt(&ok);
+      if (ok) live_max_fps_ = (v >= 90) ? 90 : 60;
     } else if (key == QLatin1String("live_chrome_profile")) {
       live_chrome_default_profile_ =
           value.compare(QLatin1String("isolated"), Qt::CaseInsensitive) != 0;
@@ -3789,29 +3885,65 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
 }
 
 void HostWindow::showAboutDialog() {
-  const QString text = tr(
-      "<h3>monaSphere v%1</h3>"
-      "<p>Linux VR video player (OpenXR / Monado)</p>"
-      "<p>Copyright (c) 2026 flex</p>"
-      "<p>GitHub:<br>"
-      "<a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p>"
-      "<p>Source license: MIT</p>"
-      "<p>FFmpeg / Qt and others are linked dynamically. "
-      "See THIRD_PARTY.md when distributing a binary.</p>")
-                           .arg(QStringLiteral("1.0.0-dev.20261014"));
+  const vrp::VoskLibStatus vosk = vrp::probe_vosk_lib();
+  QString vosk_line;
+  switch (vosk.kind) {
+    case vrp::VoskLibStatus::Kind::OfficialMatch:
+      vosk_line = tr("Vosk libvosk.so: official v%1 prebuilt — SHA-256 match")
+                      .arg(QString::fromUtf8(vrp::vosk_official_version()));
+      break;
+    case vrp::VoskLibStatus::Kind::OfficialMismatch:
+      vosk_line = tr("Vosk libvosk.so: SHA-256 MISMATCH (bundled copy refused)");
+      break;
+    case vrp::VoskLibStatus::Kind::Override:
+      vosk_line = tr("Vosk libvosk.so: override / system (%1)")
+                      .arg(QString::fromStdString(vosk.detail));
+      break;
+    case vrp::VoskLibStatus::Kind::Missing:
+    default:
+      vosk_line = tr("Vosk libvosk.so: not found");
+      break;
+  }
+  QString vosk_hash;
+  if (!vosk.actual_sha256.empty()) {
+    vosk_hash = tr("<p style=\"margin:0;font-family:monospace;font-size:9pt;\">"
+                   "SHA-256: %1</p>"
+                   "<p style=\"margin:0;font-family:monospace;font-size:9pt;\">"
+                   "expected: %2</p>")
+                    .arg(QString::fromStdString(vosk.actual_sha256),
+                         QString::fromUtf8(vrp::vosk_official_lib_sha256()));
+  } else {
+    vosk_hash = tr("<p style=\"margin:0;font-family:monospace;font-size:9pt;\">"
+                   "expected: %1</p>")
+                    .arg(QString::fromUtf8(vrp::vosk_official_lib_sha256()));
+  }
+  const QString text =
+      tr("<h3>monaSphere v%1</h3>"
+         "<p>Linux VR video player (OpenXR / Monado)</p>"
+         "<p>Copyright (c) 2026 flex</p>"
+         "<p>GitHub:<br>"
+         "<a href=\"https://github.com/3d4m0t0/monaSphere\">https://github.com/3d4m0t0/monaSphere</a></p>"
+         "<p>Source license: MIT</p>"
+         "<p>FFmpeg / Qt and others are linked dynamically. "
+         "See THIRD_PARTY.md when distributing a binary.</p>"
+         "<p>%2</p>"
+         "%3"
+         "<p style=\"margin:0;font-size:9pt;\">Official zip: "
+         "<a href=\"%4\">vosk-linux-x86_64-%5.zip</a></p>")
+          .arg(QStringLiteral("1.1.0-dev.20261127"), vosk_line, vosk_hash,
+               QString::fromUtf8(vrp::vosk_official_zip_url()),
+               QString::fromUtf8(vrp::vosk_official_version()));
   QString html = text;
   html.replace(QStringLiteral("<h3>"), QStringLiteral("<h3 style=\"margin:0;\">"));
-  html.replace(QStringLiteral("<p>"), QStringLiteral("<p style=\"margin:0;\">"));
+  // Keep explicit style= paragraphs; only bare <p> get margin:0.
+  html.replace(QRegularExpression(QStringLiteral("<p>(?![^>]*style=)")),
+               QStringLiteral("<p style=\"margin:0;\">"));
 
   QDialog dlg(this);
   dlg.setWindowTitle(tr("About"));
   dlg.setWindowIcon(windowIcon());
 
-  QTextDocument measure;
-  measure.setDefaultFont(dlg.font());
-  measure.setDocumentMargin(0);
-  measure.setHtml(html);
-  const int text_w = static_cast<int>(measure.idealWidth()) + 2;
+  const int text_w = 420;
 
   auto* icon = new QLabel(&dlg);
   const QPixmap pixmap =
@@ -3824,7 +3956,7 @@ void HostWindow::showAboutDialog() {
   body->setTextInteractionFlags(Qt::TextBrowserInteraction);
   body->setOpenExternalLinks(true);
   body->setAlignment(Qt::AlignLeft | Qt::AlignTop);
-  body->setWordWrap(false);
+  body->setWordWrap(true);
   body->setMargin(0);
   body->setFixedWidth(text_w);
   if (auto* doc = body->findChild<QTextDocument*>()) doc->setDocumentMargin(0);
@@ -6987,6 +7119,7 @@ void HostWindow::xrThreadMain() {
       bool pad_nav_right = false;
       bool pad_face_x = false;
       bool pad_face_y = false;
+      bool pad_l3 = false;
       // [アプリ]: LD_PRELOAD hook (preferred) or legacy uinput PadFilter, else PS+R1 chords.
       // Hook: guest owns pad while menu closed; host SDL navigates menu and sends BLOCK.
       const bool desk_app_live_pad =
@@ -7056,6 +7189,7 @@ void HostWindow::xrThreadMain() {
         input.view_reset = input.view_reset || gp.view_reset;
         pad_face_x = gp.face_x;
         pad_face_y = gp.face_y;
+        pad_l3 = gp.l3;
       };
 
       if (desk_app_live_pad && hook_on) {
@@ -7240,10 +7374,14 @@ void HostWindow::xrThreadMain() {
 
       // □ / X: Live browser → live_fsr cycle; else file decoder → preferred_fsr.
       // Walks Off + Preferences-checked scales only (empty mask stays Off).
+      // Mic UI: □ is delete (not FSR) — skip while live_voice_ui_ is on.
+      const bool voice_hud_on = live_voice_ui_.load(std::memory_order_acquire);
       const bool can_live_fsr_cycle =
-          yt_live && yt_session_ && !yt_session_->desktop_app_mode() && menus_closed;
+          yt_live && yt_session_ && !yt_session_->desktop_app_mode() && menus_closed &&
+          !voice_hud_on;
       const bool can_file_fsr_cycle =
-          menus_closed && !yt_session && decoder.is_open() && !fsr_locked_8k_.load();
+          menus_closed && !yt_session && decoder.is_open() && !fsr_locked_8k_.load() &&
+          !voice_hud_on;
       if (can_live_fsr_cycle && pad_face_x) {
         live_fsr_ = vrp::next_fsr_mode(live_fsr_, live_fsr_scales_);
         const auto mode = live_fsr_;
@@ -7516,6 +7654,124 @@ void HostWindow::xrThreadMain() {
         // [アプリ] live: no remap — SDL pad is released so the app sees the controller.
         const bool desk_app_live = yt_session_->desktop_app_mode();
         const bool live_menu_open = menu.visible() || menu.controls_visible();
+        // Live voice (L3): EIS TEXT inserts only — type STT growth since last_stt.
+        // □ = Backspace in browser; keep field tracker in sync but do NOT rewind last_stt
+        // (rewinding would make sync re-type the deleted character and look like STT died).
+        // × = Enter+close (swallow click). ○ = cancel.
+        static vrp::VoiceStt live_voice_stt;
+        static bool live_voice_open = false;
+        static bool live_voice_swallow_click = false;
+        static std::string live_voice_last_stt;  // last STT snapshot we already consumed
+        static std::string live_voice_field;     // UTF-8 we believe is in the search field
+        auto utf8_pop_back = [](std::string& s) {
+          if (s.empty()) return;
+          size_t i = s.size();
+          do {
+            --i;
+          } while (i > 0 && (static_cast<unsigned char>(s[i]) & 0xC0) == 0x80);
+          s.resize(i);
+        };
+        auto sync_search_field = [&](const std::string& want) {
+          if (want == live_voice_last_stt) return;
+          if (!yt_session_ || !yt_session_->x11().can_inject()) {
+            live_voice_last_stt = want;
+            live_voice_field = want;
+            return;
+          }
+          // Growth relative to last STT → type only the new tail into the field.
+          if (want.size() >= live_voice_last_stt.size() &&
+              want.compare(0, live_voice_last_stt.size(), live_voice_last_stt) == 0) {
+            const std::string suffix = want.substr(live_voice_last_stt.size());
+            if (suffix.empty() || yt_session_->x11().type_text(suffix)) {
+              live_voice_field += suffix;
+              live_voice_last_stt = want;
+            } else {
+              // Avoid per-frame retry spam when EIS TEXT / wl-copy is unavailable.
+              live_voice_last_stt = want;
+              static std::atomic<bool> inject_warned{false};
+              if (!inject_warned.exchange(true)) {
+                QMetaObject::invokeMethod(
+                    this,
+                    [this] {
+                      appendLog(tr("Voice: text not typed — non-ASCII needs EIS TEXT or wl-copy "
+                                   "(install wl-clipboard)"));
+                      showHudToast(tr("Voice: install wl-clipboard"));
+                    },
+                    Qt::QueuedConnection);
+              }
+            }
+            return;
+          }
+          // STT shrank/revised: adopt baseline without re-typing (□ may have edited field).
+          live_voice_last_stt = want;
+        };
+        auto close_live_voice = [&] {
+          live_voice_stt.stop();
+          live_voice_open = false;
+          live_voice_last_stt.clear();
+          live_voice_field.clear();
+          live_voice_hud_level_.store(0.f, std::memory_order_release);
+          live_voice_ui_.store(false, std::memory_order_release);
+          QMetaObject::invokeMethod(this, [this] { setLiveVoiceHud(false); }, Qt::QueuedConnection);
+        };
+        auto open_live_voice = [&] {
+          const std::string lang = live_voice_lang_.toStdString();
+          if (!live_voice_stt.start(lang)) {
+            const QString err = QString::fromStdString(live_voice_stt.last_error());
+            QMetaObject::invokeMethod(
+                this,
+                [this, err] {
+                  appendLog(tr("Voice: %1").arg(err));
+                  showHudToast(tr("Voice unavailable"));
+                },
+                Qt::QueuedConnection);
+            return;
+          }
+          live_voice_open = true;
+          live_voice_swallow_click = false;
+          live_voice_last_stt.clear();
+          live_voice_field.clear();
+          live_voice_hud_level_.store(0.f, std::memory_order_release);
+          live_voice_ui_.store(true, std::memory_order_release);
+          QMetaObject::invokeMethod(this, [this] { setLiveVoiceHud(true); }, Qt::QueuedConnection);
+        };
+        if (!yt_live || desk_app_live || live_menu_open || !live_voice_) {
+          if (live_voice_open) close_live_voice();
+        } else if (live_voice_open) {
+          live_voice_hud_level_.store(live_voice_stt.level(), std::memory_order_release);
+          const std::string cur = live_voice_stt.text();
+          if (cur != live_voice_last_stt) {
+            sync_search_field(cur);
+          }
+          if (pad_face_x) {
+            if (yt_session_ && yt_session_->x11().can_inject()) {
+              (void)yt_session_->x11().key_backspace(1);
+            }
+            // Browser lost one char at caret end — mirror that in our field tracker only.
+            // Leave last_stt as-is so the next sync does not re-append the deleted glyph.
+            utf8_pop_back(live_voice_field);
+            pad_face_x = false;
+          }
+          if (input.confirm) {
+            // × → Enter + end voice UI. Swallow click until × is released — otherwise
+            // close_live_voice() clears live_voice_open and the Live inject path
+            // treats the same × as a left-click on the search field (text selection).
+            if (yt_session_->x11().can_inject()) {
+              (void)yt_session_->x11().key_enter();
+            }
+            close_live_voice();
+            live_voice_swallow_click = true;
+            input.confirm = false;
+            input.back = false;
+          } else if (input.back) {
+            close_live_voice();
+            live_voice_swallow_click = true;  // also swallow if ○ was chorded with click path
+            input.back = false;
+            input.confirm = false;
+          }
+        } else if (pad_l3 && yt_session_->x11().can_inject()) {
+          open_live_voice();
+        }
         {
           static bool yt_inject_logged = false;
           static bool yt_focus_armed = false;
@@ -7527,7 +7783,7 @@ void HostWindow::xrThreadMain() {
             yt_focus_armed = false;
             yt_prev_up = yt_prev_down = yt_prev_left = yt_prev_right = false;
             desk_pass_logged = false;
-          } else if (desk_app_live || live_menu_open) {
+          } else if (desk_app_live || live_menu_open || live_voice_open) {
             if (desk_app_live && !desk_pass_logged) {
               desk_pass_logged = true;
               const bool hook = pad_hook_active_ && pad_hook_.running();
@@ -7620,13 +7876,17 @@ void HostWindow::xrThreadMain() {
             step(pad_nav_down, yt_prev_down, 0.f, kStep);
             step(pad_nav_left, yt_prev_left, -kStep, 0.f);
             step(pad_nav_right, yt_prev_right, kStep, 0.f);
-            if (input.confirm) yt_session_->x11().click();
+            if (live_voice_swallow_click) {
+              if (!input.confirm_held) live_voice_swallow_click = false;
+            } else if (input.confirm && !live_voice_open) {
+              yt_session_->x11().click();
+            }
           }
         }
         // Options long opens/closes the VR menu without stopping live (handled by VrMenu).
         // ○ never ends live; YouTube short ○/B = browser Back. Loading: ○ cancels start.
         // Wayland Chrome has no X11 xid — can_inject (EIS) is enough; key_back uses EIS.
-        if (yt_live && !live_menu_open && !desk_app_live && input.back &&
+        if (yt_live && !live_menu_open && !desk_app_live && !live_voice_open && input.back &&
             yt_session_->x11().can_inject()) {
           (void)yt_session_->x11().key_back();
         } else if (!yt_live && (input.back || input.back_held)) {
@@ -9749,7 +10009,9 @@ void HostWindow::xrThreadMain() {
         }
         const bool help_on = controls_help_.load();
         const bool toast_on = hudToastActive();
+        const bool voice_on = live_voice_ui_.load(std::memory_order_acquire);
         const int want_kind = help_on ? 1
+                                      : voice_on ? 6
                                       : menu.visible() ? 2
                                       : menu.controls_visible() ? 3
                                       : menu.seek_bar_only() ? 4
@@ -9778,7 +10040,8 @@ void HostWindow::xrThreadMain() {
             constexpr float kOldAspect = 720.f / 1280.f;
             const float y = kControlsHalfW * (kHudAspect - kOldAspect);
             scene.set_hud_layout(kControlsHalfW, kHudDistanceM, kHudAspect, y);
-          } else if (kind == 5) {
+          } else if (kind == 5 || kind == 6) {
+            // Toast + voice use the same panel scale (screen-distance toast size).
             scene.set_hud_layout(0.55f, kHudDistanceM, kHudAspect);
           }
         };

@@ -126,6 +126,7 @@ Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://curs
 | OpenAL Soft headers | HRTF 空間化 API / HRTF spatialization API |
 | AMD FidelityFX FSR1（headers） | アップスケール / Upscaling |
 | wp_drm_lease_v1（`third_party/wayland/drm-lease-v1.xml`） | DRM リース一覧の定義（MIT） / DRM lease list definition (MIT) |
+| Vosk `libvosk.so`（Apache-2.0） | Live L3 音声入力。モデルは同梱せずユーザー DL（URL・配置は [`third_party/vosk/README.md`](third_party/vosk/README.md)；`live_voice_lang`: ja/en/de/fr/es/ko/zh_CN|zh_TW） / Live L3 voice input; models not bundled — see vosk README |
 
 実行時の XR ランタイムとして **Monado**（`monado-service`）と `XR_RUNTIME_JSON` の設定が必要です。
 
@@ -243,7 +244,7 @@ Distributed binaries are expected to be built against `ffmpeg-*-mini-devel`. The
 
 - **本ソフトウェアのソース:** [MIT](LICENSE)
 - **同梱星カタログ**（`data/stars_wikidata.bin`）: [CC0 1.0](data/LICENSE)（Wikidata 由来）。詳細は [`data/README_stars.md`](data/README_stars.md)
-- **パッケージ SPDX（ソース＋同梱データ）:** `MIT AND CC0-1.0`
+- **パッケージ SPDX（ソース＋同梱データ＋Vosk）:** `MIT AND CC0-1.0 AND CC-BY-SA-3.0-IGO AND Apache-2.0`
 - **第三者成分:** [`THIRD_PARTY.md`](THIRD_PARTY.md)（Qt、FFmpeg、OpenXR、Vulkan、Wayland、XCB、vendored ライブラリ、星データ等）
 - **直接表示の確認:** Wayland client と XCB / XCB RandR は MIT で動的リンクする。リース一覧の定義 [`third_party/wayland/drm-lease-v1.xml`](third_party/wayland/drm-lease-v1.xml) は MIT で同梱し、著作権表示はそのファイルに残す
 
@@ -253,7 +254,7 @@ FFmpeg は動的リンクです。バイナリ配布時はリンク先 FFmpeg �
 
 - **Source of this software:** [MIT](LICENSE)
 - **Bundled star catalog** (`data/stars_wikidata.bin`): [CC0 1.0](data/LICENSE) (from Wikidata). See [`data/README_stars.md`](data/README_stars.md)
-- **Package SPDX (source + bundled data):** `MIT AND CC0-1.0`
+- **Package SPDX (source + bundled data + Vosk):** `MIT AND CC0-1.0 AND CC-BY-SA-3.0-IGO AND Apache-2.0`
 - **Third-party components:** [`THIRD_PARTY.md`](THIRD_PARTY.md) (Qt, FFmpeg, OpenXR, Vulkan, Wayland, XCB, vendored libraries, star data, and similar)
 - **Direct-mode checks:** Wayland client and XCB / XCB RandR are MIT and linked dynamically. The lease-list definition [`third_party/wayland/drm-lease-v1.xml`](third_party/wayland/drm-lease-v1.xml) is bundled under MIT, and its copyright notice stays in that file
 

@@ -205,6 +205,8 @@ class HostWindow : public QMainWindow {
   void hideControlsHelp();
   /** Short HMD toast (Flat scale preset). Safe from the XR thread. */
   void showHudToast(const QString& text, int duration_ms = 2200);
+  /** Live voice overlay (animated mic). Painted as HUD kind 6. */
+  void setLiveVoiceHud(bool on);
   bool hudToastActive() const;
   QString findMonadoBinary() const;
   QString findWivrnBinary() const;
@@ -265,6 +267,11 @@ class HostWindow : public QMainWindow {
   QString hud_toast_;
   std::chrono::steady_clock::time_point hud_toast_until_{};
   std::atomic<bool> hud_toast_active_{false};
+  std::atomic<bool> live_voice_ui_{false};
+  /** Mic RMS 0..1 from VoiceStt (XR thread). */
+  std::atomic<float> live_voice_hud_level_{0.f};
+  /** Display envelope for mic scale (GUI thread; attack fast / release slow). */
+  float live_voice_hud_scale_env_{0.f};
   /** Buttons that dismissed the help card — ignore until released so they do not open menus. */
   bool help_swallow_back_ = false;
   bool help_swallow_confirm_ = false;
@@ -546,6 +553,11 @@ class HostWindow : public QMainWindow {
   /** Chromium --force-device-scale-factor (keep 1 when Virtual is already scaled). */
   float live_chrome_scale_ = 1.f;
   int live_cursor_scale_ = 1;
+  int live_max_fps_ = 60;
+  /** Conf `live_voice` — L3 voice input during browser Live (default on). */
+  bool live_voice_ = true;
+  /** Conf `live_voice_lang` — Vosk code (ja/en/de/fr/es/ko/zh_CN/zh_TW). */
+  QString live_voice_lang_ = QStringLiteral("ja");
   /** Filled with fixed Virtual-monaSphere after Live; not a user setting. */
   QString live_output_;
   /** KDE portal uniqueId ("1920x0") saved with Remember for silent restore. */

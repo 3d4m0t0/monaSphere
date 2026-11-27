@@ -581,8 +581,9 @@ GamepadInput::State GamepadInput::poll() {
   st.back_held = b;
   st.face_x = edge(x, prev_x_);
   st.face_y = edge(y, prev_y_);
-  // R3 alone resets view look.
+  // R3 alone resets view look. L3 opens Live voice input.
   st.view_reset = edge(r3 && !l3, prev_r3_);
+  st.l3 = edge(l3, prev_l3_);
   const auto now = std::chrono::steady_clock::now();
   st.seek_back_held = lb;
   st.seek_forward_held = rb;

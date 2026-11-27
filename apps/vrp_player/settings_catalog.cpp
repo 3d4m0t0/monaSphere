@@ -152,6 +152,11 @@ constexpr const char* kLiveCapture[] = {"monitor", "window", nullptr};
 constexpr const char* kChromeProfile[] = {"default", "isolated", nullptr};
 constexpr const char* kBrowser[] = {"chrome", "chromium", "firefox", nullptr};
 constexpr const char* kFsrScales[] = {"1.2×", "1.5×", "2.0×", nullptr};
+/** Live voice STT language → bundled Vosk small model. */
+/** Matches UI translation locales that have a Vosk small model (zh_* share cn). */
+constexpr const char* kLiveVoiceLang[] = {"ja", "en", "de", "fr", "es", "ko", "zh_CN", "zh_TW",
+                                          nullptr};
+constexpr const char* kLiveMaxFps[] = {"60", "90", nullptr};
 
 }  // namespace
 
@@ -480,6 +485,27 @@ const QVector<Entry>& catalog() {
                  .description = QT_TR_NOOP("Host cursor size multiplier on the virtual display."),
                  .int_lo = 1,
                  .int_hi = 6});
+    e.push_back({.key = "live_voice",
+                 .category = Category::Live,
+                 .kind = ValueKind::Bool01,
+                 .visibility = Visibility::User,
+                 .default_value = "1",
+                 .label = QT_TR_NOOP("Voice input"),
+                 .description = QT_TR_NOOP(
+                     "L3 opens voice input while browser Live is active (search phrases). "
+                     "Confirm types the text and Enter; Back clears, then cancels.")});
+    e.push_back({.key = "live_voice_lang",
+                 .category = Category::Live,
+                 .kind = ValueKind::Enum,
+                 .visibility = Visibility::User,
+                 .default_value = "ja",
+                 .label = QT_TR_NOOP("Voice language"),
+                 .description = QT_TR_NOOP(
+                     "Vosk speech language (ja/en/de/fr/es/ko/zh_CN/zh_TW). "
+                     "Download the matching small model into "
+                     "~/.local/share/monasphere/vosk/ — see third_party/vosk/README.md."),
+                 .enum_values = kLiveVoiceLang,
+                 .enum_ignore_case = true});
     e.push_back({.key = "live_chrome_profile",
                  .category = Category::Live,
                  .kind = ValueKind::Enum,

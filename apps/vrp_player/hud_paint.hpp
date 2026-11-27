@@ -25,6 +25,12 @@ HudPaintResult paint_controls_help(int width = 1280, int height = 720, bool sony
 HudPaintResult paint_hud_toast(const QString& text, int width = 1280, int height = 720);
 
 /**
+ * Live voice HUD: mic only (no transcript — search field gets PartialResult).
+ * `scale` is display size multiplier (level pulse + idle breath), typically 1..~1.25.
+ */
+HudPaintResult paint_live_voice(bool listening, float scale, int width = 1280, int height = 720);
+
+/**
  * Shared 3-dot busy spinner (Live Flat + DLNA / network menu loading).
  * 8 frames cover 120° (next dot lands on previous); loop = smooth spin.
  */

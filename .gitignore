@@ -21,6 +21,9 @@ samples/
 # Compiled shaders
 shaders/*.spv
 
+# Optional Vosk C API header from the same release zip (libvosk.so is tracked).
+third_party/vosk/vosk_api.h
+
 # Not for public tracking
 packaging/README.md
 *.plan.md
