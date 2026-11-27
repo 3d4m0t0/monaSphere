@@ -51,6 +51,19 @@ class EisPointer {
    * Live switch sometimes leaves Meta in a Super-key scaled-desktop state.
    */
   bool key_escape();
+  /** UTF-8 into the focused client (EIS TEXT when available; ASCII keys otherwise). */
+  bool type_text(const std::string& utf8);
+  bool key_enter();
+  /** Backspace `count` times (for live voice field sync). */
+  bool key_backspace(int count = 1);
+  /** Forward Delete (DEL). */
+  bool key_delete(int count = 1);
+  /** Ctrl+A — select all in focused field. */
+  bool key_select_all();
+  /** Ctrl+V — paste (pair with wl-copy / clipboard for non-ASCII). */
+  bool key_paste();
+  /** End — move caret to end (collapse selection after voice type). */
+  bool key_end();
   /**
    * When false, motion still works but button/scroll are no-ops.
    * GNOME: keep false until portal grant dialogs are off Meta-* — pad click
@@ -88,12 +101,15 @@ class EisPointer {
   void* ei_ = nullptr;      // struct ei*
   void* device_ = nullptr;  // struct ei_device* (ref'd) — absolute pointer
   void* keyboard_ = nullptr;  // struct ei_device* (ref'd) — may equal device_
+  void* text_dev_ = nullptr;  // struct ei_device* (ref'd) — EI_DEVICE_CAP_TEXT when present
   int pending_fd_ = -1;     // only if setup not yet taken ownership
   uint32_t emu_seq_ = 1;
   bool emulating_ = false;
   bool kbd_emulating_ = false;
+  bool text_emulating_ = false;
   bool resumed_ = false;
   bool kbd_resumed_ = false;
+  bool text_resumed_ = false;
   std::atomic<bool> ready_{false};
   std::atomic<bool> region_local_{false};
   std::atomic<bool> buttons_enabled_{true};

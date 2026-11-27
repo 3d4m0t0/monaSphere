@@ -108,6 +108,19 @@ class ChromiumYtX11 {
 
   /** Browser Back (Alt+Left). */
   bool key_back();
+  /** Type UTF-8 at the focused field (EIS TEXT / ASCII keys / X11 clipboard+Ctrl+V). */
+  bool type_text(const std::string& utf8);
+  bool key_enter();
+  /** Backspace `count` times (EIS / XTest) — live voice search-field sync. */
+  bool key_backspace(int count = 1);
+  /** Forward Delete / DEL (EIS / XTest). */
+  bool key_delete(int count = 1);
+  /** Ctrl+A (EIS / XTest) — select all in focused field. */
+  bool key_select_all();
+  /** Ctrl+V (EIS / XTest) — paste after clipboard/wl-copy. */
+  bool key_paste();
+  /** End (EIS / XTest) — caret to end / collapse selection. */
+  bool key_end();
 
   /** Ask the app window to close (WM_DELETE_WINDOW) — safe with a shared Chrome. */
   bool close_window();
@@ -129,6 +142,9 @@ class ChromiumYtX11 {
 
   /** Re-bind Chrome window if the previous xid died (shared profile / Wayland). */
   bool ensure_inject_target();
+
+  /** Raise + focus the X11/XWayland Chrome window (useful on KDE X11 Chrome + EIS). */
+  bool activate_x11_window();
 
   /**
    * GNOME Meta-*: RecordVirtual SHM stays black until the stage gets damage.

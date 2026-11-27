@@ -2439,9 +2439,10 @@ void HostWindow::ensureLiveChromeWarm() {
   vrp::ChromiumYtLauncher warm;
   warm.set_browser(vrp::LiveBrowser::Chrome);
   warm.set_use_default_profile(use_default);
-  // KDE: Wayland follows output scale (force_x11 only via MONASPHERE_YT_X11).
-  warm.set_force_x11(false);
-  const bool ozone_x11 = !qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11");
+  // Use X11 ozone on KDE too: avoids Chromium Wayland's stuck "Press Esc to exit
+  // full screen" banner on video fullscreen (and matches GNOME X11 Chrome).
+  warm.set_force_x11(true);
+  const bool ozone_x11 = true;
   float chrome_dsf = live_chrome_scale_;
   if (ozone_x11 && live_virtual_ && live_virtual_scale_ > 1.01f &&
       std::abs(live_chrome_scale_ - 1.f) < 0.05f) {
@@ -2722,8 +2723,9 @@ void HostWindow::ensureYouTubeSession() {
       QTimer::singleShot(3500, this, [this, span] {
         if (yt_setup_phase_ != YtSetupPhase::Refresh) return;
         // Silent restore while still in setup — proves token works before HMD use.
+        // Do not call ensureLiveChromeWarm() right before launch: warm Chrome holds
+        // SingletonLock while still booting and causes the --app launch to drop.
         yt_hmd_suppress_live_.store(true, std::memory_order_release);
-        ensureLiveChromeWarm();
         beginYouTubeCapture(/*host_setup=*/false, /*url_override=*/{}, /*desktop_exec=*/{},
                             /*desktop_args=*/{}, span);
       });
@@ -2733,7 +2735,6 @@ void HostWindow::ensureYouTubeSession() {
       yt_setup_continue_ = false;
       QTimer::singleShot(3500, this, [this] {
         if (yt_setup_queue_.isEmpty()) return;
-        ensureLiveChromeWarm();
         beginNextSetupSpan(/*first=*/false);
       });
       return;
@@ -2872,6 +2873,15 @@ void HostWindow::maybeOfferLiveSetupAtStartup() {
 }
 
 void HostWindow::setupYouTubeCapture() {
+  if (vrp::detect_desktop_env() == vrp::DesktopEnv::Gnome &&
+      vrp::GnomeVirtualDisplay::managedVirtualAvailable()) {
+    appendLog(tr("Live setup: not required on GNOME (Mutter virtual display needs no token)"));
+    QMessageBox::information(
+        this, tr("Live capture setup"),
+        tr("Live capture setup is not required on GNOME.\n\n"
+           "Start Live directly from the HMD menu."));
+    return;
+  }
   // Host Tools: one interactive Remember for Virtual-monaSphere at x1 size, then
   // silent restore verify. x2/x3 later reuse the same name/token (resolution only).
   reloadLiveCaptureConf();
@@ -7558,7 +7568,8 @@ void HostWindow::xrThreadMain() {
                   this,
                   [this] {
                     QString err;
-                    (void)vrp::KwinWindowPlacer::activate_youtube_window({}, &err);
+                    (void)vrp::KwinWindowPlacer::activate_youtube_window(
+                        {}, &err, /*force_compositor_fullscreen=*/true);
                     if (yt_session_) (void)yt_session_->x11().ensure_inject_target();
                   },
                   Qt::QueuedConnection);

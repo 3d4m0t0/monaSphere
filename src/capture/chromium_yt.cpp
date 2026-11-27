@@ -213,6 +213,23 @@ void applyChromeOzoneEnv(QProcessEnvironment& env, bool force_x11) {
   env.remove(QStringLiteral("WAYLAND_SOCKET"));
 }
 
+/** Wayland Ozone + Vulkan aborts the GPU process; warm Chrome then dies → Live cold-start. */
+void appendChromeWaylandGpuArgs(QStringList& args) {
+  args << QStringLiteral("--ozone-platform=wayland");
+  args << QStringLiteral("--disable-vulkan");
+  args << QStringLiteral("--disable-features=TranslateUI,ChromeWhatsNewUI,Vulkan,"
+                         "DefaultANGLEVulkan,VulkanFromANGLE,VulkanShaderCompiler");
+  args << QStringLiteral("--use-angle=gl-egl");
+  args << QStringLiteral("--use-gl=angle");
+}
+
+/** Kill AppImage-relative Vulkan ICD probes (Dawn "Found no drivers!") when APPDIR leaked. */
+void hardenChromeGpuEnv(QProcessEnvironment& env) {
+  // Empty ICD list → Vulkan init fails closed; ANGLE/GL path stays up.
+  env.insert(QStringLiteral("VK_ICD_FILENAMES"), QStringLiteral("/dev/null"));
+  env.insert(QStringLiteral("VK_DRIVER_FILES"), QStringLiteral("/dev/null"));
+}
+
 bool chromeCmdlineIsMonasphereOwned(const QString& cmd) {
   // Isolated Live/warm profile, or our warm/Live WM_CLASS in argv.
   if (cmd.contains(QLatin1String("monasphere/chromium-yt"))) return true;
@@ -413,7 +430,6 @@ bool ChromiumYtLauncher::start() {
     args << QStringLiteral("--name=monaSphereYT");
     args << QStringLiteral("--no-first-run");
     args << QStringLiteral("--no-default-browser-check");
-    args << QStringLiteral("--disable-features=TranslateUI,ChromeWhatsNewUI");
     // Passing --force-device-scale-factor=1 on Wayland overrides the output's 200%
     // with 100%; passing virtual_scale on top of output scale doubles it (~400%).
     // follow_output_scale_: omit the flag so DE scale is the single source of truth.
@@ -436,9 +452,12 @@ bool ChromiumYtLauncher::start() {
     if (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
       if (force_x11_ || !qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11")) {
         args << QStringLiteral("--ozone-platform=x11");
+        args << QStringLiteral("--disable-features=TranslateUI,ChromeWhatsNewUI");
       } else {
-        args << QStringLiteral("--ozone-platform=wayland");
+        appendChromeWaylandGpuArgs(args);
       }
+    } else {
+      args << QStringLiteral("--disable-features=TranslateUI,ChromeWhatsNewUI");
     }
     // Shared singleton / warm / already-running: force a new app window.
     if (shared_session_ || already_running) {
@@ -464,6 +483,10 @@ bool ChromiumYtLauncher::start() {
     // Wayland session Chrome is already running. Prefer X11 so Meta place +
     // WM_CLASS are visible to our XQueryTree walker (Wayland surfaces are not).
     applyChromeOzoneEnv(env, force_x11_);
+    if (!force_x11_ && qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11") &&
+        !qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
+      hardenChromeGpuEnv(env);
+    }
   }
   if (route_audio_to_yt_sink_) {
     // Only when Flat live monitor owns the null sink (enable_audio).
@@ -605,7 +628,6 @@ bool ChromiumYtLauncher::ensureWarm() {
   args << QStringLiteral("--name=monaSphereYTWarm");
   args << QStringLiteral("--no-first-run");
   args << QStringLiteral("--no-default-browser-check");
-  args << QStringLiteral("--disable-features=TranslateUI,ChromeWhatsNewUI");
   if (!follow_output_scale_) {
     args << QStringLiteral("--force-device-scale-factor=%1")
                 .arg(QString::number(static_cast<double>(scale), 'f', 2));
@@ -613,17 +635,24 @@ bool ChromiumYtLauncher::ensureWarm() {
   if (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
     if (force_x11_ || !qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11")) {
       args << QStringLiteral("--ozone-platform=x11");
+      args << QStringLiteral("--disable-features=TranslateUI,ChromeWhatsNewUI");
     } else {
-      args << QStringLiteral("--ozone-platform=wayland");
+      appendChromeWaylandGpuArgs(args);
     }
+  } else {
+    args << QStringLiteral("--disable-features=TranslateUI,ChromeWhatsNewUI");
   }
   // Keep the process alive with no visible window. --app=about:blank +
   // --start-minimized still maps a large host window on GNOME (seen as
   // google-chrome/monaSphereYTWarm Viewable). Live then --new-window --app=URL.
   args << QStringLiteral("--no-startup-window");
 
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  QProcessEnvironment env = host_tool_environment();
   applyChromeOzoneEnv(env, force_x11_);
+  if (!force_x11_ && qEnvironmentVariableIsEmpty("MONASPHERE_YT_X11") &&
+      !qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
+    hardenChromeGpuEnv(env);
+  }
   // Manual pre-open has no yt sink; Live moves streams after Soft starts.
   env.remove(QStringLiteral("PULSE_SINK"));
   env.remove(QStringLiteral("PIPEWIRE_NODE"));

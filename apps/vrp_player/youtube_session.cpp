@@ -544,9 +544,33 @@ void YouTubeSession::closeLiveBrowserWindow() {
     }
   }
   if (!closed && x11_.have_window()) closed = x11_.close_window();
-  // clear() drops the EIS inject pointer — keep ScreenCast EIS across Chrome relaunch.
-  x11_.clear();
-  if (EisPointer* eis = activeEis()) x11_.set_eis_inject(eis);
+  if (desk_ == DesktopEnv::Kde && kde_eis_ && kde_eis_->ready()) {
+    // Park seat cursor back on primary before closing Chrome, and disconnect KWin
+    // EIS so the new Chrome places + paints before EIS reconnects and enters
+    // Virtual-monaSphere from primary (matching 1st-Live startup exactly).
+    double px = 200.0, py = 200.0;
+    if (have_saved_cursor_) {
+      px = saved_cursor_x_;
+      py = saved_cursor_y_;
+    } else if (QScreen* primary = QGuiApplication::primaryScreen()) {
+      const QPoint c = primary->availableGeometry().center();
+      px = c.x();
+      py = c.y();
+    }
+    const QRect virt(place_x_, place_y_, std::max(1, place_w_), std::max(1, place_h_));
+    if (virt.adjusted(-16, -16, 16, 16).contains(QPoint(static_cast<int>(px + 0.5),
+                                                        static_cast<int>(py + 0.5)))) {
+      px = 200.0;
+      py = 200.0;
+    }
+    kde_eis_->core().warp_desktop(px, py);
+    x11_.clear();
+    kde_eis_->stop();
+  } else {
+    // clear() drops the EIS inject pointer — keep ScreenCast EIS across Chrome relaunch.
+    x11_.clear();
+    if (EisPointer* eis = activeEis()) x11_.set_eis_inject(eis);
+  }
   kwin_window_id_.clear();
   chrome_ids_before_.clear();
   if (chrome_) chrome_->stop();
@@ -850,7 +874,8 @@ void YouTubeSession::start(const Config& cfg) {
     return;
   }
 
-  chrome_->set_force_x11(desk_ == DesktopEnv::Gnome);
+  // Use X11 ozone on both GNOME and KDE (avoids Wayland Vulkan/fullscreen-banner issues).
+  chrome_->set_force_x11(true);
   configureLiveBrowserLaunch();
   if (desk_ == DesktopEnv::Gnome) {
     bind_x11_output();
@@ -948,12 +973,12 @@ void YouTubeSession::configureLiveBrowserLaunch() {
                         .arg(QString::number(static_cast<double>(cfg_.virtual_scale), 'f', 2))
                         .arg(QString::number(static_cast<double>(cfg_.chrome_scale), 'f', 2)));
   }
-  // KDE Virtual: do not --start-fullscreen (warm/--new-window can FS on primary
-  // before KWin place). Minimize on map; placeOnOutput + activate apply FS on Virtual.
+  // Borderless maximized on Virtual (KWin placement, force_fs=false) plus Chrome's
+  // --start-fullscreen flag (Firefox excluded).
   const bool kde_virt = cfg_.virtual_display && desk_ == DesktopEnv::Kde &&
                         cfg_.browser != LiveBrowser::Firefox;
-  chrome_->set_start_fullscreen(cfg_.browser != LiveBrowser::Firefox && !kde_virt);
-  chrome_->set_start_minimized(kde_virt);
+  chrome_->set_start_fullscreen(cfg_.browser != LiveBrowser::Firefox);
+  chrome_->set_start_minimized(false);
   if (cfg_.browser == LiveBrowser::Firefox) {
     emit logMessage(tr("Firefox Live: --new-instance + XWayland; maximize (no compositor FS)"));
   }
@@ -1401,8 +1426,10 @@ void YouTubeSession::pollPlace() {
   }
 
   // X11 tree walk + Xrandr: first tick and every 3rd — KWin script is the fast path.
+  // Skip pre-place prepare_window during KDE in-place switch (touching an unmapped
+  // Chrome window on primary can race KWin placement).
   const bool x11_tick = (place_tries_ == 0 || (place_tries_ % 3) == 0);
-  if (x11_tick) {
+  if (x11_tick && !(desk_ == DesktopEnv::Kde && (switch_hold_content_ || activeEis()))) {
     (void)x11_.prepare_window(place_w_, place_h_, /*hide_host=*/false, /*move=*/false);
     if (!x11_.bind_output_by_name(output_name_.toStdString(), place_w_, place_h_)) {
       x11_.set_screen_rect(place_x_, place_y_, place_w_, place_h_);
@@ -1675,15 +1702,33 @@ void YouTubeSession::onPlaced() {
   auto activate_kde = [this] {
     if (desk_ != DesktopEnv::Kde) return;
     QString act_err;
-    const bool force_fs = cfg_.browser != LiveBrowser::Firefox;
+    const bool force_fs = desktopAppMode() || (cfg_.browser != LiveBrowser::Firefox);
     if (KwinWindowPlacer::activate_youtube_window(kwin_window_id_, &act_err, force_fs)) {
       emit logMessage(tr("KWin: activated live browser for pointer input"));
+    }
+    if (chrome_ && chrome_->force_x11()) {
+      (void)x11_.activate_x11_window();
+    }
+  };
+  auto schedule_kde_focus_settle = [this] {
+    if (desk_ != DesktopEnv::Kde) return;
+    const int gen = switch_reveal_gen_;
+    for (int delay_ms : {350, 900}) {
+      QTimer::singleShot(delay_ms, this, [this, gen] {
+        if (gen != switch_reveal_gen_ || !active_.load(std::memory_order_acquire)) return;
+        QString err;
+        const bool force_fs = desktopAppMode() || (cfg_.browser != LiveBrowser::Firefox);
+        (void)KwinWindowPlacer::activate_youtube_window(kwin_window_id_, &err, force_fs);
+        if (chrome_ && chrome_->force_x11()) {
+          (void)x11_.activate_x11_window();
+        }
+        x11_.set_cursor(place_w_ * 0.5f, place_h_ * 0.5f);
+      });
     }
   };
 
   // Capture already streaming (GNOME Meta first place, or Live↔Live Chrome switch).
   if (active_.load(std::memory_order_acquire)) {
-    activate_kde();
     setState(State::Streaming);
     if (switch_hold_content_) {
       // Keep switch_freeze (drain wallpaper, spinner covers) until Chrome has time to
@@ -1695,14 +1740,27 @@ void YouTubeSession::onPlaced() {
       const int gen = ++switch_reveal_gen_;
       constexpr int kPaintSettleMs = 550;
       emit logMessage(tr("Live: Chrome placed — waiting %1ms for paint").arg(kPaintSettleMs));
-      QTimer::singleShot(kPaintSettleMs, this, [this, gen] {
+      QTimer::singleShot(kPaintSettleMs, this, [this, gen, activate_kde, schedule_kde_focus_settle] {
         if (gen != switch_reveal_gen_ || !switch_hold_content_) return;
+        // KDE in-place switch: reconnect KWin EIS right as Chrome finishes painting,
+        // then activate and warp cursor from primary into Virtual-monaSphere
+        // (same ~700ms post-place timing and cross-output enter as 1st Live).
+        if (desk_ == DesktopEnv::Kde && kde_eis_) {
+          x11_.set_eis_inject(nullptr);
+          if (kde_eis_->start(output_name_.toStdString())) {
+            x11_.set_eis_inject(&kde_eis_->core());
+          }
+          activate_kde();
+          x11_.set_cursor(place_w_ * 0.5f, place_h_ * 0.5f);
+          schedule_kde_focus_settle();
+        }
         pending_switch_reveal_ = true;
         switch_reveal_seen_ = 0;
         emit logMessage(tr("Live: revealing stream"));
       });
       return;
     }
+    activate_kde();
     if (using_mutter_virtual_) {
       // First GNOME place: reveal when a frame arrives (same gate as KDE switch).
       gnome_live_ready_ = true;
@@ -1725,11 +1783,13 @@ QString YouTubeSession::portalParentWindow() const {
   host->winId();
   const QString plat = QGuiApplication::platformName();
   if (plat == QLatin1String("xcb")) {
+    // xdg-desktop-portal: "x11:<xid>" (decimal is accepted by KDE/GNOME portals).
     return QStringLiteral("x11:") + QString::number(static_cast<qulonglong>(host->winId()));
   }
-  if (plat.contains(QLatin1String("wayland"))) {
-    return QStringLiteral("wayland:") + QString::number(static_cast<qulonglong>(host->winId()));
-  }
+  // Wayland: Qt winId() is not the portal "wayland:<handle>" export. Passing a
+  // fake handle makes some portals (esp. from AppImage + bundled Qt) skip or
+  // hide the grant dialog. Empty parent → dialog still shows unattached.
+  if (plat.contains(QLatin1String("wayland"))) return {};
   return {};
 }
 
@@ -1930,18 +1990,15 @@ void YouTubeSession::beginPortal(bool after_reject) {
           wh->requestActivate();
         }
       }
-      host->winId();
-      const QString plat = QGuiApplication::platformName();
-      if (plat == QLatin1String("xcb")) {
-        parent = QStringLiteral("x11:") + QString::number(static_cast<qulonglong>(host->winId()));
-      } else if (plat.contains(QLatin1String("wayland"))) {
-        parent = QStringLiteral("wayland:") + QString::number(static_cast<qulonglong>(host->winId()));
-        emit logMessage(tr("ScreenCast: Wayland parent — gnome-shell grant UI may still "
-                           "open on Meta-* (X11 evacuate cannot move it)"));
-      } else {
+      parent = portalParentWindow();
+      if (parent.isEmpty() &&
+          QGuiApplication::platformName().contains(QLatin1String("wayland"))) {
+        emit logMessage(tr("ScreenCast: Wayland — grant dialog without window parent "
+                           "(Qt winId is not a portal wayland handle)"));
+      } else if (parent.isEmpty()) {
         emit logMessage(tr("ScreenCast: parent window unavailable on platform “%1” "
                            "(dialog may appear without parenting)")
-                            .arg(plat));
+                            .arg(QGuiApplication::platformName()));
       }
     }
     // GNOME Meta: VirtualDisplayManager::ensureGnomeMeta already started Mutter.
@@ -2114,13 +2171,13 @@ void YouTubeSession::launchBrowserAfterGnomeVirtual(int prefer_w, int prefer_h) 
                       .arg(place_x_)
                       .arg(place_y_));
 
-  // Platform Meta: Wayland Chrome follows the seat monitor. X11 ozone often
-  // gets an xid on Meta CRTC that never composites into RecordVirtual.
-  const bool wayland_chrome = using_mutter_virtual_;
-  chrome_->set_force_x11(!wayland_chrome);
+  // Platform Meta: Chrome 158+ Wayland hits Vulkan init failure and blacks out on
+  // Meta-*; force X11 ozone (XWayland) so pollPlaceGnome binds + fullscreens on Meta.
+  const bool wayland_chrome = false;
+  chrome_->set_force_x11(true);
   configureLiveBrowserLaunch();
   chrome_->set_start_minimized(false);
-  chrome_->set_start_fullscreen(wayland_chrome);
+  chrome_->set_start_fullscreen(using_mutter_virtual_);
 
   (void)x11_.bind_output_by_name("Meta", place_w_, place_h_);
   x11_.set_eis_origin(place_x_, place_y_);
@@ -2427,16 +2484,25 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
   // Keep beginPortal snapshot; only fill in if that failed.
   if (eis_ok) rememberSeatCursor();
 
-  // Re-focus once the event loop turns (ScreenCast just stole activation).
-  QTimer::singleShot(0, this, [this] {
-    if (!active_.load()) return;
-    if (desk_ == DesktopEnv::Kde) {
-      QString err;
-      (void)KwinWindowPlacer::activate_youtube_window(kwin_window_id_, &err);
-    }
-    (void)x11_.ensure_inject_target();
-    x11_.set_cursor(place_w_ * 0.5f, place_h_ * 0.5f);
-  });
+  // Re-focus once the event loop turns (ScreenCast just stole activation), and
+  // again after XWayland Chrome settles on Virtual-monaSphere so hover/clicks bind.
+  const int focus_gen = switch_reveal_gen_;
+  for (int delay_ms : {0, 350, 900}) {
+    QTimer::singleShot(delay_ms, this, [this, focus_gen, delay_ms] {
+      if (focus_gen != switch_reveal_gen_ || !active_.load(std::memory_order_acquire)) return;
+      if (desk_ == DesktopEnv::Kde) {
+        QString err;
+        const bool force_fs = desktopAppMode() || (cfg_.browser != LiveBrowser::Firefox);
+        (void)KwinWindowPlacer::activate_youtube_window(
+            kwin_window_id_, &err, /*force_compositor_fullscreen=*/force_fs);
+        if (chrome_ && chrome_->force_x11()) {
+          (void)x11_.activate_x11_window();
+        }
+      }
+      if (delay_ms == 0) (void)x11_.ensure_inject_target();
+      x11_.set_cursor(place_w_ * 0.5f, place_h_ * 0.5f);
+    });
+  }
   emit streamingStarted();
   emit logMessage(tr("Live source active (node %1)").arg(r.node_id));
 

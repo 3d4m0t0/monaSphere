@@ -11,6 +11,11 @@
 #include <cstring>
 #include <thread>
 
+// Ubuntu 24.04 libei lacks TEXT; vendored headers still declare it. Weak so
+// AppImage links against the older .so and falls back to ASCII keys.
+extern "C" __attribute__((weak)) void ei_device_text_utf8(struct ei_device* device,
+                                                          const char* utf8);
+
 namespace vrp {
 
 EisPointer::~EisPointer() { stop(); }
@@ -37,6 +42,16 @@ void EisPointer::teardown_unlocked() {
     ei_device_stop_emulating(static_cast<struct ei_device*>(keyboard_));
     kbd_emulating_ = false;
   }
+  if (text_dev_ && text_emulating_) {
+    ei_device_stop_emulating(static_cast<struct ei_device*>(text_dev_));
+    text_emulating_ = false;
+  }
+  if (text_dev_ && text_dev_ != keyboard_ && text_dev_ != device_) {
+    ei_device_unref(static_cast<struct ei_device*>(text_dev_));
+  }
+  text_dev_ = nullptr;
+  text_resumed_ = false;
+  text_emulating_ = false;
   if (keyboard_) {
     ei_device_unref(static_cast<struct ei_device*>(keyboard_));
     keyboard_ = nullptr;
@@ -195,6 +210,12 @@ void EisPointer::pump() {
     if (t == EI_EVENT_DISCONNECT) {
       VRP_LOG("eis-pointer: disconnected by EIS");
       ready_.store(false, std::memory_order_release);
+      if (text_dev_ && text_dev_ != keyboard_ && text_dev_ != device_) {
+        ei_device_unref(static_cast<struct ei_device*>(text_dev_));
+      }
+      text_dev_ = nullptr;
+      text_resumed_ = false;
+      text_emulating_ = false;
       if (keyboard_ && keyboard_ != device_) {
         ei_device_unref(static_cast<struct ei_device*>(keyboard_));
       }
@@ -235,6 +256,14 @@ void EisPointer::pump() {
         kbd_resumed_ = false;
         kbd_emulating_ = false;
       }
+      if (ei_device_has_capability(dev, EI_DEVICE_CAP_TEXT)) {
+        if (text_dev_ && text_dev_ != keyboard_ && text_dev_ != device_) {
+          ei_device_unref(static_cast<struct ei_device*>(text_dev_));
+        }
+        text_dev_ = ei_device_ref(dev);
+        text_resumed_ = false;
+        text_emulating_ = false;
+      }
     } else if (t == EI_EVENT_DEVICE_RESUMED) {
       struct ei_device* dev = ei_event_get_device(ev);
       if (!device_ && ei_device_has_capability(dev, EI_DEVICE_CAP_POINTER_ABSOLUTE)) {
@@ -244,8 +273,12 @@ void EisPointer::pump() {
       if (!keyboard_ && ei_device_has_capability(dev, EI_DEVICE_CAP_KEYBOARD)) {
         keyboard_ = ei_device_ref(dev);
       }
+      if (!text_dev_ && ei_device_has_capability(dev, EI_DEVICE_CAP_TEXT)) {
+        text_dev_ = ei_device_ref(dev);
+      }
       if (device_ && dev == device_) resumed_ = true;
       if (keyboard_ && dev == keyboard_) kbd_resumed_ = true;
+      if (text_dev_ && dev == text_dev_) text_resumed_ = true;
     } else if (t == EI_EVENT_DEVICE_PAUSED) {
       struct ei_device* dev = ei_event_get_device(ev);
       if (dev == device_) {
@@ -256,8 +289,20 @@ void EisPointer::pump() {
         kbd_resumed_ = false;
         kbd_emulating_ = false;
       }
+      if (dev == text_dev_) {
+        text_resumed_ = false;
+        text_emulating_ = false;
+      }
     } else if (t == EI_EVENT_DEVICE_REMOVED) {
       struct ei_device* dev = ei_event_get_device(ev);
+      if (dev == text_dev_) {
+        if (text_dev_ != keyboard_ && text_dev_ != device_) {
+          ei_device_unref(static_cast<struct ei_device*>(text_dev_));
+        }
+        text_dev_ = nullptr;
+        text_resumed_ = false;
+        text_emulating_ = false;
+      }
       if (dev == keyboard_) {
         ei_device_unref(static_cast<struct ei_device*>(keyboard_));
         keyboard_ = nullptr;
@@ -326,6 +371,164 @@ bool EisPointer::key_escape() {
   ei_device_frame(kbd, ei_now(ei));
   ei_device_keyboard_key(kbd, KEY_ESC, false);
   ei_device_frame(kbd, ei_now(ei));
+  pump();
+  return true;
+}
+
+bool EisPointer::key_enter() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  ei_device_keyboard_key(kbd, KEY_ENTER, true);
+  ei_device_frame(kbd, ei_now(ei));
+  ei_device_keyboard_key(kbd, KEY_ENTER, false);
+  ei_device_frame(kbd, ei_now(ei));
+  pump();
+  return true;
+}
+
+bool EisPointer::key_backspace(int count) {
+  if (count <= 0) return true;
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  for (int i = 0; i < count; ++i) {
+    ei_device_keyboard_key(kbd, KEY_BACKSPACE, true);
+    ei_device_frame(kbd, ei_now(ei));
+    ei_device_keyboard_key(kbd, KEY_BACKSPACE, false);
+    ei_device_frame(kbd, ei_now(ei));
+  }
+  pump();
+  return true;
+}
+
+bool EisPointer::key_delete(int count) {
+  if (count <= 0) return true;
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  for (int i = 0; i < count; ++i) {
+    ei_device_keyboard_key(kbd, KEY_DELETE, true);
+    ei_device_frame(kbd, ei_now(ei));
+    ei_device_keyboard_key(kbd, KEY_DELETE, false);
+    ei_device_frame(kbd, ei_now(ei));
+  }
+  pump();
+  return true;
+}
+
+bool EisPointer::key_select_all() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  ei_device_keyboard_key(kbd, KEY_LEFTCTRL, true);
+  ei_device_keyboard_key(kbd, KEY_A, true);
+  ei_device_frame(kbd, ei_now(ei));
+  ei_device_keyboard_key(kbd, KEY_A, false);
+  ei_device_keyboard_key(kbd, KEY_LEFTCTRL, false);
+  ei_device_frame(kbd, ei_now(ei));
+  pump();
+  return true;
+}
+
+bool EisPointer::key_paste() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  ei_device_keyboard_key(kbd, KEY_LEFTCTRL, true);
+  ei_device_keyboard_key(kbd, KEY_V, true);
+  ei_device_frame(kbd, ei_now(ei));
+  ei_device_keyboard_key(kbd, KEY_V, false);
+  ei_device_keyboard_key(kbd, KEY_LEFTCTRL, false);
+  ei_device_frame(kbd, ei_now(ei));
+  pump();
+  return true;
+}
+
+bool EisPointer::key_end() {
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_ || !ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  ei_device_keyboard_key(kbd, KEY_END, true);
+  ei_device_frame(kbd, ei_now(ei));
+  ei_device_keyboard_key(kbd, KEY_END, false);
+  ei_device_frame(kbd, ei_now(ei));
+  pump();
+  return true;
+}
+
+bool EisPointer::type_text(const std::string& utf8) {
+  if (utf8.empty()) return true;
+  std::lock_guard<std::mutex> lock(mu_);
+  if (!ei_) return false;
+  pump();
+  // Prefer TEXT capability (UTF-8 / Japanese) when libei provides it.
+  if (text_dev_ && text_resumed_ && ei_device_text_utf8) {
+    auto* ei = static_cast<struct ei*>(ei_);
+    auto* td = static_cast<struct ei_device*>(text_dev_);
+    if (!text_emulating_) {
+      if (td == keyboard_ && kbd_emulating_) {
+        text_emulating_ = true;
+      } else if (td == device_ && emulating_) {
+        text_emulating_ = true;
+      } else {
+        ei_device_start_emulating(td, emu_seq_++);
+        text_emulating_ = true;
+        if (td == keyboard_) kbd_emulating_ = true;
+        if (td == device_) emulating_ = true;
+      }
+    }
+    ei_device_text_utf8(td, utf8.c_str());
+    ei_device_frame(td, ei_now(ei));
+    pump();
+    return true;
+  }
+  // ASCII-only keyboard fallback (Latin search phrases).
+  if (!ensure_keyboard()) return false;
+  auto* ei = static_cast<struct ei*>(ei_);
+  auto* kbd = static_cast<struct ei_device*>(keyboard_);
+  auto tap = [&](uint32_t code, bool shift) {
+    if (shift) ei_device_keyboard_key(kbd, KEY_LEFTSHIFT, true);
+    ei_device_keyboard_key(kbd, code, true);
+    ei_device_frame(kbd, ei_now(ei));
+    ei_device_keyboard_key(kbd, code, false);
+    if (shift) ei_device_keyboard_key(kbd, KEY_LEFTSHIFT, false);
+    ei_device_frame(kbd, ei_now(ei));
+  };
+  for (unsigned char ch : utf8) {
+    if (ch >= 128) return false;  // need TEXT for non-ASCII
+    uint32_t code = 0;
+    bool shift = false;
+    if (ch >= 'a' && ch <= 'z') {
+      code = KEY_A + (ch - 'a');
+    } else if (ch >= 'A' && ch <= 'Z') {
+      code = KEY_A + (ch - 'A');
+      shift = true;
+    } else if (ch >= '1' && ch <= '9') {
+      code = KEY_1 + (ch - '1');
+    } else if (ch == '0') {
+      code = KEY_0;
+    } else if (ch == ' ') {
+      code = KEY_SPACE;
+    } else if (ch == '-') {
+      code = KEY_MINUS;
+    } else if (ch == '.') {
+      code = KEY_DOT;
+    } else if (ch == ',') {
+      code = KEY_COMMA;
+    } else if (ch == '/') {
+      code = KEY_SLASH;
+    } else {
+      continue;
+    }
+    tap(code, shift);
+  }
   pump();
   return true;
 }

@@ -10,7 +10,11 @@
 #include <X11/extensions/XTest.h>
 #include <X11/extensions/Xrandr.h>
 
+#include <QProcess>
+#include <QStandardPaths>
+
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -21,6 +25,28 @@
 
 namespace vrp {
 namespace {
+
+/** Install a permanent process-wide non-fatal X11 error handler once.
+ *  Restoring _XDefaultError across threads (UI pollPlaceGnome vs XR input) raced
+ *  and let transient BadWindow in XQueryTree call exit() -> SEGV. */
+void install_nonfatal_x11_error_handler() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    XSetErrorHandler([](Display*, XErrorEvent*) -> int { return 0; });
+  });
+}
+
+struct ScopedXErrorTrap {
+  Display* dpy;
+  explicit ScopedXErrorTrap(Display* d) : dpy(d) {
+    install_nonfatal_x11_error_handler();
+  }
+  ~ScopedXErrorTrap() {
+    if (dpy) XSync(dpy, False);
+  }
+  ScopedXErrorTrap(const ScopedXErrorTrap&) = delete;
+  ScopedXErrorTrap& operator=(const ScopedXErrorTrap&) = delete;
+};
 
 constexpr const char* kClass = "monaSphereYT";
 
@@ -227,10 +253,9 @@ void ChromiumYtX11::destroy_damage_window() {
     return;
   }
   auto* dpy = static_cast<Display*>(display_);
-  XErrorHandler prev = XSetErrorHandler([](Display*, XErrorEvent*) -> int { return 0; });
+  install_nonfatal_x11_error_handler();
   XDestroyWindow(dpy, damage_window_);
   XFlush(dpy);
-  XSetErrorHandler(prev);
   damage_window_ = 0;
 }
 
@@ -238,10 +263,9 @@ void ChromiumYtX11::clear() {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (display_ && damage_window_) {
     auto* dpy = static_cast<Display*>(display_);
-    XErrorHandler prev = XSetErrorHandler([](Display*, XErrorEvent*) -> int { return 0; });
+    install_nonfatal_x11_error_handler();
     XDestroyWindow(dpy, damage_window_);
     XFlush(dpy);
-    XSetErrorHandler(prev);
     damage_window_ = 0;
   }
   damage_crtc_w_ = damage_crtc_h_ = 0;
@@ -259,6 +283,7 @@ bool ChromiumYtX11::force_output_damage(bool quiet) {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!ensure_display() || !have_place_) return false;
   auto* dpy = static_cast<Display*>(display_);
+  ScopedXErrorTrap trap(dpy);
   Window root = DefaultRootWindow(dpy);
 
   int ox = place_x_;
@@ -280,19 +305,17 @@ bool ChromiumYtX11::force_output_damage(bool quiet) {
   // Expose the Meta rectangle on the shared root — prompts a stage redraw.
   XClearArea(dpy, root, ox, oy, static_cast<unsigned>(ow), static_cast<unsigned>(oh), True);
 
-  // 3×3 in the corner with a cycling solid color. A static 1×1 at center did not
-  // change content_fp, so RecordVirtual kept republishing the same SHM pool
-  // (~2.5s holds). Corner speck is negligible in HMD; unique pixels matter.
+  // 1×1 in the top-left corner alternating near-black (#010101 / #020202) so
+  // RecordVirtual keeps advancing frames without a bright colored dot in HMD.
   ++damage_tick_;
-  const unsigned r = (damage_tick_ * 37u) & 255u;
-  const unsigned g = (damage_tick_ * 91u) & 255u;
-  const unsigned b = (damage_tick_ * 17u) & 255u;
+  const unsigned c = (damage_tick_ & 1u) ? 2u : 1u;
+  const unsigned r = c, g = c, b = c;
   const unsigned long pixel =
       (static_cast<unsigned long>(r) << 16) | (static_cast<unsigned long>(g) << 8) | b;
-  const int dx = ox + 2;
-  const int dy = oy + 2;
-  constexpr unsigned kDw = 3;
-  constexpr unsigned kDh = 3;
+  const int dx = ox;
+  const int dy = oy;
+  constexpr unsigned kDw = 1;
+  constexpr unsigned kDh = 1;
 
   if (!damage_window_) {
     XSetWindowAttributes swa{};
@@ -420,6 +443,7 @@ bool ChromiumYtX11::bind_output_by_name(const std::string& output_name_substr, i
 
 bool ChromiumYtX11::ensure_display() {
   if (display_) return true;
+  install_nonfatal_x11_error_handler();
   Display* dpy = XOpenDisplay(nullptr);
   if (!dpy) {
     set_error("XOpenDisplay failed");
@@ -438,6 +462,7 @@ bool ChromiumYtX11::ensure_display() {
 bool ChromiumYtX11::find_window() {
   if (!ensure_display()) return false;
   auto* dpy = static_cast<Display*>(display_);
+  ScopedXErrorTrap trap(dpy);
   Window found = 0;
   int best = -1;
   // Shared Chrome profile often ignores --class; also match Chrome --app title
@@ -487,6 +512,7 @@ bool ChromiumYtX11::refresh_geometry() {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!display_ || !window_) return false;
   auto* dpy = static_cast<Display*>(display_);
+  ScopedXErrorTrap trap(dpy);
   Window root = 0;
   int x = 0, y = 0;
   unsigned w = 0, h = 0, bw = 0, depth = 0;
@@ -524,6 +550,7 @@ bool ChromiumYtX11::root_origin(int* root_x, int* root_y) const {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!display_ || !window_ || !root_x || !root_y) return false;
   auto* dpy = static_cast<Display*>(display_);
+  ScopedXErrorTrap trap(dpy);
   Window child = 0;
   return XTranslateCoordinates(dpy, window_, DefaultRootWindow(dpy), 0, 0, root_x, root_y,
                                &child) != 0;
@@ -532,6 +559,7 @@ bool ChromiumYtX11::root_origin(int* root_x, int* root_y) const {
 bool ChromiumYtX11::apply_chrome(int width, int height, bool hide_host, bool move) {
   if (!window_ || !display_) return false;
   auto* dpy = static_cast<Display*>(display_);
+  ScopedXErrorTrap trap(dpy);
   // MONITOR mode: keep configured virtual-display clamp (set via bind_output_by_name).
   if (!screen_input_) {
     width_ = std::max(320, width);
@@ -616,7 +644,9 @@ bool ChromiumYtX11::apply_chrome(int width, int height, bool hide_host, bool mov
 
   cursor_x_ = width_ * 0.5f;
   cursor_y_ = height_ * 0.5f;
-  (void)warp_cursor();
+  if (!(eis_ && eis_->ready())) {
+    (void)warp_cursor();
+  }
 
   int rx = 0, ry = 0;
   Window child = 0;
@@ -641,6 +671,7 @@ bool ChromiumYtX11::request_fullscreen(bool on) {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!ensure_display() || !window_) return false;
   auto* dpy = static_cast<Display*>(display_);
+  ScopedXErrorTrap trap(dpy);
   Atom state = XInternAtom(dpy, "_NET_WM_STATE", False);
   Atom fs = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
   if (state == None || fs == None) return false;
@@ -664,6 +695,7 @@ bool ChromiumYtX11::request_fullscreen_on_placed_output() {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   if (!ensure_display() || !window_ || !have_place_) return false;
   auto* dpy = static_cast<Display*>(display_);
+  ScopedXErrorTrap trap(dpy);
   Window root = DefaultRootWindow(dpy);
 
   int mon = -1;
@@ -756,10 +788,9 @@ bool ChromiumYtX11::window_alive_unlocked() const {
   if (!display_ || !window_) return false;
   auto* dpy = static_cast<Display*>(display_);
   XWindowAttributes attrs{};
-  XErrorHandler prev = XSetErrorHandler([](Display*, XErrorEvent*) -> int { return 0; });
+  install_nonfatal_x11_error_handler();
   const bool ok = XGetWindowAttributes(dpy, window_, &attrs) != 0;
   XSync(dpy, False);
-  XSetErrorHandler(prev);
   return ok;
 }
 
@@ -849,6 +880,7 @@ bool ChromiumYtX11::root_coords(int* root_x, int* root_y) const {
   // cursor stays hidden.
   if (window_ && display_ && window_alive_unlocked()) {
     auto* dpy = static_cast<Display*>(display_);
+    ScopedXErrorTrap trap(dpy);
     Window child = 0;
     int ox = 0, oy = 0;
     if (XTranslateCoordinates(dpy, window_, DefaultRootWindow(dpy), 0, 0, &ox, &oy, &child)) {
@@ -930,17 +962,16 @@ bool ChromiumYtX11::send_motion_event() {
   ev.state = 0;
   ev.is_hint = NotifyNormal;
   ev.same_screen = True;
-  XErrorHandler prev = XSetErrorHandler([](Display*, XErrorEvent*) -> int { return 0; });
+  install_nonfatal_x11_error_handler();
   XSendEvent(dpy, window_, True, PointerMotionMask, reinterpret_cast<XEvent*>(&ev));
   XFlush(dpy);
-  XSetErrorHandler(prev);
   return true;
 }
 
 bool ChromiumYtX11::focus_window() {
   if (!display_ || !window_) return false;
   auto* dpy = static_cast<Display*>(display_);
-  XErrorHandler prev = XSetErrorHandler([](Display*, XErrorEvent*) -> int { return 0; });
+  install_nonfatal_x11_error_handler();
   XMapRaised(dpy, window_);
   // EWMH activate — more reliable than XSetInputFocus alone under KWin/XWayland.
   Atom net_active = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
@@ -958,8 +989,16 @@ bool ChromiumYtX11::focus_window() {
   }
   XSetInputFocus(dpy, window_, RevertToParent, CurrentTime);
   XSync(dpy, False);
-  XSetErrorHandler(prev);
   return true;
+}
+
+bool ChromiumYtX11::activate_x11_window() {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (!ensure_display()) return false;
+  if (window_ && !window_alive_unlocked()) window_ = 0;
+  if (!window_ && !find_window()) return false;
+  (void)refresh_geometry();
+  return focus_window();
 }
 
 bool ChromiumYtX11::click() {
@@ -1114,6 +1153,190 @@ bool ChromiumYtX11::key_back() {
   return true;
 }
 
+bool ChromiumYtX11::key_enter() {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (eis_ && eis_->ready() && eis_->key_enter()) {
+    VRP_LOG("live-x11: Enter (EIS)");
+    return true;
+  }
+  if (!(window_ != 0 || screen_input_)) return false;
+  if (!ensure_display()) return false;
+  auto* dpy = static_cast<Display*>(display_);
+  if (window_) (void)focus_window();
+  else (void)warp_cursor();
+  const KeyCode enter = XKeysymToKeycode(dpy, XK_Return);
+  if (enter == 0) return false;
+  XTestFakeKeyEvent(dpy, enter, True, CurrentTime);
+  XTestFakeKeyEvent(dpy, enter, False, CurrentTime);
+  XFlush(dpy);
+  VRP_LOG("live-x11: Enter (XTest)");
+  return true;
+}
+
+bool ChromiumYtX11::key_backspace(int count) {
+  if (count <= 0) return true;
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (eis_ && eis_->ready() && eis_->key_backspace(count)) {
+    return true;
+  }
+  if (!(window_ != 0 || screen_input_)) return false;
+  if (!ensure_display()) return false;
+  auto* dpy = static_cast<Display*>(display_);
+  if (window_) (void)focus_window();
+  else (void)warp_cursor();
+  const KeyCode bs = XKeysymToKeycode(dpy, XK_BackSpace);
+  if (bs == 0) return false;
+  for (int i = 0; i < count; ++i) {
+    XTestFakeKeyEvent(dpy, bs, True, CurrentTime);
+    XTestFakeKeyEvent(dpy, bs, False, CurrentTime);
+  }
+  XFlush(dpy);
+  return true;
+}
+
+bool ChromiumYtX11::key_delete(int count) {
+  if (count <= 0) return true;
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (eis_ && eis_->ready() && eis_->key_delete(count)) {
+    return true;
+  }
+  if (!(window_ != 0 || screen_input_)) return false;
+  if (!ensure_display()) return false;
+  auto* dpy = static_cast<Display*>(display_);
+  if (window_) (void)focus_window();
+  else (void)warp_cursor();
+  const KeyCode del = XKeysymToKeycode(dpy, XK_Delete);
+  if (del == 0) return false;
+  for (int i = 0; i < count; ++i) {
+    XTestFakeKeyEvent(dpy, del, True, CurrentTime);
+    XTestFakeKeyEvent(dpy, del, False, CurrentTime);
+  }
+  XFlush(dpy);
+  return true;
+}
+
+bool ChromiumYtX11::key_select_all() {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (eis_ && eis_->ready() && eis_->key_select_all()) {
+    return true;
+  }
+  if (!(window_ != 0 || screen_input_)) return false;
+  if (!ensure_display()) return false;
+  auto* dpy = static_cast<Display*>(display_);
+  if (window_) (void)focus_window();
+  else (void)warp_cursor();
+  const KeyCode ctrl = XKeysymToKeycode(dpy, XK_Control_L);
+  const KeyCode a = XKeysymToKeycode(dpy, XK_a);
+  if (ctrl == 0 || a == 0) return false;
+  XTestFakeKeyEvent(dpy, ctrl, True, CurrentTime);
+  XTestFakeKeyEvent(dpy, a, True, CurrentTime);
+  XTestFakeKeyEvent(dpy, a, False, CurrentTime);
+  XTestFakeKeyEvent(dpy, ctrl, False, CurrentTime);
+  XFlush(dpy);
+  return true;
+}
+
+bool ChromiumYtX11::key_paste() {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (eis_ && eis_->ready() && eis_->key_paste()) {
+    return true;
+  }
+  if (!(window_ != 0 || screen_input_)) return false;
+  if (!ensure_display()) return false;
+  auto* dpy = static_cast<Display*>(display_);
+  if (window_) (void)focus_window();
+  else (void)warp_cursor();
+  const KeyCode ctrl = XKeysymToKeycode(dpy, XK_Control_L);
+  const KeyCode v = XKeysymToKeycode(dpy, XK_v);
+  if (ctrl == 0 || v == 0) return false;
+  XTestFakeKeyEvent(dpy, ctrl, True, CurrentTime);
+  XTestFakeKeyEvent(dpy, v, True, CurrentTime);
+  XTestFakeKeyEvent(dpy, v, False, CurrentTime);
+  XTestFakeKeyEvent(dpy, ctrl, False, CurrentTime);
+  XFlush(dpy);
+  return true;
+}
+
+bool ChromiumYtX11::key_end() {
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (eis_ && eis_->ready() && eis_->key_end()) {
+    return true;
+  }
+  if (!(window_ != 0 || screen_input_)) return false;
+  if (!ensure_display()) return false;
+  auto* dpy = static_cast<Display*>(display_);
+  if (window_) (void)focus_window();
+  else (void)warp_cursor();
+  const KeyCode end = XKeysymToKeycode(dpy, XK_End);
+  if (end == 0) return false;
+  XTestFakeKeyEvent(dpy, end, True, CurrentTime);
+  XTestFakeKeyEvent(dpy, end, False, CurrentTime);
+  XFlush(dpy);
+  return true;
+}
+
+bool ChromiumYtX11::type_text(const std::string& utf8) {
+  if (utf8.empty()) return true;
+  std::lock_guard<std::recursive_mutex> lock(mu_);
+  if (eis_ && eis_->ready() && eis_->type_text(utf8)) {
+    VRP_LOG("live-x11: type_text %zu bytes (EIS)", utf8.size());
+    return true;
+  }
+  bool non_ascii = false;
+  for (unsigned char ch : utf8) {
+    if (ch >= 128) {
+      non_ascii = true;
+      break;
+    }
+  }
+  // Wayland Chrome: no EIS TEXT → wl-copy + Ctrl+V (clipboard reaches Wayland clients).
+  if (non_ascii) {
+    static std::atomic<bool> logged{false};
+    const QString wl_copy = QStandardPaths::findExecutable(QStringLiteral("wl-copy"));
+    if (!wl_copy.isEmpty() && !qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
+      QProcess p;
+      p.setProcessEnvironment(host_tool_environment());
+      p.start(wl_copy, {QStringLiteral("--type"), QStringLiteral("text/plain;charset=utf-8")});
+      if (p.waitForStarted(1000)) {
+        p.write(utf8.data(), static_cast<qint64>(utf8.size()));
+        p.closeWriteChannel();
+        if (p.waitForFinished(2000) && p.exitCode() == 0 && key_paste()) {
+          VRP_LOG("live-x11: type_text %zu bytes (wl-copy+Ctrl+V)", utf8.size());
+          return true;
+        }
+      }
+    }
+    if (!logged.exchange(true)) {
+      VRP_LOG("live-x11: type_text needs EIS TEXT or wl-copy for non-ASCII (once)");
+    }
+    return false;
+  }
+  if (!(window_ != 0 || screen_input_)) return false;
+  if (!ensure_display()) return false;
+  auto* dpy = static_cast<Display*>(display_);
+  if (window_) (void)focus_window();
+  else (void)warp_cursor();
+  for (unsigned char ch : utf8) {
+    KeySym sym = XK_VoidSymbol;
+    if (ch >= 'a' && ch <= 'z') sym = XK_a + (ch - 'a');
+    else if (ch >= 'A' && ch <= 'Z') sym = XK_A + (ch - 'A');
+    else if (ch >= '0' && ch <= '9') sym = XK_0 + (ch - '0');
+    else if (ch == ' ') sym = XK_space;
+    else if (ch == '-') sym = XK_minus;
+    else if (ch == '.') sym = XK_period;
+    else if (ch == ',') sym = XK_comma;
+    else if (ch == '/') sym = XK_slash;
+    else continue;
+    const KeyCode code = XKeysymToKeycode(dpy, sym);
+    if (code == 0) continue;
+    XTestFakeKeyEvent(dpy, code, True, CurrentTime);
+    XTestFakeKeyEvent(dpy, code, False, CurrentTime);
+  }
+  XFlush(dpy);
+  VRP_LOG("live-x11: type_text %zu bytes (XTest ASCII)", utf8.size());
+  return true;
+}
+
 bool ChromiumYtX11::close_window() {
   std::lock_guard<std::recursive_mutex> lock(mu_);
   // Prefer the window we already bound (from prepare). Re-scanning can latch onto
@@ -1126,11 +1349,10 @@ bool ChromiumYtX11::close_window() {
 
   // Trap BadWindow: compositor often closes before we send WM_DELETE; the default
   // X error path has been observed to cascade into process SEGV on stop.
-  XErrorHandler prev = XSetErrorHandler([](Display*, XErrorEvent*) -> int { return 0; });
+  install_nonfatal_x11_error_handler();
   XWindowAttributes attrs{};
   if (!XGetWindowAttributes(dpy, w, &attrs)) {
     XSync(dpy, False);
-    XSetErrorHandler(prev);
     VRP_LOG("live-x11: close skipped — window 0x%lx already gone", w);
     return false;
   }
@@ -1145,7 +1367,6 @@ bool ChromiumYtX11::close_window() {
   ev.xclient.data.l[1] = CurrentTime;
   XSendEvent(dpy, w, False, NoEventMask, &ev);
   XSync(dpy, False);
-  XSetErrorHandler(prev);
   VRP_LOG("live-x11: WM_DELETE_WINDOW 0x%lx", w);
   return true;
 }
