@@ -109,7 +109,7 @@ codec set.
 - Live: stable mouse/button input after switching Live apps on KDE.
 - Settings: long labels wrap. Startup/shutdown log is off by default and set under Other.
 - Seek: full-range seeking on all decoder paths (thumbnails no longer limit seek).
-* Sun Nov 23 2026 flex - 1.1.0-dev.20261123
+* Mon Nov 23 2026 flex - 1.1.0-dev.20261123
 - 1.1.0 development candidate.
 - Live web-browser VOD and desktop apps; L3 voice (Vosk); starfield theme;
   audio track selection; filename projection/stereo tags; seek thumbnails;
