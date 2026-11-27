@@ -1990,6 +1990,16 @@
       "context": "HostWindow",
       "source": "x%1 OK.\n\nNext: on the host share dialog, pick %2 and enable Remember.",
       "translation": "x%1 OK。\n\n次: ホストの共有ダイアログで %2 を選び、Remember を有効にしてください。"
+    },
+    {
+      "context": "HostWindow",
+      "source": "GNOME: Monado service notice",
+      "translation": "GNOME: monado-service に関する注意"
+    },
+    {
+      "context": "HostWindow",
+      "source": "On GNOME, terminating monado-service while it holds a DRM lease can cause Mutter / GNOME Shell to crash or freeze the system.\n\nTo avoid this, monaSphere keeps monado-service running on exit and reuses it on the next launch.\n\nPlease be careful if you manually stop or kill monado-service while logged into GNOME.",
+      "translation": "GNOME 環境では、monado-service が DRM lease を保持したまま終了すると、Mutter / GNOME Shell のクラッシュやシステムフリーズが発生することがあります。\n\nこれを回避するため、現在 GNOME 環境では monaSphere 終了時に monado-service を終了せず、次回起動時に再利用します。\n\nGNOME ログイン中に手動で monado-service を終了する場合はご注意ください。"
     }
   ]
 }

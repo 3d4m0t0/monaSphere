@@ -160,10 +160,101 @@ HostWindow::HostWindow(vrp::PlayerOptions opt, QString shader_dir, QWidget* pare
   QTimer::singleShot(1200, this, [this] { ensureLiveChromeWarm(); });
   // After UI is up: stale/missing ScreenCast Remember → offer setup (KDE only).
   QTimer::singleShot(900, this, [this] { maybeOfferLiveSetupAtStartup(); });
+  if (vrp::detect_desktop_env() == vrp::DesktopEnv::Gnome && !usingWivrn()) {
+    QTimer::singleShot(900, this, [this] {
+      if (shutting_down_.load()) return;
+      QMessageBox::information(
+          this, tr("GNOME: Monado service notice"),
+          tr("On GNOME, terminating monado-service while it holds a DRM lease can cause "
+             "Mutter / GNOME Shell to crash or freeze the system.\n\n"
+             "To avoid this, monaSphere keeps monado-service running on exit and reuses it "
+             "on the next launch.\n\n"
+             "Please be careful if you manually stop or kill monado-service while logged into GNOME."));
+    });
+  }
   if (!usingWivrn()) {
     QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
   }
 }
+
+namespace {
+
+bool isGnomePersistentMonado() {
+  return vrp::detect_desktop_env() == vrp::DesktopEnv::Gnome;
+}
+
+/** Lightweight (<1ms, no subprocess) persistent snapshot of DRM/Monado/Shell state. */
+void logDrmMonadoMonitor(const char* tag, qint64 owned_monado_pid) {
+  auto readTrim = [](const QString& path) -> QString {
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) return {};
+    return QString::fromUtf8(f.read(64)).trimmed();
+  };
+
+  QStringList monados;
+  QString shell_info = QStringLiteral("none");
+  QDir proc_dir(QStringLiteral("/proc"));
+  for (const QString& entry : proc_dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+    bool ok = false;
+    const qint64 pid = entry.toLongLong(&ok);
+    if (!ok || pid <= 0) continue;
+    const QString comm = readTrim(QStringLiteral("/proc/%1/comm").arg(entry));
+    if (comm != QLatin1String("monado-service") && comm != QLatin1String("gnome-shell") &&
+        comm != QLatin1String("kwin_wayland")) {
+      continue;
+    }
+    const QString stat = readTrim(QStringLiteral("/proc/%1/stat").arg(entry));
+    QChar st = QLatin1Char('?');
+    const int rp = stat.lastIndexOf(QLatin1Char(')'));
+    if (rp >= 0 && rp + 2 < stat.size()) st = stat.at(rp + 2);
+    if (comm == QLatin1String("monado-service")) {
+      int card_fds = 0;
+      int render_fds = 0;
+      QDir fd_dir(QStringLiteral("/proc/%1/fd").arg(entry));
+      for (const QFileInfo& fi : fd_dir.entryInfoList(QDir::NoDotAndDotDot | QDir::System | QDir::Files)) {
+        const QString tgt = fi.symLinkTarget();
+        if (tgt.startsWith(QLatin1String("/dev/dri/card"))) ++card_fds;
+        else if (tgt.startsWith(QLatin1String("/dev/dri/render"))) ++render_fds;
+      }
+      monados << QStringLiteral("%1(%2,card=%3,ren=%4)")
+                     .arg(pid)
+                     .arg(st)
+                     .arg(card_fds)
+                     .arg(render_fds);
+    } else {
+      shell_info = QStringLiteral("%1:%2(%3)").arg(comm).arg(pid).arg(st);
+    }
+  }
+
+  QStringList conns;
+  QStringList pwrs;
+  QDir drm_dir(QStringLiteral("/sys/class/drm"));
+  for (const QString& name : drm_dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+    if (name.contains(QLatin1Char('-'))) {
+      const QString st = readTrim(QStringLiteral("/sys/class/drm/%1/status").arg(name));
+      if (st == QLatin1String("connected")) {
+        const QString en = readTrim(QStringLiteral("/sys/class/drm/%1/enabled").arg(name));
+        const QString dpms = readTrim(QStringLiteral("/sys/class/drm/%1/dpms").arg(name));
+        conns << QStringLiteral("%1=%2/%3").arg(name, en, dpms);
+      }
+    } else if (name.startsWith(QLatin1String("card"))) {
+      const QString pwr = readTrim(QStringLiteral("/sys/class/drm/%1/device/power_state").arg(name));
+      if (!pwr.isEmpty()) pwrs << QStringLiteral("%1:%2").arg(name, pwr);
+    }
+  }
+
+  const QString xdg = qEnvironmentVariable("XDG_RUNTIME_DIR");
+  const bool ipc = !xdg.isEmpty() && QFileInfo::exists(xdg + QStringLiteral("/monado_comp_ipc"));
+
+  VRP_TEARDOWN_LOG("Monitor[%s]: owned=%lld monado=[%s] ipc=%d shell=%s drm=[%s] pwr=[%s]",
+                   tag ? tag : "?", static_cast<long long>(owned_monado_pid),
+                   monados.join(QLatin1Char(',')).toUtf8().constData(), ipc ? 1 : 0,
+                   shell_info.toUtf8().constData(),
+                   conns.join(QLatin1Char(',')).toUtf8().constData(),
+                   pwrs.join(QLatin1Char(',')).toUtf8().constData());
+}
+
+}  // namespace
 
 HostWindow::~HostWindow() {
   finishAppTeardown();
@@ -219,6 +310,7 @@ void HostWindow::finishAppTeardown() {
   VRP_TEARDOWN_LOG("Host teardown: Meta/Virtual after XR/Monado…");
   destroyVirtualForLeaveLive();
   VRP_TEARDOWN_LOG("Host teardown: Meta/Virtual after XR/Monado done");
+  logDrmMonadoMonitor("exit-final", monado_ ? monado_->processId() : 0);
 }
 
 void HostWindow::stopExternalSessions() {
@@ -404,9 +496,11 @@ bool HostWindow::shutdownXrSession(int timeout_ms, bool stop_monado) {
             static_cast<long long>(elapsed));
       }
     }
+    logDrmMonadoMonitor("before-stopMonado", monado_ ? monado_->processId() : 0);
     VRP_TEARDOWN_LOG("Host teardown: stopMonadoProcess…");
     stopMonadoProcess();
     VRP_TEARDOWN_LOG("Host teardown: stopMonadoProcess done");
+    logDrmMonadoMonitor("after-stopMonado", monado_ ? monado_->processId() : 0);
   }
 
   VRP_TEARDOWN_LOG("Host teardown END — shutdownXr ok=%d forced_exit=%d", ok ? 1 : 0,
@@ -420,23 +514,35 @@ bool HostWindow::ensureMonadoReady() {
   // Previous monasphere SEGV leaves Monado up with a dead IPC client → Broken pipe
   // on the next xrCreateInstance. Restart owned Monado when the crash cookie remains.
   // Do not restart on a clean vk-release stamp: DestroyInstance with Monado alive
-  // already dropped the client; settle+restart races a new compositor against residual.
+  // already dropped the client; restarting a freshly-started Monado races DRM-lease
+  // teardown on GNOME/Mutter 51 and crashes gnome-shell (meta_device_file_get_fd).
   const bool unclean = vrp::crash_guard::consume_unclean_session();
   const bool vk_residual = vrp::crash_guard::vulkan_client_release_recent(30000);
-  if ((unclean || vk_residual) && !usingWivrn() && !monado_external_) {
-    appendLog(unclean ? tr("Previous session crashed — restarting Monado")
-                      : tr("Previous Vulkan release was slow — restarting Monado"));
+  const bool owned_running = !monado_external_ && monado_ && monado_->state() != QProcess::NotRunning;
+  VRP_TEARDOWN_LOG("Host startup: ensureMonadoReady unclean=%d vk_residual=%d owned=%d ext=%d ipc=%d",
+                   unclean ? 1 : 0, vk_residual ? 1 : 0, owned_running ? 1 : 0,
+                   monado_external_ ? 1 : 0, isMonadoIpcLive() ? 1 : 0);
+  logDrmMonadoMonitor("ensureMonadoReady", monado_ ? monado_->processId() : 0);
+  const bool gnome_persist = isGnomePersistentMonado() && !usingWivrn();
+  if (gnome_persist) {
+    if (isMonadoIpcLive()) {
+      if (!monado_external_) (void)adoptExternalMonado();
+      return true;
+    }
+    startMonado();
+  } else if (unclean && !usingWivrn() && !monado_external_ && !owned_running) {
+    appendLog(tr("Previous session crashed — restarting Monado"));
     stopMonadoProcess();
     stopSystemdMonadoForOwnedStart();
     clearStaleMonadoSocket();
     (void)vrp::crash_guard::settle_vulkan_client_release(vk_residual ? 8000 : 2500);
-  } else if (unclean && usingWivrn() && !monado_external_) {
+  } else if (unclean && usingWivrn() && !monado_external_ && !owned_running) {
     appendLog(tr("Previous session crashed — restarting WiVRn"));
     stopMonadoProcess();  // also stops owned wivrn when runtime is wivrn
-  } else if (unclean) {
+  } else if (unclean && !owned_running) {
     appendLog(tr("Previous session crashed — external runtime; clearing stale IPC only"));
     clearStaleMonadoSocket();
-  } else if (vk_residual) {
+  } else if (vk_residual && !owned_running) {
     (void)vrp::crash_guard::settle_vulkan_client_release(5000);
   }
 
@@ -720,6 +826,15 @@ bool HostWindow::holdDirectDisplay(bool x11, bool ready, bool list_empty, const 
 }
 
 bool HostWindow::deferUntilDisplayLeaseReady() {
+  // Persistent Monado on GNOME already holds the DRM lease, so Mutter stops
+  // advertising that connector to other clients. Do not wait for a free lease.
+  if (isGnomePersistentMonado() && isMonadoIpcLive()) {
+    display_lease_wait_logged_ = false;
+    display_lease_ready_logged_ = false;
+    display_lease_restart_ = false;
+    display_direct_is_x11_ = false;
+    return false;
+  }
   if (!connectedHmdUsesDrmLease()) {
     display_lease_wait_logged_ = false;
     display_lease_ready_logged_ = false;
@@ -909,9 +1024,15 @@ void HostWindow::maybeAutoConnectHeadset() {
 
   // A leftover compositor was not started with this hz=. Replace it before connecting.
   resolvePreferredDisplayMode();
-  if (monado_desired_mode_ >= 0 &&
-      (monado_hz_require_owned_ || monado_external_ || !monado_ ||
-       monado_->state() == QProcess::NotRunning)) {
+  if (isGnomePersistentMonado()) {
+    if (!monado_external_) {
+      monado_external_ = true;
+      monado_label_->setText(tr("External"));
+      appendLog(tr("Using external Monado (%1)").arg(monadoIpcPath()));
+    }
+  } else if (monado_desired_mode_ >= 0 &&
+             (monado_hz_require_owned_ || monado_external_ || !monado_ ||
+              monado_->state() == QProcess::NotRunning)) {
     appendLog(tr("Auto-connect: replace external Monado for Hz"));
     restartOwnedMonadoForHz();
     return;
@@ -1150,6 +1271,10 @@ void HostWindow::stopMonadoProcess() {
     monado_external_ = false;
     return;
   }
+  if (isGnomePersistentMonado() && !usingWivrn()) {
+    VRP_TEARDOWN_LOG("Host teardown: GNOME persistent Monado — skip terminate");
+    return;
+  }
   if (!monado_ || monado_->state() == QProcess::NotRunning) {
     clearStaleMonadoSocket();
     return;
@@ -1205,6 +1330,11 @@ void HostWindow::stopSystemdMonadoForOwnedStart() {
 }
 
 void HostWindow::restartOwnedMonadoForHz() {
+  if (isGnomePersistentMonado() && !usingWivrn() && isMonadoIpcLive()) {
+    appendLog(tr("GNOME: keeping existing Monado running (skipping restart for Hz)"));
+    (void)adoptExternalMonado();
+    return;
+  }
   monado_hz_require_owned_ = true;
   monado_external_ = false;
   if (monado_ && monado_->state() != QProcess::NotRunning) {
@@ -5686,6 +5816,11 @@ void HostWindow::maybeRestartMonadoForHz() {
 void HostWindow::startMonado() { startOwnedMonado(/*allow_external_adopt=*/true); }
 
 void HostWindow::startOwnedMonado(bool allow_external_adopt) {
+  VRP_TEARDOWN_LOG("Host startup: startOwnedMonado allow_adopt=%d state=%d ipc=%d hz_req=%d",
+                   allow_external_adopt ? 1 : 0,
+                   monado_ ? static_cast<int>(monado_->state()) : -1,
+                   isMonadoIpcLive() ? 1 : 0, monado_hz_require_owned_ ? 1 : 0);
+  logDrmMonadoMonitor("startOwnedMonado", monado_ ? monado_->processId() : 0);
   if (usingWivrn()) {
     startOwnedWivrn(allow_external_adopt);
     return;
@@ -5713,6 +5848,10 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
     }
   }
   resolvePreferredDisplayMode();
+  if (isGnomePersistentMonado() && isMonadoIpcLive() && adoptExternalMonado()) {
+    VRP_TEARDOWN_LOG("Host startup: GNOME persistent Monado reused");
+    return;
+  }
   // When DESIRED_MODE must stick, never attach to a pre-existing service.
   if (monado_hz_require_owned_ || (preferred_hz_ > 0 && monado_desired_mode_ >= 0)) {
     allow_external_adopt = false;
@@ -5780,6 +5919,33 @@ void HostWindow::startOwnedMonado(bool allow_external_adopt) {
       msg += QStringLiteral(" mode=%1").arg(monado_desired_mode_);
     }
     appendLog(msg);
+  }
+  if (isGnomePersistentMonado()) {
+    const QString cfg_dir = QStandardPaths::writableLocation(QStandardPaths::ConfigLocation) +
+                            QStringLiteral("/monasphere");
+    QDir().mkpath(cfg_dir);
+    QProcess detached;
+    detached.setProcessEnvironment(env);
+    detached.setProgram(bin);
+    detached.setStandardOutputFile(cfg_dir + QStringLiteral("/monado-service.log"),
+                                   QIODevice::WriteOnly | QIODevice::Truncate);
+    detached.setStandardErrorFile(cfg_dir + QStringLiteral("/monado-service-err.log"),
+                                  QIODevice::WriteOnly | QIODevice::Truncate);
+    qint64 pid = 0;
+    if (!detached.startDetached(&pid)) {
+      monado_label_->setText(tr("Start failed"));
+      setHealth("Error", tr("Failed to start detached monado-service"));
+      appendLog(tr("Start failed (detached): %1").arg(bin));
+      return;
+    }
+    monado_external_ = true;
+    monado_hz_require_owned_ = false;
+    monado_label_->setText(tr("Persistent pid %1").arg(pid));
+    setHealth("Wait", "Monado up. Waiting for HMD");
+    VRP_TEARDOWN_LOG("Host startup: started detached persistent Monado pid=%lld",
+                     static_cast<long long>(pid));
+    QTimer::singleShot(400, this, [this] { maybeAutoConnectHeadset(); });
+    return;
   }
   monado_->start();
   if (!monado_->waitForStarted(3000)) {
@@ -6095,7 +6261,11 @@ void HostWindow::xrThreadMain() {
     } clear_xr{this};
     xr.set_controller_prefs(opt_.controller_profile, opt_.controller_hand);
     xr.set_preferred_display_refresh_hz(static_cast<float>(effectivePreferredHz()));
+    VRP_TEARDOWN_LOG("Host startup: xr.init BEGIN");
+    logDrmMonadoMonitor("xr-init-begin", monado_ ? monado_->processId() : 0);
     xr.init(&xr_stop_, report_progress);
+    VRP_TEARDOWN_LOG("Host startup: xr.init END");
+    logDrmMonadoMonitor("xr-init-end", monado_ ? monado_->processId() : 0);
     vk_create_hung_.store(false, std::memory_order_release);
     {
       const QString vk_probe = QString::fromStdString(xr.vulkan_video_probe().summary());
