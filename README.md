@@ -5,11 +5,9 @@ Linux 向けのネイティブ VR 動画プレーヤーです。コマンド名�
 OpenXR（Monado）と Vulkan で HMD に映像を出します。
 HMD 映像内にファイルダイアログと再生コントロールの UI を持ち、各種操作が行えます。
 
-**版 1.0.0-dev.20261014**
+**版 1.1.0-dev.20261127**（v1.1.0 候補）
 
-1.0.0-dev.20260928 からの更新:
-
-今回から AppImage 版を用意した（[`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`](https://github.com/3d4m0t0/monaSphere/releases/tag/1.0.0-dev.20261014)）。中には本体、Qt 6、LGPL の FFmpeg、OpenXR ローダが入っている。動かすには、ホスト側に次のものが要る。
+[AppImage](https://github.com/3d4m0t0/monaSphere/releases) には本体、Qt 6、LGPL の FFmpeg、OpenXR ローダが入っている。動かすには、ホスト側に次のものが要る。
 
 - glibc が Ubuntu 24.04 以降（openSUSE Tumbleweed を含む）。それより古いディストリビューションでは動かない
 - Vulkan に対応した GPU と、そのドライバ
@@ -18,27 +16,6 @@ HMD 映像内にファイルダイアログと再生コントロールの UI を
 
 注意: ゲームパッドは、現在 SDL が認識できるものだけ使える。
 
-- PSVR2 向け Monado 起動時の問題を修正
-- ファイル名による投影・モードの自動選択の対応を増やした。空白、`_`、`-`、`.` は区切りとして同じ語になる
-
-| 選択 / Selection | タグ / Tags |
-|-----------------|------------|
-| 360 | `360`（`360fps` はフレームレートとして無視 / `360fps` is a frame rate and is ignored） |
-| 180 | `180`（`180fps` はフレームレートとして無視 / `180fps` is a frame rate and is ignored） |
-| 平面 / Flat | `fisheye`、`180f`、`MKX200`、`VRCA220`、`RF52`、`EAC`、`360EAC` |
-| フル SBS / Full SBS | `fullsbs`、`fsbs`、`3dfsbs`、`3dhf`、`3dphf`、`lrf`、`full side by side` |
-| ハーフ SBS / Half SBS | `halfsbs`、`hsbs`、`3dhsbs`、`3dsbs`、`3dh`、`3dph`、`lrh`、`sbs3d`、`side by side`、`left right`、`sbs`、`lr`、`3d` |
-| フル OU / Full OU | `fullou`、`fulltb`、`ftab`、`ftb`、`3dftab`、`3dvf`、`3dpvf`、`tbf`、`full over under`、`full top bottom` |
-| ハーフ OU / Half OU | `halfou`、`hou`、`htab`、`htb`、`3dhtab`、`3dtab`、`3dv`、`3dpv`、`tbh`、`ou3d`、`tb3d`、`over under`、`top bottom`、`ou`、`tb` |
-
-- ファイル一覧でのレスポンスを向上。L スティックの選択に対応
-- シークを改善。L スティックによるシーク。シーク用サムネイルの作成
-- R スティックでの視点変更。VR 酔い対策込み
-- 4:2:0 の色差を Catmull-Rom で拡大し、色の縁を単一のバイリニアよりシャープにした
-- ファイルダイアログのプレビューを高解像にした。立体視に対応
-- AppImage でも、ホスト UI のフォントと明暗を実行中のデスクトップ設定に合うように変更
-- Ubuntu 24.04 の OpenXR 1.0 ヘッダでもビルドできるようにした
-
 ### English
 
 A native VR video player for Linux. The command name is `monasphere`.
@@ -46,11 +23,9 @@ A native VR video player for Linux. The command name is `monasphere`.
 Video is presented to the HMD with OpenXR (Monado) and Vulkan.
 The in-HMD UI provides a file dialog, playback controls, and related operations.
 
-**Version 1.0.0-dev.20261014**
+**Version 1.1.0-dev.20261127** (v1.1.0 candidate)
 
-Changes since 1.0.0-dev.20260928:
-
-An AppImage is now provided ([`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`](https://github.com/3d4m0t0/monaSphere/releases/tag/1.0.0-dev.20261014)). It contains the program, Qt 6, an LGPL FFmpeg, and the OpenXR loader. The host still needs:
+The [AppImage](https://github.com/3d4m0t0/monaSphere/releases) contains the program, Qt 6, an LGPL FFmpeg, and the OpenXR loader. The host still needs:
 
 - glibc from Ubuntu 24.04 or newer (including openSUSE Tumbleweed). Older distributions will not run it
 - A Vulkan-capable GPU and its driver
@@ -58,17 +33,6 @@ An AppImage is now provided ([`monaSphere-1.0.0-dev.20261014-x86_64.AppImage`](h
 - `libcuda.so.1` for NVIDIA zero-copy playback. VA-API / VDPAU need their drivers on the host
 
 Note: only gamepads that SDL can recognize are usable.
-
-- Fixed Monado startup for PSVR2
-- Filename detection of projection and stereo covers more tags. Spaces, `_`, `-`, and `.` are word breaks. The tags are in the table above
-
-- The file list responds faster. The left stick moves the selection
-- Seek improved: left-stick seek, and seek thumbnails are generated
-- The right stick turns the view, with a motion-sickness countermeasure
-- 4:2:0 chroma is upsampled with Catmull-Rom, so color edges stay sharper than a single bilinear sample
-- The file-dialog preview is higher resolution and shows stereo
-- In the AppImage, the host UI font and light or dark appearance follow the running desktop
-- The build succeeds with Ubuntu 24.04's OpenXR 1.0 headers
 
 ## AI の利用について
 
@@ -92,7 +56,7 @@ Referral registration link: [cursor.com/referral?code=TI3UQLE9PFH3](https://curs
 | XR | OpenXR 1.x（ランタイムは Monado を想定 / Monado is the expected runtime） |
 | 入力 / Input | XR コントローラ / ゲームパッド（任意） / XR controllers or gamepad (optional) |
 | 映像 / Video | ローカルファイル（FFmpeg）。未導入時はプレースホルダ表示のみ / Local files via FFmpeg. Placeholder only if FFmpeg is absent |
-| 音声 / Audio | 2ch は共通で Soft HRTF 4.0（側差＋`surround_gain`）。ラウドネスは `audio_normalize`（標準 ON）。Live/[アプリ] は Pulse `monaSphereYt`→monitor→同 upmix。詳細は [`data/README_live.md`](data/README_live.md)。フォールバックは miniaudio / Shared 2ch Soft HRTF 4.0 (`surround_gain`, `audio_normalize` default on); Live/[アプリ] via yt monitor. See `data/README_live.md`. miniaudio fallback |
+| 音声 / Audio | 2ch は共通で Soft HRTF 4.0（側差＋`surround_gain`）。ラウドネスは `audio_normalize`（標準 ON）。Live/[アプリ] は Pulse `monaSphereYt`→monitor→同 upmix。詳細は [`data/README_live.md`](data/README_live.md)。フォールバックは miniaudio / Shared 2ch Soft HRTF 4.0 (`surround_gain`, `audio_normalize` default on); Live/[Apps] via yt monitor. See `data/README_live.md`. miniaudio fallback |
 | UI | Qt 6 Widgets（ホストウィンドウ / host window） |
 
 ## 依存するライブラリ / Dependencies
@@ -136,30 +100,59 @@ At runtime, **Monado** (`monado-service`) and `XR_RUNTIME_JSON` are required.
 ## 主な機能
 
 - 投影 フラット / 投影 180° / 投影 360°、および mono / SBS / OU
+- ファイル名による投影・ステレオの自動選択（空白 / `_` / `-` / `.` を語区切り）。タグ:
+
+| 選択 / Selection | タグ / Tags |
+|-----------------|------------|
+| 360 | `360`（`360fps` はフレームレートとして無視 / `360fps` is a frame rate and is ignored） |
+| 180 | `180`（`180fps` はフレームレートとして無視 / `180fps` is a frame rate and is ignored） |
+| 平面 / Flat | `fisheye`、`180f`、`MKX200`、`VRCA220`、`RF52`、`EAC`、`360EAC` |
+| フル SBS / Full SBS | `fullsbs`、`fsbs`、`3dfsbs`、`3dhf`、`3dphf`、`lrf`、`full side by side` |
+| ハーフ SBS / Half SBS | `halfsbs`、`hsbs`、`3dhsbs`、`3dsbs`、`3dh`、`3dph`、`lrh`、`sbs3d`、`side by side`、`left right`、`sbs`、`lr`、`3d` |
+| フル OU / Full OU | `fullou`、`fulltb`、`ftab`、`ftb`、`3dftab`、`3dvf`、`3dpvf`、`tbf`、`full over under`、`full top bottom` |
+| ハーフ OU / Half OU | `halfou`、`hou`、`htab`、`htb`、`3dhtab`、`3dtab`、`3dv`、`3dpv`、`tbh`、`ou3d`、`tb3d`、`over under`、`top bottom`、`ou`、`tb` |
+
 - HMD 映像内にファイルダイアログと再生コントロール、設定が行える UI
-- HMD 自動検出と Monado 起動（所有プロセス）
+- ファイル一覧の L スティック選択。ダイアログプレビューは高解像・立体視対応
+- L スティックシークとシーク用サムネイル
+- R スティックでの視点変更（VR 酔い対策込み）
+- HMD 自動検出と Monado / WiVRn 起動（所有プロセス）
 - リフレッシュレート選択（環境の表示モードに依存）
-- FSR1 アップスケール（ファイル再生／ブラウザ Live。Live は `live_fsr`、□ で切替）
+- FSR1 アップスケール（ファイル再生／ブラウザ Live。Live は `live_fsr`、ボタン操作で切替）
 - ハードウェアデコード連携（環境により NVDEC / VA-API / Vulkan Video 等）
-- NVIDIA 既定: CUDA↔Vulkan NV12。任意で FFmpeg **Vulkan Video ゼロコピー**（`monasphere.conf` の `vulkan_video=1`。AVVkFrame を HMD／FSR へ直サンプル）
+- NVIDIA 既定: CUDA↔Vulkan NV12。任意で FFmpeg **Vulkan Video ゼロコピー**（`monasphere.conf` の `vulkan_video=1`。AVVkFrame を HMD／FSR へ直サンプル。AV1 動作には Qt 6.12.0+ と FFmpeg `libavcodec` 61+ が必須）
+- 4:2:0 色差の Catmull-Rom 拡大（単一バイリニアより色縁がシャープ）
 - XR メニュー、リセンター、コントローラ / ゲームパッド操作
+- 音声トラック選択
 - OpenAL Soft HRTF（世界固定スピーカー＋頭部追跡）。2ch は側差 4.0（`surround_gain`、file / Live / [アプリ] 共通）。ラウドネスは `audio_normalize`（標準 ON）。[`data/README_live.md`](data/README_live.md)
-- Live ブラウザ / デスクトップアプリ（ScreenCast + Virtual MONITOR）
-- ロケール準備（`tr` / `VRP_TR`、詳細は `translations/README.md`）
+- Live ウェブブラウザを利用した VOD の視聴、およびデスクトップアプリ（ScreenCast + Virtual MONITOR）
+- Live L3 音声入力（Vosk。モデルはユーザー DL、`live_voice` / `live_voice_lang`。詳細は [`third_party/vosk/README.md`](third_party/vosk/README.md)）
+- 背景テーマ starfield（全天星カタログ・天の川）。詳細は [`data/README_milkyway.md`](data/README_milkyway.md)
+- AppImage 配布（ホスト UI のフォント・明暗はデスクトップ設定に追従）
+- ロケール（`tr` / `VRP_TR`、詳細は `translations/README.md`）
 
 ### English
 
 - Projection: flat / 180° / 360°, and mono / SBS / OU
+- Filename auto-detect for projection and stereo (spaces / `_` / `-` / `.` as word breaks); tags in the table above
 - In-HMD UI for the file dialog, playback controls, and settings
-- Automatic HMD detection and owned Monado startup
+- File-list left-stick selection; high-resolution stereo file-dialog preview
+- Left-stick seek and seek thumbnails
+- Right-stick view turn with a motion-sickness countermeasure
+- Automatic HMD detection and owned Monado / WiVRn startup
 - Refresh-rate selection (depends on available display modes)
-- FSR1 upscaling (file playback and browser Live; Live uses `live_fsr`, cycle with □)
+- FSR1 upscaling (file playback and browser Live; Live uses `live_fsr`, cycle with a button)
 - Hardware decode (NVDEC, VA-API, Vulkan Video, when available)
-- NVIDIA default: CUDA↔Vulkan NV12. Optional FFmpeg **Vulkan Video zero-copy** (`vulkan_video=1` in `monasphere.conf` — sample AVVkFrame straight to the HMD / FSR)
+- NVIDIA default: CUDA↔Vulkan NV12. Optional FFmpeg **Vulkan Video zero-copy** (`vulkan_video=1` in `monasphere.conf` — sample AVVkFrame straight to the HMD / FSR; AV1 requires Qt 6.12.0+ and FFmpeg `libavcodec` 61+)
+- 4:2:0 chroma upsampled with Catmull-Rom (sharper color edges than a single bilinear sample)
 - XR menu, recenter, and controller / gamepad input
-- OpenAL Soft HRTF (world-locked speakers + head tracking); shared 2ch→4.0 upmix (`surround_gain`) and loudness match (`audio_normalize`, default on) for file / Live / [アプリ] (see [`data/README_live.md`](data/README_live.md))
-- Live browser / desktop apps (ScreenCast + Virtual MONITOR)
-- Locale groundwork (`tr` / `VRP_TR`; see `translations/README.md`)
+- Audio track selection
+- OpenAL Soft HRTF (world-locked speakers + head tracking); shared 2ch→4.0 upmix (`surround_gain`) and loudness match (`audio_normalize`, default on) for file / Live / [Apps] (see [`data/README_live.md`](data/README_live.md))
+- VOD viewing via Live web browser, and desktop apps (ScreenCast + Virtual MONITOR)
+- Live L3 voice input (Vosk; user-downloaded models, `live_voice` / `live_voice_lang` — see [`third_party/vosk/README.md`](third_party/vosk/README.md))
+- Background theme starfield (all-sky stars and Milky Way); see [`data/README_milkyway.md`](data/README_milkyway.md)
+- AppImage packaging (host UI font and light/dark follow the desktop)
+- Locale (`tr` / `VRP_TR`; see `translations/README.md`)
 
 ## 動作環境
 
