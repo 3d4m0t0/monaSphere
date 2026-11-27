@@ -433,9 +433,13 @@ add_custom_command(TARGET vrp_player POST_BUILD
           $<TARGET_FILE_DIR:vrp_player>/libmonasphere_padhook.so
 )
 
+if(NOT DEFINED CMAKE_INSTALL_LIBDIR OR "${CMAKE_INSTALL_LIBDIR}" STREQUAL "")
+  set(CMAKE_INSTALL_LIBDIR "lib")
+endif()
+
 install(TARGETS vrp_player RUNTIME DESTINATION bin)
-install(TARGETS monasphere_padhook LIBRARY DESTINATION lib)
-install(TARGETS vrp_gamepad_icons vrp_starfield ARCHIVE DESTINATION lib)
+install(TARGETS monasphere_padhook LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS vrp_gamepad_icons vrp_starfield ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(FILES ${CMAKE_SOURCE_DIR}/src/ui/gamepad_icons.hpp DESTINATION include/vrp/ui)
 install(FILES ${CMAKE_SOURCE_DIR}/src/starfield/starfield.hpp DESTINATION include/vrp/starfield)
 install(FILES
@@ -493,7 +497,7 @@ install(DIRECTORY ${CMAKE_SOURCE_DIR}/translations/
 # third_party/vosk/SHA256SUMS; runtime refuses a mismatched bundled copy.
 set(VRP_VOSK_SO ${CMAKE_SOURCE_DIR}/third_party/vosk/linux-x86_64/libvosk.so)
 if(EXISTS "${VRP_VOSK_SO}")
-  install(FILES ${VRP_VOSK_SO} DESTINATION lib/monasphere RENAME libvosk.so)
+  install(FILES ${VRP_VOSK_SO} DESTINATION ${CMAKE_INSTALL_LIBDIR}/monasphere RENAME libvosk.so)
   install(FILES
     ${CMAKE_SOURCE_DIR}/third_party/vosk/LICENSE
     ${CMAKE_SOURCE_DIR}/third_party/vosk/NOTICE
