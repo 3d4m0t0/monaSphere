@@ -5,7 +5,10 @@ Linux 向けのネイティブ VR 動画プレーヤーです。コマンド名�
 OpenXR（Monado）と Vulkan で HMD に映像を出します。
 HMD 映像内にファイルダイアログと再生コントロールの UI を持ち、各種操作が行えます。
 
-**版 1.1.0-dev.20261127**（v1.1.0 候補）
+**版 1.1.0-dev.20261127**（v1.1.0 候補・pre-release）: [Release ページ](https://github.com/3d4m0t0/monaSphere/releases/tag/1.1.0-dev.20261127)
+
+- [AppImage](https://github.com/3d4m0t0/monaSphere/releases/download/1.1.0-dev.20261127/monaSphere-1.1.0-dev.20261127-x86_64.AppImage)（任意のディストリビューション。下記の要件を満たすこと）
+- [RPM](https://github.com/3d4m0t0/monaSphere/releases/download/1.1.0-dev.20261127/monasphere-1.1.0-dev.20261127.x86_64.rpm) / [SRPM](https://github.com/3d4m0t0/monaSphere/releases/download/1.1.0-dev.20261127/monasphere-1.1.0-dev.20261127.src.rpm): **openSUSE Tumbleweed 向け**（Qt 6.12 / FFmpeg 8 SONAME でビルド）。他のディストリビューションでは AppImage を使ってください
 
 [AppImage](https://github.com/3d4m0t0/monaSphere/releases) には本体、Qt 6、LGPL の FFmpeg、OpenXR ローダが入っている。動かすには、ホスト側に次のものが要る。
 
@@ -23,7 +26,10 @@ A native VR video player for Linux. The command name is `monasphere`.
 Video is presented to the HMD with OpenXR (Monado) and Vulkan.
 The in-HMD UI provides a file dialog, playback controls, and related operations.
 
-**Version 1.1.0-dev.20261127** (v1.1.0 candidate)
+**Version 1.1.0-dev.20261127** (v1.1.0 candidate, pre-release): [Release page](https://github.com/3d4m0t0/monaSphere/releases/tag/1.1.0-dev.20261127)
+
+- [AppImage](https://github.com/3d4m0t0/monaSphere/releases/download/1.1.0-dev.20261127/monaSphere-1.1.0-dev.20261127-x86_64.AppImage) (any distribution that meets the requirements below)
+- [RPM](https://github.com/3d4m0t0/monaSphere/releases/download/1.1.0-dev.20261127/monasphere-1.1.0-dev.20261127.x86_64.rpm) / [SRPM](https://github.com/3d4m0t0/monaSphere/releases/download/1.1.0-dev.20261127/monasphere-1.1.0-dev.20261127.src.rpm): **for openSUSE Tumbleweed** (built against Qt 6.12 / FFmpeg 8 SONAMEs). On other distributions, use the AppImage
 
 The [AppImage](https://github.com/3d4m0t0/monaSphere/releases) contains the program, Qt 6, an LGPL FFmpeg, and the OpenXR loader. The host still needs:
 
