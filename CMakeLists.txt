@@ -53,6 +53,13 @@ else()
 endif()
 pkg_check_modules(OPENXR REQUIRED openxr)
 pkg_check_modules(VULKAN REQUIRED vulkan)
+# AppImage Distrobox (Ubuntu 24.04) ships Vulkan 1.3.275 headers without
+# VK_KHR_video_decode_av1. Pass -DVulkan_INCLUDE_DIR=<newer>/include to compile
+# against Khronos headers while still linking the host/distro loader.
+if(DEFINED Vulkan_INCLUDE_DIR AND EXISTS "${Vulkan_INCLUDE_DIR}/vulkan/vulkan.h")
+  set(VULKAN_INCLUDE_DIRS "${Vulkan_INCLUDE_DIR}")
+  message(STATUS "Vulkan headers override: ${Vulkan_INCLUDE_DIR}")
+endif()
 pkg_check_modules(WAYLAND_CLIENT REQUIRED wayland-client)
 pkg_check_modules(XCB_RANDR REQUIRED xcb xcb-randr)
 find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
@@ -257,8 +264,9 @@ target_include_directories(vrp_core PUBLIC
   ${CMAKE_SOURCE_DIR}/third_party/openal
   ${CMAKE_SOURCE_DIR}/third_party/fsr1
   ${OPENXR_INCLUDE_DIRS}
-  ${VULKAN_INCLUDE_DIRS}
 )
+# BEFORE so a Vulkan_INCLUDE_DIR override wins over /usr/include from other deps.
+target_include_directories(vrp_core BEFORE PUBLIC ${VULKAN_INCLUDE_DIRS})
 target_link_libraries(vrp_core PUBLIC
   vrp_starfield
   ${OPENXR_LIBRARIES}

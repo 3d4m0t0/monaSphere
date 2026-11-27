@@ -26,6 +26,7 @@
 #include "youtube_session.hpp"
 #include "capture/desktop_env.hpp"
 #include "capture/gnome_virtual_display.hpp"
+#include "capture/host_process_env.hpp"
 #include "capture/kde_virtual_display.hpp"
 #include "capture/kwin_window_placer.hpp"
 #include "capture/screencast_portal.hpp"
@@ -735,31 +736,7 @@ QString leaseListText(const DrmLeaseProbeResult& probe) {
   return parts.join(QStringLiteral(", "));
 }
 
-// AppRun prepends $APPDIR/usr/lib so the bundled LGPL FFmpeg loads. Host tools
-// (monado-service, wivrn-server, vulkaninfo) must keep the system library
-// search path; Ubuntu libs there break Tumbleweed's OpenSSL and SDL.
-QProcessEnvironment hostToolEnvironment() {
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-  const QByteArray appdir = qgetenv("APPDIR");
-  if (appdir.isEmpty()) return env;
-  const QString bundled = QString::fromLocal8Bit(appdir) + QStringLiteral("/usr/lib");
-  const QString key = QStringLiteral("LD_LIBRARY_PATH");
-  if (!env.contains(key)) return env;
-  const QStringList parts = env.value(key).split(QLatin1Char(':'), Qt::SkipEmptyParts);
-  QStringList kept;
-  kept.reserve(parts.size());
-  for (const QString& part : parts) {
-    const QString trimmed = part.endsWith(QLatin1Char('/')) ? part.chopped(1) : part;
-    if (trimmed == bundled) continue;
-    kept.push_back(part);
-  }
-  if (kept.isEmpty()) {
-    env.remove(key);
-  } else {
-    env.insert(key, kept.join(QLatin1Char(':')));
-  }
-  return env;
-}
+QProcessEnvironment hostToolEnvironment() { return vrp::host_tool_environment(); }
 
 }  // namespace
 
@@ -3543,9 +3520,21 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   // [アプリ] pad: prefer LD_PRELOAD hook (no uinput). Legacy grab+uinput if hook .so missing.
   pad_hook_active_ = false;
   if (!cfg.exec.isEmpty()) {
-    const QString hook_lib =
-        QCoreApplication::applicationDirPath() + QStringLiteral("/libmonasphere_padhook.so");
-    if (QFile::exists(hook_lib) && pad_hook_.start()) {
+    const QString app_dir = QCoreApplication::applicationDirPath();
+    const QStringList candidates = {
+        app_dir + QStringLiteral("/libmonasphere_padhook.so"),
+        app_dir + QStringLiteral("/../lib/libmonasphere_padhook.so"),
+        app_dir + QStringLiteral("/../lib64/libmonasphere_padhook.so"),
+    };
+    QString hook_lib;
+    for (const QString& cand : candidates) {
+      if (QFile::exists(cand)) {
+        const QString canon = QFileInfo(cand).canonicalFilePath();
+        hook_lib = canon.isEmpty() ? QDir::cleanPath(cand) : canon;
+        break;
+      }
+    }
+    if (!hook_lib.isEmpty() && pad_hook_.start()) {
       pad_hook_active_ = true;
       cfg.pad_hook_lib = hook_lib;
       cfg.pad_hook_sock = QString::fromStdString(pad_hook_.socket_path());

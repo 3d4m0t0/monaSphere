@@ -42,6 +42,7 @@ int open_drm_render_fd() {
   return -1;
 }
 
+#if defined(SPA_META_SyncTimeline)
 /** Wait for SPA_META_SyncTimeline acquire (DRM syncobj timeline or eventfd-style). */
 bool wait_sync_timeline_acquire(spa_buffer* buf, int drm_fd) {
   if (!buf) return true;
@@ -52,7 +53,12 @@ bool wait_sync_timeline_acquire(spa_buffer* buf, int drm_fd) {
   // Prefer SPA_DATA_SyncObj planes (Mutter / explicit-sync producers).
   for (uint32_t i = 0; i < buf->n_datas; ++i) {
     spa_data& d = buf->datas[i];
+#if defined(SPA_DATA_SyncObj)
     if (d.type != SPA_DATA_SyncObj || d.fd < 0) continue;
+#else
+    (void)d;
+    continue;
+#endif
     if (drm_fd < 0) break;
     uint32_t handle = 0;
     if (drmSyncobjFDToHandle(drm_fd, static_cast<int>(d.fd), &handle) != 0) continue;
@@ -99,10 +105,14 @@ void signal_sync_timeline_release(spa_buffer* buf, int drm_fd) {
   int release_fd = -1;
   int syncobj_count = 0;
   for (uint32_t i = 0; i < buf->n_datas; ++i) {
+#if defined(SPA_DATA_SyncObj)
     if (buf->datas[i].type == SPA_DATA_SyncObj && buf->datas[i].fd >= 0) {
       ++syncobj_count;
       release_fd = static_cast<int>(buf->datas[i].fd);
     }
+#else
+    (void)i;
+#endif
   }
   if (syncobj_count >= 2 && release_fd >= 0 && drm_fd >= 0) {
     uint32_t handle = 0;
@@ -118,6 +128,10 @@ void signal_sync_timeline_release(spa_buffer* buf, int drm_fd) {
     (void)::write(static_cast<int>(buf->datas[2].fd), &cmd, sizeof(cmd));
   }
 }
+#else
+bool wait_sync_timeline_acquire(spa_buffer*, int) { return true; }
+void signal_sync_timeline_release(spa_buffer*, int) {}
+#endif
 
 enum class DmabufSyncResult { Ok, IoctlFail, Timeout };
 
@@ -481,8 +495,13 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
   // producer acquire point before publish. KDE ScreenCast: do not mandate
   // SyncTimeline — mandatory + drain-without-release stalled the pool and left
   // Live on the spinner with streaming-but-no-buffers.
+  // Ubuntu 24.04 SPA headers lack SyncTimeline — fall back to plain DmaBuf.
+#if defined(SPA_META_SyncTimeline)
   const bool want_sync_timeline =
       negotiated_mod && st->self && st->self->skip_unpainted_bo();
+#else
+  const bool want_sync_timeline = false;
+#endif
   const int want_bufs = negotiated_mod ? 4 : 8;
   const int want_bufs_min = negotiated_mod ? 3 : 4;
   st->requested_buffers = want_bufs;
@@ -497,6 +516,7 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
   const spa_pod* params[6];
   uint32_t n_params = 0;
   spa_pod_frame f{};
+#if defined(SPA_META_SyncTimeline)
   if (want_sync_timeline) {
     // Option A (Mutter): DmaBuf + SyncTimeline (mandatory on this buffers choice).
     spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers);
@@ -518,6 +538,7 @@ void on_stream_param_changed(void* data, uint32_t id, const spa_pod* param) {
     spa_pod_builder_int(&b, SPA_META_FEATURE_SYNC_TIMELINE_RELEASE);
     params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_pop(&b, &f));
   }
+#endif
   // Plain DmaBuf / SHM buffers (KDE path; also Mutter fallback if SyncTimeline declined).
   params[n_params++] = static_cast<spa_pod*>(spa_pod_builder_add_object(
       &b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers, SPA_PARAM_BUFFERS_buffers,
@@ -751,6 +772,7 @@ void on_process(void* data) {
     // root cause of visual reorder (monotonic dma_seq with stale content).
     if (st->drm_fd < 0) st->drm_fd = open_drm_render_fd();
     bool synced = false;
+#if defined(SPA_META_SyncTimeline)
     auto* stl = static_cast<spa_meta_sync_timeline*>(
         spa_buffer_find_meta_data(buf, SPA_META_SyncTimeline, sizeof(spa_meta_sync_timeline)));
     if (stl && stl->acquire_point != 0) {
@@ -767,7 +789,9 @@ void on_process(void* data) {
         return;
       }
       synced = true;
-    } else {
+    } else
+#endif
+    {
       // Fallback: EXPORT_SYNC_FILE on the dma-buf (NVIDIA implicit sync is unreliable).
       const DmabufSyncResult sr = wait_dmabuf_export_sync(d->fd);
       if (sr == DmabufSyncResult::Ok) {

@@ -5,6 +5,7 @@
 #include "common.hpp"
 
 #include "capture/gnome_portal_dialog.hpp"
+#include "capture/host_process_env.hpp"
 #include "capture/kde_virtual_display.hpp"
 
 #include <QCoreApplication>
@@ -1281,7 +1282,7 @@ void YouTubeSession::beginPlaceDesktopApp() {
   });
 
   {
-    QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+    QProcessEnvironment env = host_tool_environment();
     if (cfg_.enable_audio) {
       env.insert(QStringLiteral("PULSE_SINK"), QStringLiteral("monaSphereYt"));
       env.insert(QStringLiteral("PIPEWIRE_NODE"), QStringLiteral("monaSphereYt"));

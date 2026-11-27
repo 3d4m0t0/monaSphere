@@ -19,25 +19,31 @@ distrobox enter "$name" -- sudo env DEBIAN_FRONTEND=noninteractive apt-get insta
   build-essential \
   ca-certificates \
   cmake \
+  curl \
+  glslang-dev \
+  glslang-tools \
+  libavcodec-dev \
+  libavformat-dev \
+  libavutil-dev \
+  libei-dev \
+  libopenal-dev \
+  libopenxr-dev \
+  libpipewire-0.3-dev \
+  libpulse-dev \
+  libsdl2-dev \
+  libswresample-dev \
+  libswscale-dev \
+  libvulkan-dev \
+  libwayland-bin \
+  libwayland-dev \
+  libxcb1-dev \
+  libxcb-randr0-dev \
+  libxrandr-dev \
+  libxtst-dev \
   ninja-build \
   pkg-config \
   qt6-base-dev \
   qt6-base-private-dev \
-  libopenxr-dev \
-  libvulkan-dev \
-  libsdl2-dev \
-  glslang-tools \
-  glslang-dev \
-  libavcodec-dev \
-  libavformat-dev \
-  libavutil-dev \
-  libswscale-dev \
-  libswresample-dev \
-  libpulse-dev \
-  libopenal-dev \
-  libwayland-bin \
-  libwayland-dev \
-  libxcb1-dev \
-  libxcb-randr0-dev
+  unzip
 
 echo "Enter the box with: distrobox enter $name"

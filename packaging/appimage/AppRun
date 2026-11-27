@@ -1,11 +1,27 @@
 #!/bin/sh
-# AppImage runtime leaves $ORIGIN at the .AppImage file, so the bundled
-# LGPL FFmpeg is not visible unless this directory is on LD_LIBRARY_PATH.
+# AppImage entry: keep bundled LGPL FFmpeg on LD_LIBRARY_PATH, and expose
+# desktop/Qt paths so xdg-desktop-portal can resolve app id "monasphere"
+# (ScreenCast / RemoteDesktop grant + restore_token Remember).
 set -eu
 if [ -n "${APPDIR:-}" ]; then
   here=$APPDIR
 else
   here=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 fi
+
+# Bundled FFmpeg / Qt (linuxdeploy layout).
 export LD_LIBRARY_PATH="$here/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# qt.conf Prefix=../ → plugins next to bin; still set explicitly for robustness.
+export QT_PLUGIN_PATH="$here/usr/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+export QT_QPA_PLATFORM_PLUGIN_PATH="$here/usr/plugins/platforms"
+
+# Portal / desktop lookup: monasphere.desktop under share/applications.
+export XDG_DATA_DIRS="$here/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# Prefer host GLib schemas / icons when present (bundled Ubuntu libs on Tumbleweed).
+if [ -d /usr/share/glib-2.0/schemas ]; then
+  export GSETTINGS_SCHEMA_DIR="${GSETTINGS_SCHEMA_DIR:-/usr/share/glib-2.0/schemas}"
+fi
+
 exec "$here/usr/bin/monasphere" "$@"

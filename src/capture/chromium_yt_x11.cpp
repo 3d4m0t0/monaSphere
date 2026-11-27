@@ -1,5 +1,6 @@
 #include "capture/chromium_yt_x11.hpp"
 #include "capture/eis_pointer.hpp"
+#include "capture/host_process_env.hpp"
 
 #include "common.hpp"
 

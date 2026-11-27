@@ -1,5 +1,7 @@
 #include "capture/chromium_yt.hpp"
 
+#include "capture/host_process_env.hpp"
+
 #include "common.hpp"
 
 #include <QDir>
@@ -471,7 +473,7 @@ bool ChromiumYtLauncher::start() {
           firefox ? "firefox" : "chrome", static_cast<double>(scale), shared_session_ ? 1 : 0,
           already_running ? 1 : 0, profile_note.toUtf8().constData());
 
-  QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+  QProcessEnvironment env = host_tool_environment();
   if (firefox) {
     // Wayland + 200% + (browser or video) fullscreen double-scales YouTube (1869724).
     // XWayland does not; keep WAYLAND_DISPLAY so XWayland can attach to the session.

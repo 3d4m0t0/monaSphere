@@ -1,5 +1,6 @@
 #include "capture/kde_virtual_display.hpp"
 
+#include "capture/host_process_env.hpp"
 #include "common.hpp"
 
 #include <QElapsedTimer>
@@ -33,6 +34,7 @@ bool runKscreen(const QStringList& args, QByteArray* stdout_out, int timeout_ms 
   const QString bin = findKscreenDoctor();
   if (bin.isEmpty()) return false;
   QProcess p;
+  p.setProcessEnvironment(host_tool_environment());
   p.setProcessChannelMode(QProcess::MergedChannels);
   p.start(bin, args);
   if (!p.waitForStarted(2000)) return false;
@@ -509,6 +511,8 @@ bool KdeVirtualDisplay::start() {
           args.join(QLatin1Char(' ')).toUtf8().constData());
   proc_.setProgram(bin);
   proc_.setArguments(args);
+  // Host Plasma binary — never inherit AppImage $APPDIR/usr/lib (breaks Virtual-*).
+  proc_.setProcessEnvironment(host_tool_environment());
   // Detach from TTY noise; keep stderr for diagnosis via QProcess::read.
   proc_.setProcessChannelMode(QProcess::MergedChannels);
   proc_.start();
@@ -518,6 +522,19 @@ bool KdeVirtualDisplay::start() {
     launched_scale_ = 0.f;
     emit failed(proc_.errorString().isEmpty() ? QStringLiteral("krfb-virtualmonitor failed to start")
                                               : proc_.errorString());
+    return false;
+  }
+  // Brief settle + log if the process dies immediately (AppImage env regressions).
+  if (proc_.waitForFinished(300)) {
+    const QByteArray out = proc_.readAll();
+    owned_ = false;
+    launched_w_ = launched_h_ = 0;
+    launched_scale_ = 0.f;
+    const QString detail = QString::fromLocal8Bit(out).trimmed();
+    VRP_LOG("live: krfb-virtualmonitor exited early code=%d: %s", proc_.exitCode(),
+            detail.isEmpty() ? "(no output)" : detail.toUtf8().constData());
+    emit failed(detail.isEmpty() ? QStringLiteral("krfb-virtualmonitor exited immediately")
+                                 : detail);
     return false;
   }
   owned_ = true;
