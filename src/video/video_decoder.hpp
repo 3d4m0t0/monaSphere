@@ -393,6 +393,7 @@ class VideoDecoder {
   struct FFmpegState;
   std::unique_ptr<FFmpegState> ff_;
   std::mutex ff_mu_;
+  std::mutex codec_mu_;
 
   std::thread decode_thread_;
   std::atomic<bool> decode_stop_{false};

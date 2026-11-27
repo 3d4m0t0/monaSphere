@@ -1344,10 +1344,13 @@ void VideoDecoder::demux_loop() {
         const bool audio_full =
             want_audio && (audio_pkt_q_.size() >= kAudioMaxPackets ||
                            audio_pkt_bytes_ >= kAudioMaxBytes);
+        // Audio packets are small (AAC ~370B, Opus ~200–500B), so a byte floor
+        // of kAudioMaxBytes/4 (512 KiB) stayed true up to kAudioMaxPackets
+        // (256 pkts ≈ 6s) and dragged ~100 MiB of 4K60 video ahead on seek.
+        // Gate audio starvation on packet count (~0.5s) instead.
+        constexpr size_t kAudioLowPackets = 24;
         const bool audio_needs =
-            want_audio && !audio_full &&
-            (audio_pkt_q_.size() < (kAudioMaxPackets / 4) ||
-             audio_pkt_bytes_ < (kAudioMaxBytes / 4));
+            want_audio && !audio_full && audio_pkt_q_.size() < kAudioLowPackets;
         const bool video_needs =
             !video_full &&
             (pkt_q_.size() < (max_pkts / 4) || pkt_bytes_ < (target_bytes / 4));
@@ -2911,8 +2914,8 @@ bool VideoDecoder::decode_next(VideoFrame& out, bool convert_rgba, double presen
       set_decode_phase("pop_empty");
       return false;
     }
-    set_decode_phase("ff_mu_lock");
-    std::unique_lock<std::mutex> lock(ff_mu_);
+    set_decode_phase("codec_mu_lock");
+    std::unique_lock<std::mutex> lock(codec_mu_);
     if (!ff_->codec) return false;
     std::unique_lock<std::mutex> cuda_lock(cuda_decode_mu(), std::defer_lock);
     if (ff_->hw_device_ctx) {
