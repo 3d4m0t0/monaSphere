@@ -25,11 +25,16 @@ inline std::atomic<bool>& vrp_persist_display_enabled_flag() {
   return on;
 }
 inline std::atomic<bool>& vrp_persist_teardown_enabled_flag() {
-  static std::atomic<bool> on{true};
+  static std::atomic<bool> on{false};
   return on;
 }
 inline std::atomic<bool>& vrp_seek_detail_enabled_flag() {
   static std::atomic<bool> on{false};
+  return on;
+}
+/** NVIDIA GPU only (TEST): PowerMizer kick (teardown + decode stall). conf gpu_kick=0|1, default on. */
+inline std::atomic<bool>& vrp_gpu_kick_enabled_flag() {
+  static std::atomic<bool> on{true};
   return on;
 }
 inline void vrp_set_persist_display_log(bool on) {
@@ -41,6 +46,9 @@ inline void vrp_set_persist_teardown_log(bool on) {
 inline void vrp_set_seek_detail_log(bool on) {
   vrp_seek_detail_enabled_flag().store(on, std::memory_order_release);
 }
+inline void vrp_set_gpu_kick(bool on) {
+  vrp_gpu_kick_enabled_flag().store(on, std::memory_order_release);
+}
 inline bool vrp_persist_display_enabled() {
   return vrp_persist_display_enabled_flag().load(std::memory_order_acquire);
 }
@@ -49,6 +57,9 @@ inline bool vrp_persist_teardown_enabled() {
 }
 inline bool vrp_seek_detail_enabled() {
   return vrp_seek_detail_enabled_flag().load(std::memory_order_acquire);
+}
+inline bool vrp_gpu_kick_enabled() {
+  return vrp_gpu_kick_enabled_flag().load(std::memory_order_acquire);
 }
 
 /**

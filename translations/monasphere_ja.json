@@ -1903,8 +1903,23 @@
     },
     {
       "context": "Preferences",
-      "source": "Live teardown log",
-      "translation": "Live 終了ログ"
+      "source": "Startup / shutdown persistent log",
+      "translation": "起動・終了時の永続ログ"
+    },
+    {
+      "context": "Preferences",
+      "source": "Write startup/shutdown and Live teardown breadcrumbs to ~/.config/monasphere/live-teardown.log.",
+      "translation": "起動・終了時および Live 終了時のログを ~/.config/monasphere/live-teardown.log に永続出力します。"
+    },
+    {
+      "context": "Preferences",
+      "source": "GPU PowerMizer kick (NVIDIA TEST)",
+      "translation": "GPU PowerMizer キック（NVIDIA向け TEST）"
+    },
+    {
+      "context": "Preferences",
+      "source": "NVIDIA GPU only (TEST): wake PowerMizer during decode stalls and XR teardown (empty GPU submits). Default on; turn off if a newer driver makes it unnecessary.",
+      "translation": "NVIDIA GPU向け（TEST）：デコード停滞・XR終了時にPowerMizerを起こす（空のGPU submit）。標準ON。新しいドライバで不要ならOFFにできます。"
     },
     {
       "context": "Preferences",

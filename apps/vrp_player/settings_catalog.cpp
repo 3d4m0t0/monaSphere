@@ -562,13 +562,25 @@ const QVector<Entry>& catalog() {
                  .default_value = "0",
                  .label = QT_TR_NOOP("Live display log"),
                  .description = QT_TR_NOOP("Write Live display breadcrumbs under ~/.config/monasphere/.")});
-    e.push_back({.key = "live_teardown_log",
-                 .category = Category::Live,
+    // --- Other ---
+    e.push_back({.key = "gpu_kick",
+                 .category = Category::Other,
                  .kind = ValueKind::Bool01,
-                 .visibility = Visibility::Advanced,
+                 .visibility = Visibility::User,
                  .default_value = "1",
-                 .label = QT_TR_NOOP("Live teardown log"),
-                 .description = QT_TR_NOOP("Write Live teardown breadcrumbs for debugging.")});
+                 .label = QT_TR_NOOP("GPU PowerMizer kick (NVIDIA TEST)"),
+                 .description = QT_TR_NOOP(
+                     "NVIDIA GPU only (TEST): wake PowerMizer during decode stalls and XR teardown "
+                     "(empty GPU submits). Default on; turn off if a newer driver makes it unnecessary.")});
+    e.push_back({.key = "live_teardown_log",
+                 .category = Category::Other,
+                 .kind = ValueKind::Bool01,
+                 .visibility = Visibility::User,
+                 .default_value = "0",
+                 .label = QT_TR_NOOP("Startup / shutdown persistent log"),
+                 .description = QT_TR_NOOP(
+                     "Write startup/shutdown and Live teardown breadcrumbs to "
+                     "~/.config/monasphere/live-teardown.log.")});
 
     // --- Thumbs (file-dialog preview + advanced seek strip) ---
     static_assert(vrp::kSeekThumbCount == 128);

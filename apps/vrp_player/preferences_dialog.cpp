@@ -416,8 +416,14 @@ void PreferencesDialog::addEntryRow(QFormLayout* form, const vrp::settings::Entr
   if (e.kind != vrp::settings::ValueKind::Flags) sizeEditorToContents(editor, e.kind, e.key);
   editors_.insert(key, editor);
 
+  auto* lbl = new QLabel(label, this);
+  lbl->setWordWrap(true);
+  lbl->setMaximumWidth(230);
+  lbl->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+  lbl->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+
   if (e.kind == vrp::settings::ValueKind::Flags) {
-    form->addRow(label, editor);
+    form->addRow(lbl, editor);
   } else {
     // Editor stays content-sized; stretch fills the rest of the field column.
     auto* editor_cell = new QWidget(this);
@@ -426,12 +432,20 @@ void PreferencesDialog::addEntryRow(QFormLayout* form, const vrp::settings::Entr
     editor_row->addWidget(editor, 0, Qt::AlignLeft | Qt::AlignVCenter);
     editor_row->addStretch(1);
     editor_cell->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-    form->addRow(label, editor_cell);
+    form->addRow(lbl, editor_cell);
   }
 
   if (e.description && e.description[0]) {
-    auto* hint = new WrappingHintLabel(
-        QCoreApplication::translate("Preferences", e.description), this);
+    QString hint_text = QCoreApplication::translate("Preferences", e.description);
+    if (key == QLatin1String("vulkan_video")) {
+      hint_text += QLatin1Char('\n');
+      hint_text += tr("This build: FFmpeg %1 (libavcodec %2.%3.%4).")
+                       .arg(QString::fromUtf8(av_version_info()),
+                            QString::number(LIBAVCODEC_VERSION_MAJOR),
+                            QString::number(LIBAVCODEC_VERSION_MINOR),
+                            QString::number(LIBAVCODEC_VERSION_MICRO));
+    }
+    auto* hint = new WrappingHintLabel(hint_text, this);
     hint->setWordWrap(true);
     hint->setForegroundRole(QPalette::WindowText);
     hint->setAlignment(Qt::AlignLeft | Qt::AlignTop);

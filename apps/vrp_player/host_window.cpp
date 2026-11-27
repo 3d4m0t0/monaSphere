@@ -1912,6 +1912,9 @@ void HostWindow::loadAppConf() {
     } else if (line.startsWith(QStringLiteral("seek_detail_log="))) {
       const QString v = line.mid(QStringLiteral("seek_detail_log=").size()).trimmed();
       vrp_set_seek_detail_log(v == QLatin1String("1"));
+    } else if (line.startsWith(QStringLiteral("gpu_kick="))) {
+      const QString v = line.mid(QStringLiteral("gpu_kick=").size()).trimmed();
+      vrp_set_gpu_kick(v != QLatin1String("0"));
     } else if (line.startsWith(QStringLiteral("hz="))) {
       bool ok = false;
       const int v = line.mid(3).toInt(&ok);
@@ -3898,6 +3901,8 @@ void HostWindow::applyPreferences(const QHash<QString, QString>& values) {
       vrp_set_persist_teardown_log(value == QLatin1String("1"));
     } else if (key == QLatin1String("seek_detail_log")) {
       vrp_set_seek_detail_log(value == QLatin1String("1"));
+    } else if (key == QLatin1String("gpu_kick")) {
+      vrp_set_gpu_kick(value != QLatin1String("0"));
     } else if (key == QLatin1String("thumb_count")) {
       bool ok = false;
       const int v = value.toInt(&ok);

@@ -649,6 +649,7 @@ struct PowermizerKickHelper {
 }  // namespace
 
 void XrVulkanApp::kick_queues_for_teardown(int rounds, int interval_ms) {
+  if (!vrp_gpu_kick_enabled()) return;
   if (!device_ || !queue_ || !command_pool_ || rounds <= 0) return;
   VRP_TEARDOWN_LOG("XR: teardown PowerMizer kick %d×%dms (device+decode still live)", rounds,
                    interval_ms);
@@ -713,37 +714,45 @@ void XrVulkanApp::destroy_vk_instance() {
     // Device is gone — side-channel kicks keep PowerMizer up while ICD drains
     // residual Vulkan Video / compositor client state (else DestroyInstance can
     // sit for ~100s and the next xrCreateVulkanInstanceKHR wedges).
+    // Skipped when gpu_kick=0 (newer drivers may not need this).
+    const bool do_kick = vrp_gpu_kick_enabled();
     std::atomic<bool> kick_done{false};
     auto kick_finished = std::make_shared<std::atomic<bool>>(false);
-    std::thread kicker([&, kick_finished] {
-      PowermizerKickHelper helper;
-      if (!helper.init()) {
-        VRP_TEARDOWN_LOG("XR: PowerMizer kick helper unavailable during DestroyInstance");
-        while (!kick_done.load(std::memory_order_acquire))
-          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::thread kicker;
+    if (do_kick) {
+      kicker = std::thread([&, kick_finished] {
+        PowermizerKickHelper helper;
+        if (!helper.init()) {
+          VRP_TEARDOWN_LOG("XR: PowerMizer kick helper unavailable during DestroyInstance");
+          while (!kick_done.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          kick_finished->store(true, std::memory_order_release);
+          return;
+        }
+        VRP_TEARDOWN_LOG("XR: PowerMizer kick helper live during DestroyInstance");
+        int n = 0;
+        while (!kick_done.load(std::memory_order_acquire)) {
+          helper.kick();
+          ++n;
+          if (n == 1 || n == 10 || (n % 50) == 0)
+            VRP_TEARDOWN_LOG("XR: DestroyInstance PowerMizer kick #%d", n);
+          // Short slices so a finished DestroyInstance is noticed quickly.
+          for (int s = 0; s < 10 && !kick_done.load(std::memory_order_acquire); ++s)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        const auto s0 = std::chrono::steady_clock::now();
+        helper.shutdown();
+        const auto sm = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - s0)
+                            .count();
+        VRP_TEARDOWN_LOG("XR: PowerMizer kick helper stopped (%d kicks, shutdown %lld ms)", n,
+                         static_cast<long long>(sm));
         kick_finished->store(true, std::memory_order_release);
-        return;
-      }
-      VRP_TEARDOWN_LOG("XR: PowerMizer kick helper live during DestroyInstance");
-      int n = 0;
-      while (!kick_done.load(std::memory_order_acquire)) {
-        helper.kick();
-        ++n;
-        if (n == 1 || n == 10 || (n % 50) == 0)
-          VRP_TEARDOWN_LOG("XR: DestroyInstance PowerMizer kick #%d", n);
-        // Short slices so a finished DestroyInstance is noticed quickly.
-        for (int s = 0; s < 10 && !kick_done.load(std::memory_order_acquire); ++s)
-          std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      }
-      const auto s0 = std::chrono::steady_clock::now();
-      helper.shutdown();
-      const auto sm = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now() - s0)
-                          .count();
-      VRP_TEARDOWN_LOG("XR: PowerMizer kick helper stopped (%d kicks, shutdown %lld ms)", n,
-                       static_cast<long long>(sm));
+      });
+    } else {
+      VRP_TEARDOWN_LOG("XR: PowerMizer kick helper skipped (gpu_kick=0)");
       kick_finished->store(true, std::memory_order_release);
-    });
+    }
     const auto t0 = std::chrono::steady_clock::now();
     VRP_TEARDOWN_LOG("XR: shutdown vkDestroyInstance enter");
     vkDestroyInstance(vk_inst, nullptr);
@@ -751,18 +760,21 @@ void XrVulkanApp::destroy_vk_instance() {
                         std::chrono::steady_clock::now() - t0)
                         .count();
     kick_done.store(true, std::memory_order_release);
-    // Cap join: XR DestroyInstance already done — do not stall Host on helper ICD quirks.
-    constexpr auto kJoinBudget = std::chrono::milliseconds(400);
-    const auto join_deadline = std::chrono::steady_clock::now() + kJoinBudget;
-    while (!kick_finished->load(std::memory_order_acquire) &&
-           std::chrono::steady_clock::now() < join_deadline)
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    if (kick_finished->load(std::memory_order_acquire)) {
-      kicker.join();
-    } else {
-      VRP_TEARDOWN_LOG("XR: PowerMizer kick helper still draining — detach (DestroyInstance %lld ms)",
-                       static_cast<long long>(ms));
-      kicker.detach();
+    if (do_kick) {
+      // Cap join: XR DestroyInstance already done — do not stall Host on helper ICD quirks.
+      constexpr auto kJoinBudget = std::chrono::milliseconds(400);
+      const auto join_deadline = std::chrono::steady_clock::now() + kJoinBudget;
+      while (!kick_finished->load(std::memory_order_acquire) &&
+             std::chrono::steady_clock::now() < join_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      if (kick_finished->load(std::memory_order_acquire)) {
+        kicker.join();
+      } else {
+        VRP_TEARDOWN_LOG(
+            "XR: PowerMizer kick helper still draining — detach (DestroyInstance %lld ms)",
+            static_cast<long long>(ms));
+        kicker.detach();
+      }
     }
     VRP_TEARDOWN_LOG("XR: shutdown vkDestroyInstance leave %lld ms", static_cast<long long>(ms));
     if (ms >= 5000) {
