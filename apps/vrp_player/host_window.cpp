@@ -3504,6 +3504,7 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
   cfg.virtual_display = live_virtual_;
   cfg.virtual_w = use_w;
   cfg.virtual_h = use_h;
+  cfg.max_fps = live_max_fps_;
   // Always Virtual-monaSphere (span → resolution only). Name is not user-configurable.
   cfg.virtual_name = vrp::KdeVirtualDisplay::nameForSpan(span);
   cfg.output_hint = vrp::KdeVirtualDisplay::outputNameForSpan(span);
@@ -9305,14 +9306,10 @@ void HostWindow::xrThreadMain() {
                 live_dma_pending = {};
               }
             }
-            // 3) Display-paced import: ≤~60Hz (first frame immediate).
-            //    Live FSR samples the present image async — do not overwrite it
-            //    while that pass still reads it (in-place rewrite flicker).
-            constexpr auto kMinDmaImportGap = std::chrono::milliseconds(15);
-            const bool need_first = !pw_dma_tex.has_valid_frame();
-            const bool paced =
-                need_first || last_dma_import_at == std::chrono::steady_clock::time_point{} ||
-                (now - last_dma_import_at) >= kMinDmaImportGap;
+            // 3) Import pacing is governed by PipeWire maxFramerate (live_max_fps) and
+            //    GPU eye/FSR completion gates. Do not apply a fixed 15ms gap here — on a
+            //    90Hz HMD (11.1ms/frame) 15ms skips every other frame and caps Live at 45fps.
+            const bool paced = true;
             const bool fsr_blocks_import = live_fsr_armed && fsr.busy();
             // mark_eye_done at most once per XR tick. A second mark in the same
             // tick (old try_promote path) burned present-hold and rewrote present
@@ -9419,7 +9416,9 @@ void HostWindow::xrThreadMain() {
             if (!defer_promote_this_tick && pw_dma &&
                 !(yt_session_ && yt_session_->dma_disabled()) && !pw_dma_tex.import_abandoned()) {
               mark_dma_eye_once();
-              if (pw_dma_tex.try_promote_pending()) imported_dma = true;
+              if (pw_dma_tex.try_promote_pending()) {
+                imported_dma = true;
+              }
             }
           }
           // switch_freeze already bound the last picture — do not ingest wallpaper.

@@ -383,6 +383,19 @@ bool KdeVirtualDisplay::queryOutputMode(const QString& output_name_substr, int* 
   return mode_w && mode_h && *mode_w > 0 && *mode_h > 0;
 }
 
+double KdeVirtualDisplay::queryOutputRefreshHz(const QString& output_name_substr) {
+  QJsonObject o;
+  if (!findOutputObject(output_name_substr, &o, nullptr, /*require_enabled=*/false)) return 0.0;
+  const QString cur = o.value(QStringLiteral("currentModeId")).toVariant().toString();
+  const QJsonArray modes = o.value(QStringLiteral("modes")).toArray();
+  for (const QJsonValue& mv : modes) {
+    const QJsonObject m = mv.toObject();
+    if (!cur.isEmpty() && m.value(QStringLiteral("id")).toVariant().toString() != cur) continue;
+    return m.value(QStringLiteral("refreshRate")).toDouble();
+  }
+  return 0.0;
+}
+
 bool KdeVirtualDisplay::outputExists(const QString& output_name_substr) {
   QJsonObject o;
   return findOutputObject(output_name_substr, &o, nullptr, /*require_enabled=*/false);

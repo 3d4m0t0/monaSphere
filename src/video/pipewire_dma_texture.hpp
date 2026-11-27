@@ -171,7 +171,7 @@ class PipewireDmaTexture {
    * thrash cannot flash a new image every XR commit.
    */
   uint64_t present_hold_until_epoch_ = 0;
-  static constexpr uint64_t kPresentHoldEpochs = 2;
+  static constexpr uint64_t kPresentHoldEpochs = 1;
   /** Once EXPORT_SYNC_FILE has succeeded, later ioctl-fail soft-skips the blit. */
   bool dmabuf_sync_ever_ok_ = false;
 

@@ -83,6 +83,7 @@ class YouTubeSession : public QObject {
     bool virtual_display = true;
     int virtual_w = 1960;
     int virtual_h = 1080;
+    int max_fps = 60;
     /** krfb-virtualmonitor --scale (1.0–3.0). 2.0 = 200%. */
     float virtual_scale = 2.f;
     /**

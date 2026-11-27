@@ -109,7 +109,7 @@ class PipewireCapture {
    */
   bool start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial = 0,
              std::vector<uint64_t> consumer_modifiers = {}, int prefer_w = 0, int prefer_h = 0,
-             bool prefer_shm = false);
+             bool prefer_shm = false, int max_fps = 60);
   void stop();
 
   /**
@@ -192,6 +192,7 @@ class PipewireCapture {
   int prefer_w_ = 0;
   int prefer_h_ = 0;
   bool prefer_shm_ = false;
+  int max_fps_ = 60;
   std::atomic<bool> skip_unpainted_bo_{false};
   std::atomic<bool> running_{false};
   std::atomic<bool> stop_{false};

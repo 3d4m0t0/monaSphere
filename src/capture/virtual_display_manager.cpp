@@ -247,19 +247,28 @@ QString VirtualDisplayManager::pinPortalGeometry() {
   const QPoint origin = KdeVirtualDisplay::preferredPlaceOrigin();
   const float sc = scale() >= 1.f ? scale() : 1.f;
   (void)KdeVirtualDisplay::enableOutput(out, origin.x(), origin.y(), sc);
+  VRP_LOG("Virtual: refresh %s = %.3f Hz (kscreen currentMode)", out.toUtf8().constData(),
+          KdeVirtualDisplay::queryOutputRefreshHz(out));
   // Let Qt / KWin publish the new QScreen geometry (portal uniqueId source).
+  // Cap wait: a full 2.5s spin was the largest fixed Live delay after Virtual
+  // identity. Accept the first stable id (or expect match) within ~600ms.
   QElapsedTimer wait;
   wait.start();
   QString id;
-  while (wait.elapsed() < 2500) {
-    QCoreApplication::processEvents(QEventLoop::AllEvents, 50);
+  QString first_id;
+  const QString expect = KdeVirtualDisplay::portalUniqueIdFromPoint(origin);
+  while (wait.elapsed() < 600) {
+    QCoreApplication::processEvents(QEventLoop::AllEvents, 40);
     id = KdeVirtualDisplay::queryQtPortalUniqueId(out);
     if (!id.isEmpty()) {
-      const QString expect = KdeVirtualDisplay::portalUniqueIdFromPoint(origin);
+      if (first_id.isEmpty()) first_id = id;
       if (id == expect) break;
+      // Id published but not yet at expected origin — keep briefly, then take it.
+      if (wait.elapsed() >= 200) break;
     }
-    QThread::msleep(100);
+    QThread::msleep(40);
   }
+  if (id.isEmpty()) id = first_id;
   if (id.isEmpty()) {
     // Qt may not list compositor-only Virtual (xcb host). Fall back to the
     // origin we asked for — same formula portal uses when the screen is visible.

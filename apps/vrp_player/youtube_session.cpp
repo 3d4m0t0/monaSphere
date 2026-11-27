@@ -2390,7 +2390,7 @@ void YouTubeSession::onPortalStarted(const ScreencastPortal::Result& r) {
                               .arg(cfg_.drm_modifiers.size()));
   }
   if (!capture_->start(r.pw_fd, r.node_id, r.pipewire_serial, cfg_.drm_modifiers, prefer_w, prefer_h,
-                       /*prefer_shm=*/false)) {
+                       /*prefer_shm=*/false, cfg_.max_fps)) {
     const QString err = QString::fromStdString(capture_->last_error());
     if (r.pw_fd >= 0) ::close(r.pw_fd);
     if (r.eis_fd >= 0) ::close(r.eis_fd);

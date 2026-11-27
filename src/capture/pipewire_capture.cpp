@@ -324,14 +324,15 @@ constexpr spa_fraction kMaxFpsMin{1, 1};
 constexpr spa_fraction kMaxFpsCap{60, 1};
 
 /** Plain EnumFormat (MemFd-friendly). Keep this first in connect params. */
-spa_pod* build_format_plain(spa_pod_builder* b, uint32_t prefer_w, uint32_t prefer_h) {
+spa_pod* build_format_plain(spa_pod_builder* b, uint32_t prefer_w, uint32_t prefer_h,
+                            uint32_t max_fps) {
   spa_rectangle def_size{prefer_w, prefer_h};
   spa_rectangle min_size{64, 64};
   spa_rectangle max_size{8192, 8192};
   spa_fraction var_fps = kVarFps;
-  spa_fraction max_def = kMaxFpsDef;
+  spa_fraction max_def{max_fps, 1};
   spa_fraction max_min = kMaxFpsMin;
-  spa_fraction max_cap = kMaxFpsCap;
+  spa_fraction max_cap{max_fps, 1};
   return static_cast<spa_pod*>(spa_pod_builder_add_object(
       b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat, SPA_FORMAT_mediaType,
       SPA_POD_Id(SPA_MEDIA_TYPE_video), SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
@@ -352,15 +353,15 @@ spa_pod* build_format_plain(spa_pod_builder* b, uint32_t prefer_w, uint32_t pref
  * modifier-less, fail on NVIDIA, and demote to MemFd).
  */
 spa_pod* build_format_modifier(spa_pod_builder* b, const std::vector<uint64_t>& mods,
-                               uint32_t prefer_w, uint32_t prefer_h) {
+                               uint32_t prefer_w, uint32_t prefer_h, uint32_t max_fps) {
   spa_pod_frame f[2];
   spa_rectangle def_size{prefer_w, prefer_h};
   spa_rectangle min_size{64, 64};
   spa_rectangle max_size{8192, 8192};
   spa_fraction var_fps = kVarFps;
-  spa_fraction max_def = kMaxFpsDef;
+  spa_fraction max_def{max_fps, 1};
   spa_fraction max_min = kMaxFpsMin;
-  spa_fraction max_cap = kMaxFpsCap;
+  spa_fraction max_cap{max_fps, 1};
 
   std::vector<uint64_t> list = mods;
   if (list.empty()) list.push_back(DRM_FORMAT_MOD_LINEAR);
@@ -1226,10 +1227,11 @@ bool PipewireCapture::take_latest_dma(PipewireDmaFrame& out, uint64_t& seen_seq)
 
 bool PipewireCapture::start(int pw_fd, uint32_t node_id, uint64_t pipewire_serial,
                             std::vector<uint64_t> consumer_modifiers, int prefer_w, int prefer_h,
-                            bool prefer_shm) {
+                            bool prefer_shm, int max_fps) {
   stop();
   // pw_fd < 0 → default user PipeWire socket (in-session Mutter ScreenCast).
   prefer_shm_ = prefer_shm;
+  max_fps_ = (max_fps >= 90) ? 90 : 60;
   consumer_modifiers_ = std::move(consumer_modifiers);
   if (!prefer_shm_ && consumer_modifiers_.empty())
     consumer_modifiers_.push_back(DRM_FORMAT_MOD_LINEAR);
@@ -1354,13 +1356,15 @@ void PipewireCapture::thread_main(int pw_fd, uint32_t node_id, uint64_t serial) 
   // Meta). prefer_shm_ skips modifiers (debug / emergency only).
   const spa_pod* params[2];
   uint32_t n_params = 0;
+  const uint32_t max_fps = static_cast<uint32_t>(max_fps_ >= 90 ? 90 : 60);
   if (prefer_shm_) {
-    params[n_params++] = build_format_plain(&builder, st.prefer_w, st.prefer_h);
-    VRP_LOG("pipewire: SHM-only EnumFormat (prefer_shm override)");
+    params[n_params++] = build_format_plain(&builder, st.prefer_w, st.prefer_h, max_fps);
+    VRP_LOG("pipewire: SHM-only EnumFormat (prefer_shm override, maxFps=%u)", max_fps);
   } else {
     params[n_params++] =
-        build_format_modifier(&builder, st.consumer_modifiers, st.prefer_w, st.prefer_h);
-    params[n_params++] = build_format_plain(&builder, st.prefer_w, st.prefer_h);
+        build_format_modifier(&builder, st.consumer_modifiers, st.prefer_w, st.prefer_h, max_fps);
+    params[n_params++] = build_format_plain(&builder, st.prefer_w, st.prefer_h, max_fps);
+    VRP_LOG("pipewire: maxFramerate cap=%u fps", max_fps);
   }
 
   // MAP_BUFFERS: required for MemFd CPU path.

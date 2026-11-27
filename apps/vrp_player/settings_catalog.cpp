@@ -446,6 +446,16 @@ const QVector<Entry>& catalog() {
                  .default_value = "1",
                  .label = QT_TR_NOOP("Virtual display"),
                  .description = QT_TR_NOOP("Create a virtual output for Live (recommended on).")});
+    e.push_back({.key = "live_max_fps",
+                 .category = Category::Live,
+                 .kind = ValueKind::Enum,
+                 .visibility = Visibility::User,
+                 .default_value = "60",
+                 .label = QT_TR_NOOP("Max capture FPS"),
+                 .description = QT_TR_NOOP(
+                     "PipeWire ScreenCast maxFramerate cap (60 or 90). "
+                     "Actual rate also depends on the compositor/virtual display."),
+                 .enum_values = kLiveMaxFps});
     e.push_back({.key = "live_virtual_size",
                  .category = Category::Live,
                  .kind = ValueKind::SizeWxH,

@@ -101,6 +101,8 @@ class KdeVirtualDisplay : public QObject {
    */
   static bool queryOutputMode(const QString& output_name_substr, int* mode_w, int* mode_h,
                               float* scale, QString* matched_name = nullptr);
+  /** Current mode refresh rate in Hz (kscreen-doctor -j), 0 if unknown. */
+  static double queryOutputRefreshHz(const QString& output_name_substr);
   /** True while kscreen still lists an output whose name contains substr. */
   static bool outputExists(const QString& output_name_substr);
   /**
