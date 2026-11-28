@@ -118,6 +118,8 @@ class HostWindow : public QMainWindow {
   void ensureLiveChromeWarm();
   /** GNOME: once per session when Wayland system Chrome forces isolated. */
   void maybeWarnGnomeChromeIsolated(bool forced_isolated);
+  /** Non-GNOME: once per session when Wayland system Chrome is running (shared profile). */
+  void maybeWarnWaylandChromeBanner(bool use_default_chrome, bool forced_isolated);
   void beginYouTubeCapture(bool host_setup, const QString& url_override = {},
                            const QString& desktop_exec = {},
                            const QStringList& desktop_args = {}, int monitor_span = 1,
@@ -572,6 +574,8 @@ class HostWindow : public QMainWindow {
   bool live_chrome_warm_ = true;
   /** Session flag: already showed GNOME Wayland→isolated Chrome dialog. */
   bool gnome_chrome_isolated_warned_ = false;
+  /** Session flag: already showed Wayland Chrome fullscreen-banner dialog. */
+  bool wayland_chrome_banner_warned_ = false;
   /** Conf `live_browser` — chrome (default) or firefox. */
   vrp::LiveBrowser live_browser_ = vrp::LiveBrowser::Chrome;
   /** Filled on XR thread from PipewireDmaTexture::query_sampleable_modifiers. */

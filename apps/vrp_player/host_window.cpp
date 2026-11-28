@@ -2596,6 +2596,23 @@ void HostWindow::maybeWarnGnomeChromeIsolated(bool forced_isolated) {
          "completely, then restart monaSphere."));
 }
 
+void HostWindow::maybeWarnWaylandChromeBanner(bool use_default_chrome, bool forced_isolated) {
+  if (!use_default_chrome || forced_isolated || wayland_chrome_banner_warned_) return;
+  if (live_browser_ != vrp::LiveBrowser::Chrome) return;
+  if (shutting_down_.load(std::memory_order_acquire)) return;
+  if (!vrp::ChromiumYtLauncher::userWaylandSharedChromeRunning()) return;
+  wayland_chrome_banner_warned_ = true;
+  appendLog(tr("Live: system Chrome is running on Wayland — fullscreen \"Press Esc\" banner "
+               "may not disappear (close Chrome completely or start it with --ozone-platform=x11)"));
+  QMessageBox::information(
+      this, tr("Live Chrome"),
+      tr("System Chrome is already running on Wayland.\n\n"
+         "When Live shares a Wayland Chrome process, the \"Press Esc to exit full screen\" "
+         "banner may stay visible during fullscreen playback.\n\n"
+         "Closing Chrome completely (or launching Chrome with --ozone-platform=x11) "
+         "resolves this. You can also continue without closing it."));
+}
+
 void HostWindow::ensureLiveChromeWarm() {
   if (shutting_down_.load(std::memory_order_acquire)) return;
   if (!live_chrome_warm_) return;
@@ -2614,6 +2631,7 @@ void HostWindow::ensureLiveChromeWarm() {
   const bool use_default = vrp::YouTubeSession::resolveUseDefaultChromeProfile(
       live_chrome_default_profile_, live_browser_, live_virtual_, &forced_iso);
   maybeWarnGnomeChromeIsolated(forced_iso);
+  maybeWarnWaylandChromeBanner(use_default, forced_iso);
 
   vrp::ChromiumYtLauncher warm;
   warm.set_browser(vrp::LiveBrowser::Chrome);
@@ -3508,6 +3526,7 @@ void HostWindow::beginYouTubeCapture(bool host_setup, const QString& url_overrid
     const bool use_default_chrome = vrp::YouTubeSession::resolveUseDefaultChromeProfile(
         live_chrome_default_profile_, live_browser_, live_virtual_, &forced_iso);
     maybeWarnGnomeChromeIsolated(forced_iso);
+    maybeWarnWaylandChromeBanner(use_default_chrome, forced_iso);
     const QString browser_name =
         live_browser_ == vrp::LiveBrowser::Firefox ? tr("Firefox") : tr("Chrome");
     appendLog(tr("Live browser: %1 (%2)")
